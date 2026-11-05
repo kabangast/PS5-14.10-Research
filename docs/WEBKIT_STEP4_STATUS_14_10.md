@@ -85,6 +85,37 @@ entries are **duplicates of the real values** (`130,131,132,130,131,132`).
 no pointer-shaped values. This is a duplicate-report artifact, **not** an
 out-of-bounds read. The lead is closed.
 
+## Closed: the `m_stateStack.m_size` desync (P705)
+
+The last candidate built on *proven* primitives (same-type alias only, no 768 B
+forge) was the save-count desync described in the `pastawithpesto` reference:
+
+> "stale wrapper retains `m_stateStack.m_size = 9` (from 8 saves) while the new
+> ctx has `m_size = 1`. Reading `last()` through the stale wrapper indexes
+> `buffer[8]` = 2800 bytes past the end of the 1-State buffer -> reads adjacent
+> heap as float64."
+
+P705 tested it directly, with three save-count pairings. In each, the victim was
+built with `vsaves`, UAF'd, reclaimed by a same-type context built with `rsaves`,
+and then read through the **stale** wrapper after setting a marker through the
+**reclaiming** handle:
+
+| Section | victim saves | reclaim saves | read through stale wrapper |
+|---|---|---|---|
+| S1 | 8 | 0 | `1111.5` — the reclaiming handle's value |
+| S2 | 0 | 8 | `2222.5` — the reclaiming handle's value |
+| S3 | 16 | 1 | `3333.5` — the reclaiming handle's value |
+
+All three report `SHARED-no-desync`. S1 is the reference's exact case.
+
+This is expected structurally: `m_stateStack` is a member **inside** the 768 B
+context object. Same-type reclaim means both JS handles address **one** object,
+so there is exactly **one** `m_size`; the stale wrapper does not keep its own
+copy of the Vector. No desync exists, so no OOB read follows from it.
+
+The lead is closed. It was the last path that used primitives measured to work on
+this build rather than ones measured to fail.
+
 ## Honest position on step 4
 
 The step-4 framing — "chain address disclosure + memory overlap into a data
@@ -114,3 +145,5 @@ and this document records that as a measured result rather than a surmise.
 | P701 | `p701-state-buffer-reclaim.html` | freed state buffer (6656 B) — dies at the read |
 | P702 | `p702-alias-only-primitives.html` | maps what the alias provides |
 | P703 | `p703-linedash-desync-oob.html` | characterises the dash length anomaly (closed) |
+| P704 | `p704-chunk-timeline-dump.html` | full 192 B chunk timeline; only 9 static bytes, Timer region empty |
+| P705 | `p705-mstate-size-desync.html` | `m_size` desync - **closed**, state is shared |
