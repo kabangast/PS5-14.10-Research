@@ -101,6 +101,26 @@ Decisive outcomes:
 - **`C-VERDICT nonzero=false` (lw returned 0.0)** → AB reclaimed but the canary
   address was off, or `lineWidth` read a zeroed qword; retest with `p58` directly.
 
+## P694 first run result (2026-11-05 21:57) — and the concurrent-edit bug
+
+P694 deployed, ran, and reached `P694-A-HIT | p58=0x10008b5c30|p68=0x10007e2ed0`
+(FontFace leak clean), then `B-READ | lw=1337` with no crash. But `1337` is the
+old same-type spray marker — a **concurrent edit had re-inserted the same-type
+`sprayX2` (lineWidth=1337) plus an `lw = 1337.0` fallback into the deployed
+`index.html`, overriding the AB-only design. So `lineWidth` read through the
+same-type alias again, and the canary was not a pointer read.
+
+The beacon also recorded an independent `BigInt` mix bug in the re-edited stage C
+(`P694-BOOT-ERR | Invalid mix of BigInt and other type in subtraction`), further
+evidence the deployed file was not the one written here.
+
+**P695** (`probes/phase13_webkit/p695-cross-type-forge-oracle.html`) removes the
+same-type spray entirely and separates the FontFace leak (stage A, ends in
+`location.reload()`) from the clean UAF `+ AB-only forge` (stage B, reads `p58`
+back from sessionStorage), so the forged m_stateStack is the only thing lineWidth
+can reach. Watch `B-NOLEAK|p58-missing` as a sign sessionStorage does not survive
+the WebProcess reload (then fall back to cookie persistence).
+
 ## Next after a successful read
 
 The confirmed escalation path (pastawithpesto README / FINDINGS):
