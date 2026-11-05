@@ -21,6 +21,9 @@ import threading
 SPOOF_DOMAINS = {
     b'manuals.playstation.net',
     b'ps5.np.playstation.net',
+    b'www.playstation.com',
+    b'ecode.np.cs.playstation.net',
+    b'static.playstation.com',
 }
 
 
@@ -147,7 +150,8 @@ def main():
     print('  PS5 DNS Spoofer')
     print('=' * 50)
     print(f'  Listening: {args.host}:{args.port}')
-    print(f'  Spoofing:  manuals.playstation.net -> {spoof_ip}')
+    for dom in sorted(SPOOF_DOMAINS):
+        print(f'  Spoofing:  {dom.decode()} -> {spoof_ip}')
     print(f'  Upstream:  {args.upstream}')
     print()
     print(f'  Set PS5 DNS to: {spoof_ip}')

