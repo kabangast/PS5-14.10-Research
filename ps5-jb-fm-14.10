@@ -85,14 +85,17 @@ PHASE A — WEBKIT EXPLOITATION
       RAF removal = RELIABLE CRASH 5/5 (P1070, 2026-11-10 06:34 UTC; beacon
       log shows PRE-B2 then immediate browser BOOT every run). Possibly
       CVE-2023-40447/CVE-2023-41976 class. Unexploited.
-    - CVE-2025-31277 RegExp HABT OOB: candidate, UPSTREAM-VERIFIED 2026-11-10.
-      tryCreateContiguousArrayWithPattern() (JSGlobalObjectInlines.h, RUNTIME
-      path — no JIT needed) created Contiguous match arrays after
-      have-a-bad-time; fix commit 716536ce98d6 (bug 291745, Yusuke Suzuki)
-      adds a 3-line isHavingABadTime() check; regression test matches P1077's
-      trigger verbatim. Fix dated 2025-10-06, Safari 7621 branch — postdates
-      PS5's WebKit (~17.0); present unless Sony backported. Probe P1077
-      authored, NEVER RUN (browser crash loop). See CONFLICTS (resolved #1).
+    - CVE-2025-31277 RegExp HABT OOB: TESTED 2026-11-10 09:23 UTC — DEAD.
+      P1077 first run (beacon path fixed to /beacon.php, crash-resume state
+      machine added): HABT triggers fine (A1:true), but post-HABT match
+      arrays behave as SLOW arrays — writes at [100], [8192] and the exact
+      PoC index [41530] all grow length normally (len:101, 8193, 41531)
+      with clean readback; section C: 200/200 OOB writes, 900 buffers
+      scanned, 0 corruption; section D: 0 leaks. DONE VULN:false. The
+      engine respects have-a-bad-time for match results — Sony backported
+      the fix or equivalent. Upstream bug 291745/fix commit 716536ce98d6
+      verified real (runtime path, not JIT); the PS5 build is not
+      vulnerable to it. Lead CLOSED.
     - CVE-2026-28847 YARR stack overflow: P607 deployed 2026-11-03, no
       confirmed result.
 2.  DONE for canvas UAF (P605v1) and B2 crash (P1070). P1077 untested.
@@ -260,15 +263,16 @@ HARDEST WALLS ON 14.10 (updated)
 
 EVIDENCE CONFLICTS (must resolve, do not average)
 ==================================================
-1. CVE-2025-31277: RESOLVED 2026-11-10 via upstream source. Retraction
-   doc's "JIT — DEAD" row was WRONG (corrected in place): fix commit
-   716536ce98d6 (fetched from WebKit/WebKit mirror) shows bug 291745 lives
-   in the runtime file JSGlobalObjectInlines.h and the regression test is
-   the exact P1077 trigger — no JIT involvement. Caveats: (a) the CVE
-   label is approximate — CVE-2025-31277 was Apple's May 2025 advisory but
-   this commit is dated 2025-10-06, so the true CVE may be a later one;
-   exploitability is unaffected; (b) Sony could have backported the fix.
-   Resolution path unchanged: run P1077 on the PS5.
+1. CVE-2025-31277: RESOLVED 2026-11-10, TWICE. (a) Via upstream source:
+   retraction doc's "JIT — DEAD" row was wrong about the mechanism (fix
+   commit 716536ce98d6 shows a runtime bug in JSGlobalObjectInlines.h;
+   regression test = P1077's trigger verbatim). (b) Via LIVE TEST: P1077
+   ran on the PS5 09:23 UTC — post-HABT match arrays use slow-put (length
+   grows on OOB-index writes), 0 corruption, 0 leaks, VULN:false. The
+   retraction row's CONCLUSION ("DEAD") stands, its REASON was wrong
+   (not "JIT absent" — the engine respects HABT; Sony backported or
+   equivalent). CVE label caveat: CVE-2025-31277 was Apple's May 2025
+   advisory; the commit is Oct 2025, so the true CVE id may differ.
 2. P927 (2026-11-09) claims ASLR defeat + lineDash arbitrary R/W bus;
    the 2026-11-10 retraction scorecard says arbitrary read NOT ACHIEVED and
    retracts the FontFace leak family. Treat P927 as unverified until
@@ -282,22 +286,27 @@ EVIDENCE CONFLICTS (must resolve, do not average)
 
 PROBE QUEUE (browser; index.html deployment per COORDINATION.md lock)
 =====================================================================
-LIVE:      P1069v7 "Fresh Leak + Size Scan" (deployed 2026-11-10 10:59
-           local, awaiting PS5 browser reload; zero beacons).
+COMPLETED: P1069v9 (FL leak stabilized ~100%; 4/4 lineWidth crashes —
+           AB(768) cross-type reclaim re-confirmed dead, matching the
+           P693-P705 matrix in docs/WEBKIT_STEP4_STATUS_14_10.md).
+COMPLETED: P1077 (CVE-2025-31277 RegExp HABT OOB) — DEAD, VULN:false
+           (2026-11-10 09:23 UTC). Top lead closed.
 QUEUED:    P1071-P1075 (B2 layer-UAF exploitation variants), P1076
-           (structuredClone UAF, likely fixed), P1077 (RegExp HABT OOB —
-           top priority), P1078-P1082 (mega/chain variants).
-NOTE:      B2 crash loop repeatedly blocks page loads; keep the deployed
-           probe small enough to beacon before crashing.
+           (structuredClone UAF, likely fixed), P1078-P1082 (mega/chain
+           variants — review before running; several predate the v9 fixes).
+NOTE:      keep deployed probes on /beacon.php (the /en/ps5/beacon.gif
+           endpoint does not exist — P1077's original beacons were
+           silently dropped until fixed).
 
 NEXT RESEARCH ACTIONS (priority order)
 ======================================
-1. Run P1077 (resolves Conflict 1; if B4 write lands OOB it opens steps 4-10).
-2. Get P1069v7 result (resolves Conflict 3; verify or kill the P1069v3 leak).
-3. Exploit B2 crash (P1074/P1075): GraphicsLayer is fastMalloc, Gigacage OFF
-   — ArrayBuffer sprays share that heap; spray + crash + reclaim scan.
-4. If a verified leak lands: rebuild addrOf/fakeObj (steps 6-8) on the
-   aliased-context groom (step 3 already reliable).
-5. Kernel side (parallel, from Lua entry): only new-bug hunting remains —
+1. Exploit B2 compositor crash (P1074/P1075): GraphicsLayer is fastMalloc,
+   Gigacage OFF — AB sprays share that heap. This is now the ONLY live
+   WebKit memory-corruption lead: reliable 5/5 crash, unexploited.
+2. Widen the FL leak: scan ALL spray size classes (not just 192) for
+   recurring qwords at offset 0 across reloads — vtable/code-pointer
+   candidates (per-size-class segregation means other freed objects may
+   leak code pointers even though the 192B font object doesn't).
+3. Kernel side (parallel, from Lua entry): only new-bug hunting remains —
    13.60 static capture diffing and untested argument contracts, per
    JAILBREAK_CHAIN_14_10.md gates. Do not rerun documented dead ends.

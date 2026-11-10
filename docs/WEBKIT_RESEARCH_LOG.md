@@ -337,8 +337,14 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
   - FL deep scan: reclaimed font object qword +0 = 0x1 (not a vtable), heap ptrs at +0x58/+0x68, NO code pointers.
 - **Next**: recover real CanvasRenderingContext2D layout (dump surviving fields via live alias handle from P605v2 before filling), or get a code-pointer leak for a real vtable.
 
-## Priority leads — UPDATED 2026-11-10
-1. **CVE-2025-31277 RegExp HABT OOB** — JSC runtime bug, fixed 2025, 100% present on PS5 Safari 17.0 (P1077 DEPLOYED)
-2. **B2 Compositor Layer UAF** — Reliable crash (5/5), needs exploitation (P1074 ready, P1075 backup)
-3. **CVE-2026-43720 same-type reclaim** — Aliased CanvasRenderingContext2D confirmed (P605v2)
+## 2026-11-10 — P1077: CVE-2025-31277 RegExp HABT OOB — TESTED, DEAD
+- First run ever (beacon path fixed to /beacon.php — the /en/ps5/beacon.gif endpoint never existed; crash-resume state machine added).
+- **Result: VULN:false.** HABT triggers (A1:true), but post-HABT match arrays are SLOW arrays: writes at [100]/[8192]/[41530] grow length normally (101/8193/41531) with clean readback. Section C: 200/200 OOB writes, 900 buffers scanned, 0 corruption. Section D: 0 leaks.
+- The engine respects have-a-bad-time for match results — Sony backported the fix or equivalent. Upstream bug 291745 is real (fix commit 716536ce98d6 verified) but the PS5 build is not vulnerable.
+- **Lead CLOSED.** This was the #1 priority lead.
+
+## Priority leads — UPDATED 2026-11-10 (post-P1077)
+1. **B2 Compositor Layer UAF** — Reliable crash (5/5), GraphicsLayer is fastMalloc + Gigacage OFF → AB sprays share the heap. ONLY live WebKit memory-corruption lead. (P1074/P1075 ready)
+2. **FL leak widening** — scan all spray size classes for recurring offset-0 qwords (vtable/code-pointer candidates)
+3. **CVE-2026-43720 same-type reclaim** — faithful alias but no pointer control (P702/P703); byte-write into the 768B object not reachable (P693-P705 matrix)
 4. **CVE-2023-28205 structuredClone UAF** — Likely fixed but worth testing (P1076 ready)

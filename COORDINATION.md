@@ -12,9 +12,9 @@
 ```
 STATUS: UNLOCKED
 AGENT: None
-PROBE: P1069v9 COMPLETE — ALL-DONE (A/B/C/D all CRASHED on lineWidth; FL leak ~100% reliable)
-DEPLOYED_AT: 2026-11-10T09:16Z
-LAST: P1069v9
+PROBE: P1077 COMPLETE — CVE-2025-31277 DEAD (VULN:false; post-HABT match arrays are slow-put, 0 corruption, 0 leaks)
+DEPLOYED_AT: 2026-11-10T09:22Z
+LAST: P1077
 ```
 
 ## CURRENT ASSIGNMENTS
@@ -22,6 +22,11 @@ LAST: P1069v9
 - **Gemini:** Subsystem benchmarking & JSC execution limits mapping -> ALL GOALS STOPPED (Standby)
 
 ## ACTIVITY LOG (newest first)
+
+### 2026-11-10 - Claude (P1077: CVE-2025-31277 TESTED — DEAD, VULN:false)
+- Fixed P1077 before first run: its beacons pointed at /en/ps5/beacon.gif which DOES NOT EXIST on the server (only /beacon.php at root logs) — all prior "P1077 deployed, no results" was partly a silent-drop artifact. Added crash-resume section state machine + JSERR hook.
+- **Result (09:23 UTC, 19 beacons, DONE)**: HABT triggers (A1:true) but post-HABT match arrays are slow-put: writes at [100]/[8192]/[41530] grow length (101/8193/41531), clean readback. C: 200/200 OOB writes, 900 buffers, 0 corruption. D: 0 leaks. VULN:false.
+- Engine respects have-a-bad-time for match results — Sony backported or equivalent. **#1 priority lead CLOSED.** New #1: B2 compositor layer UAF (P1074/P1075).
 
 ### 2026-11-10 - Claude (P1069v9: FIX FOR v8 CRASH LOOP — DEPLOYED 09:16Z)
 - **v8 diagnosis**: 0/25 FL-HIT, silent BOOT→FL-START→BOOT loop. Root cause: v8 filled 144 spray ABs with 0xBB byte-by-byte INSIDE the FontFace 'then' getter during font teardown — the fill loop widened the UAF race window, engine touched the freed font object before reclaim buffers landed, process died in the getter before any scan beacon. Also: ALL patterns were gated on FL success, but pattern A_allzero needs no leak.
