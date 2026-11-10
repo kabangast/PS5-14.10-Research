@@ -1,0 +1,256 @@
+PS5 Full Jailbreak Chain via WebKit (0 to 100) — ARCHIVE OF ALL STEPS TO HV
+================================================================================
+Firmware: 14.10 | Kernel: FreeBSD r230171 (Sep 28 2026) | WebKit ~= Safari 17.0
+Archive maintained per research goal. Last full update: 2026-11-10.
+Sources: docs/WEBKIT_RESEARCH_LOG.md, docs/WEBKIT_PRIMITIVE_RETRACTION.md,
+CLAUDE.md evidence ledger, JAILBREAK_CHAIN_14_10.md, tools/browser_runner/beacon_logs/
+
+ROADMAP (35 steps)
+==================
+
+PHASE A: WEBKIT EXPLOITATION (Browser → Native Code)
+-----------------------------------------------------
+1.  Find a WebKit bug (memory corruption - UAF, OOB, type confusion)
+2.  Trigger the bug (craft JS/HTML that hits the vulnerable code path)
+3.  Stabilize the corruption (heap groom so freed/OOB memory lands predictably)
+4.  Get an info leak (read a JSCell/object pointer from corrupted memory)
+5.  Defeat ASLR (calculate WebKit heap base from leaked pointer)
+6.  Build addrOf primitive (JS object -> its raw heap address)
+7.  Build fakeObj primitive (raw address -> treat it as JS object)
+8.  Create fake ArrayBuffer (forge a butterfly/backing store pointer you control)
+9.  Get arbitrary read (read any userland address via fake ArrayBuffer)
+10. Get arbitrary write (write any userland address via fake ArrayBuffer)
+11. Defeat WebKit mitigations (Gigacage, StructureID randomization, IsoHeap)
+12. Find JIT page or RWX region (or use a code-signing bypass)
+13. Write shellcode (place your payload in executable memory)
+14. Hijack control flow (overwrite a function pointer or vtable)
+15. Execute userland shellcode (native code in WebProcess)
+
+PHASE B: SANDBOX ESCAPE (WebProcess → Full Userland)
+-----------------------------------------------------
+16. Escape WebKit sandbox (syscall or IPC escape)
+
+PHASE C: KERNEL EXPLOITATION (Userland → Ring 0)
+-------------------------------------------------
+17. Leak kernel ASLR slide (find kernel base address from userland)
+18. Find a kernel bug (race condition, UAF, overflow in a syscall)
+19. Trigger kernel bug from userland (craft the syscall sequence)
+20. Get kernel read primitive
+21. Get kernel write primitive
+
+PHASE D: PRIVILEGE ESCALATION (Ring 0 → Root/Unrestricted)
+-----------------------------------------------------------
+22. Find kernel credentials struct (locate process ucred)
+23. Escalate privileges (uid=0, capabilities/authid)
+24. Disable kernel security flags (syscall filtering, sandbox)
+25. Disable W^X in kernel (patch PTEs or security policy)
+26. Map kernel as RW from userland (or keep kernel R/W primitive)
+27. Patch kernel to allow unsigned code
+
+PHASE E: HYPERVISOR BYPASS (Ring 0 → Ring -1)
+----------------------------------------------
+28. Defeat hypervisor checks (HV monitors kernel integrity)
+29. Find hypervisor bug (separate vuln in the HV layer)
+30. Escape hypervisor (HV-level code exec or neutralize monitoring)
+31. Disable IOMMU restrictions (DMA to all physical memory)
+
+PHASE F: PERSISTENCE + PAYLOAD (Jailbreak Complete)
+----------------------------------------------------
+32. Patch secure boot chain
+33. Install payload loader (persistent/semi-persistent entry)
+34. Load homebrew enabler (HEN/Mira/GoldHEN equivalent)
+35. Run unsigned code, dump games, install packages
+
+
+PER-STEP STATUS ARCHIVE (evidence-cited, 2026-11-10)
+=====================================================
+
+PHASE 0 — EXISTING USERLAND ENTRY (not on the WebKit path)
+----------------------------------------------------------
+0.  DONE. Lua 5.1 loader on TCP 9026 gives repeatable userland code exec in
+    the game process TODAY. Confirmed primitives: raw make_syscall() for tested
+    numbers, heap R/W via GPU mmap (256+ pages), userland module bases via
+    dynlib_get_info(593), CClosure +0x20 redirect for selected targets (56c/56f),
+    thr_create(430)/thr_new(455) threads with 5-arg ROP syscall chains (396f),
+    POSIX shm, kqueue timers, RAW socket injection. Phase A/B are only needed
+    for a browser-based entry; the kernel wall (Phase C) is identical either way.
+
+PHASE A — WEBKIT EXPLOITATION
+-----------------------------
+1.  DONE (candidates confirmed).
+    - CVE-2026-43720 canvas getContext() re-entrancy UAF: trigger confirmed,
+      desync getter creates two contexts, crashes on stale access (P605v1,
+      2026-11-03). Independent same-type reclaim (P605v2, P606).
+    - B2 compositor layer crash: MutationObserver + will-change:transform +
+      RAF removal = RELIABLE CRASH 5/5 (P1070, 2026-11-10 06:34 UTC; beacon
+      log shows PRE-B2 then immediate browser BOOT every run). Possibly
+      CVE-2023-40447/CVE-2023-41976 class. Unexploited.
+    - CVE-2025-31277 RegExp HABT OOB: candidate, UPSTREAM-VERIFIED 2026-11-10.
+      tryCreateContiguousArrayWithPattern() (JSGlobalObjectInlines.h, RUNTIME
+      path — no JIT needed) created Contiguous match arrays after
+      have-a-bad-time; fix commit 716536ce98d6 (bug 291745, Yusuke Suzuki)
+      adds a 3-line isHavingABadTime() check; regression test matches P1077's
+      trigger verbatim. Fix dated 2025-10-06, Safari 7621 branch — postdates
+      PS5's WebKit (~17.0); present unless Sony backported. Probe P1077
+      authored, NEVER RUN (browser crash loop). See CONFLICTS (resolved #1).
+    - CVE-2026-28847 YARR stack overflow: P607 deployed 2026-11-03, no
+      confirmed result.
+2.  DONE for canvas UAF (P605v1) and B2 crash (P1070). P1077 untested.
+3.  PARTIAL/DONE for the canvas bug. Same-type reclaim is 100% reliable:
+    spray 200 CanvasRenderingContext2D reclaims the freed slot; positions
+    consistent (spray[7] of 500, spray[10] of 1000) across independent
+    sessions (P605v2 2026-11-03, P606 fork). Bidirectional property R/W
+    through aliased handles confirmed (lineWidth/globalAlpha/font/fill/
+    strokeStyle/lineDashOffset, dash arrays, transform matrix, state stack).
+    Cross-type (ArrayBuffer) reclaim BLOCKED by IsoHeap/TZone (14 sprays
+    crashed, P605 notes; P571v14: 12 triggers, 1100+ ABs, zero reclaim).
+4.  NOT ACHIEVED — NO VERIFIED LEAK.
+    - FontFace "heap pointer leak" RETRACTED (P1043, 2026-11-10): the
+      "pointer" was the probe's own sfVersion header bytes.
+    - APNG "overread" RETRACTED (P1042/P1043): region is frame-1 fill +
+      alpha from normal canvas compositing, not a decoder overread.
+    - P927 (2026-11-09) claimed CSSFontFace UAF discloses heap base +
+      vtable and a lineDash R/W bus — UNVERIFIED and undermined by the
+      FontFace retraction; flagged by the P605 notes as third-party claim.
+    - P1069v3 finished 2026-11-10 08:27 UTC with DONE att=1 leak=yes
+      (READY.txt) — leak content undocumented/unconfirmed; P1069v7
+      "Fresh Leak + Size Scan" deployed 10:59 local to re-measure; no
+      beacons yet. P1069v6 size-scan ended mid-run (all sizes 384-2048
+      previously CRASHED; UAF-OK + spray n=600, no reclaim verdict).
+5.  NOT ACHIEVED (depends on 4).
+6.  NOT ACHIEVED.  7. NOT ACHIEVED.  8. NOT ACHIEVED.
+9.  NOT ACHIEVED — retraction scorecard: "Arbitrary address read: NOT
+    ACHIEVED". Aliased same-type contexts are same-layout handles, not an
+    arbitrary address primitive.
+10. NOT ACHIEVED (same).
+11. PARTIAL — map complete, bypass not achieved: IsoHeap/TZone ON (blocks
+    cross-type UAF), Gigacage OFF (P1072 note), Baseline JIT PRESENT
+    (P1043: 62ms/5M loop), DFG/FTL ABSENT (kills JIT CVEs incl.
+    CVE-2024-23222, CVE-2024-44308, CVE-2023-42917), no WebAssembly, no
+    SharedArrayBuffer, conservative GC (WeakRef/FinalizationRegistry timing
+    attacks fail, P1043).
+12. BLOCKED — no DFG/FTL pages exist; W^X enforced at kernel/hypervisor
+    (mtypeprotect RWX "success" never sets PTE X, 54d/124a; mprotect bit 0x4
+    refused, 423a).
+13. NOT ACHIEVED.  14. NOT ACHIEVED.  15. NOT ACHIEVED.
+
+PHASE B — SANDBOX ESCAPE
+------------------------
+16. NOT ACHIEVED — never reached (Phase A incomplete). SceNKWebProcess
+    sandbox unmapped.
+
+PHASE C — KERNEL EXPLOITATION (front line; attacked from the Lua entry)
+-----------------------------------------------------------------------
+17. BLOCKED — KASLR NOT DEFEATED. Exhaustive, all clean (see CLAUDE.md):
+    sysctl deep scan all CTL trees (56g3); AF_ROUTE sanitized (53b);
+    NET_RT_DUMP "kernel pointers" = sockaddr boundary artifacts (56e/56e2);
+    kld* raise SIGSYS from nosys trampoline (353a/353b); mincore/madvise+624
+    no intra-kernel discrimination (56f); mprotect timing = scheduling noise
+    (56h-56i2); GPU pool zero-filled on alloc (348a); sys 674 VM map is
+    userland-only (55e/55f); thread ucontext dump userland-only (56n);
+    SCM_CREDS/sigaction/fstat/getdirentries/getrusage/SO_TIMESTAMP/kevent
+    all clean (56o-56q); ~32M device ioctl calls, zero leaks (273a-287a).
+18. BLOCKED — every candidate kernel bug is dead:
+    - AIO 662 "double-free" = double-STATUS report, not double-free (70e);
+      D lock serializes entry_dispose (72a-72c); generation IDs block
+      3-thread slot reuse (71a); Sony per-type zones + zero-init; RTHDR
+      cross-spray 0 overlaps (75c-75e).
+    - netcontrol(99) queue UAF dead — close leaks the ref instead of
+      freeing (223a-234a).
+    - CVE-2026-49418 msync device-pager UAF — MS_INVALIDATE -1 on all
+      mappings (58a/58b, 455a-455d).
+    - CVE-2026-49412 IPV6_MSFILTER — API removed by Sony (50e2/50e3).
+    - CVE-2026-45257 KTLS — not present (50f).
+    - CVE-2024-43102 UMTX_SHM — subsystem stubbed (151a-152k).
+    - ZDI-26-784 kqueue race — >10,000 races, locking solid (271g-271i).
+    - Object lifetime races at native speed — all clean (410a-422b).
+    - CVE-2026-3038 sa_len=127 routing overflow — accepted, no panic,
+      likely patched (56e).
+    - Sysent 679-734 credential-gated even from child thread (275b-275d);
+      677/678 lethal; measured table ends at 676.
+19. NOT ACHIEVED.  20. NOT ACHIEVED.  21. NOT ACHIEVED.
+
+PHASE D — PRIVILEGE ESCALATION
+------------------------------
+22. NOT ACHIEVED — ucred never located (no kernel pointers at all).
+23. NOT ACHIEVED — authid gates hold: 535/536/563-566 identity-compare and
+    return -1 (332a/333a); sys 587 shows capability word 0x20000000, bit 62
+    clear (55e).
+24. NOT ACHIEVED — sys 643 "chicken switches" accept all 32 bits but change
+    nothing observable (55a).
+25. NOT ACHIEVED — W^X enforcement is below the kernel (hypervisor PTE
+    level); all kernel-level handlers inert (54d/124a/423a).
+26. NOT ACHIEVED.  27. NOT ACHIEVED.
+    (Sys 637 set_phys_fmem_limit writes one fixed field child+0x280, no
+    capability check for self — not a general write; low values hang the
+    console, 339a/340a/346b.)
+
+PHASE E — HYPERVISOR BYPASS (the goal's far end)
+-------------------------------------------------
+28. NOT STARTED — requires kernel R/W (steps 20-21) first. HV is largely
+    unknown: no HV interface reachable from userland has been identified.
+    W^X evidence (step 25) implies the HV interposes on PTE X bits.
+29. NOT STARTED — no HV bug candidate exists.
+30. NOT STARTED.
+31. NOT STARTED.
+    Preliminary only: sandboxed-JS microbenchmarks (Gemini P1008-P1011,
+    2026-11-09) measured Zen 2 timing baselines — BTB 1.04x, RSB wrap 0.91x,
+    IBTB polymorph 1.32x, LFB contention 1.14x, SSB 3.00x, cache eviction
+    4.50x tax. These are JS-observable CPU behaviors, NOT security boundary
+    crossings; labels like "PSP mailbox" were JS crypto benchmarks. They are
+    side-channel groundwork at best, with no demonstrated cross-domain read.
+
+PHASE F — PERSISTENCE + PAYLOAD
+--------------------------------
+32. NOT STARTED.  33. NOT STARTED.  34. NOT STARTED.  35. NOT STARTED.
+
+
+HARDEST WALLS ON 14.10 (updated)
+================================
+- Step 4:  No verified info leak anywhere (FontFace/APNG retracted;
+           400+ syscalls, all kernel-pointer scans clean).
+- Step 11: IsoHeap/TZone ACTIVE (blocks cross-type reclaim).
+- Step 12: No DFG/FTL JIT (LLInt + Baseline only), W^X at HV level.
+- Step 17: KASLR undefeated after exhaustive measurement.
+- Step 18: No reachable kernel memory-corruption bug found.
+- Step 28-30: PS5 hypervisor is unknown territory.
+
+EVIDENCE CONFLICTS (must resolve, do not average)
+==================================================
+1. CVE-2025-31277: RESOLVED 2026-11-10 via upstream source. Retraction
+   doc's "JIT — DEAD" row was WRONG (corrected in place): fix commit
+   716536ce98d6 (fetched from WebKit/WebKit mirror) shows bug 291745 lives
+   in the runtime file JSGlobalObjectInlines.h and the regression test is
+   the exact P1077 trigger — no JIT involvement. Caveats: (a) the CVE
+   label is approximate — CVE-2025-31277 was Apple's May 2025 advisory but
+   this commit is dated 2025-10-06, so the true CVE may be a later one;
+   exploitability is unaffected; (b) Sony could have backported the fix.
+   Resolution path unchanged: run P1077 on the PS5.
+2. P927 (2026-11-09) claims ASLR defeat + lineDash arbitrary R/W bus;
+   the 2026-11-10 retraction scorecard says arbitrary read NOT ACHIEVED and
+   retracts the FontFace leak family. Treat P927 as unverified until
+   replicated with sentinel controls.
+3. P1069v3 "leak=yes" (2026-11-10 08:27 UTC) has no documented leak content;
+   P1069v7 re-measurement is deployed and pending.
+
+PROBE QUEUE (browser; index.html deployment per COORDINATION.md lock)
+=====================================================================
+LIVE:      P1069v7 "Fresh Leak + Size Scan" (deployed 2026-11-10 10:59
+           local, awaiting PS5 browser reload; zero beacons).
+QUEUED:    P1071-P1075 (B2 layer-UAF exploitation variants), P1076
+           (structuredClone UAF, likely fixed), P1077 (RegExp HABT OOB —
+           top priority), P1078-P1082 (mega/chain variants).
+NOTE:      B2 crash loop repeatedly blocks page loads; keep the deployed
+           probe small enough to beacon before crashing.
+
+NEXT RESEARCH ACTIONS (priority order)
+======================================
+1. Run P1077 (resolves Conflict 1; if B4 write lands OOB it opens steps 4-10).
+2. Get P1069v7 result (resolves Conflict 3; verify or kill the P1069v3 leak).
+3. Exploit B2 crash (P1074/P1075): GraphicsLayer is fastMalloc, Gigacage OFF
+   — ArrayBuffer sprays share that heap; spray + crash + reclaim scan.
+4. If a verified leak lands: rebuild addrOf/fakeObj (steps 6-8) on the
+   aliased-context groom (step 3 already reliable).
+5. Kernel side (parallel, from Lua entry): only new-bug hunting remains —
+   13.60 static capture diffing and untested argument contracts, per
+   JAILBREAK_CHAIN_14_10.md gates. Do not rerun documented dead ends.
