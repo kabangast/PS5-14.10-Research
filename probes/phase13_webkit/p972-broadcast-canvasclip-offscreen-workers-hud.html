@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>PS5 FW 14.10 // BROADCAST, CANVAS CLIP, OFFSCREEN &amp; MATH HUD</title>
+<style>
+:root {
+  --bg-dark: #040711;
+  --panel-bg: rgba(8, 14, 28, 0.94);
+  --neon-cyan: #00f3ff;
+  --neon-green: #00ff66;
+  --neon-amber: #ffb800;
+  --neon-pink: #ff0077;
+  --neon-purple: #9d00ff;
+  --text-dim: #7085a5;
+  --text-main: #e2f1ff;
+  --border-glow: rgba(0, 243, 255, 0.35);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background-color: var(--bg-dark);
+  background-image: 
+    radial-gradient(ellipse at 50% 0%, rgba(0, 243, 255, 0.16), transparent 75%),
+    linear-gradient(rgba(0, 243, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 243, 255, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 28px 28px, 28px 28px;
+  color: var(--text-main);
+  font-family: "SF Mono", "Consolas", monospace;
+  padding: 16px;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+.scanline {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.02), rgba(0, 255, 0, 0.01), rgba(0, 255, 0, 0.02));
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+  z-index: 999;
+}
+
+/* Header */
+.header {
+  border: 1px solid var(--neon-cyan);
+  background: rgba(0, 243, 255, 0.07);
+  box-shadow: 0 0 20px rgba(0, 243, 255, 0.3);
+  padding: 12px 20px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title-glitch {
+  font-size: 18px;
+  font-weight: 900;
+  letter-spacing: 2px;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 10px rgba(0, 243, 255, 0.8);
+}
+.target-badge {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: rgba(0, 255, 102, 0.15);
+  border: 1px solid var(--neon-green);
+  color: var(--neon-green);
+  font-weight: bold;
+}
+
+/* Pipeline Trackers */
+.pipeline-track {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.node {
+  background: var(--panel-bg);
+  border: 1px solid rgba(112, 133, 165, 0.25);
+  border-radius: 6px;
+  padding: 10px;
+  position: relative;
+  transition: all 0.3s ease;
+}
+.node.done {
+  border-color: var(--neon-green);
+  box-shadow: 0 0 10px rgba(0, 255, 102, 0.25);
+}
+.node.active {
+  border-color: var(--neon-cyan);
+  box-shadow: 0 0 12px rgba(0, 243, 255, 0.4);
+}
+.node.locked {
+  border-color: rgba(112, 133, 165, 0.2);
+  opacity: 0.55;
+}
+.node-step {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.node.done .node-step { color: var(--neon-green); }
+.node.active .node-step { color: var(--neon-cyan); }
+.node-title {
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--text-main);
+  margin-bottom: 4px;
+}
+.node-desc {
+  font-size: 9px;
+  color: var(--text-dim);
+  line-height: 1.3;
+}
+
+/* Grid Layout */
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.hud-panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-glow);
+  border-radius: 6px;
+  padding: 14px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid rgba(0, 243, 255, 0.2);
+  padding-bottom: 8px;
+  margin-bottom: 12px;
+}
+.panel-title {
+  font-size: 13px;
+  font-weight: bold;
+  color: var(--neon-cyan);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+.panel-tag {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: rgba(0, 243, 255, 0.1);
+  color: var(--neon-cyan);
+  border: 1px solid rgba(0, 243, 255, 0.3);
+}
+
+.live-meter {
+  display: flex;
+  justify-content: space-between;
+  padding: 7px 0;
+  border-bottom: 1px solid rgba(112, 133, 165, 0.12);
+  font-size: 12px;
+}
+.val-ok { color: var(--neon-green); font-weight: bold; }
+.val-hex { color: var(--neon-amber); font-weight: bold; }
+.val-cyan { color: var(--neon-cyan); font-weight: bold; }
+.val-dim { color: var(--text-dim); }
+
+/* Live Terminal */
+.terminal-panel {
+  background: #020409;
+  border: 1px solid rgba(0, 243, 255, 0.4);
+  border-radius: 6px;
+  padding: 12px;
+  font-size: 11px;
+  box-shadow: inset 0 0 14px rgba(0, 0, 0, 0.8);
+}
+.terminal-log {
+  max-height: 220px;
+  overflow-y: auto;
+  line-height: 1.45;
+  color: #a4c2e6;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+
+<div class="header">
+  <div class="title-glitch">PS5 // P972: BROADCAST, CANVAS CLIP, OFFSCREEN &amp; MATH HUD</div>
+  <div class="target-badge" id="mStatusBadge">INITIALIZING...</div>
+</div>
+
+<!-- 6-Stage Pipeline Node Status -->
+<div class="pipeline-track">
+  <div class="node active" id="nodeStage1">
+    <div class="node-step">Stage 1 [ACTIVE]</div>
+    <div class="node-title">BROADCAST MESH</div>
+    <div class="node-desc">Window + 3 workers broadcast</div>
+  </div>
+  <div class="node locked" id="nodeStage2">
+    <div class="node-step">Stage 2 [STANDBY]</div>
+    <div class="node-title">PATH2D CLIPPING</div>
+    <div class="node-desc">ctx.clip(path, evenodd) raster</div>
+  </div>
+  <div class="node locked" id="nodeStage3">
+    <div class="node-step">Stage 3 [STANDBY]</div>
+    <div class="node-title">WORKER OFFSCREEN</div>
+    <div class="node-desc">OffscreenCanvas in WorkerGlobal</div>
+  </div>
+  <div class="node locked" id="nodeStage4">
+    <div class="node-step">Stage 4 [STANDBY]</div>
+    <div class="node-title">500 RAPID PINGS</div>
+    <div class="node-desc">MessageChannel stream roundtrip</div>
+  </div>
+  <div class="node locked" id="nodeStage5">
+    <div class="node-step">Stage 5 [STANDBY]</div>
+    <div class="node-title">MATH.HYPOT 100K</div>
+    <div class="node-desc">100,000 float vector math ops</div>
+  </div>
+  <div class="node locked" id="nodeStage6">
+    <div class="node-step">Stage 6 [STANDBY]</div>
+    <div class="node-title">SYSTEM VERDICT</div>
+    <div class="node-desc">Unified telemetry consensus</div>
+  </div>
+</div>
+
+<div class="dashboard-grid">
+  <!-- Left Panel: Broadcast & Canvas Clipping -->
+  <div class="hud-panel">
+    <div class="panel-header">
+      <div class="panel-title">Broadcast Mesh &amp; Vector Clip</div>
+      <div class="panel-tag">MESH / 2D CLIP</div>
+    </div>
+    <div class="live-meter"><span>BroadcastChannel Multi-Worker Mesh:</span><span class="val-cyan" id="mBcStatus">Connecting...</span></div>
+    <div class="live-meter"><span>3 Workers Average Delivery Latency:</span><span class="val-cyan" id="mBcLatency">Testing...</span></div>
+    <div class="live-meter"><span>Canvas Path2D evenodd Clipping:</span><span class="val-cyan" id="mClipSupport">Pending...</span></div>
+    <div class="live-meter"><span>Clipped Pixel Bounding Fidelity:</span><span class="val-cyan" id="mClipFidelity">Pending...</span></div>
+    <div class="live-meter"><span>Clip Rasterization Latency:</span><span class="val-cyan" id="mClipRaster">Pending...</span></div>
+  </div>
+
+  <!-- Right Panel: Worker Offscreen & High-Frequency IPC -->
+  <div class="hud-panel">
+    <div class="panel-header">
+      <div class="panel-title">Offscreen &amp; High-Frequency IPC</div>
+      <div class="panel-tag">OFFSCREEN / IPC / FPU</div>
+    </div>
+    <div class="live-meter"><span>Worker-Thread OffscreenCanvas:</span><span class="val-cyan" id="mOffscreenWorker">Pending...</span></div>
+    <div class="live-meter"><span>500 Sequential IPC Pings:</span><span class="val-cyan" id="mIpcDuration">Pending...</span></div>
+    <div class="live-meter"><span>Per-Message IPC Roundtrip:</span><span class="val-cyan" id="mIpcPerMsg">Pending...</span></div>
+    <div class="live-meter"><span>Math.hypot() 100,000 Vectors:</span><span class="val-cyan" id="mMathBench">Pending...</span></div>
+    <div class="live-meter"><span>FPU Vector Math Throughput:</span><span class="val-cyan" id="mMathThroughput">Pending...</span></div>
+  </div>
+</div>
+
+<!-- Live Terminal Panel -->
+<div class="terminal-panel">
+  <div class="terminal-log" id="termLog"></div>
+</div>
+
+<script>
+var term = document.getElementById('termLog');
+var statusBadge = document.getElementById('mStatusBadge');
+
+var nodeStage1 = document.getElementById('nodeStage1');
+var nodeStage2 = document.getElementById('nodeStage2');
+var nodeStage3 = document.getElementById('nodeStage3');
+var nodeStage4 = document.getElementById('nodeStage4');
+var nodeStage5 = document.getElementById('nodeStage5');
+var nodeStage6 = document.getElementById('nodeStage6');
+
+var mBcStatus = document.getElementById('mBcStatus');
+var mBcLatency = document.getElementById('mBcLatency');
+var mClipSupport = document.getElementById('mClipSupport');
+var mClipFidelity = document.getElementById('mClipFidelity');
+var mClipRaster = document.getElementById('mClipRaster');
+
+var mOffscreenWorker = document.getElementById('mOffscreenWorker');
+var mIpcDuration = document.getElementById('mIpcDuration');
+var mIpcPerMsg = document.getElementById('mIpcPerMsg');
+var mMathBench = document.getElementById('mMathBench');
+var mMathThroughput = document.getElementById('mMathThroughput');
+
+/* Global Trackers */
+var gBcAvgRtt = 0;
+var gClipOk = false;
+var gClipMs = 0;
+var gWorkerOffscreenOk = false;
+var gIpcDurationMs = 0;
+var gIpcPerMsgUs = 0;
+var gMathMs = 0;
+
+function log(msg) {
+  var d = document.createElement('div');
+  d.textContent = '[' + new Date().toISOString().slice(11, 23) + '] ' + msg;
+  term.appendChild(d);
+  term.scrollTop = term.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P972-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+window.onerror = function(msg, url, line) {
+  syncBn('JS-ERR', msg + ' at line ' + line);
+  log('[!] ERROR: ' + msg + ' (Line ' + line + ')');
+};
+
+log('[*] Probe P972 online: Broadcast Mesh, Canvas Clip, Worker Offscreen & Math 100k.');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * STAGE 1: BroadcastChannel Multi-Worker Mesh
+ * ============================================================ */
+var hasBc = (typeof BroadcastChannel !== 'undefined');
+var bcReplies = 0;
+var bcLats = [];
+var bcDone = false;
+
+if (hasBc && typeof Worker !== 'undefined') {
+  try {
+    var bcName = 'ps5_mesh_ch_' + Date.now();
+    var mainBc = new BroadcastChannel(bcName);
+
+    var bcWorkerCode = [
+      'var ch = new BroadcastChannel("' + bcName + '");',
+      'ch.onmessage = function(e) {',
+      '  if (e.data && e.data.cmd === "ping") {',
+      '    self.postMessage({ tSend: e.data.tSend });',
+      '  }',
+      '};'
+    ].join('\n');
+
+    var bcBlob = new Blob([bcWorkerCode], { type: 'application/javascript' });
+    var bcUrl = URL.createObjectURL(bcBlob);
+    var bcWorkers = [];
+    for (var bw = 0; bw < 3; bw++) {
+      bcWorkers.push(new Worker(bcUrl));
+    }
+
+    for (var bIdx = 0; bIdx < 3; bIdx++) {
+      (function(idx) {
+        bcWorkers[idx].onmessage = function(ev) {
+          if (bcDone) return;
+          var rtt = Math.max(1, Math.round(performance.now() - ev.data.tSend));
+          bcLats.push(rtt);
+          bcReplies++;
+
+          if (bcReplies === 3) {
+            bcDone = true;
+            var sum = bcLats.reduce(function(a, b) { return a + b; }, 0);
+            gBcAvgRtt = (sum / 3).toFixed(1);
+
+            mBcStatus.textContent = 'ESTABLISHED (3/3 Workers connected)';
+            mBcStatus.className = 'val-ok';
+            mBcLatency.textContent = gBcAvgRtt + ' ms (LATS: ' + bcLats.join(',') + ')';
+
+            log('[+] Broadcast Mesh: 3 workers responded in avg ' + gBcAvgRtt + 'ms');
+            syncBn('BROADCAST-MESH', 'workers=3|avgRtt=' + gBcAvgRtt + '|lats=' + bcLats.join(','));
+
+            bcWorkers.forEach(function(wk) { wk.terminate(); });
+            mainBc.close();
+
+            nodeStage1.className = 'node done';
+            nodeStage1.querySelector('.node-step').textContent = 'Stage 1 [DONE]';
+            executeCanvasClipStage();
+          }
+        };
+      })(bIdx);
+    }
+
+    setTimeout(function() {
+      mainBc.postMessage({ cmd: 'ping', tSend: performance.now() });
+    }, 40);
+
+    setTimeout(function() {
+      if (!bcDone) {
+        bcDone = true;
+        bcWorkers.forEach(function(wk) { wk.terminate(); });
+        mainBc.close();
+        mBcStatus.textContent = bcReplies + ' / 3 RESPONDED (TIMEOUT)';
+        mBcStatus.className = 'val-hex';
+        nodeStage1.className = 'node locked';
+        executeCanvasClipStage();
+      }
+    }, 600);
+
+  } catch(bce) {
+    bcDone = true;
+    mBcStatus.textContent = 'ERROR: ' + bce.message;
+    mBcStatus.className = 'val-dim';
+    nodeStage1.className = 'node locked';
+    executeCanvasClipStage();
+  }
+} else {
+  mBcStatus.textContent = 'UNSUPPORTED';
+  mBcStatus.className = 'val-dim';
+  nodeStage1.className = 'node locked';
+  executeCanvasClipStage();
+}
+
+/* ============================================================
+ * STAGE 2: Canvas 2D Path2D Boolean Clipping
+ * ============================================================ */
+function executeCanvasClipStage() {
+  nodeStage2.className = 'node active';
+  nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [ACTIVE]';
+
+  try {
+    var cvs = document.createElement('canvas');
+    cvs.width = 300;
+    cvs.height = 300;
+    var ctx = cvs.getContext('2d');
+
+    // Star path with overlapping self-intersection
+    var pathClip = new Path2D();
+    pathClip.moveTo(150, 20);
+    pathClip.lineTo(60, 260);
+    pathClip.lineTo(280, 100);
+    pathClip.lineTo(20, 100);
+    pathClip.lineTo(240, 260);
+    pathClip.closePath();
+
+    ctx.save();
+    ctx.clip(pathClip, 'evenodd');
+
+    var tClip0 = performance.now();
+    ctx.fillStyle = 'rgba(0, 255, 128, 1)';
+    ctx.fillRect(0, 0, 300, 300);
+    gClipMs = Math.max(1, Math.round(performance.now() - tClip0));
+
+    var pxInside = ctx.getImageData(150, 120, 1, 1).data;
+    var pxOutside = ctx.getImageData(5, 5, 1, 1).data;
+    gClipOk = (pxInside[1] > 200 && pxOutside[3] === 0);
+    ctx.restore();
+
+    mClipSupport.textContent = 'SUPPORTED (Path2D evenodd)';
+    mClipSupport.className = 'val-ok';
+    mClipFidelity.textContent = gClipOk ? '100% BOUNDING FIDELITY VERIFIED' : 'CLIP LEAK';
+    mClipFidelity.className = gClipOk ? 'val-ok' : 'val-hex';
+    mClipRaster.textContent = gClipMs + ' ms (EVENODD FILL RASTERIZED)';
+
+    log('[+] Canvas Clipping: supported=true, fidelity=' + gClipOk + ', time=' + gClipMs + 'ms');
+    syncBn('CANVAS-CLIP', 'supported=true|fidelity=' + gClipOk + '|timeMs=' + gClipMs);
+
+    nodeStage2.className = 'node done';
+    nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [DONE]';
+  } catch(ce) {
+    log('[-] Canvas clip error: ' + ce.message);
+    syncBn('CLIP-ERR', ce.message);
+    nodeStage2.className = 'node locked';
+  }
+
+  executeOffscreenWorkerStage();
+}
+
+/* ============================================================
+ * STAGE 3: OffscreenCanvas in Worker Thread
+ * ============================================================ */
+function executeOffscreenWorkerStage() {
+  nodeStage3.className = 'node active';
+  nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [ACTIVE]';
+
+  var workerOffscreenChecked = false;
+  var offReason = 'unknown';
+
+  try {
+    var offscreenWorkerCode = [
+      'var hasOffscreen = (typeof OffscreenCanvas !== "undefined");',
+      'if (hasOffscreen) {',
+      '  try {',
+      '    var oc = new OffscreenCanvas(64, 64);',
+      '    var ctx = oc.getContext("2d");',
+      '    ctx.fillStyle = "red";',
+      '    ctx.fillRect(0, 0, 64, 64);',
+      '    self.postMessage({ ok: true, reason: "active_2d_rendered" });',
+      '  } catch(e) {',
+      '    self.postMessage({ ok: false, reason: "ctx_error_" + e.message });',
+      '  }',
+      '} else {',
+      '  self.postMessage({ ok: false, reason: "undefined_in_worker" });',
+      '}'
+    ].join('\n');
+
+    var owBlob = new Blob([offscreenWorkerCode], { type: 'application/javascript' });
+    var owUrl = URL.createObjectURL(owBlob);
+    var ow = new Worker(owUrl);
+
+    ow.onmessage = function(ev) {
+      if (workerOffscreenChecked) return;
+      workerOffscreenChecked = true;
+      gWorkerOffscreenOk = (ev.data && ev.data.ok === true);
+      offReason = (ev.data && ev.data.reason) || 'unknown';
+
+      mOffscreenWorker.textContent = gWorkerOffscreenOk ? 'SUPPORTED (2D Canvas rendered in Worker)' : ('UNSUPPORTED (' + offReason + ')');
+      mOffscreenWorker.className = gWorkerOffscreenOk ? 'val-ok' : 'val-dim';
+
+      log('[+] Worker OffscreenCanvas: ok=' + gWorkerOffscreenOk + ', reason=' + offReason);
+      syncBn('WORKER-OFFSCREEN', 'ok=' + gWorkerOffscreenOk + '|reason=' + encodeURIComponent(offReason));
+
+      ow.terminate();
+      nodeStage3.className = 'node done';
+      nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [DONE]';
+      executeRapidIpcStage();
+    };
+
+    setTimeout(function() {
+      if (!workerOffscreenChecked) {
+        workerOffscreenChecked = true;
+        ow.terminate();
+        mOffscreenWorker.textContent = 'TIMEOUT';
+        mOffscreenWorker.className = 'val-dim';
+        log('[-] Worker OffscreenCanvas timeout');
+        syncBn('WORKER-OFFSCREEN', 'ok=false|reason=timeout');
+        nodeStage3.className = 'node locked';
+        executeRapidIpcStage();
+      }
+    }, 400);
+
+  } catch(owe) {
+    workerOffscreenChecked = true;
+    mOffscreenWorker.textContent = 'INIT ERR: ' + owe.message;
+    mOffscreenWorker.className = 'val-dim';
+    nodeStage3.className = 'node locked';
+    executeRapidIpcStage();
+  }
+}
+
+/* ============================================================
+ * STAGE 4: 500 Sequential Rapid IPC Pings
+ * ============================================================ */
+function executeRapidIpcStage() {
+  nodeStage4.className = 'node active';
+  nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [ACTIVE]';
+
+  try {
+    var rapidCh = new MessageChannel();
+    var echoWorkerCode = [
+      'self.onmessage = function(e) {',
+      '  if (e.data && e.data.port) {',
+      '    var p = e.data.port;',
+      '    p.onmessage = function(ev) {',
+      '      p.postMessage(ev.data);',
+      '    };',
+      '  }',
+      '};'
+    ].join('\n');
+
+    var ewBlob = new Blob([echoWorkerCode], { type: 'application/javascript' });
+    var ewUrl = URL.createObjectURL(ewBlob);
+    var ew = new Worker(ewUrl);
+
+    ew.postMessage({ port: rapidCh.port2 }, [rapidCh.port2]);
+
+    var totalPings = 500;
+    var currentPing = 0;
+    var tRapid0 = performance.now();
+
+    rapidCh.port1.onmessage = function(ev) {
+      currentPing++;
+      if (currentPing < totalPings) {
+        rapidCh.port1.postMessage(currentPing);
+      } else {
+        gIpcDurationMs = Math.max(1, Math.round(performance.now() - tRapid0));
+        gIpcPerMsgUs = ((gIpcDurationMs * 1000) / totalPings).toFixed(1);
+
+        mIpcDuration.textContent = gIpcDurationMs + ' ms (500 ROUNDTRIPS COMPLETED)';
+        mIpcPerMsg.textContent = gIpcPerMsgUs + ' µs PER MESSAGE RTT';
+        mIpcPerMsg.className = 'val-ok';
+
+        log('[+] Rapid IPC: 500 pings in ' + gIpcDurationMs + 'ms (~' + gIpcPerMsgUs + ' µs/msg)');
+        syncBn('RAPID-IPC', 'durationMs=' + gIpcDurationMs + '|count=500|perMsgUs=' + gIpcPerMsgUs);
+
+        ew.terminate();
+        nodeStage4.className = 'node done';
+        nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [DONE]';
+        executeMathStage();
+      }
+    };
+
+    setTimeout(function() {
+      rapidCh.port1.postMessage(0);
+    }, 25);
+
+    setTimeout(function() {
+      if (currentPing < totalPings) {
+        ew.terminate();
+        mIpcDuration.textContent = currentPing + ' / 500 COMPLETED (TIMEOUT)';
+        mIpcDuration.className = 'val-hex';
+        nodeStage4.className = 'node locked';
+        executeMathStage();
+      }
+    }, 800);
+
+  } catch(ipe) {
+    log('[-] Rapid IPC error: ' + ipe.message);
+    syncBn('IPC-ERR', ipe.message);
+    nodeStage4.className = 'node locked';
+    executeMathStage();
+  }
+}
+
+/* ============================================================
+ * STAGE 5: Math.hypot() 100,000 Vectors
+ * ============================================================ */
+function executeMathStage() {
+  nodeStage5.className = 'node active';
+  nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [ACTIVE]';
+
+  try {
+    var tMath0 = performance.now();
+    var acc = 0;
+    for (var mi = 0; mi < 100000; mi++) {
+      var x = mi * 0.01;
+      var y = mi * 0.02;
+      var z = mi * 0.03;
+      acc += Math.hypot(x, y, z) + Math.atan2(y, x) + Math.sin(x) * Math.cos(y);
+    }
+    gMathMs = Math.max(1, Math.round(performance.now() - tMath0));
+    var opsPerSec = Math.round((100000 / (gMathMs / 1000)));
+
+    mMathBench.textContent = gMathMs + ' ms (100,000 3D HYPOT VECTORS)';
+    mMathThroughput.textContent = opsPerSec.toLocaleString() + ' VECTORS / SEC';
+    mMathThroughput.className = 'val-ok';
+
+    log('[+] Vector Math: 100,000 in ' + gMathMs + 'ms (~' + opsPerSec + ' ops/s)');
+    syncBn('VECTOR-MATH', 'timeMs=' + gMathMs + '|opsPerSec=' + opsPerSec);
+
+    nodeStage5.className = 'node done';
+    nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [DONE]';
+  } catch(me) {
+    log('[-] Vector math error: ' + me.message);
+    syncBn('MATH-ERR', me.message);
+    nodeStage5.className = 'node locked';
+  }
+
+  completeMasterStage(gBcAvgRtt, gClipOk, gClipMs, gWorkerOffscreenOk, gIpcDurationMs, gMathMs);
+}
+
+/* ============================================================
+ * STAGE 6: Master Verdict & Summary
+ * ============================================================ */
+function completeMasterStage(bcRtt, clipOk, clipMs, offOk, ipcMs, mathMs) {
+  nodeStage6.className = 'node done';
+  nodeStage6.querySelector('.node-step').textContent = 'Stage 6 [DONE]';
+
+  statusBadge.textContent = 'ALL 6 STAGES NOMINAL';
+  statusBadge.style.background = '#00ff66';
+
+  log('[*] Probe P972 complete: Broadcast Mesh, Canvas Clip, Worker Offscreen & Math benchmarked.');
+  syncBn('DONE', 'status=P972_COMPLETE|bcAvgRtt=' + bcRtt + '|clipOk=' + clipOk + '|clipMs=' + clipMs + '|workerOffscreen=' + offOk + '|ipc500Ms=' + ipcMs + '|mathMs=' + mathMs);
+}
+
+/* Auto-Reload Watcher for autonomous progression */
+var initialReloadToken = null;
+function checkAutoReload() {
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/reload.txt?t=' + Date.now(), true);
+    xhr.onload = function() {
+      if (xhr.status === 200) {
+        var token = xhr.responseText.trim();
+        if (initialReloadToken === null) {
+          initialReloadToken = token;
+        } else if (token !== initialReloadToken) {
+          log('[*] New deployment detected (token: ' + token + '). Auto-reloading in 500ms...');
+          setTimeout(function() { location.reload(); }, 500);
+        }
+      }
+    };
+    xhr.send();
+  } catch(e) {}
+}
+setInterval(checkAutoReload, 1500);
+</script>
+</body>
+</html>

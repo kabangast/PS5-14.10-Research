@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1069</title>
+<style>
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px;margin:0}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#22c55e}.fail{color:#ef4444}.warn{color:#f59e0b}.info{color:#38bdf8}
+h2{color:#7dd3fc;margin:8px 0 4px;font-size:13px}
+</style>
+</head>
+<body>
+<div id="hud"></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1069-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+
+var hud=document.getElementById('hud');
+function log(cls,msg){
+  var d=document.createElement('div');d.className=cls;d.textContent=msg;hud.appendChild(d);
+  hud.scrollTop=hud.scrollHeight;
+}
+
+bn('BOOT','yarr-jit-escalation');
+log('info','=== P1069: YARR JIT Escalation Battery ===');
+
+var tests=[];var testIdx=0;
+function addTest(name,fn){tests.push({name:name,fn:fn});}
+function runNext(){
+  if(testIdx>=tests.length){
+    bn('DONE','all-'+tests.length+'-complete');
+    log('ok','=== ALL TESTS COMPLETE ===');
+    return;
+  }
+  var t=tests[testIdx];testIdx++;
+  bn('PRE-'+t.name,'starting');
+  log('info','['+testIdx+'/'+tests.length+'] '+t.name);
+  try{
+    t.fn(function(result){
+      bn('POST-'+t.name,String(result).slice(0,800));
+      log(String(result).indexOf('ANOMALY')>=0||String(result).indexOf('MISMATCH')>=0?'warn':'ok','  -> '+result);
+      setTimeout(runNext,30);
+    });
+  }catch(e){
+    bn('ERR-'+t.name,e.message);
+    log('fail','  ERR: '+e.message);
+    setTimeout(runNext,30);
+  }
+}
+
+// ================================================================
+// SECTION A: PR #74212 Lookbehind Named Backref Bug Escalation
+// Confirmed: named backref in lookbehind matches empty instead of
+// the captured content. Can we leverage this for memory corruption?
+// ================================================================
+
+// A1: Confirm the bug is present
+addTest('A1-LOOKBEHIND-NAMED-CONFIRM',function(cb){
+  try{
+    var re=/(?<=(?<a>x)\k<a>)z/;
+    var m='xxz'.match(re);
+    // Correct: \k<a> should match 'x', so lookbehind matches 'xx' before 'z' -> match at index 2
+    // Buggy: \k<a> matches empty, so lookbehind matches just 'x' before 'z' -> match at different index
+    var noLB=/(?<a>x)\k<a>z/;
+    var m2='xxz'.match(noLB);
+    cb('match:'+(m?m.index:'null')+'|cap:'+(m?m.groups.a:'null')+'|nolb:'+(m2?m2.index:'null')+'|nolbcap:'+(m2?m2.groups.a:'null'));
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// A2: Lookbehind backref with replace - does wrong match position cause wrong replacement?
+addTest('A2-LOOKBEHIND-REPLACE',function(cb){
+  try{
+    var re=/(?<=(?<a>\w+)\k<a>)!/g;
+    var input='abcabc!def!abab!';
+    var result=input.replace(re,'@');
+    // If backref matches empty, the lookbehind is just (\w+) which always succeeds
+    // So ALL '!' get replaced. Correct behavior: only '!' after doubled words
+    var count=(result.match(/@/g)||[]).length;
+    cb('result:'+result+'|replaced:'+count);
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// A3: Lookbehind backref affecting split boundaries
+addTest('A3-LOOKBEHIND-SPLIT',function(cb){
+  try{
+    var re=/(?<=(?<x>.)\k<x>)/g;
+    var input='aabbccde';
+    var parts=input.split(re);
+    // Correct: split after 'aa', after 'bb', after 'cc' (doubled chars)
+    // Buggy (empty backref): split after every char (since lookbehind is just (.))
+    cb('parts:'+parts.length+'|vals:'+parts.join(','));
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// A4: Use bug in replace to control buffer content
+addTest('A4-REPLACE-BUFFER-CONTROL',function(cb){
+  try{
+    // If lookbehind matches at wrong position, the $` and $' in replacement
+    // template give different prefix/suffix strings
+    var re=/(?<=(?<a>A+)\k<a>)X/;
+    var input='AAAX';
+    var result=input.replace(re,function(match,p1,offset,str,groups){
+      return 'off:'+offset+'|pre:'+str.slice(0,offset)+'|grp:'+groups.a;
+    });
+    cb('result:'+result);
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// ================================================================
+// SECTION B: YARR JIT Hot-Path Stress
+// Run patterns many times to force JIT compilation, then check for
+// miscompilation symptoms
+// ================================================================
+
+// B1: Nested quantifier JIT stress
+addTest('B1-NESTED-QUANT-JIT',function(cb){
+  var re=/((a+)+b)/;
+  var anomalies=0;
+  for(var i=0;i<5000;i++){
+    var input='a'.repeat(i%20+1)+'b';
+    var m=input.match(re);
+    if(!m||m[0]!==input)anomalies++;
+  }
+  cb('iters:5000|anomalies:'+anomalies);
+});
+
+// B2: Alternation with varying capture groups
+addTest('B2-ALTERNATION-CAPTURES',function(cb){
+  var re=/(a(b)c)|(d(e)f)|(g(h)i)/;
+  var inputs=['abc','def','ghi','xyz'];
+  var results=[];
+  for(var r=0;r<1000;r++){
+    for(var j=0;j<inputs.length;j++){
+      var m=inputs[j].match(re);
+      if(r===999){
+        // Check last iteration for correctness
+        if(inputs[j]==='abc'){
+          if(!m||m[1]!=='abc'||m[2]!=='b')results.push('MISMATCH-abc');
+        }else if(inputs[j]==='def'){
+          if(!m||m[3]!=='def'||m[4]!=='e')results.push('MISMATCH-def');
+        }else if(inputs[j]==='ghi'){
+          if(!m||m[5]!=='ghi'||m[6]!=='h')results.push('MISMATCH-ghi');
+        }else if(inputs[j]==='xyz'){
+          if(m)results.push('MISMATCH-xyz-shouldfail');
+        }
+      }
+    }
+  }
+  cb('iters:4000|issues:'+results.join(';'));
+});
+
+// B3: Backreference counting under JIT
+addTest('B3-BACKREF-COUNT-JIT',function(cb){
+  var re=/(.)\1{3}/; // Match a char repeated 4 times
+  var anomalies=0;
+  for(var i=0;i<3000;i++){
+    var c=String.fromCharCode(65+(i%26));
+    var input=c.repeat(4)+'x';
+    var m=input.match(re);
+    if(!m||m[0]!==c.repeat(4)||m[1]!==c)anomalies++;
+    // Also test non-match
+    var input2=c.repeat(3)+'x';
+    var m2=input2.match(re);
+    if(m2)anomalies++;
+  }
+  cb('iters:6000|anomalies:'+anomalies);
+});
+
+// B4: Unicode casefolding edge cases in JIT
+addTest('B4-UNICODE-CASEFOLD-JIT',function(cb){
+  // Characters where case-insensitive matching is tricky
+  var pairs=[
+    ['ß','SS'], // German sharp s -> SS
+    ['İ','i'], // Turkish dotted I
+    ['ſ','s'], // Long s
+    ['ﬀ','ff'], // ff ligature
+    ['ẞ','SS'], // Capital sharp s
+  ];
+  var results=[];
+  for(var i=0;i<pairs.length;i++){
+    try{
+      var re=new RegExp(pairs[i][0],'iu');
+      var m=pairs[i][1].match(re);
+      results.push(pairs[i][0].charCodeAt(0).toString(16)+':'+(m?'Y':'N'));
+    }catch(e){
+      results.push(pairs[i][0].charCodeAt(0).toString(16)+':E');
+    }
+  }
+  cb('casefold:'+results.join('|'));
+});
+
+// B5: Lookbehind with variable-length content under JIT
+addTest('B5-LOOKBEHIND-VARLEN-JIT',function(cb){
+  var anomalies=0;
+  // Variable-length lookbehind should work in modern engines
+  try{
+    var re=/(?<=a{2,5})x/g;
+    for(var i=0;i<2000;i++){
+      var n=(i%6)+1; // 1 to 6 a's
+      var input='a'.repeat(n)+'x';
+      var m=input.match(re);
+      var expected=n>=2; // Should match if 2+ a's before x
+      if((!!m)!==expected)anomalies++;
+    }
+  }catch(e){
+    cb('ERR:'+e.message);return;
+  }
+  cb('iters:2000|anomalies:'+anomalies);
+});
+
+// B6: Regex lastIndex manipulation (classic JSC bug class)
+addTest('B6-LASTINDEX-MANIP',function(cb){
+  var anomalies=0;
+  var re=/ab/g;
+  for(var i=0;i<2000;i++){
+    re.lastIndex=0;
+    var m=re.exec('xababab');
+    if(!m||m.index!==1){anomalies++;continue;}
+    // Set lastIndex to object with valueOf
+    re.lastIndex={valueOf:function(){return 3;}};
+    var m2=re.exec('xababab');
+    if(!m2||m2.index!==3)anomalies++;
+  }
+  cb('iters:2000|anomalies:'+anomalies);
+});
+
+// B7: Regex with toString side effect in replace
+addTest('B7-REPLACE-TOSTRING-SIDE',function(cb){
+  var callCount=0;
+  var evil={
+    toString:function(){
+      callCount++;
+      return 'replacement';
+    }
+  };
+  var re=/test/g;
+  for(var i=0;i<1000;i++){
+    'test test test'.replace(re,evil);
+  }
+  // Each replace should call toString 3 times (3 matches) * 1000 = 3000
+  cb('calls:'+callCount+'|expected:3000|match:'+(callCount===3000));
+});
+
+// ================================================================
+// SECTION C: YARR JIT + TypedArray sizing
+// Can wrong regex results influence buffer/array sizing?
+// ================================================================
+
+// C1: Use regex match to size ArrayBuffer, check for OOB
+addTest('C1-REGEX-SIZED-BUFFER',function(cb){
+  try{
+    // Pattern that matches different lengths depending on the bug
+    var re=/(?<=(?<len>\d+)\k<len>)x/;
+    var input='88x'; // With bug: matches after '8', len='8'. Correct: matches after '88', len='8'
+    var m=input.match(re);
+    var size=m?parseInt(m.groups.len):0;
+    if(size>0&&size<4096){
+      var buf=new ArrayBuffer(size);
+      var view=new Uint8Array(buf);
+      // Fill with pattern
+      for(var i=0;i<view.length;i++)view[i]=0xAA;
+      cb('size:'+size+'|len:'+view.length+'|matchIdx:'+(m?m.index:-1));
+    }else{
+      cb('no-match-or-bad-size:'+size);
+    }
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// C2: Regex match groups used as array indices
+addTest('C2-REGEX-INDEX-ACCESS',function(cb){
+  try{
+    var arr=new Array(100);
+    for(var i=0;i<100;i++)arr[i]=i*10;
+    // Use regex to extract index from string
+    var re=/(?<=item(?<idx>\d+)_)value/;
+    var inputs=['item5_value','item99_value','item0_value'];
+    var results=[];
+    for(var j=0;j<inputs.length;j++){
+      var m=inputs[j].match(re);
+      if(m){
+        var idx=parseInt(m.groups.idx);
+        results.push(idx+':'+arr[idx]);
+      }
+    }
+    cb('indices:'+results.join('|'));
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// C3: String.replace with regex controlling allocation size
+addTest('C3-REPLACE-ALLOC-SIZE',function(cb){
+  try{
+    var bigStr='A'.repeat(10000);
+    // Replace with function that allocates based on match position
+    var re=/(?<=(?<pre>A{1,100})\k<pre>)B/g;
+    var input='A'.repeat(200)+'B'+'A'.repeat(200)+'B';
+    var allocSizes=[];
+    input.replace(re,function(match,p1,offset){
+      allocSizes.push(offset);
+      return 'X';
+    });
+    cb('matches:'+allocSizes.length+'|offsets:'+allocSizes.join(','));
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// ================================================================
+// SECTION D: YARR Compilation Edge Cases
+// Patterns that stress the YARR compiler and JIT
+// ================================================================
+
+// D1: Catastrophic backtracking detection
+addTest('D1-CATASTROPHIC-BT',function(cb){
+  var start=Date.now();
+  try{
+    // This should be handled by YARR's backtracking limit
+    var re=/^(a+)+$/;
+    var input='a'.repeat(25)+'!';
+    var m=input.match(re);
+    var elapsed=Date.now()-start;
+    cb('match:'+(m?'yes':'no')+'|time:'+elapsed+'ms');
+  }catch(e){cb('ERR:'+e.message+'|time:'+(Date.now()-start)+'ms');}
+});
+
+// D2: Large capture group count
+addTest('D2-LARGE-CAPTURE-COUNT',function(cb){
+  try{
+    // Build regex with many capture groups
+    var parts=[];
+    for(var i=0;i<100;i++)parts.push('(a)');
+    var reStr=parts.join('');
+    var re=new RegExp(reStr);
+    var input='a'.repeat(100);
+    var m=input.match(re);
+    cb('groups:'+(m?m.length:'0')+'|last:'+(m?m[100]:'null'));
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// D3: Named groups with duplicate names (different alternation branches)
+addTest('D3-DUPLICATE-NAMED-GROUPS',function(cb){
+  try{
+    var re=/(?<val>abc)|(?<val>def)/;
+    var m1='abc'.match(re);
+    var m2='def'.match(re);
+    cb('m1:'+(m1?m1.groups.val:'null')+'|m2:'+(m2?m2.groups.val:'null'));
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// D4: Regex with assertion combinations
+addTest('D4-ASSERTION-COMBOS',function(cb){
+  var anomalies=0;
+  try{
+    // Lookahead + lookbehind + word boundary combinations
+    var re=/(?<=\b\w)(?=\w\b)/g;
+    var input='ab cd ef';
+    for(var i=0;i<2000;i++){
+      var matches=[];
+      var m;
+      re.lastIndex=0;
+      while((m=re.exec(input))!==null){
+        matches.push(m.index);
+        if(matches.length>20)break; // safety
+      }
+      // Should match between chars in 2-char words
+      if(matches.length!==3||matches[0]!==1||matches[1]!==4||matches[2]!==7){
+        anomalies++;
+      }
+    }
+  }catch(e){cb('ERR:'+e.message);return;}
+  cb('iters:2000|anomalies:'+anomalies);
+});
+
+// D5: Regex JIT with string.matchAll iterator
+addTest('D5-MATCHALL-ITERATOR',function(cb){
+  try{
+    var re=/(?<word>\w+)/g;
+    var input='hello world foo bar';
+    var results=[];
+    for(var i=0;i<1000;i++){
+      var count=0;
+      var iter=input.matchAll(re);
+      var next;
+      while(!(next=iter.next()).done){
+        count++;
+        if(i===999)results.push(next.value.groups.word);
+      }
+      if(count!==4)results.push('ANOMALY-count:'+count);
+    }
+    cb('words:'+results.join(',')+' (expect:hello,world,foo,bar)');
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// D6: Sticky flag + lookbehind interaction
+addTest('D6-STICKY-LOOKBEHIND',function(cb){
+  try{
+    var re=/(?<=a)b/y;
+    var anomalies=0;
+    for(var i=0;i<2000;i++){
+      re.lastIndex=1;
+      var m=re.exec('ab');
+      if(!m||m.index!==1)anomalies++;
+      re.lastIndex=0;
+      var m2=re.exec('ab');
+      if(m2)anomalies++; // Should fail at index 0 (no 'a' before)
+      re.lastIndex=1;
+      var m3=re.exec('xb');
+      if(m3)anomalies++; // Should fail ('x' not 'a' before)
+    }
+    cb('iters:6000|anomalies:'+anomalies);
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// ================================================================
+// SECTION E: RegExp.$1-$9 Stale Capture Exploitation
+// Check if JIT leaves stale capture data accessible
+// ================================================================
+
+// E1: Capture group data persistence across calls
+addTest('E1-STALE-CAPTURES',function(cb){
+  try{
+    /(secret_(\w+))/.exec('secret_password123');
+    var c1=RegExp.$1;var c2=RegExp.$2;
+    // Now execute a different regex
+    /no_match/.exec('xxx');
+    var c1after=RegExp.$1;var c2after=RegExp.$2;
+    // Do captures persist?
+    cb('before:'+c1+'|'+c2+'|after:'+c1after+'|'+c2after+'|persist:'+(c1===c1after));
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// E2: Race captures between regex operations
+addTest('E2-CAPTURE-RACE',function(cb){
+  var anomalies=0;
+  for(var i=0;i<2000;i++){
+    /(val_(\d+))/.exec('val_'+i);
+    var expected='val_'+i;
+    if(RegExp.$1!==expected)anomalies++;
+    // Interleave with different regex
+    /(\w)/.exec('X');
+    // $1 should now be 'X', not 'val_N'
+    if(RegExp.$1!=='X')anomalies++;
+  }
+  cb('iters:4000|anomalies:'+anomalies);
+});
+
+// E3: BigUint64Array + regex for controlled allocation
+addTest('E3-BIGU64-REGEX-ALLOC',function(cb){
+  try{
+    if(typeof BigUint64Array==='undefined'){cb('SKIP-no-BigUint64');return;}
+    // Use regex match to determine allocation then read pointer-width values
+    var re=/(?<=size:(?<s>\d+))!/;
+    var m='size:64!'.match(re);
+    var sz=m?parseInt(m.groups.s):8;
+    var buf=new ArrayBuffer(sz);
+    var view=new BigUint64Array(buf);
+    // Check if we can read raw 64-bit values
+    var vals=[];
+    for(var i=0;i<view.length;i++){
+      vals.push('0x'+view[i].toString(16));
+    }
+    cb('size:'+sz+'|u64count:'+view.length+'|vals:'+vals.join(','));
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+log('info','Starting '+tests.length+' tests...');
+setTimeout(runNext,100);
+</script>
+</body>
+</html>

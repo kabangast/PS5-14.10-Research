@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P844v11</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function bn(tag,data){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/ps5_beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||''),false);
+    x.send();
+  }catch(e){}
+}
+
+var KEY='p844v11_test';
+function getTest(){try{return parseInt(localStorage.getItem(KEY))||0;}catch(e){return 0;}}
+function setTest(n){try{localStorage.setItem(KEY,String(n));}catch(e){}}
+function clearTest(){try{localStorage.removeItem(KEY);}catch(e){}}
+
+var testNum=getTest();
+log('P844v11 BOOT test='+testNum);
+bn('P844v11-BOOT','test='+testNum);
+
+var pm=_PS.postMessage;
+
+var TESTS=[
+  // ============================================================
+  // SECTION A: Proxy introspection — what does the binding READ?
+  // ============================================================
+
+  // T0: Baseline — real string (must survive)
+  function T0(){
+    var r;
+    try{r=pm.call(_PS,'hello_baseline');}catch(e){r='err:'+e.message;}
+    return 'baseline='+String(r);
+  },
+
+  // T1: Proxy that returns "hello" from Symbol.toPrimitive
+  // Logs EVERY property access the binding makes
+  function T1(){
+    var accessLog=[];
+    var handler={
+      get:function(target,prop){
+        var pstr=(typeof prop==='symbol')?prop.toString():String(prop);
+        accessLog.push('get:'+pstr);
+        if(prop===Symbol.toPrimitive)return function(hint){
+          accessLog.push('toPrim:'+hint);
+          return 'from_toPrimitive';
+        };
+        if(prop==='toString')return function(){
+          accessLog.push('toString_called');
+          return 'from_toString';
+        };
+        if(prop==='valueOf')return function(){
+          accessLog.push('valueOf_called');
+          return 'from_valueOf';
+        };
+        return undefined;
+      },
+      has:function(target,prop){
+        var pstr=(typeof prop==='symbol')?prop.toString():String(prop);
+        accessLog.push('has:'+pstr);
+        return prop in target;
+      },
+      getPrototypeOf:function(target){
+        accessLog.push('getProto');
+        return Object.getPrototypeOf(target);
+      }
+    };
+    var p=new Proxy({},handler);
+    var r='none';
+    try{r=pm.call(_PS,p);}catch(e){r='err:'+e.message;}
+    return 'r='+String(r)+'|log='+accessLog.join(',');
+  },
+
+  // T2: Proxy on _PS itself — intercept the THIS object
+  // What does the binding read from the receiver?
+  function T2(){
+    var accessLog=[];
+    var handler={
+      get:function(target,prop){
+        var pstr=(typeof prop==='symbol')?prop.toString():String(prop);
+        accessLog.push('this_get:'+pstr);
+        if(prop==='postMessage')return pm; // return real function
+        return Reflect.get(target,prop);
+      }
+    };
+    var fakePS=new Proxy(_PS,handler);
+    var r='none';
+    try{r=fakePS.postMessage('proxy_this_test');}catch(e){r='err:'+e.message;}
+    return 'r='+String(r)+'|log='+accessLog.join(',');
+  },
+
+  // ============================================================
+  // SECTION B: Non-string primitive returns from toString
+  // If these DON'T crash → ToPrimitive succeeds (string returned)
+  // If these DO crash → binding checks isString() after conversion
+  // ============================================================
+
+  // T3: toString returns integer 42
+  function T3(){
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return 42;}});}catch(e){r='err:'+e.message;}
+    return 'int='+String(r);
+  },
+
+  // T4: toString returns boolean true
+  function T4(){
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return true;}});}catch(e){r='err:'+e.message;}
+    return 'bool='+String(r);
+  },
+
+  // T5: toString returns null
+  function T5(){
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return null;}});}catch(e){r='err:'+e.message;}
+    return 'null='+String(r);
+  },
+
+  // T6: toString returns undefined
+  function T6(){
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return undefined;}});}catch(e){r='err:'+e.message;}
+    return 'undef='+String(r);
+  },
+
+  // T7: toString returns 0n (BigInt)
+  function T7(){
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return 0n;}});}catch(e){r='err:'+e.message;}
+    return 'bigint='+String(r);
+  },
+
+  // T8: Symbol.toPrimitive returns number (bypasses toString entirely)
+  function T8(){
+    var obj={};
+    obj[Symbol.toPrimitive]=function(hint){return 999;};
+    var r='none';
+    try{r=pm.call(_PS,obj);}catch(e){r='err:'+e.message;}
+    return 'toPrim_num='+String(r);
+  },
+
+  // T9: valueOf returns string, toString returns object
+  // ToPrimitive(hint:string): tries toString first (returns object=fail),
+  // then valueOf (returns string=success)
+  function T9(){
+    var r='none';
+    try{r=pm.call(_PS,{
+      toString:function(){return {};}, // non-primitive
+      valueOf:function(){return 'from_valueOf_str';}
+    });}catch(e){r='err:'+e.message;}
+    return 'valueOf_str='+String(r);
+  },
+
+  // ============================================================
+  // SECTION C: postMessage.call with different `this` contexts
+  // Test what the binding does with the receiver
+  // ============================================================
+
+  // T10: call with this=null
+  function T10(){
+    var r='none';
+    try{r=pm.call(null,'test_null_this');}catch(e){r='err:'+e.message;}
+    return 'null_this='+String(r);
+  },
+
+  // T11: call with this=regular object
+  function T11(){
+    var r='none';
+    try{r=pm.call({},'test_obj_this');}catch(e){r='err:'+e.message;}
+    return 'obj_this='+String(r);
+  },
+
+  // T12: call with this=undefined
+  function T12(){
+    var r='none';
+    try{r=pm.call(undefined,'test_undef_this');}catch(e){r='err:'+e.message;}
+    return 'undef_this='+String(r);
+  },
+
+  // T13: postMessage with no arguments
+  function T13(){
+    var r='none';
+    try{r=pm.call(_PS);}catch(e){r='err:'+e.message;}
+    return 'no_args='+String(r);
+  },
+
+  // T14: postMessage with multiple arguments
+  function T14(){
+    var r='none';
+    try{r=pm.call(_PS,'arg1','arg2','arg3');}catch(e){r='err:'+e.message;}
+    return 'multi='+String(r);
+  },
+
+  // ============================================================
+  // SECTION D: String length edge cases
+  // ============================================================
+
+  // T15: empty string
+  function T15(){
+    var r='none';
+    try{r=pm.call(_PS,'');}catch(e){r='err:'+e.message;}
+    return 'empty='+String(r);
+  },
+
+  // T16: very long string (1MB)
+  function T16(){
+    var s='';for(var i=0;i<20;i++)s+=s||'A'.repeat(1024);
+    var r='none';
+    try{r=pm.call(_PS,s);}catch(e){r='err:'+e.message;}
+    return 'long_'+s.length+'='+String(r);
+  },
+
+  // T17: string with null bytes
+  function T17(){
+    var s='hello\0world\0test';
+    var r='none';
+    try{r=pm.call(_PS,s);}catch(e){r='err:'+e.message;}
+    return 'nullbytes='+String(r);
+  },
+
+  // ============================================================
+  // SECTION E: Return value analysis — does postMessage return data?
+  // ============================================================
+
+  // T18: Check return value type and content
+  function T18(){
+    var r1='none',r2='none',r3='none';
+    try{
+      r1=pm.call(_PS,'ret_test_1');
+      r2=pm.call(_PS,'ret_test_2');
+      r3=pm.call(_PS,'ret_test_3');
+    }catch(e){return 'err:'+e.message;}
+    return 'r1='+typeof r1+':'+String(r1)+'|r2='+typeof r2+':'+String(r2)+'|r3='+typeof r3+':'+String(r3);
+  },
+
+  // ============================================================
+  // SECTION F: Prototype pollution — can we inject into the binding?
+  // ============================================================
+
+  // T19: Override String.prototype methods before postMessage
+  function T19(){
+    var origSP=String.prototype.toString;
+    var called=false;
+    String.prototype.toString=function(){
+      called=true;
+      return origSP.call(this);
+    };
+    var r='none';
+    try{r=pm.call(_PS,'proto_test');}catch(e){r='err:'+e.message;}
+    String.prototype.toString=origSP;
+    return 'proto='+String(r)+'|called='+called;
+  },
+
+  // T20: Override Object.prototype.toString before passing object
+  function T20(){
+    var origOT=Object.prototype.toString;
+    var intercepted=[];
+    Object.prototype.toString=function(){
+      intercepted.push(typeof this);
+      return 'INTERCEPTED';
+    };
+    var r='none';
+    try{r=pm.call(_PS,{});}catch(e){r='err:'+e.message;}
+    Object.prototype.toString=origOT;
+    return 'r='+String(r)+'|intercepted='+intercepted.join(',');
+  }
+];
+
+var NAMES=[
+  'T0-baseline','T1-proxyArg','T2-proxyThis',
+  'T3-intReturn','T4-boolReturn','T5-nullReturn','T6-undefReturn','T7-bigintReturn',
+  'T8-toPrimNum','T9-valueOfStr',
+  'T10-nullThis','T11-objThis','T12-undefThis','T13-noArgs','T14-multiArgs',
+  'T15-emptyStr','T16-longStr','T17-nullBytes',
+  'T18-retVals',
+  'T19-strProto','T20-objProto'
+];
+
+function runTest(){
+  if(testNum>=TESTS.length){
+    log('ALL '+TESTS.length+' TESTS COMPLETE');
+    bn('P844v11-DONE','all='+TESTS.length);
+    clearTest();
+    return;
+  }
+  var name=NAMES[testNum]||('T'+testNum);
+  log('Running '+name+'...');
+  setTest(testNum+1);
+  bn('P844v11-'+name+'-PRE','starting');
+  try{
+    var result=TESTS[testNum]();
+    log(name+': '+result);
+    bn('P844v11-'+name+'-OK',String(result).substring(0,900));
+  }catch(e){
+    log(name+' EXCEPTION: '+e.message);
+    bn('P844v11-'+name+'-ERR',e.message);
+  }
+  setTimeout(function(){location.reload();},100);
+}
+
+setTimeout(runTest,200);
+</script>
+</body>
+</html>

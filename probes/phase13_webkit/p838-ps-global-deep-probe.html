@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P838</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P838: _PS Global + postMessageNative + JSC Internals Deep Probe</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P838-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+function safeStr(v){
+  try{
+    if(v===null)return'null';
+    if(v===undefined)return'undef';
+    var t=typeof v;
+    if(t==='function')return'fn:'+v.name+'('+v.length+')';
+    if(t==='object'){
+      if(Array.isArray(v))return'arr['+v.length+']';
+      var keys=Object.getOwnPropertyNames(v);
+      return'obj{'+keys.slice(0,15).join(',')+'}';
+    }
+    return t+':'+String(v).slice(0,80);
+  }catch(e){return'ERR:'+e.message.slice(0,30);}
+}
+
+bn('BOOT','start');
+log('P838: Deep probe of PS5 WebKit internals...','hot');
+
+/* ===== PHASE A: _PS global investigation ===== */
+log('','');
+log('--- Phase A: _PS Global Object ---','hot');
+
+var psResults=[];
+try{
+  if(typeof _PS==='undefined'){
+    psResults.push('_PS=undefined');
+    bn('PS-TYPE','undefined');
+  }else{
+    var psType=typeof _PS;
+    psResults.push('type='+psType);
+    bn('PS-TYPE',psType);
+
+    if(psType==='object'||psType==='function'){
+      /* Enumerate ALL properties */
+      var psProps=[];
+      try{psProps=Object.getOwnPropertyNames(_PS);}catch(e){psResults.push('enumERR='+e.message);}
+
+      var psProto=null;
+      try{psProto=Object.getPrototypeOf(_PS);}catch(e){}
+      var protoProps=[];
+      if(psProto&&psProto!==Object.prototype){
+        try{protoProps=Object.getOwnPropertyNames(psProto);}catch(e){}
+      }
+
+      psResults.push('ownProps='+psProps.length);
+      psResults.push('protoProps='+protoProps.length);
+      bn('PS-PROPS','own=['+psProps.join(',')+']|proto=['+protoProps.join(',')+']');
+      log('_PS own props ('+psProps.length+'): '+psProps.join(', '),'info');
+      if(protoProps.length)log('_PS proto props: '+protoProps.join(', '),'info');
+
+      /* Deep inspect each property */
+      var allProps=psProps.concat(protoProps);
+      for(var i=0;i<allProps.length;i++){
+        var k=allProps[i];
+        try{
+          var desc=Object.getOwnPropertyDescriptor(_PS,k)||Object.getOwnPropertyDescriptor(psProto,k);
+          var val=_PS[k];
+          var info=k+'='+safeStr(val);
+          if(desc){
+            if(desc.get)info+='[getter]';
+            if(desc.set)info+='[setter]';
+            if(!desc.writable&&desc.value!==undefined)info+='[readonly]';
+            if(!desc.configurable)info+='[frozen]';
+          }
+          log('  _PS.'+info,'ok');
+          bn('PS-PROP-'+k,info);
+
+          /* If it's a function, try calling with no args */
+          if(typeof val==='function'){
+            try{
+              var ret=val.call(_PS);
+              var retStr=safeStr(ret);
+              log('    -> call() = '+retStr,'hot');
+              bn('PS-CALL-'+k,retStr);
+
+              /* If it returns an object, enumerate that too */
+              if(ret!==null&&ret!==undefined&&typeof ret==='object'){
+                var retKeys=Object.getOwnPropertyNames(ret).slice(0,20);
+                log('    -> keys: '+retKeys.join(', '),'info');
+                bn('PS-RET-'+k,'keys='+retKeys.join(','));
+
+                /* Dump first 10 values */
+                for(var j=0;j<Math.min(retKeys.length,10);j++){
+                  try{
+                    var rv=ret[retKeys[j]];
+                    log('      .'+retKeys[j]+' = '+safeStr(rv),'info');
+                  }catch(e2){}
+                }
+              }
+            }catch(e){
+              log('    -> call() threw: '+e.message.slice(0,60),'fail');
+              bn('PS-CALL-'+k,'ERR:'+e.message.slice(0,80));
+            }
+          }
+
+          /* If it's an object, enumerate sub-properties */
+          if(val!==null&&typeof val==='object'&&val!==_PS){
+            try{
+              var subKeys=Object.getOwnPropertyNames(val).slice(0,20);
+              if(subKeys.length>0){
+                log('    sub-keys: '+subKeys.join(', '),'info');
+                bn('PS-SUB-'+k,'keys='+subKeys.join(','));
+                for(var j=0;j<Math.min(subKeys.length,10);j++){
+                  try{
+                    var sv=val[subKeys[j]];
+                    log('      .'+subKeys[j]+' = '+safeStr(sv),'info');
+                  }catch(e2){}
+                }
+              }
+            }catch(e){}
+          }
+        }catch(e){
+          log('  _PS.'+k+' = ERR: '+e.message.slice(0,50),'fail');
+          bn('PS-PROP-'+k,'ERR:'+e.message.slice(0,80));
+        }
+      }
+
+      /* Check prototype chain depth */
+      var chain=[];
+      var p=_PS;
+      for(var i=0;i<10;i++){
+        p=Object.getPrototypeOf(p);
+        if(!p)break;
+        chain.push(p.constructor?p.constructor.name:'?');
+      }
+      psResults.push('chain='+chain.join('->'));
+      bn('PS-CHAIN',chain.join('->'));
+      log('Proto chain: '+chain.join(' -> '),'info');
+
+      /* toString / valueOf */
+      try{
+        var ts=_PS.toString();
+        psResults.push('toString='+ts.slice(0,80));
+        log('_PS.toString() = '+ts.slice(0,100),'info');
+        bn('PS-TOSTR',ts.slice(0,200));
+      }catch(e){psResults.push('toString=ERR');}
+
+      try{
+        var vo=_PS.valueOf();
+        psResults.push('valueOf='+(vo===_PS?'self':safeStr(vo)));
+      }catch(e){}
+
+      /* JSON stringify attempt */
+      try{
+        var js=JSON.stringify(_PS);
+        psResults.push('json='+js.slice(0,100));
+        bn('PS-JSON',js.slice(0,300));
+        log('JSON: '+js.slice(0,200),'info');
+      }catch(e){psResults.push('json=ERR:'+e.message.slice(0,30));}
+    }else{
+      psResults.push('val='+String(_PS).slice(0,80));
+      bn('PS-VAL',String(_PS).slice(0,200));
+    }
+  }
+}catch(e){
+  psResults.push('ERR='+e.message);
+  bn('PS-ERR',e.message);
+}
+
+/* ===== PHASE B: postMessageNative investigation ===== */
+log('','');
+log('--- Phase B: postMessageNative ---','hot');
+
+var pmnResults=[];
+try{
+  if(typeof postMessageNative==='undefined'){
+    pmnResults.push('undef');
+  }else{
+    pmnResults.push('type='+typeof postMessageNative);
+    pmnResults.push('name='+postMessageNative.name);
+    pmnResults.push('length='+postMessageNative.length);
+    log('postMessageNative: '+typeof postMessageNative+', name='+postMessageNative.name+', arity='+postMessageNative.length,'info');
+
+    var pmnStr=Function.prototype.toString.call(postMessageNative);
+    pmnResults.push('str='+pmnStr.slice(0,80));
+    log('toString: '+pmnStr.slice(0,120),'info');
+    bn('PMN-STR',pmnStr.slice(0,200));
+
+    /* Try calling with various args */
+    var pmnTests=[
+      ['noarg',[]],
+      ['empty-str',['']],
+      ['obj',[{probe:'P838'}]],
+      ['star',['test','*']]
+    ];
+    for(var i=0;i<pmnTests.length;i++){
+      try{
+        var r=postMessageNative.apply(window,pmnTests[i][1]);
+        pmnResults.push(pmnTests[i][0]+'='+safeStr(r));
+        log('  call('+pmnTests[i][0]+') = '+safeStr(r),'ok');
+      }catch(e){
+        pmnResults.push(pmnTests[i][0]+'=ERR:'+e.message.slice(0,40));
+        log('  call('+pmnTests[i][0]+') threw: '+e.message.slice(0,60),'fail');
+      }
+    }
+  }
+}catch(e){pmnResults.push('ERR='+e.message);}
+bn('PMN',pmnResults.join('|'));
+
+/* ===== PHASE C: Atomics deep test ===== */
+log('','');
+log('--- Phase C: Atomics capabilities ---','hot');
+
+var atomResults=[];
+try{
+  atomResults.push('type='+typeof Atomics);
+  var atomProps=Object.getOwnPropertyNames(Atomics);
+  atomResults.push('props='+atomProps.join(','));
+  log('Atomics props: '+atomProps.join(', '),'info');
+
+  /* isLockFree — reveals architecture word size */
+  var lockFree=[];
+  for(var i=1;i<=8;i++){
+    lockFree.push(i+'='+(Atomics.isLockFree(i)?'Y':'N'));
+  }
+  atomResults.push('lockFree='+lockFree.join(','));
+  log('Atomics.isLockFree: '+lockFree.join(' '),'info');
+
+  /* Can we use Atomics on regular Int32Array? */
+  try{
+    var sab32=new Int32Array(new ArrayBuffer(16));
+    sab32[0]=42;
+    var loaded=Atomics.load(sab32,0);
+    atomResults.push('loadNonSAB='+loaded);
+    log('Atomics.load on normal AB: '+loaded,'ok');
+
+    /* Atomics.store */
+    Atomics.store(sab32,0,99);
+    atomResults.push('storeNonSAB='+sab32[0]);
+
+    /* Atomics.exchange */
+    var prev=Atomics.exchange(sab32,0,77);
+    atomResults.push('exchangeNonSAB=prev:'+prev+',now:'+sab32[0]);
+
+    /* Atomics.compareExchange */
+    var ce=Atomics.compareExchange(sab32,0,77,55);
+    atomResults.push('casNonSAB=prev:'+ce+',now:'+sab32[0]);
+
+    log('Atomics on regular AB: WORKS (load/store/exchange/CAS)','hot');
+  }catch(e){
+    atomResults.push('nonSAB-ERR='+e.message.slice(0,40));
+    log('Atomics on regular AB: '+e.message.slice(0,60),'fail');
+  }
+
+  /* Atomics.waitAsync — available? */
+  if(typeof Atomics.waitAsync==='function'){
+    atomResults.push('waitAsync=YES');
+    log('Atomics.waitAsync: YES','hot');
+  }else{
+    atomResults.push('waitAsync=NO');
+  }
+}catch(e){atomResults.push('ERR='+e.message);}
+bn('ATOMICS',atomResults.join('|'));
+
+/* ===== PHASE D: FinalizationRegistry + WeakRef ===== */
+log('','');
+log('--- Phase D: GC monitoring ---','hot');
+
+var gcResults=[];
+try{
+  var collected=[];
+  var fr=new FinalizationRegistry(function(val){
+    collected.push(val);
+  });
+
+  /* Register some objects and let them go */
+  (function(){
+    var obj1={name:'probe1'};
+    var obj2={name:'probe2'};
+    var obj3={name:'probe3'};
+    fr.register(obj1,'obj1');
+    fr.register(obj2,'obj2');
+    fr.register(obj3,'obj3');
+    /* Also test WeakRef */
+    var wr=new WeakRef(obj1);
+    gcResults.push('wrDeref='+(wr.deref()===obj1?'alive':'dead'));
+    /* obj1,obj2,obj3 go out of scope here */
+  })();
+
+  gcResults.push('preGC-collected='+collected.length);
+  log('Pre-GC: '+collected.length+' collected','info');
+
+  /* Force GC via allocation pressure */
+  var junk=[];
+  for(var i=0;i<10000;i++){
+    junk.push(new ArrayBuffer(1024));
+    if(i%2000===0){junk.length=0;} /* Let GC reclaim */
+  }
+  junk=null;
+
+  gcResults.push('postAlloc-collected='+collected.length);
+  log('Post-alloc-pressure: '+collected.length+' collected','info');
+}catch(e){gcResults.push('ERR='+e.message);}
+bn('GC',gcResults.join('|'));
+
+/* ===== PHASE E: Other interesting globals ===== */
+log('','');
+log('--- Phase E: Interesting globals scan ---','hot');
+
+var globResults=[];
+
+/* Check for WebKit internals */
+var interestingNames=['_PS','postMessageNative','webkitURL','webkitRequestAnimationFrame',
+  'webkitCancelAnimationFrame','WebKitPoint','WebKitCSSMatrix','WebKitMutationObserver',
+  'gc','GCController','$','$$','internals','testRunner',
+  'debug','debugger','__jsc__','JSC','webkit','WebKit'];
+
+for(var i=0;i<interestingNames.length;i++){
+  var n=interestingNames[i];
+  try{
+    var v=window[n];
+    if(v!==undefined){
+      globResults.push(n+'='+safeStr(v));
+      if(n!=='_PS'&&n!=='postMessageNative'){
+        log('  window.'+n+' = '+safeStr(v),'ok');
+      }
+    }
+  }catch(e){globResults.push(n+'=ERR');}
+}
+
+/* Check for console extensions */
+try{
+  var conProps=Object.getOwnPropertyNames(console);
+  var nonStd=conProps.filter(function(p){
+    return ['log','warn','error','info','debug','trace','dir','table','time','timeEnd',
+      'count','assert','clear','group','groupEnd','groupCollapsed','profile','profileEnd'].indexOf(p)<0;
+  });
+  if(nonStd.length>0){
+    globResults.push('console-extra='+nonStd.join(','));
+    log('Non-standard console: '+nonStd.join(', '),'hot');
+    for(var i=0;i<nonStd.length;i++){
+      try{log('  console.'+nonStd[i]+' = '+safeStr(console[nonStd[i]]),'info');}catch(e){}
+    }
+  }
+}catch(e){}
+
+/* Check for navigator extensions */
+try{
+  var navExtras=[];
+  var navProps=Object.getOwnPropertyNames(navigator);
+  for(var i=0;i<navProps.length;i++){
+    if(/playstation|ps[345]|sony|sce|orbis/i.test(navProps[i])){
+      navExtras.push(navProps[i]+'='+safeStr(navigator[navProps[i]]));
+    }
+  }
+  if(navExtras.length>0){
+    globResults.push('nav-ps='+navExtras.join(','));
+    log('PS5 navigator props: '+navExtras.join(', '),'hot');
+  }
+  /* Also get userAgent */
+  globResults.push('ua='+navigator.userAgent.slice(0,120));
+}catch(e){}
+
+bn('GLOBALS',globResults.join('|'));
+
+/* ===== PHASE F: _PS function bruteforce ===== */
+/* If _PS has no properties, try treating it as a function or constructor */
+log('','');
+log('--- Phase F: _PS deep analysis ---','hot');
+
+var deepResults=[];
+try{
+  if(typeof _PS!=='undefined'){
+    /* Try as constructor */
+    try{
+      var inst=new _PS();
+      deepResults.push('new='+safeStr(inst));
+      log('new _PS() = '+safeStr(inst),'hot');
+    }catch(e){
+      deepResults.push('new=ERR:'+e.message.slice(0,40));
+    }
+
+    /* Check Symbol.iterator */
+    try{
+      if(_PS[Symbol.iterator]){
+        var iter=_PS[Symbol.iterator]();
+        var items=[];
+        for(var i=0;i<10;i++){
+          var n=iter.next();
+          if(n.done)break;
+          items.push(safeStr(n.value));
+        }
+        deepResults.push('iter='+items.join(','));
+        log('_PS iterable: '+items.join(', '),'hot');
+      }
+    }catch(e){}
+
+    /* Check indexed access */
+    try{
+      for(var i=0;i<5;i++){
+        var v=_PS[i];
+        if(v!==undefined)deepResults.push('['+i+']='+safeStr(v));
+      }
+    }catch(e){}
+
+    /* Proxy wrap to catch all property accesses */
+    try{
+      var accessed=[];
+      var p=new Proxy(_PS,{
+        get:function(t,prop){
+          if(typeof prop==='string')accessed.push(prop);
+          return Reflect.get(t,prop);
+        }
+      });
+      /* Try common patterns */
+      try{var v=p.version;}catch(e){}
+      try{var v=p.getInfo;}catch(e){}
+      try{var v=p.memory;}catch(e){}
+      try{var v=p.debug;}catch(e){}
+      try{var v=p.system;}catch(e){}
+      try{var v=p.kernel;}catch(e){}
+      try{var v=p.address;}catch(e){}
+      try{var v=p.base;}catch(e){}
+      try{var v=p.native;}catch(e){}
+      try{var v=p.modules;}catch(e){}
+    }catch(e){}
+
+    /* Symbols on _PS */
+    try{
+      var syms=Object.getOwnPropertySymbols(_PS);
+      if(syms.length>0){
+        deepResults.push('symbols='+syms.length);
+        for(var i=0;i<syms.length;i++){
+          try{
+            var sv=_PS[syms[i]];
+            deepResults.push('sym['+String(syms[i])+']='+safeStr(sv));
+            log('  _PS['+String(syms[i])+'] = '+safeStr(sv),'hot');
+          }catch(e){}
+        }
+      }
+    }catch(e){}
+  }
+}catch(e){deepResults.push('deep-ERR='+e.message);}
+bn('PS-DEEP',deepResults.join('|'));
+
+/* ===== PHASE G: Summary ===== */
+log('','');
+log('====== P838 COMPLETE ======','hot');
+var summary='_PS='+psResults.slice(0,3).join(',');
+summary+='|pmn='+pmnResults.slice(0,2).join(',');
+summary+='|atomics='+atomResults.slice(0,3).join(',');
+summary+='|gc='+gcResults.join(',');
+bn('DONE',summary);
+log('Summary: '+summary.slice(0,200),'ok');
+
+</script></body></html>

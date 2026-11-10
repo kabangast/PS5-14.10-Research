@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P935: Web Audio & Multi-Worker Concurrency Pool</title>
+<style>
+:root {
+  --bg: #090d16;
+  --card: #111827;
+  --border: #1f2937;
+  --text: #e5e7eb;
+  --dim: #9ca3af;
+  --cyan: #06b6d4;
+  --green: #10b981;
+  --amber: #f59e0b;
+  --red: #ef4444;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  padding: 16px;
+  line-height: 1.5;
+}
+.header {
+  border: 1px solid var(--border);
+  background: var(--card);
+  padding: 14px 18px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title { font-size: 16px; font-weight: bold; color: var(--cyan); }
+.badge {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: #374151;
+  font-weight: 600;
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.card {
+  border: 1px solid var(--border);
+  background: var(--card);
+  padding: 12px 14px;
+  border-radius: 6px;
+}
+.card h3 {
+  font-size: 12px;
+  color: var(--dim);
+  text-transform: uppercase;
+  margin-bottom: 8px;
+  letter-spacing: 0.5px;
+}
+.stat {
+  display: flex;
+  justify-content: space-between;
+  padding: 3px 0;
+  border-bottom: 1px dotted rgba(255,255,255,0.08);
+  font-size: 12px;
+}
+.stat:last-child { border-bottom: none; }
+.stat-val { font-weight: bold; }
+.ok { color: var(--green); }
+.warn { color: var(--amber); }
+.err { color: var(--red); }
+.console {
+  border: 1px solid var(--border);
+  background: #05070d;
+  padding: 12px;
+  border-radius: 6px;
+}
+.console-header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--dim);
+  margin-bottom: 8px;
+}
+#log {
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 11px;
+  color: #d1d5db;
+  max-height: 280px;
+  overflow-y: auto;
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <div class="title">PROBE P935: Web Audio & Multi-Worker Concurrency Pool</div>
+    <div style="font-size: 11px; color: var(--dim); margin-top: 2px;">PS5 WebKit 14.10 Empirical Diagnostic Suite</div>
+  </div>
+  <div id="statusBadge" class="badge">INITIALIZING</div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h3>Web Audio Subsystem</h3>
+    <div class="stat"><span>AudioContext:</span><span id="mAudioCtx" class="stat-val">Testing...</span></div>
+    <div class="stat"><span>OfflineAudioContext:</span><span id="mOfflineCtx" class="stat-val">Testing...</span></div>
+    <div class="stat"><span>AudioBuffer:</span><span id="mAudioBuf" class="stat-val">Pending</span></div>
+    <div class="stat"><span>Sample Rate:</span><span id="mSampleRate" class="stat-val">Pending</span></div>
+  </div>
+
+  <div class="card">
+    <h3>AudioBuffer Backing Memory</h3>
+    <div class="stat"><span>Channel Data:</span><span id="mChannelData" class="stat-val">Testing...</span></div>
+    <div class="stat"><span>Transfer Detach:</span><span id="mAudioDetach" class="stat-val">Testing...</span></div>
+    <div class="stat"><span>Post-Detach Buffer:</span><span id="mPostDetachBuf" class="stat-val">Pending</span></div>
+    <div class="stat"><span>Re-Read Channel:</span><span id="mReReadChannel" class="stat-val">Pending</span></div>
+  </div>
+
+  <div class="card">
+    <h3>Multi-Worker Concurrency Pool (4x)</h3>
+    <div class="stat"><span>Worker Pool Size:</span><span id="mPoolSize" class="stat-val">Spawning...</span></div>
+    <div class="stat"><span>Active Responses:</span><span id="mPoolResp" class="stat-val">0 / 4</span></div>
+    <div class="stat"><span>Min Latency:</span><span id="mMinLat" class="stat-val">--</span></div>
+    <div class="stat"><span>Max Latency:</span><span id="mMaxLat" class="stat-val">--</span></div>
+  </div>
+</div>
+
+<div class="console">
+  <div class="console-header">
+    <span>DIAGNOSTIC LOG</span>
+    <span class="ok">TAG: P935</span>
+  </div>
+  <pre id="log">[*] Probe P935 initialized.</pre>
+</div>
+
+<script>
+'use strict';
+var logEl = document.getElementById('log');
+var statusBadge = document.getElementById('statusBadge');
+var mAudioCtx = document.getElementById('mAudioCtx');
+var mOfflineCtx = document.getElementById('mOfflineCtx');
+var mAudioBuf = document.getElementById('mAudioBuf');
+var mSampleRate = document.getElementById('mSampleRate');
+var mChannelData = document.getElementById('mChannelData');
+var mAudioDetach = document.getElementById('mAudioDetach');
+var mPostDetachBuf = document.getElementById('mPostDetachBuf');
+var mReReadChannel = document.getElementById('mReReadChannel');
+var mPoolSize = document.getElementById('mPoolSize');
+var mPoolResp = document.getElementById('mPoolResp');
+var mMinLat = document.getElementById('mMinLat');
+var mMaxLat = document.getElementById('mMaxLat');
+
+function log(msg) {
+  var d = document.createElement('div');
+  d.textContent = msg;
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P935-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+log('[*] P935 Loaded: Probing Web Audio subsystem and 4-worker thread pool.');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * STAGE 1: Web Audio Subsystem Detection
+ * ============================================================ */
+var AudioCtor = window.AudioContext || window.webkitAudioContext;
+var OfflineCtor = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+
+var hasAudio = typeof AudioCtor === 'function';
+var hasOffline = typeof OfflineCtor === 'function';
+
+mAudioCtx.textContent = hasAudio ? 'SUPPORTED' : 'UNSUPPORTED';
+mAudioCtx.className = 'stat-val ' + (hasAudio ? 'ok' : 'warn');
+
+mOfflineCtx.textContent = hasOffline ? 'SUPPORTED' : 'UNSUPPORTED';
+mOfflineCtx.className = 'stat-val ' + (hasOffline ? 'ok' : 'warn');
+
+log('[+] Web Audio Detection: AudioContext=' + hasAudio + ', OfflineAudioContext=' + hasOffline);
+
+var actx = null;
+var sampleRate = -1;
+var audioBufOk = false;
+
+if (hasAudio || hasOffline) {
+  try {
+    if (hasOffline) {
+      actx = new OfflineCtor(1, 44100, 44100);
+    } else {
+      actx = new AudioCtor();
+    }
+    sampleRate = actx.sampleRate;
+    mSampleRate.textContent = sampleRate + ' Hz';
+    mSampleRate.className = 'stat-val ok';
+
+    var testBuf = actx.createBuffer(1, 1024, sampleRate);
+    audioBufOk = (testBuf !== null && testBuf.length === 1024);
+    mAudioBuf.textContent = audioBufOk ? '1024 FRAMES' : 'NULL_BUFFER';
+    mAudioBuf.className = 'stat-val ' + (audioBufOk ? 'ok' : 'err');
+
+    log('[+] AudioContext initialized: sampleRate=' + sampleRate + ', bufferCreated=' + audioBufOk);
+    syncBn('AUDIO-INIT', 'audio=' + hasAudio + '|offline=' + hasOffline + '|rate=' + sampleRate + '|bufOk=' + audioBufOk);
+  } catch(e) {
+    mAudioBuf.textContent = 'ERROR (' + e.message + ')';
+    mAudioBuf.className = 'stat-val err';
+    log('[-] AudioContext init error: ' + e.message);
+    syncBn('AUDIO-ERR', 'err=' + e.message);
+  }
+} else {
+  mSampleRate.textContent = 'N/A';
+  mAudioBuf.textContent = 'N/A';
+  syncBn('AUDIO-INIT', 'supported=false');
+}
+
+/* ============================================================
+ * STAGE 2: AudioBuffer Backing Memory & Detachment Check
+ * ============================================================ */
+if (actx && audioBufOk) {
+  try {
+    var aBuf = actx.createBuffer(1, 512, sampleRate);
+    var chan = aBuf.getChannelData(0);
+    chan[0] = 0.12345;
+    chan[511] = 0.67890;
+
+    mChannelData.textContent = 'Float32 (512)';
+    mChannelData.className = 'stat-val ok';
+    log('[+] ChannelData allocated: type=' + chan.constructor.name + ', len=' + chan.length);
+
+    // Attempt to transfer backing buffer
+    var rawArrayBuf = chan.buffer;
+    var detachThrew = false;
+    var detachErrMsg = '';
+    var isDetached = false;
+
+    try {
+      var cloned = structuredClone(rawArrayBuf, { transfer: [rawArrayBuf] });
+      isDetached = (rawArrayBuf.byteLength === 0);
+    } catch(derr) {
+      detachThrew = true;
+      detachErrMsg = derr.name || derr.message;
+    }
+
+    mAudioDetach.textContent = detachThrew ? 'PROTECTED (' + detachErrMsg + ')' : (isDetached ? 'DETACHED (0B)' : 'ATTACHED');
+    mAudioDetach.className = 'stat-val ' + (isDetached ? 'ok' : 'warn');
+    mPostDetachBuf.textContent = rawArrayBuf.byteLength + ' Bytes';
+
+    // Test re-reading channel data post-transfer
+    var reReadOk = false;
+    try {
+      var chan2 = aBuf.getChannelData(0);
+      reReadOk = (chan2 !== null && chan2.length === 512);
+      mReReadChannel.textContent = reReadOk ? 'RE-ACQUIRED (512)' : 'EMPTY';
+      mReReadChannel.className = 'stat-val ' + (reReadOk ? 'ok' : 'warn');
+    } catch(rerr) {
+      mReReadChannel.textContent = 'THREW (' + (rerr.name || 'Error') + ')';
+      mReReadChannel.className = 'stat-val warn';
+    }
+
+    log('[+] AudioBuffer Detach: threw=' + detachThrew + ', isDetached=' + isDetached + ', reRead=' + reReadOk);
+    syncBn('AUDIO-DETACH', 'threw=' + detachThrew + '|detached=' + isDetached + '|postLen=' + rawArrayBuf.byteLength + '|reRead=' + reReadOk);
+  } catch(e) {
+    log('[-] AudioBuffer memory test error: ' + e.message);
+  }
+} else {
+  mChannelData.textContent = 'N/A';
+  mAudioDetach.textContent = 'N/A';
+  mPostDetachBuf.textContent = 'N/A';
+  mReReadChannel.textContent = 'N/A';
+}
+
+/* ============================================================
+ * STAGE 3: Multi-Worker Concurrency Pool (4x Workers)
+ * ============================================================ */
+var POOL_SIZE = 4;
+var workers = [];
+var responses = 0;
+var latencies = [];
+var poolStartTime = Date.now();
+
+mPoolSize.textContent = POOL_SIZE + ' Workers';
+mPoolSize.className = 'stat-val ok';
+
+for (var w = 0; w < POOL_SIZE; w++) {
+  (function(workerId) {
+    try {
+      var wrk = new Worker('/worker.js');
+      var sendTime = Date.now();
+
+      wrk.onmessage = function(e) {
+        var lat = Date.now() - sendTime;
+        responses++;
+        latencies.push(lat);
+
+        mPoolResp.textContent = responses + ' / ' + POOL_SIZE;
+        log('[+] Worker #' + workerId + ' responded with ' + (e.data ? e.data.type : 'PONG') + ' in ' + lat + 'ms');
+
+        if (responses === POOL_SIZE) {
+          var minL = Math.min.apply(null, latencies);
+          var maxL = Math.max.apply(null, latencies);
+          mMinLat.textContent = minL + ' ms';
+          mMinLat.className = 'stat-val ok';
+          mMaxLat.textContent = maxL + ' ms';
+          mMaxLat.className = 'stat-val ok';
+
+          statusBadge.textContent = 'ALL TESTS PASSED';
+          statusBadge.style.background = '#10b981';
+
+          log('[*] Multi-worker pool verified: 4/4 responded. Min=' + minL + 'ms, Max=' + maxL + 'ms');
+          syncBn('WORKER-POOL', 'total=4|minLat=' + minL + '|maxLat=' + maxL + '|lats=' + latencies.join(','));
+          syncBn('DONE', 'status=P935_COMPLETE');
+        }
+      };
+
+      wrk.onerror = function(err) {
+        responses++;
+        log('[-] Worker #' + workerId + ' error: ' + (err.message || 'Error'));
+        if (responses === POOL_SIZE) {
+          syncBn('WORKER-POOL-PARTIAL', 'responses=' + (responses - 1));
+          syncBn('DONE', 'status=P935_PARTIAL');
+        }
+      };
+
+      wrk.postMessage({ type: 'PING', id: workerId });
+      workers.push(wrk);
+    } catch(spawnErr) {
+      log('[-] Failed to spawn worker #' + workerId + ': ' + spawnErr.message);
+    }
+  })(w);
+}
+</script>
+</body>
+</html>

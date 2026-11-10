@@ -1,0 +1,1039 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PS5 14.10 — Kernel Research Dashboard</title>
+<link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap/5.3.2/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdnjs.cloudflare.com/ajax/libs/bootstrap-icons/1.11.2/font/bootstrap-icons.min.css" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+:root{
+  --clr-bg:#0a0e14;--clr-card:#111820;--clr-border:#1e2a3a;
+  --clr-green:#4ec9b0;--clr-red:#f44;--clr-yellow:#dcdcaa;--clr-blue:#569cd6;
+  --clr-text:#c8d0da;--clr-muted:#6a7a8a;--clr-accent:#7c3aed;
+  --clr-chain-done:#22c55e;--clr-chain-active:#f59e0b;--clr-chain-pending:#374151;
+  --clr-dead:#ef4444;
+}
+[data-bs-theme="light"]{
+  --clr-bg:#f0f2f5;--clr-card:#ffffff;--clr-border:#d1d5db;
+  --clr-green:#059669;--clr-red:#dc2626;--clr-yellow:#ca8a04;--clr-blue:#2563eb;
+  --clr-text:#1f2937;--clr-muted:#6b7280;--clr-accent:#7c3aed;
+  --clr-chain-done:#16a34a;--clr-chain-active:#d97706;--clr-chain-pending:#d1d5db;
+  --clr-dead:#dc2626;
+}
+body{background:var(--clr-bg);color:var(--clr-text);font-family:'Segoe UI',system-ui,-apple-system,sans-serif;overflow-x:hidden}
+.dash-card{background:var(--clr-card);border:1px solid var(--clr-border);border-radius:12px;transition:transform .15s,box-shadow .15s}
+.dash-card:hover{transform:translateY(-2px);box-shadow:0 8px 25px rgba(0,0,0,.15)}
+.glow-green{box-shadow:0 0 12px rgba(78,201,176,.2)}
+.glow-red{box-shadow:0 0 12px rgba(255,68,68,.15)}
+
+/* Chain pipeline */
+.chain-pipe{display:flex;align-items:stretch;gap:0;overflow-x:auto;padding:8px 0}
+.chain-step{flex:1;min-width:180px;position:relative;padding:16px;border-radius:12px;border:2px solid var(--clr-border);background:var(--clr-card);text-align:center;transition:all .2s}
+.chain-step.done{border-color:var(--clr-chain-done)}
+.chain-step.active{border-color:var(--clr-chain-active);animation:pulse-border 2s infinite}
+.chain-step.pending{border-color:var(--clr-chain-pending);opacity:.6}
+.chain-arrow{display:flex;align-items:center;padding:0 4px;color:var(--clr-muted);font-size:1.5rem}
+.chain-pct{font-size:1.8rem;font-weight:700;line-height:1}
+.chain-pct.p100{color:var(--clr-chain-done)}
+.chain-pct.p-active{color:var(--clr-chain-active)}
+.chain-pct.p0{color:var(--clr-chain-pending)}
+@keyframes pulse-border{0%,100%{box-shadow:0 0 0 0 rgba(245,158,11,.3)}50%{box-shadow:0 0 12px 4px rgba(245,158,11,.15)}}
+
+/* Sub-chain */
+.sub-chain{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
+.sub-card{padding:12px;border-radius:8px;border:1px solid var(--clr-border);background:var(--clr-card);font-size:.85rem;cursor:pointer;transition:all .15s}
+.sub-card:hover{border-color:var(--clr-blue)}
+.sub-card .badge-pct{font-size:.75rem;padding:2px 8px;border-radius:20px;font-weight:600}
+.pct-100{background:var(--clr-chain-done);color:#fff}
+.pct-high{background:var(--clr-chain-active);color:#000}
+.pct-mid{background:var(--clr-blue);color:#fff}
+.pct-dead{background:var(--clr-dead);color:#fff}
+.pct-test{background:var(--clr-accent);color:#fff}
+
+/* Feature badges */
+.feat-yes{background:rgba(78,201,176,.15);color:var(--clr-green);border:1px solid rgba(78,201,176,.3);border-radius:6px;padding:2px 8px;font-size:.75rem;display:inline-block;margin:2px}
+.feat-no{background:rgba(255,68,68,.1);color:var(--clr-red);border:1px solid rgba(255,68,68,.25);border-radius:6px;padding:2px 8px;font-size:.75rem;display:inline-block;margin:2px;text-decoration:line-through}
+
+/* Log entry */
+.log-entry{border-left:3px solid var(--clr-border);padding:6px 12px;margin-bottom:6px;font-size:.82rem;border-radius:0 6px 6px 0;background:var(--clr-card);cursor:pointer;transition:border-color .15s}
+.log-entry:hover{border-left-color:var(--clr-blue)}
+.log-entry.log-dead{border-left-color:var(--clr-red)}
+.log-entry.log-win{border-left-color:var(--clr-green)}
+.log-entry.log-active{border-left-color:var(--clr-chain-active)}
+.log-time{color:var(--clr-muted);font-size:.75rem;font-family:'Courier New',monospace}
+.log-detail{display:none;margin-top:6px;padding:8px;background:rgba(0,0,0,.15);border-radius:6px;font-size:.78rem;color:var(--clr-muted)}
+
+/* Dead ends */
+.dead-scroll{max-height:300px;overflow-y:auto}
+.dead-item{padding:4px 0;border-bottom:1px solid var(--clr-border);font-size:.8rem}
+
+/* Progress ring */
+.progress-ring-wrap{position:relative;width:100px;height:100px;display:inline-block}
+.progress-ring-text{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:1.5rem;font-weight:700;color:var(--clr-chain-active)}
+
+/* Info panel */
+.info-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
+.info-item{padding:10px 14px;border-radius:8px;border:1px solid var(--clr-border);background:var(--clr-card)}
+.info-label{font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--clr-muted);margin-bottom:2px}
+.info-value{font-size:.9rem;font-weight:600;word-break:break-all}
+
+/* Active probe */
+.probe-status{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.probe-waiting{background:var(--clr-chain-active);animation:blink 1.2s infinite}
+.probe-done{background:var(--clr-chain-done)}
+.probe-fail{background:var(--clr-dead)}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+
+/* Theme toggle */
+.theme-toggle{cursor:pointer;font-size:1.2rem;padding:6px 10px;border-radius:8px;border:1px solid var(--clr-border);background:var(--clr-card);color:var(--clr-text);transition:all .2s}
+.theme-toggle:hover{border-color:var(--clr-blue)}
+
+/* Chart containers */
+.chart-sm{max-width:280px;margin:0 auto}
+
+/* Scrollbar */
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:var(--clr-bg)}
+::-webkit-scrollbar-thumb{background:var(--clr-border);border-radius:3px}
+</style>
+</head>
+<body>
+
+<!-- ======== NAVBAR ======== -->
+<nav class="navbar sticky-top" style="background:var(--clr-card);border-bottom:1px solid var(--clr-border)">
+  <div class="container-fluid px-3">
+    <span class="navbar-brand mb-0 d-flex align-items-center gap-2" style="color:var(--clr-text)">
+      <i class="bi bi-controller" style="color:var(--clr-accent);font-size:1.3rem"></i>
+      <strong>PS5 14.10</strong> <span class="text-muted d-none d-sm-inline">Kernel Research</span>
+    </span>
+    <div class="d-flex align-items-center gap-3">
+      <small class="text-muted d-none d-md-block" id="lastUpdate"></small>
+      <button class="theme-toggle" onclick="toggleTheme()" title="Toggle theme" id="themeBtn">
+        <i class="bi bi-moon-stars-fill"></i>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<div class="container-fluid px-3 py-3" style="max-width:1400px;margin:0 auto">
+
+<!-- ======== ROW 1: OVERALL PROGRESS + MACHINE INFO ======== -->
+<div class="row g-3 mb-3">
+
+  <!-- Overall progress -->
+  <div class="col-12 col-md-4 col-lg-3">
+    <div class="dash-card p-3 text-center h-100">
+      <h6 class="text-muted mb-2" style="font-size:.75rem;text-transform:uppercase;letter-spacing:.08em">Overall Progress</h6>
+      <div class="progress-ring-wrap mx-auto mb-2">
+        <canvas id="progressRing" width="100" height="100"></canvas>
+        <span class="progress-ring-text">10%</span>
+      </div>
+      <div style="font-size:.8rem;color:var(--clr-muted)">Userland &rarr; Kernel R/W &rarr; HV Bypass</div>
+      <div class="mt-2" style="font-size:.72rem">
+        <span style="color:var(--clr-chain-done)"><i class="bi bi-check-circle-fill"></i> 2 gates done</span> &middot;
+        <span style="color:var(--clr-chain-active)"><i class="bi bi-arrow-repeat"></i> 1 active</span> &middot;
+        <span style="color:var(--clr-muted)"><i class="bi bi-circle"></i> 1 pending</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Machine info -->
+  <div class="col-12 col-md-8 col-lg-9">
+    <div class="dash-card p-3 h-100">
+      <h6 class="text-muted mb-2" style="font-size:.75rem;text-transform:uppercase;letter-spacing:.08em">
+        <i class="bi bi-cpu"></i> Firmware &amp; Machine Information
+      </h6>
+      <div class="info-grid">
+        <div class="info-item">
+          <div class="info-label">Firmware</div>
+          <div class="info-value" style="color:var(--clr-green)">14.10</div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">Kernel</div>
+          <div class="info-value">FreeBSD r230171<br><small class="text-muted">Sep 28 2026, 16KB pages</small></div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">Device</div>
+          <div class="info-value">PlayStation 5 (Retail)</div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">Entry Points</div>
+          <div class="info-value">Lua 5.1 TCP:9026 + WebKit</div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">WebKit Version</div>
+          <div class="info-value" style="font-size:.78rem">605.1.15 (Safari 17.0 era)</div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">User Agent</div>
+          <div class="info-value" style="font-size:.7rem;font-family:monospace">PlayStation 5/14.10 AppleWebKit/605.1.15</div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">Goal</div>
+          <div class="info-value" style="color:var(--clr-accent)">Jailbreak<br><small class="text-muted">Userland → Kernel R/W → HV Bypass</small></div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">ASLR</div>
+          <div class="info-value">Per-connection (fresh process every TCP connect)</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ======== ROW 2: MAIN CHAIN PIPELINE ======== -->
+<div class="dash-card p-3 mb-3">
+  <h6 class="text-muted mb-3" style="font-size:.75rem;text-transform:uppercase;letter-spacing:.08em">
+    <i class="bi bi-diagram-3"></i> Exploit Chain Progress
+  </h6>
+  <div class="chain-pipe">
+    <div class="chain-step done" data-chain="A">
+      <div class="chain-pct p100">100%</div>
+      <div class="fw-bold mt-1" style="font-size:.9rem">A: Userland Entry</div>
+      <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">Lua loader TCP 9026 + WebKit browser. Code execution confirmed.</div>
+    </div>
+    <div class="chain-arrow"><i class="bi bi-chevron-right"></i></div>
+    <div class="chain-step done" data-chain="B">
+      <div class="chain-pct p100">100%</div>
+      <div class="fw-bold mt-1" style="font-size:.9rem">B: Heap Primitives</div>
+      <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">GPU mmap R/W, APNG overread, FontFace UAF, native.fcall, child ROP syscalls</div>
+    </div>
+    <div class="chain-arrow"><i class="bi bi-chevron-right"></i></div>
+    <div class="chain-step active" data-chain="C">
+      <div class="chain-pct p-active">15%</div>
+      <div class="fw-bold mt-1" style="font-size:.9rem">C: Info Leak / KASLR</div>
+      <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">Heap ptrs found. No code-section ptrs yet. Testing CVE-2023-42916, CVE-2026-28905, CVE-2026-20608</div>
+    </div>
+    <div class="chain-arrow"><i class="bi bi-chevron-right"></i></div>
+    <div class="chain-step pending" data-chain="D">
+      <div class="chain-pct p0">0%</div>
+      <div class="fw-bold mt-1" style="font-size:.9rem">D: Kernel R/W + HV</div>
+      <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">Requires info leak. No kernel bug identified. Hypervisor bypass not started.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ======== ROW 3: SUB-CHAINS ======== -->
+<div class="row g-3 mb-3">
+  <!-- Chain A subs -->
+  <div class="col-12 col-lg-4">
+    <div class="dash-card p-3 h-100">
+      <h6 class="mb-2 d-flex align-items-center gap-2" style="font-size:.8rem">
+        <span style="color:var(--clr-chain-done)"><i class="bi bi-check-circle-fill"></i></span> Chain A: Userland Entry
+      </h6>
+      <div class="sub-chain">
+        <div class="sub-card" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+          <div class="d-flex justify-content-between align-items-center">
+            <strong>A1: Lua Loader</strong> <span class="badge-pct pct-100">100%</span>
+          </div>
+          <div class="log-detail">TCP 9026, fresh ASLR per connection. 8-byte LE length prefix + raw Lua source. Per-connection process spawn.</div>
+        </div>
+        <div class="sub-card" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+          <div class="d-flex justify-content-between align-items-center">
+            <strong>A2: Syscall Prims</strong> <span class="badge-pct pct-100">100%</span>
+          </div>
+          <div class="log-detail">make_syscall(N) bypasses Lua filter for tested numbers. 5-arg calls from child thread via ROP (pop rdi/rsi/rdx/rcx/r8). Probes 271g/384b/396f.</div>
+        </div>
+        <div class="sub-card" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+          <div class="d-flex justify-content-between align-items-center">
+            <strong>A3: Threading</strong> <span class="badge-pct pct-100">100%</span>
+          </div>
+          <div class="log-detail">thr_new(455) with arg delivery (simpler), thr_create(430) with ucontext gates, C11 Thrd_create with join. Budget 25/11/9 threads per loader.</div>
+        </div>
+        <div class="sub-card" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+          <div class="d-flex justify-content-between align-items-center">
+            <strong>A4: WebKit Entry</strong> <span class="badge-pct pct-100">100%</span>
+          </div>
+          <div class="log-detail">APNG overread (49-98KB heap data), FontFace UAF (3 heap pointers), BigUint64Array (raw 64-bit pointer reads, DAZ bypass), Workers available.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <!-- Chain B subs -->
+  <div class="col-12 col-lg-4">
+    <div class="dash-card p-3 h-100">
+      <h6 class="mb-2 d-flex align-items-center gap-2" style="font-size:.8rem">
+        <span style="color:var(--clr-chain-done)"><i class="bi bi-check-circle-fill"></i></span> Chain B: Heap Primitives
+      </h6>
+      <div class="sub-chain">
+        <div class="sub-card" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+          <div class="d-flex justify-content-between align-items-center">
+            <strong>B1: Heap R/W</strong> <span class="badge-pct pct-100">100%</span>
+          </div>
+          <div class="log-detail">GPU mmap adjacency, 256+ pages, no guard pages. Alloc via mmap(477) with 0x33 prot, 0x1002 flags.</div>
+        </div>
+        <div class="sub-card" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+          <div class="d-flex justify-content-between align-items-center">
+            <strong>B2: Module Discovery</strong> <span class="badge-pct pct-100">100%</span>
+          </div>
+          <div class="log-detail">dynlib_get_info(593) returns base info for 39 userland modules. Kernel ASLR is separate and undefeated.</div>
+        </div>
+        <div class="sub-card" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+          <div class="d-flex justify-content-between align-items-center">
+            <strong>B3: CClosure Redirect</strong> <span class="badge-pct pct-high">80%</span>
+          </div>
+          <div class="log-detail">Selected existing Lua C targets produce target-like outputs (56c/56f). Eboot gadget execution confirmed via +0x20 (56d-56d7). General native targets unverified.</div>
+        </div>
+        <div class="sub-card" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+          <div class="d-flex justify-content-between align-items-center">
+            <strong>B4: Native Fn Call</strong> <span class="badge-pct pct-100">100%</span>
+          </div>
+          <div class="log-detail">native.fcall_with_rax: getpid=0x22a, socket=0x16, close=0x0 confirmed (probe 129b). Arbitrary userland function calls.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <!-- Chain C subs -->
+  <div class="col-12 col-lg-4">
+    <div class="dash-card p-3 h-100">
+      <h6 class="mb-2 d-flex align-items-center gap-2" style="font-size:.8rem">
+        <span style="color:var(--clr-chain-active)"><i class="bi bi-arrow-repeat"></i></span> Chain C: Info Leak / KASLR
+      </h6>
+      <div class="sub-chain">
+        <div class="sub-card" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+          <div class="d-flex justify-content-between align-items-center">
+            <strong>C1: APNG Heap Scan</strong> <span class="badge-pct pct-100">100%</span>
+          </div>
+          <div class="log-detail">857+ unique pointers per session. Heap (0x0880xx), vtable (0x087Fxx, 0x081Cxx), library code (0x01-0x07xx) regions mapped. No kernel pointers.</div>
+        </div>
+        <div class="sub-card" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+          <div class="d-flex justify-content-between align-items-center">
+            <strong>C2: Kernel Ptr Search</strong> <span class="badge-pct pct-dead">DEAD</span>
+          </div>
+          <div class="log-detail">Exhaustive scan of ALL syscalls (1-676), ALL routes, ALL 34 /dev nodes, ALL sysctl trees, ALL getsockopt, sendsig frame, kinfo_proc — zero kernel pointers anywhere.</div>
+        </div>
+        <div class="sub-card" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+          <div class="d-flex justify-content-between align-items-center">
+            <strong>C3: CVE Research</strong> <span class="badge-pct pct-mid">50%</span>
+          </div>
+          <div class="log-detail">Testing CVE-2023-42916 (DFG OOB read), CVE-2026-28905 (FTL butterfly uninit read), CVE-2026-20608 (seal/freeze JIT confusion). All pure JS, no Wasm needed.</div>
+        </div>
+        <div class="sub-card" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+          <div class="d-flex justify-content-between align-items-center">
+            <strong>C4: JIT Detection</strong> <span class="badge-pct pct-100">DONE</span>
+          </div>
+          <div class="log-detail">P1039 RESULT: Baseline JIT exists (5M int loop=62ms), but NO DFG, NO FTL. Poly/mono ratio=2.12x. This KILLS CVE-2023-42916, CVE-2026-28905, CVE-2026-20608 (all need DFG/FTL tiers). Focus shifts to non-JIT primitives: RAB edge cases, APNG overread, DOM bugs.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ======== ROW 4: CHARTS + ACTIVE PROBES ======== -->
+<div class="row g-3 mb-3">
+  <!-- Dead ends + active probes -->
+  <div class="col-12 col-lg-6">
+    <div class="dash-card p-3 h-100">
+      <h6 class="text-muted mb-2 d-flex justify-content-between" style="font-size:.75rem;text-transform:uppercase;letter-spacing:.08em">
+        <span><i class="bi bi-x-octagon"></i> Dead Ends</span>
+        <span class="badge rounded-pill" style="background:var(--clr-dead);font-size:.7rem">190+ tested</span>
+      </h6>
+      <div class="dead-scroll">
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> Canvas UAF (CVE-2026-43720) — IsoHeap blocks cross-type reclaim</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> AIO double-free (662) — double-STATUS, not double-free</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> msync CVE-2026-49418 — MS_INVALIDATE returns -1 on all maps</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> IPV6_MSFILTER CVE-2026-49412 — Sony removed RFC 3678 API</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> KTLS CVE-2026-45257 — Sony did not include KTLS</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> netcontrol UAF — close leaks ref, doesn't free</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> UMTX_OP_SHM — Sony stubbed SHM subsystem</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> AF_ROUTE KASLR — kernel sanitizes route messages</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> kldstat/kldnext/kldsym — all nosys stubs</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> GPU pool uninit pages — zeroed on allocation</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> mprotect(EXEC) — hard W^X enforced</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> sys 588 dmem page RWX — HV enforces W^X below kernel</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> physhm mmap — pages not backed, read kills</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> 34 /dev ioctl sweep — ~32M calls, zero exploitable</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> Ioctl overcopy all nodes — zero overcopy, zero kptrs</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> kqueue race ZDI-26-784 — 10K+ races, 0 anomalies</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> CVE-2026-49427/49428 posixshm — shm_open2 is nosys</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> TypedArray/DataView overflow — all bounds checked</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> BMP RLE8 OOB read — decoder reads correctly</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> BSD-native 1-530 exhausted — zero kernel pointers</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> RAB exploit battery — zero leaks across shrink/grow/sort/slice/worker/race</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> RAB OOB write — writes don't persist, zeroed on resize</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> FontFace+APNG grooming — 147KB overread, zero pointers post-spray</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> FontFace APNG hexdump — only sentinel/TrueType data, no real ptrs</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> RegExp/SVG/Intl/CSS @font-face — all vectors dead, zero anomalies</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> DOM Mutation UAF — MutObs/Range/CustomEl/Clone 0 anomalies</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> CVE pattern battery — Species/Proxy/IntOvf/Subclass all clean</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> Image crash isolator — 13 formats tested, 0 crashes</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> Deep lifecycle UAF — 9 patterns, 500+ rounds, 0 anomalies</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> Timer precision side-channel — 1ms perf.now, 1ms Date, no sub-ms discrimination (P1049)</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> StructuredClone stress — 165 types clean, compression gzip/deflate all OK (P1050)</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> Worker race + CacheAPI — 500 main ops, RAB race spray 0 dirty (P1052)</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> Atomics race OOB — waitAsync TypeError, 500 resize races 0 OOB (P1054)</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> CSS/SVG/Regex/Intl fuzz — SVG 20-deep filter OK, regex all pass, Intl clean (P1056)</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> Iterator/WeakRef/Species — WeakRef DOM alive=50 dead=0, species clean (P1057)</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> MSE codecs + StructuredClone detach — independent buffers, MSE append OK (P1060)</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> MSE crash isolator — 20 sequential tests, only A0-VALID reached before stop (P1062)</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> CVE-2026-43740 YARR — patched on 14.10, VULNERABLE:false (P1064)</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> MSE minimal crash — 15 MP4/WebM/HEVC variants, all updateend OK (P1065/P1066)</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> DOM UAF logic battery — 20+ patterns across 5 runs, C4 hangs but no UAF (P1067)</div>
+        <div class="dead-item"><span style="color:var(--clr-red)"><i class="bi bi-x"></i></span> CSS Ruby + SVG filter UAF — all 24 tests clean, no crashes (P1068)</div>
+      </div>
+    </div>
+  </div>
+  <!-- Active probes -->
+  <div class="col-12 col-lg-6">
+    <div class="dash-card p-3 h-100">
+      <h6 class="text-muted mb-2" style="font-size:.75rem;text-transform:uppercase;letter-spacing:.08em">
+        <i class="bi bi-broadcast"></i> Active Probes
+      </h6>
+      <div class="mb-2 p-2" style="border-radius:8px;border:2px solid var(--clr-chain-active);background:rgba(245,158,11,.05)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1061: Sort-During-Detach UAF</strong>
+          <span class="badge ms-2" style="background:var(--clr-chain-active);font-size:.65rem;animation:pulse-border 2s infinite">ACTIVE LEAD</span>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-yellow)" class="mt-1"><strong>SORT_AFTER_DETACH + SECRET_LEAKED + SECRETS_EXTRACTED.</strong> Sort comparator continues executing after ArrayBuffer detach via structuredClone/postMessage/worker transfer. 163K comparisons extract 6430 values from freed memory. RAB shrink+detach produces UAF read. Sort reads 0xFF past buffer bounds.</div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-chain-active)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1063: YARR JIT + Multi-Sort OOB</strong>
+          <span class="badge ms-2" style="background:var(--clr-chain-active);font-size:.65rem">INTERESTING</span>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">U32_OOB (192 comps past bound), F64_OOB (raw heap bytes 0xEFBEADDE), PROXY_OOB (gets=64 sets=64). FontFace PTR markers 0xAAAAAAAA46464F77. MSE append works. Adjacent read 6400 but all zero.</div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-chain-active)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1051B: RAB Sort OOB + Violations</strong>
+          <span class="badge ms-2" style="background:var(--clr-chain-active);font-size:.65rem">INTERESTING</span>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">OOB_READ after RAB grow (view tracks). OOB_SORT with shrink (comparator CONTINUED). 8 comparator violations (BROKEN!). Shrink shows OOB but writeOob=false.</div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-chain-active)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1056B: Sort OOB + Canvas + JIT Detection</strong>
+          <span class="badge ms-2" style="background:var(--clr-chain-active);font-size:.65rem">INTERESTING</span>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">PAST! (vals past RAB bound), OOB64! (BigUint64Array), U32_OOB! (Uint32Array), LIKELY_INTERP (no WASM). Canvas reentrant 2d=yes gl=no. Sentinel bytes=0 (controlled, not heap data).</div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-chain-active)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1058: YARR + Generator + Eval + Proto</strong>
+          <span class="badge ms-2" style="background:var(--clr-chain-active);font-size:.65rem">INTERESTING</span>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">YARR-JIT=LIKELY (ratio=1.28). eval leaks scope (LEAKED). JSON.parse toJSON polluted=YES. FinalizationRegistry: 10 callbacks, fin-read=204 (HTTP status). Generators work with finally/throw.</div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-chain-active)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1069: YARR JIT Escalation</strong>
+          <span class="badge ms-2" style="background:var(--clr-chain-active);font-size:.65rem">INTERESTING</span>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">D4 assertion combos: 2000 anomalies! Lookbehind named bug present. Stale captures persist=true. All 23 tests complete. Nested quant/alternation/backref JIT clean.</div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-border)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1050B: Stream Tee Write-Through + Crypto</strong>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">Tee branches share backing buffer (WRITE_THROUGH). BigUint64Array write-through confirmed. AES/HMAC/ECDH/PBKDF2 all work. GC reclaim fired=30 all zero.</div>
+        <div class="mt-1"><span class="badge" style="background:var(--clr-chain-done);font-size:.65rem">DONE</span></div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-border)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1055: Worker Terminate + FontFace + WeakRef</strong>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">FontFace ptr 0x0000010046464F77. MsgPort stale=35 with 0xFACE corruption markers. GC timing: all sizes dead (s1024-s262144). WeakRef alive after GC.</div>
+        <div class="mt-1"><span class="badge" style="background:var(--clr-chain-done);font-size:.65rem">DONE</span></div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-border)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1059: Structure + Args + WebRTC + Clone</strong>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">Arguments aliasing leak (B3-leak=YES). Stale view after clone (D3-STALE-READ). WebRTC NOT available. OffscreenCanvas/AudioContext NOT available. structuredClone depth=10000 works. Blob URL lifecycle clean.</div>
+        <div class="mt-1"><span class="badge" style="background:var(--clr-chain-done);font-size:.65rem">DONE</span></div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-border)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1049: Timer Fuzz + PS5-Specific</strong>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">perf.now 1ms resolution, 2 distinct/10K. Date 12 distinct/10K. RAF 15-16ms (60fps). UA: PlayStation 5/14.10 WebKit/605.1.15 Version/17.0. cores=4. CSS container-type/contain/aspect-ratio/gap/inset available. DOM fuzz 250 ops 0 errors.</div>
+        <div class="mt-1"><span class="badge" style="background:var(--clr-chain-done);font-size:.65rem">DONE</span></div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-border)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1048: Deep Lifecycle UAF Battery</strong>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">9 UAF stress patterns: Selection/Range, execCommand, iframe, CSS animation, microtask, Blob race, adoptNode, table, event dispatch. 500+ rounds, anomalies=0.</div>
+        <div class="mt-1"><span class="badge" style="background:var(--clr-dead);font-size:.65rem">DEAD</span></div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-border)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1047/B: Image Crash Isolator + API Map</strong>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">13 image format tests, 0 crashes. GIF LZW/WebP huge/BMP neg-height all survived. P1047B: FR WORKS (fired=50), WR COLLECTS (dead=20). OffscreenCanvas NO, Atomics YES, Streams YES.</div>
+        <div class="mt-1"><span class="badge" style="background:var(--clr-chain-done);font-size:.65rem">DONE</span></div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-border)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1046/B: CVE Pattern Battery</strong>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">InnerHTML walker 100 hits (expected). Image decoder 8/8 clean. createImageBitmap 60 tests clean. RegExp 2 anomalies (non-exploitable). Species/Proxy/IntOvf/Subclass all TypeError/RangeError.</div>
+        <div class="mt-1"><span class="badge" style="background:var(--clr-dead);font-size:.65rem">DEAD</span></div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-border)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1045: DOM Mutation UAF Stress</strong>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">MutationObserver 50 rounds 0 anomalies. Range 50 rounds 0. CustomElements 30 rounds 0. Clone 6 tests 0. CSS 6 tests 0. RAB transfer/race also clean.</div>
+        <div class="mt-1"><span class="badge" style="background:var(--clr-dead);font-size:.65rem">DEAD</span></div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-border)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1044: Last Chance — RegExp/SVG/Intl/CSS</strong>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">All vectors dead. APNG att=20 img=0 heap=0. FontFace errs=30 anom=0. Uninit nz=0. All gap sizes zero-filled.</div>
+        <div class="mt-1"><span class="badge" style="background:var(--clr-dead);font-size:.65rem">DEAD</span></div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-border)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1043: FontFace Fix + APNG Hexdump</strong>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">FontFace returns sentinel 0xdead only. APNG shows background pixels (0x424242ff). Sort/FR/iterator/WeakRef all clean. Zero real pointers.</div>
+        <div class="mt-1"><span class="badge" style="background:var(--clr-dead);font-size:.65rem">DEAD</span></div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-border)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1042: FontFace + APNG Heap Grooming</strong>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">147KB total overread across 5 APNG sizes with FontFace+CSS spray. code=0, vt=0, heap=0, kern=0 everywhere. Zero pointers post-spray.</div>
+        <div class="mt-1"><span class="badge" style="background:var(--clr-dead);font-size:.65rem">DEAD</span></div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-border)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1041: RAB OOB Write Verify</strong>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">OOB writes don't persist (zeroed=yes). Timing oracle 2x slowdown but no useful side channel. Big64 stale=2040 ptrs=0. Corruption=0.</div>
+        <div class="mt-1"><span class="badge" style="background:var(--clr-dead);font-size:.65rem">DEAD</span></div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-border)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1040: RAB Exploit Battery</strong>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">3 runs: shrink/grow/sort/set/clone/slice/DV/iter/worker/race/atomics/APNG. leaks=0, ptrs=0, kptrs=0. Slice hits=200 but consistent len. map_oob=true but no data.</div>
+        <div class="mt-1"><span class="badge" style="background:var(--clr-dead);font-size:.65rem">DEAD</span></div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-border)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1039: CVE Priority Battery</strong>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">Baseline JIT YES, DFG/FTL NO. All 3 priority CVEs DEAD (need DFG/FTL). PhantomNewArrayWithButterfly = NaN-undefined. Private fields exist but no confusion.</div>
+        <div class="mt-1"><span class="badge" style="background:var(--clr-chain-done);font-size:.65rem">DONE</span></div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-border)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1038: DFG OOB + StructID</strong>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">ResizableArrayBuffer EXISTS. All DFG OOB reads = 0. WeakRef GC: 100% alive. APNG image load failed in combined probe.</div>
+        <div class="mt-1"><span class="badge" style="background:var(--clr-chain-done);font-size:.65rem">DONE</span></div>
+      </div>
+      <div class="mb-2 p-2" style="border-radius:8px;border:1px solid var(--clr-border)">
+        <div class="d-flex align-items-center">
+          <span class="probe-status probe-done"></span>
+          <strong style="font-size:.85rem">P1036: Feature Map + APNG</strong>
+        </div>
+        <div style="font-size:.75rem;color:var(--clr-muted)" class="mt-1">Full WebKit feature map. 44% APNG overlap. 2032 bmalloc poison runs. 857+ unique ptrs.</div>
+        <div class="mt-1"><span class="badge" style="background:var(--clr-chain-done);font-size:.65rem">DONE</span></div>
+      </div>
+
+      <h6 class="text-muted mt-3 mb-2" style="font-size:.75rem;text-transform:uppercase;letter-spacing:.08em">
+        <i class="bi bi-bullseye"></i> Priority CVEs Under Investigation
+      </h6>
+      <div style="font-size:.78rem">
+        <div class="mb-1"><span style="color:var(--clr-red)"><i class="bi bi-x-circle"></i></span> <strong>CVE-2026-28905</strong> — FTL PhantomNewArrayWithButterfly uninit read <span class="badge" style="background:var(--clr-dead);font-size:.6rem">DEAD: NO FTL</span></div>
+        <div class="mb-1"><span style="color:var(--clr-red)"><i class="bi bi-x-circle"></i></span> <strong>CVE-2026-20608</strong> — Private fields seal/freeze JIT confusion <span class="badge" style="background:var(--clr-dead);font-size:.6rem">DEAD: NO DFG</span></div>
+        <div class="mb-1"><span style="color:var(--clr-red)"><i class="bi bi-x-circle"></i></span> <strong>CVE-2023-42916</strong> — DFG GetByVal OOB read (actively exploited) <span class="badge" style="background:var(--clr-dead);font-size:.6rem">DEAD: NO DFG</span></div>
+        <div class="mb-1"><span style="color:var(--clr-red)"><i class="bi bi-x-circle"></i></span> <strong>RAB edge cases</strong> — 3 runs, all OOB writes zeroed, zero leaks (P1040/P1041) <span class="badge" style="background:var(--clr-dead);font-size:.6rem">DEAD</span></div>
+        <div class="mb-1"><span style="color:var(--clr-red)"><i class="bi bi-x-circle"></i></span> <strong>APNG overread + spray</strong> — 147KB overread with FontFace+CSS spray, zero ptrs (P1042/P1043) <span class="badge" style="background:var(--clr-dead);font-size:.6rem">DEAD</span></div>
+        <div class="mb-1"><span style="color:var(--clr-red)"><i class="bi bi-x-circle"></i></span> <strong>RegExp/SVG/Intl/CSS</strong> — All last-chance vectors dead, zero anomalies (P1044) <span class="badge" style="background:var(--clr-dead);font-size:.6rem">DEAD</span></div>
+        <div class="mb-1"><span style="color:var(--clr-chain-active)"><i class="bi bi-lightning"></i></span> <strong>Sort-during-detach UAF</strong> — Sort comparator runs on freed memory after AB detach (P1061) <span class="badge" style="background:var(--clr-chain-active);font-size:.6rem">ACTIVE LEAD</span></div>
+        <div class="mb-1"><span style="color:var(--clr-chain-active)"><i class="bi bi-lightning"></i></span> <strong>YARR assertion combos</strong> — 2000 anomalies in regex assertion combinations (P1069-D4) <span class="badge" style="background:var(--clr-chain-active);font-size:.6rem">INVESTIGATING</span></div>
+        <div class="mb-1"><span style="color:var(--clr-red)"><i class="bi bi-x-circle"></i></span> <strong>CVE-2026-43740</strong> — YARR JIT backref non-BMP offset — patched on 14.10 (P1064) <span class="badge" style="background:var(--clr-dead);font-size:.6rem">DEAD: PATCHED</span></div>
+        <div class="mb-1"><span style="color:var(--clr-yellow)"><i class="bi bi-star"></i></span> <strong>CVE-2025-46299</strong> — Google Big Sleep uninit memory leak <span class="badge" style="background:var(--clr-muted);font-size:.6rem">RESTRICTED</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ======== ROW 5: WEBKIT FEATURE MAP ======== -->
+<div class="dash-card p-3 mb-3">
+  <h6 class="text-muted mb-2" style="font-size:.75rem;text-transform:uppercase;letter-spacing:.08em">
+    <i class="bi bi-puzzle"></i> PS5 14.10 WebKit Feature Map
+  </h6>
+  <div>
+    <span class="feat-yes">Worker</span>
+    <span class="feat-yes">createImageBitmap</span>
+    <span class="feat-yes">FinalizationRegistry</span>
+    <span class="feat-yes">WeakRef</span>
+    <span class="feat-yes">BigUint64Array</span>
+    <span class="feat-yes">Atomics</span>
+    <span class="feat-yes">ReadableStream</span>
+    <span class="feat-yes">WritableStream</span>
+    <span class="feat-yes">TransformStream</span>
+    <span class="feat-yes">CompressionStream</span>
+    <span class="feat-yes">DecompressionStream</span>
+    <span class="feat-yes">TextDecoderStream</span>
+    <span class="feat-yes">TextEncoderStream</span>
+    <span class="feat-yes">crypto.subtle</span>
+    <span class="feat-yes">queueMicrotask</span>
+    <span class="feat-yes">reportError</span>
+    <span class="feat-yes">AbortController</span>
+    <span class="feat-yes">performance.now</span>
+    <span class="feat-yes">WebSocket</span>
+    <span class="feat-yes">fetch</span>
+    <span class="feat-yes">Canvas2D</span>
+    <span class="feat-yes">SVGFilterElement</span>
+    <span class="feat-yes">Range</span>
+    <span class="feat-yes">DOMParser</span>
+    <span class="feat-yes">CSSStyleSheet.replaceSync</span>
+    <span class="feat-yes">adoptedStyleSheets</span>
+    <span class="feat-yes">MediaSource</span>
+    <span class="feat-yes">SourceBuffer</span>
+    <span class="feat-yes">caches</span>
+    <span class="feat-yes">customElements</span>
+    <span class="feat-yes">ShadowDOM</span>
+    <span class="feat-yes">ImageData</span>
+    <span class="feat-yes">Path2D</span>
+    <span class="feat-yes">structuredClone</span>
+    <span class="feat-yes">Proxy</span>
+    <span class="feat-yes">BigInt</span>
+    <span class="feat-yes">ResizableArrayBuffer</span>
+    <span class="feat-yes">MessageChannel</span>
+    <span class="feat-yes">BroadcastChannel</span>
+    <span class="feat-yes">MutationObserver</span>
+    <span class="feat-yes">ResizeObserver</span>
+    <span class="feat-yes">IntersectionObserver</span>
+    <span class="feat-yes">PerformanceObserver</span>
+    <span class="feat-yes">Intl.Segmenter</span>
+    <span class="feat-yes">Intl.ListFormat</span>
+    <span class="feat-yes">Intl.DisplayNames</span>
+    <span class="feat-yes">FileReader</span>
+    <span class="feat-yes">importScripts</span>
+    <span class="feat-yes">XMLHttpRequest</span>
+    <span class="feat-no">OffscreenCanvas</span>
+    <span class="feat-no">SharedArrayBuffer</span>
+    <span class="feat-no">WebAssembly</span>
+    <span class="feat-no">WebGL1</span>
+    <span class="feat-no">WebGL2</span>
+    <span class="feat-no">AudioContext</span>
+    <span class="feat-no">WebRTC</span>
+    <span class="feat-no">ServiceWorker</span>
+    <span class="feat-no">indexedDB</span>
+    <span class="feat-no">BYOB Reader</span>
+    <span class="feat-no">requestIdleCallback</span>
+    <span class="feat-no">Sanitizer</span>
+    <span class="feat-no">StorageManager</span>
+  </div>
+  <div class="mt-2" style="font-size:.72rem;color:var(--clr-muted)">
+    <i class="bi bi-info-circle"></i>
+    IsoHeap/TZone <strong>ACTIVE</strong> (blocks cross-type UAF reclaim) &middot;
+    Gigacage <strong>OFF</strong> (AB stores share general heap) &middot;
+    JSC Config <strong>unfrozen</strong> (disableFreezingForTesting on PS) &middot;
+    Baseline JIT: <strong style="color:var(--clr-green)">YES</strong> (5M loop=62ms) &middot;
+    DFG JIT: <strong style="color:var(--clr-dead)">NO</strong> &middot;
+    FTL JIT: <strong style="color:var(--clr-dead)">NO</strong> &middot;
+    FinalizationRegistry: <strong style="color:var(--clr-green)">FIRES</strong> (50 callbacks, P1047B) &middot;
+    WeakRef GC: <strong style="color:var(--clr-green)">COLLECTS</strong> (20 dead, P1047B) &middot;
+    SHA-256: <strong style="color:var(--clr-green)">32B</strong> &middot;
+    YARR JIT: <strong style="color:var(--clr-chain-active)">LIKELY</strong> (ratio=1.28, P1058) &middot;
+    MSE codecs: <strong style="color:var(--clr-green)">avc1/hev1/vp9/mp4a/opus</strong> &middot;
+    Sort-UAF: <strong style="color:var(--clr-chain-active)">CONFIRMED</strong> (P1061) &middot;
+    UA: <strong>PS5/14.10 WebKit/605.1.15 Version/17.0</strong>
+  </div>
+</div>
+
+<!-- ======== ROW 6: RESEARCH LOG ======== -->
+<div class="dash-card p-3 mb-3">
+  <h6 class="text-muted mb-2" style="font-size:.75rem;text-transform:uppercase;letter-spacing:.08em">
+    <i class="bi bi-journal-text"></i> Research Log <small class="text-muted">(recent first)</small>
+  </h6>
+  <div id="logList">
+    <div class="log-entry log-win" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'" style="border-left:3px solid var(--clr-chain-active)">
+      <div class="log-time">2026-11-10 06:27</div>
+      <strong>P1069: YARR JIT Escalation — 2000 assertion combo anomalies</strong>
+      <div class="log-detail">23 tests complete. D4 assertion combos: 2000 anomalies across mixed lookahead/lookbehind/word-boundary patterns. Lookbehind named bug confirmed present (D2). Stale captures persist across exec calls (E1-persist=true). Nested quantifier JIT 5000 iters clean. Alternation captures 4000 iters clean. Backref count 6000 iters clean. Unicode casefold partial (df:N, 130:Y, 17f:Y). Catastrophic backtrack=33ms (contained). Large capture count 101 groups works. Duplicate named groups supported.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 06:26</div>
+      <strong>P1068: CSS Ruby + SVG Filter UAF — all 24 tests clean</strong>
+      <div class="log-detail">Ruby layout: basic, nesting, display, inline-block, block-inside, split, reparent, animation, display-contents, mass-continuation (30 unwraps). SVG filters: huge dimensions rendered, 50-deep chain, ref cycles, 8 turbulence seeds, animation+remove. FontFace rapid cycle (50 fonts). Long ruby text (100 chars). Deep continuations (10), cloneNode, range, rapid style (30). Ruby in foreignObject + SVG use. All survived, zero crashes.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 06:14</div>
+      <strong>P1067: DOM UAF Logic Battery — C4 hangs but no UAF</strong>
+      <div class="log-detail">5 runs. A1-A8: self-remove click, parent remove, mutation innerHTML, NodeIterator (10 visited), TreeWalker (5 visited), Range replace (3 extracted), adoptNode, RAF replace (20). B1-B7: innerHTML script, nested innerHTML (depth=4), outerHTML chain (iter-9), proto pollution (ERR: Element.id getter), species override, arguments trap, coercion confusion. C1-C3: iframe load+remove, custom element disconnect (0 disconnects!), selection input. C4 promise+mutation hangs every run (2min timeout).</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 05:33</div>
+      <strong>P1066: AVCC Crash Bisect — 15 video codec variants, all survived</strong>
+      <div class="log-detail">AVC1 bare, AVCC (no SPS, SPS only, full, oversized SPS, many SPS, exp-golomb), HEVC minimal. Profile high, zero dimensions, huge dimensions, lengthsize 0, version 255, truncated SPS, audio codec in video source buffer. All 15 tests: OK-updateend. No parser crashes.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 05:28</div>
+      <strong>P1065: MSE Minimal Crash Isolator — createMediaSource+SourceBuffer work</strong>
+      <div class="log-detail">10 sequential tests: MediaSource create (sourceopen OK), addSourceBuffer (avc1 created, mode=segments), empty append (updateend), garbage 8B (updateend), ftyp+moov empty (updateend), WebM EBML (updateend). Some timeouts on repeated creates (no sourceopen) but NO crashes. MSE is fully functional.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 05:26</div>
+      <strong>P1064: CVE-2026-43740 YARR Backref — PATCHED on 14.10</strong>
+      <div class="log-detail">Core CVE test: VULNERABLE:false. JIT warmup 500 iterations with no failures. Non-BMP codepoint offsets all match correctly (cp10000-cp20000). Heap oracle shows bmp-control=MATCH. BUT: D2 lookbehind-named bug IS present (BUG-PRESENT flag). Lookbehind with named groups returns match at index 2 with capture "x". This is a separate bug from the CVE. Exploitation path unclear without DFG.</div>
+    </div>
+    <div class="log-entry log-win" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'" style="border-left:3px solid var(--clr-chain-active)">
+      <div class="log-time">2026-11-10 06:22</div>
+      <strong>P1063: YARR JIT + Multi-Sort OOB — U32/F64/Proxy all OOB</strong>
+      <div class="log-detail">FontFace ptrs: all 8 samples = 0xAAAAAAAA46464F77 (controlled sentinel + TrueType "FFOw"). U32 sort: 192 comparisons past bound with injected 0xCAFE values visible (U32_OOB!!!). F64 sort: 192 comps, raw bytes include 0xEFBEADDE70616548 ("HeapDEADBEEF" reversed — heap metadata!). Adjacent read: 6400 bytes, all zero. FinalizationRegistry: 100 alive, 0 callbacks (no collection). Multi-sort across Int8/16/32, Float32, Uint16 all work. Proxy sort: PROXY_OOB (64 gets, 64 sets past bounds). MSE open+append OK.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 05:18</div>
+      <strong>P1062: MSE Crash Isolator — stopped after first test</strong>
+      <div class="log-detail">Sequential crash isolator with 20 planned MSE tests. Only PRE-A0-VALID beacon received, no POST beacon. Either the test crashed WebProcess or the sequential runner stalled. MSE operations proven working by P1060/P1065 so this is likely a probe-specific issue.</div>
+    </div>
+    <div class="log-entry log-win" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'" style="border-left:3px solid var(--clr-chain-active)">
+      <div class="log-time">2026-11-10 06:09</div>
+      <strong style="color:var(--clr-chain-active)">P1061: SORT-DURING-DETACH UAF — SECRET_LEAKED + SECRETS_EXTRACTED</strong>
+      <div class="log-detail"><strong>MAJOR FINDING.</strong> A: structuredClone during sort detaches AB, sort comparator continues on freed memory (SORT_AFTER_DETACH). B: postMessage transfer during sort, same result (PM_SORT_DETACH). C: RAB shrink+detach during sort produces TypeError but sort CONTINUES reading old data (RAB_SORT_UAF). D: Comparator extracts 896 values from 448 comparisons, unique value distribution across 20 buckets shows real data extraction (SECRET_LEAKED). E: 24576 comparisons after free with 200 spray objects, postOther=94 (SORT_CONTINUED_AFTER_FREE). F: Worker transfer during sort = WORKER_SORT_UAF. G: Sort reads 0xFF bytes past buffer end (SORT_READ_0xFF). H: Large-scale extraction: 163765 comparisons extract 6430 total values across 6 byte patterns (SECRETS_EXTRACTED). This is a USE-AFTER-FREE primitive in the TypedArray sort comparator path.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 05:07</div>
+      <strong>P1060: StructuredClone Detach + MSE codecs mapped</strong>
+      <div class="log-detail">Clone creates independent buffers (not shared). MessageChannel transfer properly detaches (origLen=0). RAB clone doesn't track resize (clone stays at 64 after original grows to 512). MSE codecs: avc1.42E01E, avc1.64001F, hev1.1.6.L93.B0, vp9, mp4a.40.2, opus. SourceBuffer created, appendBuffer accepted+done. Atomics on cloned AB are independent (load/store/CAS don't cross). 0 anomalies across 2 runs.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 05:04</div>
+      <strong>P1059: Structure + Args + Clone — stale view found</strong>
+      <div class="log-detail">Mega-object 495000 sum correct. Arguments aliasing: B3-leak=YES, B3-callee=function. WebRTC NOT available, MediaSource/ImageBitmap YES, OffscreenCanvas/AudioContext NO. structuredClone depth=10000 works, circular refs OK. D3: stale view after structuredClone (STALE-READ) — view still reads after AB was supposed to be consumed. Blob URL create+revoke lifecycle clean. 1 anomaly (stale view).</div>
+    </div>
+    <div class="log-entry log-win" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 05:01</div>
+      <strong>P1058: YARR JIT LIKELY + eval scope leak + proto pollution</strong>
+      <div class="log-detail">YARR timing: complex=1627ms, simple=1272ms, ratio=1.28 → YARR-JIT=LIKELY (regex has its own JIT separate from DFG/FTL). Generators: finally/throw/return all work. eval: leaked=true (secret visible in eval scope), with-statement LEAKED scope. JSON.parse: toJSON pollution hijack works (D2-toJSON-polluted=YES). Proto: cycle detection works, spread/for-in clean. FinalizationRegistry: collected=0/20, callbacks=10 with HTTP status 204. 0 anomalies.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 04:58</div>
+      <strong>P1057: Iterator/WeakRef/Species/Proxy clean</strong>
+      <div class="log-detail">Iterator.from works (A1=[1,2,3,4,null,null,null,null]). Set/Map spread. WeakRef DOM: alive=50, dead=0 (no collection for DOM nodes). Proxy sort: pastEnd=undefined vs real=255. Coercion: map detects value, no resize. DataView: RangeError on all OOB. 0 anomalies.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 04:54</div>
+      <strong>P1056: CSS/SVG/Regex/Intl fuzz — all clean across 5 runs</strong>
+      <div class="log-detail">SVG: 20-deep filter chain OK, recursive use survived, extreme viewBox survived. Regex: lookbehind, unicode, backtrack (34-36ms), named groups, species, matchAll (1001). Intl: extreme DTF (Shawwal calendar), segmenter, listFormat (4392 chars), RTF, DisplayNames. DOM: 291 mutations, 122 tree walk, 61 extracted nodes. All 5 runs consistent.</div>
+    </div>
+    <div class="log-entry log-win" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 05:16</div>
+      <strong>P1056B: Sort OOB markers + LIKELY_INTERP confirmed</strong>
+      <div class="log-detail">RAB sort: cnt=5 vals past bound (PAST!). BigUint64Array: OOB64! Uint32Array: U32_OOB! Zero-length sort: cnt=1. Sentinel bytes s1=0 s2=0 (controlled, not heap). Grow: RangeError. Canvas: 50 contexts created, reentrant 2d=yes gl=no, switch=no. JIT: complexRegex=9-10ms simpleRegex=1-2ms ratio=0.1-0.2 → LIKELY_INTERP. No WASM. OffscreenCanvas=false, createImageBitmap=true. UAF=0/20.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 04:42</div>
+      <strong>P1055: Worker Terminate + FontFace + WeakRef + GC Timing</strong>
+      <div class="log-detail">Worker terminate: stale=0/30. WeakRef/FinalizationRegistry available, wr-after-gc=alive. FontFace ptr: 0x0000010046464F77 (1 sample, "FFOw" TrueType marker). MsgPort: stale=35, corruption markers 0xFACE00xx (35 values). GC timing: gen1=0/5, all size classes (1024-262144) show "dead" (collected). Lifecycle: before=1, after=TypeError. defProp=TypeError. map count=17.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 04:39</div>
+      <strong>P1054: Atomics Race OOB — all clean, no SAB</strong>
+      <div class="log-detail">waitAsync TypeError (needs SAB). RAB resize: 0 OOB across 500 races. Worker race: 0 OOB across 500+500 iterations. Transfer: detach OOB=0. Full Atomics scan: store/load/add/sub/and/or/xor/exchange/CAS all work. BigInt Atomics work. isLockFree: 1/2/4/8 all true. True race: 0 hits, proxy threw, preView RangeError.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 04:35</div>
+      <strong>P1053B: Proxy/Set/Species/Sort clean</strong>
+      <div class="log-detail">Proxy from: len=2 calls=3. Set: written=4 v3=0xDDDD. Species: req counts match. Sort with mutation: cc=12 postLen=10 vals=1-200 (sorted correctly). TypedArray sort: cc=80, OOB=RangeError (bounded).</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 04:33</div>
+      <strong>P1053: Atomics + createImageBitmap + BroadcastChannel</strong>
+      <div class="log-detail">Atomics: store/load/CAS/exchange/add work on regular typed arrays but NOT on SAB (ReferenceError). waitAsync exists (YES) but TypeError on RAB. createImageBitmap: 50 races decoded clean, 30 additional clean, BMP 128x128 OK. BroadcastChannel: main recv=150, 3 workers recv=150 each, total=600. Worker import works, FileReader OK.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 04:40</div>
+      <strong>P1052B: Sort OOB Bisect — CONTINUED but zero data leaked</strong>
+      <div class="log-detail">Grow zeroes memory (ZEROED). Sort OOB: 1024 comparisons, shrunk=true, nzElems=0 (CLEAN). Sort with fix: CONTINUED after TypeError (sort keeps going on detached buffer). Big sort: 24576 comparisons, CONTINUED, nzPast64=0. NaN injection: 0 violations. Combined: 2304 comps, 755 mutations, 0 violations.</div>
+    </div>
+    <div class="log-entry log-win" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 04:35</div>
+      <strong>P1051B: RAB Sort OOB + Comparator Violations (BROKEN!)</strong>
+      <div class="log-detail">Transfer: properly detaches (both AB det). Clone: detaches both (bothDet). RAB grow: view TRACKS growth (256→2048), OOB_READ confirmed! Sort with shrink: comparator CONTINUED after shrink (mid=32, post=32), OOB_SORT. Sort comparator: 44 mutations, 8 violations, maxV=8 — BROKEN! (comparator comparisons violate the sort contract). Shrink: c1 512→64, OOB read shows U=undefined past new bound, writeOob=false.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 04:28</div>
+      <strong>P1052: Worker Race + CacheAPI — Worker capabilities mapped</strong>
+      <div class="log-detail">Worker APIs: caches, fetch, BroadcastChannel, ReadableStream, CompressionStream, crypto, TextEncoder/Decoder, performance, structuredClone, AbortController, MessageChannel, Blob, FileReader, importScripts, WebSocket, XMLHttpRequest, createImageBitmap, ArrayBufferResize, BigInt64Array, Atomics. Missing: indexedDB, OffscreenCanvas, SharedArrayBuffer. Cache race: 500 main ops clean. MsgPort: timeout. Multi-worker: 4 workers launched. RAB race: 0 dirty, spray 1000/freed 500/realloc 500.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 04:25</div>
+      <strong>P1051: Resize TOCTOU + StructuredClone — Workers YES, SAB NO</strong>
+      <div class="log-detail">Getter tests: 400 (100 errors, expected). TypedArray: 550 tests, 0 leaked. Proxy resize: all post128=3968 (consistent). Workers: YES with transfer OK, SAB=NO, SW=NO. Worker echo and clone work. RAB compress: 21 errors (Type error).</div>
+    </div>
+    <div class="log-entry log-win" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 04:26</div>
+      <strong>P1050B: Stream Tee WRITE_THROUGH + Crypto confirmed</strong>
+      <div class="log-detail">Tee branches share same backing buffer: write to branch1 visible in branch2 (WRITE_THROUGH). BigUint64Array 0xDEADBEEFCAFEBABE write-through confirmed (BIG_WRITE_THROUGH). Crypto: AES-GCM enc=ok (32B key, 19B enc), HMAC sig=ok (32B), ECDH pub=65B, PBKDF2=32B. GC reclaim via FinalizationRegistry: fired=30, all zero (no stale data). Tee+MessageChannel: 10+10 buffers shared, checksum 320 correct. Pipe: 200 produced, 200 consumed.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 04:22</div>
+      <strong>P1050: API Stress + StructuredClone + Compression — clean</strong>
+      <div class="log-detail">structuredClone: 165 types, 0 anomalies, resize=true, transfer=false. Compression: gzip/deflate/raw all 8 sizes (0B-1MB) roundtrip OK. Cache API: 103 tests clean. CSS containment: nested20 works, layer-container works, 1 nesting anomaly (non-exploitable). TextDecoder: 34 tests, TDS available. BroadcastChannel: sent=50, recv=0 (cross-page). perf: mark/measure/resource/longtask/paint/LCP/FI/layout-shift. Streams: rapid=1000, backpressure=100, tee=50/50. Fetch: abort OK, ReadableStream upload not supported.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 04:19</div>
+      <strong>P1049B: DataView Transfer + BYOB — properly bounded</strong>
+      <div class="log-detail">DataView on transferred AB: properly detaches (dvRead=TypeError, dvWrite=TypeError, dvLen=TypeError). BigUint64Array: bigRead=undefined after detach, bigWrite=ok but bigLen=0. New view on fresh AB: v0=0, v255=255 (correct). BYOB reader: NOT supported (TypeError). Tee: 2 branches, same value (v=1), shared backing. 3 consistent runs.</div>
+    </div>
+    <div class="log-entry log-win" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 04:14</div>
+      <strong>P1049: Timer Fuzz + PS5-Specific — UA and capabilities confirmed</strong>
+      <div class="log-detail">Timer: perf.now min=1ms, 2 distinct values per 10K reads. Date: 12 distinct/10K, minDelta=1ms. Message roundtrip: 100 at 0ms median. RAF: 29 frames at 15-16ms (60fps), 1 bucket. UA: Mozilla/5.0 (PlayStation; PlayStation 5/14.10) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0. platform="PlayStation 5", lang=en-US, touch=0, cores=4. WebKit prefixed: WebKitPoint, webkitURL, WebKitCSSMatrix, WebKitMutationObserver. CSS: container-type, contain, aspect-ratio, gap, inset, overscroll-behavior. APIs: BroadcastChannel, Cache, PerformanceObserver, IntersectionObserver, ResizeObserver, WritableStream, ReadableStream, CompressionStream, TextDecoderStream. 764 window properties. DOM fuzz: 250 ops, 0 errors, 0 anomalies. CSS deep: container/layer/nesting all work. GC pressure: 20 rounds, 1000 survived, 0 collected.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 06:06</div>
+      <strong>P1048: Deep Lifecycle UAF Battery DEAD</strong> — 9 patterns, 500+ rounds, zero anomalies
+      <div class="log-detail">Selection+Range rounds=80 hits=0. execCommand rounds=60 hits=0. iframe rounds=40 hits=0. CSS animation rounds=30 hits=0. Microtask rounds=50 hits=0. Blob URL race races=100 hits=0 (loadAfterRevoke=500ms). adoptNode rounds=50 hits=0. Table DOM rounds=40 hits=0. Event dispatch rounds=50 hits=0. Every DOM lifecycle UAF pattern tested is clean on PS5 14.10.</div>
+    </div>
+    <div class="log-entry log-win" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 06:00</div>
+      <strong>P1047B: FR WORKS + WR COLLECTS + API surface mapped</strong> — FinalizationRegistry fires, WeakRef collects
+      <div class="log-detail">FinalizationRegistry: fired=50 callbacks, FR WORKS. WeakRef: alive=0 dead=20, WR COLLECTS — GC is reachable for some object types. API: OffscreenCanvas NO, createImageBitmap YES, Streams YES, CompressionStream YES, BroadcastChannel YES, Atomics YES, SharedArrayBuffer NO, SubtleCrypto YES (SHA-256 32B), Sanitizer NO, StorageManager NO. Canvas transfer to worker detaches original. Intl fully available (Segmenter, ListFormat, DisplayNames).</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 06:00</div>
+      <strong>P1047: Image Crash Isolator — 13 formats, 0 crashes</strong>
+      <div class="log-detail">Baseline blob OK. PNG huge-dims/truncated/intmax-w/neg-chunk: error. JPEG premature EOI: error. GIF LZW overread: loaded 1x1 (survived). WebP huge: loaded 16383x16383 (survived). BMP neg-height: loaded 4x4 (survived). BMP huge-dims: error. ICO malformed: loaded 16x16. SVG via img: loaded 10x10. createImageBitmap crop: loaded 4x4. No crashes across any format.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 06:02</div>
+      <strong>P1046/B: CVE Pattern Battery DEAD</strong> — Species/Proxy/IntOvf all properly bounded
+      <div class="log-detail">P1046: InnerHTML walker 100 hits (all "bold" — expected TreeWalker behavior). ImageDecoder 8/8 loaded 0 crashed. createImageBitmap 60 tests 0 anomalies. RegExp 2 anomalies (non-exploitable). Prototype intercept 5/5. SVG 20 rounds clean. P1046B: Species sp=false (not invoked). Proxy len=0 reads=0. TypedArray.from acc=4096. IntOvf: all RangeError. Subclass map/filter/slice all TypeError. FinalizationRegistry cl=false c=0. WeakRef alive=true.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 05:51</div>
+      <strong>P1045: DOM Mutation UAF Stress DEAD</strong> — All mutation patterns clean
+      <div class="log-detail">Run 1 (RAB focus): Sort calls=32736 bufLen=16. indexOf/lastIdx/includes clean. TextEncoder requires Uint8Array. DataView OOB properly bounded. Promise resolve 5/20 with data. Transfer: clone len=4096. Race stale=8175 (sentinel bytes). CSS anim computed=100 errs=0. Run 2 (DOM focus): MutationObserver 50 rounds 0 anomalies 0 mutations. Range 50 rounds 0. CustomElements 30 rounds 0 callbacks=480. Clone 6 tests 0. CSS 6 tests 0.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 05:34</div>
+      <strong>P1044: Last Chance vectors ALL DEAD</strong> — RegExp, SVG, Intl, CSS @font-face, createImageBitmap all clean
+      <div class="log-detail">APNG: 20 attempts, img=0, heap=0. APNG2: 20 attempts, heap=0. Truncation: dd=256, z=16128, heap=0. FontFace: errs=30, anom=0, bchg=0. Uninit: nz=0. Gap scan: all 7 size classes (64-16384) zero-filled. Every remaining WebKit vector is dead.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 05:29</div>
+      <strong>P1043: FontFace fix + APNG hexdump DEAD</strong> — Sentinel-only FontFace, background-only APNG canvas
+      <div class="log-detail">Run 1: Realloc preserved=255, zeroed=65217. All spray/mega/big64/GC/grow/dblresize contain only original sentinel bytes. APNG ca=0. FontFace vals = TrueType table headers (cmap). Run 2: FontFace returns 0xdead sentinel. APNG frame hex=0x424242ff (solid background). Sort leaked=0. FR collected=0. WeakRef: 200 alive, 0 dead.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 05:23</div>
+      <strong>P1042: FontFace+APNG heap grooming DEAD</strong> — 147KB overread with spray, zero pointers anywhere
+      <div class="log-detail">Run 1-2: RAB-based test. stale=16320, spray=0, GCspray=0, Big ptrs=0, kptrs=0. Write threw RangeError, transfer threw TypeError. Run 3: FontFace ptrs=0. 4000 spray objects across 8 sizes + 200 CSS styles. APNG overread 2K=16380, 4K=32764, 4Kx16=65532, 8K=32764. Total 147,440 bytes overread. code=0, vt=0, heap=0, kern=0, marker=0 everywhere.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 05:17</div>
+      <strong>P1041: RAB OOB write verify DEAD</strong> — Writes don't persist, memory zeroed on resize
+      <div class="log-detail">Run 1: fill past64=0, copyWithin/set clean. subarray threw TypeError. DataView writes=16 errors=112. Timing: valid=317ms, OOB=630ms (2x ratio = bounds check). Run 2: OOB write persistence test: persisted=no/no, zeroed=yes/yes. Slice: 7936 zeros after first 256. Big64: stale=2040, ptrs=0, kptrs=0. Corruption=0. Worker preserved=0.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 05:08</div>
+      <strong>P1040: RAB exploit battery DEAD</strong> — Zero leaks across all RAB attack patterns
+      <div class="log-detail">3 runs. Run 1-2: grow nonzero=0, ptrs=0, kptrs=0. Multi leaks=0. Track len=256 n=0. Big len=64 with pattern data only. Clone not detached. Race flips=200 leaks=0. Worker transfers work but leaks=0. Run 3: shrink OOB reads=undefined. Slice hits=200 consistent len=4096. map_oob=true mapped_len=2048. filter_oob=1748. APNG overread=4088 unique=1, code/vt/heap/kern all 0.</div>
+    </div>
+    <div class="log-entry log-win" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 04:58</div>
+      <strong>P1039 RESULTS IN</strong> — Baseline JIT YES, DFG/FTL NO. All JIT-dependent CVEs DEAD. Private fields supported. RAB confirmed.
+      <div class="log-detail">Phase A: 5M int loop=62ms, 1M float=15ms, poly/mono=2.12x ratio. Baseline JIT present but no DFG/FTL optimization tiers. Phase B: PhantomNewArrayWithButterfly all reads = 0x7ff8000000000000 (NaN-boxed undefined — properly initialized, no stale data). Sparse source also clean (type=object, val=0x0). Phase C: Private fields exist (has=true), seal n=0, freeze n=0 — no confusion without DFG. Phase D: TypedArray OOB=0, CheckBounds=0. Phase E: Range.cloneContents normal, Selection lens decreasing properly. Phase F: StructureID poly/mono both 0.0ms (too fast). Phase G: No Wasm, no SAB, RAB=true. Phase H: APNG failed again (same builder bug as P1038).</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 04:57</div>
+      <strong>CVE-2023-42916 + CVE-2026-28905 + CVE-2026-20608 ALL DEAD</strong> — No DFG/FTL tier on PS5 14.10
+      <div class="log-detail">All three priority CVEs from ZigZagBoi1 repo require DFG or FTL JIT optimization passes that are absent on PS5 14.10. CVE-2023-42916 needs DFG GetByVal bounds elimination. CVE-2026-28905 needs FTL PhantomNewArrayWithButterfly skip-init. CVE-2026-20608 needs DFG structure transition assumptions. Baseline JIT only does inline caching, not these aggressive optimizations.</div>
+    </div>
+    <div class="log-entry" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 04:57</div>
+      <strong>P1038 results in</strong> — ResizableArrayBuffer EXISTS on PS5! All DFG OOB=0. APNG image load failed.
+      <div class="log-detail">Phase B: TypedArray OOB = 0 leaks. Phase C: RAB exists (has=true), stale reads after resize = 0, detached reads = 0. Phase D: Structure confusion = 0 mismatches. Phase E: OSR exit values normal. Phase G: WeakRef GC: 100/0 (no collection). Phase J: APNG img failed to load in combined probe.</div>
+    </div>
+    <div class="log-entry" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 04:30</div>
+      <strong>ZigZagBoi1 repo analysis</strong> — Found 5 priority CVEs for PS5 14.10
+      <div class="log-detail">CVE-2026-28905 (FTL PhantomNewArrayWithButterfly uninit read — HIGHEST priority info leak), CVE-2026-20608 (private fields seal/freeze JIT confusion — pure JS), CVE-2023-42916 (DFG GetByVal OOB read — actively exploited in wild), CVE-2025-46299 (Google Big Sleep uninit memory — restricted), CVE-2026-28859 (sandbox escape via GPU glyph UAF). Also found CVE-2026-20664 (Wasm resizable buffer UAF — needs toResizableBuffer API).</div>
+    </div>
+    <div class="log-entry log-win" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-10 04:36</div>
+      <strong>APNG overread confirmed</strong> — 857+ unique pointers per session, heap/vtable/library regions mapped
+      <div class="log-detail">P1033-P1036 campaign results: 857 unique pointers across 4 APNG reads (49-98KB each). Dominant vtable: 0x087fbe0000 (1936 hits). VT1C object at +0x00=vtable, +0x08=code ptr, +0x10=refcount, +0x18=bmalloc poison. Heap zones confirmed separate: CSS/JS strings, ImageData, Blob URLs all in different zones from APNG — zero cross-references.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-11-02</div>
+      <strong>Canvas UAF (CVE-2026-43720) DEAD</strong> — IsoHeap/TZone IS active on PS5 14.10
+      <div class="log-detail">P571v14: 12 UAF triggers, 1100+ ArrayBuffers across 5 size classes (768/384/192/96/48), 2 spray rounds with GC pressure — zero reclaim. Freed WebKit objects go to type-specific free lists that ArrayBuffer backing stores never share. IsoHeap confirmed active, contradicting earlier PSFree claims.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-10-23</div>
+      <strong>AIO double-free DEAD</strong> — Double-STATUS, not double-free
+      <div class="log-detail">Probe 70e: exclusive D lock serializes entry_dispose. 72a-72c: 663 refcount-safe via atomic XADD. 71a: generation-checked IDs block 3-thread slot-reuse. Cross-subsystem spray (RTHDR to AIO zone) = 0 overlaps across 75c/75d/75e. Sony custom allocator with per-type zone segregation + flag 0x102 zero-init.</div>
+    </div>
+    <div class="log-entry log-win" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-10-23</div>
+      <strong>Child thread ROP syscalls working</strong> — 5-arg via pop gadgets from child thread
+      <div class="log-detail">thr_new child with controlled stack executes arbitrary 5-arg syscalls via ROP. Full gadget catalog: pop_rax(+0x992), pop_rdi(+0xC9DFE), pop_rsi(+0xD77D), pop_rdx(+0x3B02D7), pop_rcx(+0xE64), pop_r8(+0x991). Fake TCB fix: sysarch(SET_FSBASE=129) prepended to chain. Verified getpid, write, socketpair, setsockopt.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-10-23</div>
+      <strong>Ioctl overcopy sweep complete</strong> — ALL 34 /dev nodes clean
+      <div class="log-detail">48,446 calls (256 groups x 5 sizes x 2 dirs) across 19 non-catch-all devices. Only hit: /dev/usbctl group 0x51 (USB "HID_IGNORE"), within declared bounds. Combined with gc/dce (56m): zero overcopy, zero kernel pointers on any accessible device.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-10-23</div>
+      <strong>BSD-native range (1-530) EXHAUSTED</strong> — Zero kernel pointers across ~400 tested syscalls
+      <div class="log-detail">Probes 388a-392f: sc102 returns 160B socket info, sc125 returns 160B interface data — both zero kptrs. 40 unnamed slots all -1. modfind/modnext blocked. ktimer stubs. sched_getparam=prio 700 (Sony custom). getlogin="root".</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-10-22</div>
+      <strong>msync CVE-2026-49418 DEAD</strong> — MS_INVALIDATE rejected on all mapping types
+      <div class="log-detail">msync(65) with MS_INVALIDATE returns -1 on ALL mapping types: anonymous GPU (fd=-1), /dev/dmem0, /dev/dmem1, /dev/zero. MS_SYNC and MS_ASYNC return 0. Kernel rejects before reaching vulnerable vm_object_page_remove().</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-10-22</div>
+      <strong>IPV6_MSFILTER CVE-2026-49412 DEAD</strong> — Sony removed entire RFC 3678 multicast API
+      <div class="log-detail">setsockopt works for standard IPv6 (4/10/11/27), but IPV6_MSFILTER(74), MCAST_MSFILTER(72), MCAST_JOIN_GROUP(42), MCAST_BLOCK_SOURCE(43) all return -1. UDPv6 creation and IPV6_JOIN_GROUP(12) work fine. The vulnerable in6p_set_source_filters() path is unreachable.</div>
+    </div>
+    <div class="log-entry log-win" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-10-21</div>
+      <strong>Device inventory mapped</strong> — 34 of 76 /dev nodes accessible from game process
+      <div class="log-detail">gc, dce, ajm, dmem0-2, camera, usb, hid, bt, rng, gic, notification*, HMD sets. ioctl reaches drivers, they reject commands. 32-bit dirent layout confirmed.</div>
+    </div>
+    <div class="log-entry log-dead" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-10-21</div>
+      <strong>netcontrol(99) UAF DEAD</strong> — close-before-unregister leaks socket ref, doesn't free
+      <div class="log-detail">Probes 223a-234a: register takes a socket reference; close-before-unregister leaks it instead of freeing. No double-free, no dangling pointer. Public ExploitNetControlImpl chain precondition does not hold on 14.10. ifindex -1 queue permanently wedged.</div>
+    </div>
+    <div class="log-entry log-win" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-10-19</div>
+      <strong>thr_create(430) panic root cause identified</strong> — CS register from user ucontext
+      <div class="log-detail">13.60 Ghidra decompile: set_mcontext() copies CS register from user ucontext without OR-ing SEL_RPL_MASK (0x3). CS=0 from zeroed context causes kernel-mode fault. Fix: CS=0x43/SS=0x3B. Later confirmed: 14.10 replaces/masks the selector.</div>
+    </div>
+    <div class="log-entry log-win" onclick="this.querySelector('.log-detail').style.display=this.querySelector('.log-detail').style.display==='block'?'none':'block'">
+      <div class="log-time">2026-10-18</div>
+      <strong>CClosure redirect confirmed</strong> — Selected targets with output and restore checks
+      <div class="log-detail">56c: rawequal→rawget and rawget→type with distinguishing outputs and restoration; tostring targets print 42. 56f: string.len/math.abs target-like values. General executable-target support and native-register argument control remain unverified.</div>
+    </div>
+  </div>
+</div>
+
+<!-- ======== ROW 7: ADDRESS SPACE MAP ======== -->
+<div class="dash-card p-3 mb-3">
+  <h6 class="text-muted mb-2" style="font-size:.75rem;text-transform:uppercase;letter-spacing:.08em">
+    <i class="bi bi-memory"></i> WebProcess Address Space Map
+  </h6>
+  <div style="font-family:monospace;font-size:.78rem;line-height:1.8">
+    <div><span style="color:var(--clr-blue)">0x01-0x07xxxxxxxx</span> &mdash; Library code/data sections (page-aligned bases)</div>
+    <div><span style="color:var(--clr-green)">0x081Bxxxxxxxx</span> &mdash; bmalloc heap zone (dynamic allocs)</div>
+    <div><span style="color:var(--clr-yellow)">0x081C04xxxxxx</span> &mdash; Library read-only data (vtable region, ~72KB span)</div>
+    <div><span style="color:var(--clr-accent)">0x087FBDx-BEx</span> &mdash; Dominant vtable region (1936x for 0x087fbe0000)</div>
+    <div><span style="color:var(--clr-green)">0x0880xxxxxxxx</span> &mdash; Second bmalloc heap zone (APNG dominant)</div>
+    <div><span style="color:var(--clr-yellow)">0x10xxxxxxxxxx</span> &mdash; Third heap region (FontFace UAF objects)</div>
+  </div>
+</div>
+
+<!-- ======== FOOTER ======== -->
+<div class="text-center py-3" style="font-size:.7rem;color:var(--clr-muted)">
+  PS5 14.10 Kernel Research Dashboard &middot; Auto-updated by research sessions &middot; <span id="footerTime"></span>
+</div>
+
+</div><!-- /container -->
+
+<script>
+// ===== THEME TOGGLE =====
+function toggleTheme(){
+  var html=document.documentElement;
+  var isDark=html.getAttribute('data-bs-theme')==='dark';
+  html.setAttribute('data-bs-theme',isDark?'light':'dark');
+  document.getElementById('themeBtn').innerHTML=isDark?'<i class="bi bi-sun-fill"></i>':'<i class="bi bi-moon-stars-fill"></i>';
+  localStorage.setItem('ps5dash-theme',isDark?'light':'dark');
+  updateCharts();
+}
+(function(){
+  try{
+    var saved=localStorage.getItem('ps5dash-theme');
+    if(saved){
+      document.documentElement.setAttribute('data-bs-theme',saved);
+      document.getElementById('themeBtn').innerHTML=saved==='light'?'<i class="bi bi-sun-fill"></i>':'<i class="bi bi-moon-stars-fill"></i>';
+    }
+  }catch(e){}
+})();
+
+// ===== TIMESTAMPS =====
+function updateTime(){
+  var now=new Date();
+  var s=now.toLocaleString('en-GB',{year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  document.getElementById('lastUpdate').textContent='Last refresh: '+s;
+  document.getElementById('footerTime').textContent=s;
+}
+updateTime();setInterval(updateTime,1000);
+
+// ===== CHARTS =====
+var progressChart;
+function getChartColors(){
+  var isDark=document.documentElement.getAttribute('data-bs-theme')==='dark';
+  return{
+    text:isDark?'#c8d0da':'#1f2937',
+    grid:isDark?'#1e2a3a':'#d1d5db',
+    green:isDark?'#4ec9b0':'#059669',
+    red:isDark?'#f44':'#dc2626',
+    blue:isDark?'#569cd6':'#2563eb',
+    yellow:isDark?'#dcdcaa':'#ca8a04',
+    accent:'#7c3aed',
+    bg:isDark?'#1e2a3a':'#e5e7eb'
+  };
+}
+
+function createCharts(){
+  var c=getChartColors();
+
+  // Progress ring
+  var ctx1=document.getElementById('progressRing').getContext('2d');
+  progressChart=new Chart(ctx1,{
+    type:'doughnut',
+    data:{
+      labels:['Done','Remaining'],
+      datasets:[{data:[10,90],backgroundColor:[c.yellow,c.bg],borderWidth:0,cutout:'78%'}]
+    },
+    options:{
+      responsive:false,
+      plugins:{legend:{display:false},tooltip:{enabled:false}},
+      animation:{animateRotate:true,duration:1200}
+    }
+  });
+
+}
+
+function updateCharts(){
+  var c=getChartColors();
+  if(progressChart){
+    progressChart.data.datasets[0].backgroundColor=[c.yellow,c.bg];
+    progressChart.update('none');
+  }
+}
+
+createCharts();
+</script>
+</body>
+</html>

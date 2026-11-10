@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1085 - B2 Cascade Discriminator</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:11px/1.5 monospace;padding:8px}
+#log{background:#12121a;border:1px solid #2a2a3a;border-radius:6px;padding:8px;margin:6px 0;
+max-height:60vh;overflow-y:auto;font-size:11px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.fail{color:#ff4444}.warn{color:#ffaa00}.info{color:#66aaff}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head>
+<body>
+<h2 style="color:#00ff88;font-size:14px">P1085 B2 Cascade Discriminator</h2>
+<div id="log"></div>
+<div id="sandbox" style="position:absolute;left:-9999px;top:-9999px;width:800px;height:600px;overflow:hidden"></div>
+
+<script>
+'use strict';
+var L=document.getElementById('log'),sandbox=document.getElementById('sandbox');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight}
+function B(t,d){var m=String(d||'');log('info','[B] P1085-'+t+' | '+m);
+try{var u='/beacon.php?tag=P1085-'+encodeURIComponent(t);if(m)u+='&data='+encodeURIComponent(m.slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* ══════════════════════════════════════════════════════════
+   P1085: Is the "B2 crash" a UAF or a mutation-cascade
+   resource exhaustion?
+
+   P1084 measured CRASH@cycles=1 for EVERY spray size (incl.
+   no-spray control): the JS trigger loop runs ONCE, then the
+   process dies 16-25s later, asynchronously. The observer uses
+   subtree:true and appends a NEW will-change layer INSIDE the
+   mutation callback — that append is itself a subtree mutation,
+   so the observer cascades unboundedly, creating layers while
+   RAF removals never fire (page occluded → RAF throttled).
+
+   P1074 (childList only, NO subtree) did NOT crash in 40 cycles.
+   Correlation: crash <=> subtree:true cascade.
+
+   Tests (one per load, crash-resume):
+     T0: subtree:true, uncapped cascade (control — should crash)
+     T1: subtree:true, cascade CAPPED at 20 observer-created layers
+     T2: subtree:true, CAPPED at 200 layers
+     T3: subtree:false, uncapped (P1074 shape — should survive)
+     T4: subtree:true, uncapped, but NO will-change on created
+         layers (plain divs — cascade without compositing)
+   If T1/T2 survive => exhaustion, not UAF. If T4 crashes =>
+   cascade alone (no layers) is enough => not a layer bug at all.
+   Wall-clock from RUN-START to death is recorded via a 1s
+   heartbeat to localStorage.
+   ══════════════════════════════════════════════════════════ */
+
+var TESTS=[
+  {name:'T0-subtree-uncapped',   subtree:true,  cap:0,   willChange:true},
+  {name:'T1-subtree-cap20',      subtree:true,  cap:20,  willChange:true},
+  {name:'T2-subtree-cap200',     subtree:true,  cap:200, willChange:true},
+  {name:'T3-nosubtree-uncapped', subtree:false, cap:0,   willChange:true},
+  {name:'T4-subtree-nolayer',    subtree:true,  cap:0,   willChange:false}
+];
+var sec=0,res={};
+try{sec=parseInt(localStorage.getItem('p1085_sec')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1085_res');if(r)res=JSON.parse(r);}catch(e){}
+
+if(sec>0&&sec<=TESTS.length){
+  var pn=TESTS[sec-1].name;
+  var aliveSec=0,created=0;
+  try{aliveSec=parseInt(localStorage.getItem('p1085_hb')||'0');}catch(e){}
+  try{created=parseInt(localStorage.getItem('p1085_created')||'0');}catch(e){}
+  if(!res[pn]){
+    res[pn]='DIED@'+aliveSec+'s,created='+created;
+    B('DIED','test='+pn+'|aliveSec='+aliveSec+'|created='+created);
+  }
+  try{localStorage.setItem('p1085_hb','0');localStorage.setItem('p1085_created','0');}catch(e){}
+}
+function save(){try{localStorage.setItem('p1085_sec',''+sec);
+  localStorage.setItem('p1085_res',JSON.stringify(res));}catch(e){}}
+save();
+
+B('BOOT','sec='+sec+'|prev='+JSON.stringify(res).slice(0,400));
+log('ok','=== P1085 cascade discriminator (sec='+sec+') ===');
+
+function runOne(t){
+  return new Promise(function(resolve){
+    sandbox.innerHTML='';
+    var container=document.createElement('div');
+    container.style.cssText='position:relative;width:100px;height:100px';
+    sandbox.appendChild(container);
+    void sandbox.offsetHeight;
+
+    var created=0,triggered=0,elapsed=0;
+    var obs=new MutationObserver(function(){
+      if(t.cap>0&&created>=t.cap)return;
+      var el=document.createElement('div');
+      el.style.cssText='position:absolute;width:10px;height:10px'+
+        (t.willChange?';transform:translateZ(0);will-change:transform':'');
+      container.appendChild(el);
+      created++;
+      try{localStorage.setItem('p1085_created',''+created);}catch(e){}
+      requestAnimationFrame(function(){
+        if(el.parentNode)el.parentNode.removeChild(el);
+      });
+    });
+    obs.observe(container,{childList:true,subtree:t.subtree});
+
+    /* heartbeat: proves the page is alive, measures wall time to death */
+    var hb=setInterval(function(){
+      elapsed++;
+      try{localStorage.setItem('p1085_hb',''+elapsed);}catch(e){}
+      if(elapsed>=45){ /* survived 45s => call it survived */
+        clearInterval(hb);obs.disconnect();
+        resolve('SURVIVED45s,created='+created+',trig='+triggered);
+      }
+    },1000);
+
+    /* slow trigger: one mutation per 50ms, 40 max — the cascade does the work */
+    var trig=setInterval(function(){
+      if(triggered>=40||elapsed>=45){clearInterval(trig);return;}
+      var d=document.createElement('div');
+      d.textContent='t'+triggered;
+      container.appendChild(d);
+      triggered++;
+    },50);
+
+    B('RUN-START','test='+t.name);
+  });
+}
+
+async function run(){
+  if(sec<TESTS.length){
+    var t=TESTS[sec];
+    try{localStorage.setItem('p1085_sec',''+(sec+1));
+        localStorage.setItem('p1085_hb','0');
+        localStorage.setItem('p1085_created','0');}catch(e){}
+    var outcome=await runOne(t);
+    res[t.name]=outcome;sec++;save();
+    B('RUN-DONE','test='+t.name+'|outcome:'+outcome);
+    setTimeout(function(){location.reload(true);},400);
+    return;
+  }
+  var summary=TESTS.map(function(t){return t.name+'='+(res[t.name]||'?');}).join(' | ');
+  B('DONE',summary);
+  log('ok','=== P1085 COMPLETE: '+summary+' ===');
+  try{localStorage.setItem('p1085_sec','0');localStorage.removeItem('p1085_res');
+  localStorage.removeItem('p1085_hb');localStorage.removeItem('p1085_created');}catch(e){}
+}
+
+run();
+
+/* auto-reload check */
+(function(){
+  var cur='P1085-b2-cascade-discriminator';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body>
+</html>

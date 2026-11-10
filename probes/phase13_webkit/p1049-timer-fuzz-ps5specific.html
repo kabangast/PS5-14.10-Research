@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P1049</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.pass{color:#22c55e}.fail{color:#ef4444}.warn{color:#f59e0b}.info{color:#38bdf8}
+h2{color:#7dd3fc;margin:8px 0 4px;font-size:13px}
+</style></head><body><div id="hud"><b class="info">P1049: Timer Precision + DOM Fuzz + PS5-Specific</b><br>
+<span class="warn">Checking side-channel viability + fuzzing DOM + probing PS5 features...</span><div id="log"></div></div>
+<div id="arena" style="position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;overflow:hidden"></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1049-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+function lg(s,c){var d=document.getElementById('log');if(d){d.innerHTML+='<div class="'+(c||'info')+'">'+s+'</div>';d.scrollTop=d.scrollHeight;}}
+
+var arena=document.getElementById('arena');
+var anomalies=[];
+
+bn('BOOT','ts='+Date.now().toString(36));
+lg('P1049 booted');
+
+// ======================================================================
+// PHASE A: Timer Resolution Analysis
+// Check if performance.now(), Date.now(), and other timing primitives
+// have enough resolution for side-channel attacks.
+// ======================================================================
+setTimeout(function phaseA(){
+  lg('<h2>[A] Timer Resolution Analysis</h2>');
+  var res = {};
+
+  // Test performance.now() resolution
+  if(typeof performance !== 'undefined' && performance.now){
+    var pSamples = [];
+    var lastP = performance.now();
+    var pDistinct = 0;
+    for(var i=0; i<10000; i++){
+      var now = performance.now();
+      if(now !== lastP){
+        pSamples.push(now - lastP);
+        lastP = now;
+        pDistinct++;
+      }
+    }
+    // Find minimum granularity
+    var minGran = 999;
+    for(var i=0; i<pSamples.length; i++){
+      if(pSamples[i] > 0 && pSamples[i] < minGran) minGran = pSamples[i];
+    }
+    res.perfNow = 'min='+minGran.toFixed(6)+'ms|distinct='+pDistinct+'/10000';
+
+    // Check if it's reduced precision (100ms buckets = Site Isolation mitigation)
+    var buckets = {};
+    for(var i=0; i<pSamples.length; i++){
+      var rounded = Math.round(pSamples[i] * 1000) / 1000;
+      buckets[rounded] = (buckets[rounded]||0) + 1;
+    }
+    var bKeys = Object.keys(buckets);
+    res.perfBuckets = bKeys.length;
+    res.perfTop3 = bKeys.sort(function(a,b){return buckets[b]-buckets[a]}).slice(0,3).join(',');
+  } else {
+    res.perfNow = 'UNAVAILABLE';
+  }
+
+  // Test Date.now() resolution
+  var dSamples = [];
+  var lastD = Date.now();
+  var dDistinct = 0;
+  for(var i=0; i<10000; i++){
+    var now = Date.now();
+    if(now !== lastD){
+      dSamples.push(now - lastD);
+      lastD = now;
+      dDistinct++;
+    }
+  }
+  res.dateNow = 'distinct='+dDistinct+'/10000|minDelta='+(dSamples.length>0?Math.min.apply(null,dSamples):'none')+'ms';
+
+  // Test MessageChannel round-trip
+  if(typeof MessageChannel !== 'undefined'){
+    try {
+      var mc = new MessageChannel();
+      var rtTimes = [];
+      var rtCount = 0;
+      mc.port2.onmessage = function(){
+        var end = performance.now();
+        rtTimes.push(end);
+        rtCount++;
+        if(rtCount < 100){
+          var start = performance.now();
+          rtTimes.push(-start); // negative = start marker
+          mc.port1.postMessage(0);
+        }
+      };
+      var start = performance.now();
+      rtTimes.push(-start);
+      mc.port1.postMessage(0);
+
+      // Give it time to complete
+      setTimeout(function(){
+        var rtDeltas = [];
+        for(var i=0; i<rtTimes.length-1; i+=2){
+          if(rtTimes[i] < 0 && rtTimes[i+1] > 0){
+            rtDeltas.push(rtTimes[i+1] + rtTimes[i]); // end - (-start) = end + start... need to fix
+          }
+        }
+        // Calculate round-trips: pairs of (start, end)
+        var trips = [];
+        for(var i=0; i<rtTimes.length; i++){
+          if(rtTimes[i] < 0 && i+1 < rtTimes.length && rtTimes[i+1] > 0){
+            trips.push(rtTimes[i+1] - (-rtTimes[i]));
+          }
+        }
+        if(trips.length > 0){
+          trips.sort(function(a,b){return a-b});
+          res.msgRt = 'count='+trips.length+'|min='+trips[0].toFixed(4)+'ms|med='+trips[Math.floor(trips.length/2)].toFixed(4)+'ms';
+        } else {
+          res.msgRt = 'count=0';
+        }
+
+        mc.port1.close();
+        mc.port2.close();
+
+        finishA();
+      }, 200);
+    } catch(e){
+      res.msgRt = 'ERROR:'+e.message;
+      finishA();
+    }
+  } else {
+    res.msgRt = 'UNAVAILABLE';
+    finishA();
+  }
+
+  function finishA(){
+    // Test requestAnimationFrame timing
+    if(typeof requestAnimationFrame !== 'undefined'){
+      var rafTimes = [];
+      var rafCount = 0;
+      function rafLoop(ts){
+        rafTimes.push(ts);
+        rafCount++;
+        if(rafCount < 30) requestAnimationFrame(rafLoop);
+        else {
+          var rafDeltas = [];
+          for(var i=1; i<rafTimes.length; i++) rafDeltas.push(rafTimes[i]-rafTimes[i-1]);
+          if(rafDeltas.length > 0){
+            rafDeltas.sort(function(a,b){return a-b});
+            res.raf = 'count='+rafDeltas.length+'|min='+rafDeltas[0].toFixed(2)+'ms|max='+rafDeltas[rafDeltas.length-1].toFixed(2)+'ms|med='+rafDeltas[Math.floor(rafDeltas.length/2)].toFixed(2)+'ms';
+          }
+          finishAComplete();
+        }
+      }
+      requestAnimationFrame(rafLoop);
+    } else {
+      res.raf = 'UNAVAILABLE';
+      finishAComplete();
+    }
+  }
+
+  function finishAComplete(){
+    var msg = 'perf='+res.perfNow+'|date='+res.dateNow+'|msgRt='+(res.msgRt||'?')+'|raf='+(res.raf||'?')+'|buckets='+(res.perfBuckets||'?')+'|top='+(res.perfTop3||'?');
+    bn('A-TIMER', msg);
+    lg('[A] Timer: '+msg);
+    setTimeout(phaseB, 10);
+  }
+}, 50);
+
+// ======================================================================
+// PHASE B: PS5-Specific Feature Probing
+// Test features that Sony may have added/modified in their WebKit fork.
+// ======================================================================
+function phaseB(){
+  lg('<h2>[B] PS5-Specific Feature Probe</h2>');
+  var res = {};
+
+  // 1. Check navigator properties for PS5-specific data
+  try {
+    res.ua = navigator.userAgent.slice(0,100);
+    res.platform = navigator.platform;
+    res.lang = navigator.language;
+    res.cookieEnabled = navigator.cookieEnabled;
+    res.doNotTrack = navigator.doNotTrack;
+    res.maxTouchPoints = navigator.maxTouchPoints;
+    res.hardwareConcurrency = navigator.hardwareConcurrency;
+    res.deviceMemory = navigator.deviceMemory;
+    res.connection = navigator.connection ? JSON.stringify({
+      type: navigator.connection.type,
+      downlink: navigator.connection.downlink,
+      rtt: navigator.connection.rtt,
+      effectiveType: navigator.connection.effectiveType
+    }) : 'none';
+  } catch(e){ res.navError = e.message; }
+
+  // 2. Check for PS5-specific JS objects
+  var ps5Objects = ['PlayStation', 'PS5', 'SCE', 'SceNp', 'webkit', 'WebKitPoint',
+    'webkitURL', 'webkitAudioContext', 'webkitSpeechRecognition', 'WebKitCSSMatrix',
+    'WebKitMutationObserver', 'webkitRequestAnimationFrame', 'webkitCancelAnimationFrame',
+    'SceError', 'SceNet', 'SceBrowser', 'SceUser', 'SceSystem', 'SceAccount',
+    'sceNp', 'sceBrowser', 'sceUser', 'SceWebKit', 'sceKernel', 'SceKernel',
+    'native', '__sc', '__sony', '__sce', '__browser'];
+  var found = [];
+  for(var i=0; i<ps5Objects.length; i++){
+    try {
+      if(typeof window[ps5Objects[i]] !== 'undefined'){
+        var type = typeof window[ps5Objects[i]];
+        var props = [];
+        try {
+          if(type === 'object' || type === 'function'){
+            props = Object.getOwnPropertyNames(window[ps5Objects[i]]).slice(0,20);
+          }
+        } catch(e){}
+        found.push(ps5Objects[i]+':'+type+(props.length>0?'['+props.join(',')+']':''));
+      }
+    } catch(e){}
+  }
+  res.ps5objs = found.length > 0 ? found.join('|') : 'none';
+
+  // 3. Check all window properties for Sony/PS5 hints
+  var sonyProps = [];
+  try {
+    var allProps = Object.getOwnPropertyNames(window);
+    for(var i=0; i<allProps.length; i++){
+      var p = allProps[i].toLowerCase();
+      if(p.indexOf('sce') !== -1 || p.indexOf('sony') !== -1 || p.indexOf('playstation') !== -1 ||
+         p.indexOf('ps5') !== -1 || p.indexOf('psn') !== -1 || p.indexOf('orbis') !== -1 ||
+         p.indexOf('prospero') !== -1 || p.indexOf('__sc') !== -1){
+        sonyProps.push(allProps[i]);
+      }
+    }
+  } catch(e){}
+  res.sonyWinProps = sonyProps.length > 0 ? sonyProps.join(',') : 'none';
+
+  // 4. Check document/element for custom attributes/properties
+  var sonyDocProps = [];
+  try {
+    var docProps = Object.getOwnPropertyNames(document);
+    for(var i=0; i<docProps.length; i++){
+      var p = docProps[i].toLowerCase();
+      if(p.indexOf('sce') !== -1 || p.indexOf('sony') !== -1 || p.indexOf('webkit') !== -1){
+        sonyDocProps.push(docProps[i]);
+      }
+    }
+  } catch(e){}
+  res.sonyDocProps = sonyDocProps.length > 0 ? sonyDocProps.join(',') : 'none';
+
+  // 5. Check CSS @supports for PS5-specific properties
+  var cssSupports = [];
+  var cssTests = [
+    '-webkit-overflow-scrolling: touch',
+    '-webkit-appearance: none',
+    '-webkit-text-fill-color: red',
+    '-webkit-background-clip: text',
+    '-webkit-mask-image: none',
+    'color-scheme: dark',
+    'container-type: inline-size',
+    'contain: strict',
+    'aspect-ratio: 1',
+    'gap: 1px',
+    'inset: 0',
+    'overscroll-behavior: contain'
+  ];
+  for(var i=0; i<cssTests.length; i++){
+    try {
+      if(CSS.supports(cssTests[i])) cssSupports.push(cssTests[i].split(':')[0].trim());
+    } catch(e){}
+  }
+  res.cssSupports = cssSupports.join(',') || 'none';
+
+  // 6. Check for interesting APIs
+  var apiChecks = {
+    'Notification': typeof Notification,
+    'BroadcastChannel': typeof BroadcastChannel,
+    'Cache': typeof Cache,
+    'CacheStorage': typeof caches,
+    'ServiceWorkerContainer': typeof navigator.serviceWorker,
+    'Geolocation': typeof navigator.geolocation,
+    'MediaDevices': typeof navigator.mediaDevices,
+    'Gamepad': typeof navigator.getGamepads,
+    'Bluetooth': typeof navigator.bluetooth,
+    'USB': typeof navigator.usb,
+    'Serial': typeof navigator.serial,
+    'HID': typeof navigator.hid,
+    'Presentation': typeof navigator.presentation,
+    'Clipboard': typeof navigator.clipboard,
+    'PerformanceObserver': typeof PerformanceObserver,
+    'IntersectionObserver': typeof IntersectionObserver,
+    'ResizeObserver': typeof ResizeObserver,
+    'WritableStream': typeof WritableStream,
+    'ReadableStream': typeof ReadableStream,
+    'CompressionStream': typeof CompressionStream,
+    'TextDecoderStream': typeof TextDecoderStream,
+    'ReportingObserver': typeof ReportingObserver,
+    'OffscreenCanvas': typeof OffscreenCanvas
+  };
+  var apiAvail = [];
+  for(var k in apiChecks){
+    if(apiChecks[k] !== 'undefined') apiAvail.push(k);
+  }
+  res.apis = apiAvail.join(',') || 'none';
+
+  // 7. Count total window properties (attack surface size)
+  try {
+    res.totalWinProps = Object.getOwnPropertyNames(window).length;
+  } catch(e){ res.totalWinProps = '?'; }
+
+  var msg = 'ua='+res.ua+'|platform='+res.platform+'|lang='+res.lang+'|touch='+res.maxTouchPoints+
+    '|cores='+(res.hardwareConcurrency||'?')+'|devMem='+(res.deviceMemory||'?')+
+    '|ps5objs='+res.ps5objs+'|sonyWin='+res.sonyWinProps+'|sonyDoc='+res.sonyDocProps+
+    '|css='+res.cssSupports+'|apis='+res.apis+'|props='+res.totalWinProps;
+  bn('B-PS5', msg);
+  lg('[B] PS5: '+msg);
+  setTimeout(phaseC, 10);
+}
+
+// ======================================================================
+// PHASE C: Rapid DOM Fuzzing (250 random operations)
+// Generate random DOM trees, perform random mutations, check for
+// crashes, anomalous behavior, or exposed internal state.
+// ======================================================================
+function phaseC(){
+  lg('<h2>[C] DOM Fuzz (250 random ops)</h2>');
+  var res = {ops:0, errors:0, crashes:0, anomalies:0};
+
+  var tagPool = ['div','span','p','b','i','a','ul','li','table','tr','td','th',
+    'form','input','select','option','textarea','button','label',
+    'h1','h2','h3','blockquote','pre','code','em','strong','small',
+    'details','summary','dialog','template','slot','picture','source',
+    'svg','circle','rect','path','g','text','use','defs','clipPath'];
+
+  function randTag(){ return tagPool[Math.floor(Math.random()*tagPool.length)]; }
+  function randStr(n){ var s=''; for(var i=0;i<n;i++) s+=String.fromCharCode(33+Math.floor(Math.random()*93)); return s; }
+
+  var container = document.createElement('div');
+  arena.appendChild(container);
+
+  // Build initial tree
+  container.innerHTML = '<div id="fuzz-root"><p>seed</p></div>';
+  var root = container.querySelector('#fuzz-root');
+
+  for(var op=0; op<250; op++){
+    try {
+      var action = Math.floor(Math.random() * 12);
+      var nodes = root.querySelectorAll('*');
+      var target = nodes.length > 0 ? nodes[Math.floor(Math.random()*nodes.length)] : root;
+
+      switch(action){
+        case 0: // Append child
+          var el = document.createElement(randTag());
+          el.textContent = randStr(10);
+          target.appendChild(el);
+          break;
+        case 1: // Remove child
+          if(target.firstChild && target !== root){
+            target.removeChild(target.firstChild);
+          }
+          break;
+        case 2: // innerHTML replace
+          target.innerHTML = '<'+randTag()+'>'+randStr(20)+'</'+randTag()+'>';
+          break;
+        case 3: // insertAdjacentHTML
+          target.insertAdjacentHTML('beforeend', '<'+randTag()+' class="fuzz">'+randStr(5)+'</'+randTag()+'>');
+          break;
+        case 4: // cloneNode deep + append
+          if(target !== root){
+            var clone = target.cloneNode(true);
+            root.appendChild(clone);
+          }
+          break;
+        case 5: // setAttribute with various types
+          var attrNames = ['style','class','id','data-x','title','role','hidden','draggable','contenteditable'];
+          target.setAttribute(attrNames[Math.floor(Math.random()*attrNames.length)], randStr(30));
+          break;
+        case 6: // Range operations
+          var range = document.createRange();
+          if(nodes.length >= 2){
+            var n1 = nodes[Math.floor(Math.random()*nodes.length)];
+            var n2 = nodes[Math.floor(Math.random()*nodes.length)];
+            try {
+              range.setStartBefore(n1);
+              range.setEndAfter(n2);
+              range.extractContents();
+            } catch(e){}
+          }
+          break;
+        case 7: // Forced layout
+          void target.offsetHeight;
+          void target.getBoundingClientRect();
+          var cs = window.getComputedStyle(target);
+          void cs.display; void cs.width;
+          break;
+        case 8: // Adopt from another document
+          var doc2 = document.implementation.createHTMLDocument('fuzz');
+          doc2.body.innerHTML = '<div>adopted-'+op+'</div>';
+          var adopted = document.adoptNode(doc2.body.firstChild);
+          target.appendChild(adopted);
+          break;
+        case 9: // textContent overwrite
+          target.textContent = randStr(50);
+          break;
+        case 10: // outerHTML replace (not on root)
+          if(target !== root && target.parentNode){
+            try { target.outerHTML = '<'+randTag()+'>replaced-'+op+'</'+randTag()+'>'; } catch(e){}
+          }
+          break;
+        case 11: // normalize (merge adjacent text nodes)
+          root.normalize();
+          break;
+      }
+      res.ops++;
+    } catch(e){
+      res.errors++;
+    }
+
+    // Check tree consistency every 50 ops
+    if(op % 50 === 49){
+      try {
+        var nodeCount = root.querySelectorAll('*').length;
+        var html = root.innerHTML;
+        if(nodeCount > 5000){
+          // Prevent OOM — trim tree
+          while(root.childNodes.length > 10) root.removeChild(root.lastChild);
+        }
+      } catch(e){ res.anomalies++; anomalies.push('C-consistency:'+e.message); }
+    }
+  }
+
+  arena.removeChild(container);
+
+  bn('C-DOMFUZZ', 'ops='+res.ops+'|errors='+res.errors+'|anomalies='+res.anomalies);
+  lg('[C] DOM fuzz: ops='+res.ops+' errors='+res.errors+' anomalies='+res.anomalies, res.anomalies>0?'warn':'pass');
+  setTimeout(phaseD, 10);
+}
+
+// ======================================================================
+// PHASE D: CSS Deep Parsing Stress
+// Target CSS parser with complex/unusual inputs that may trigger bugs.
+// ======================================================================
+function phaseD(){
+  lg('<h2>[D] CSS Deep Parsing Stress</h2>');
+  var res = {tests:0, errors:0, anomalies:0};
+
+  // Test 1: Deeply nested calc()
+  try {
+    var calcStr = '10px';
+    for(var i=0; i<50; i++) calcStr = 'calc('+calcStr+' + 1px)';
+    var el = document.createElement('div');
+    el.style.width = calcStr;
+    arena.appendChild(el);
+    void el.offsetWidth;
+    arena.removeChild(el);
+    res.tests++;
+  } catch(e){ res.errors++; }
+
+  // Test 2: CSS custom properties with long chains
+  try {
+    var style = document.createElement('style');
+    var css = ':root{';
+    for(var i=0; i<100; i++){
+      css += '--v'+i+':var(--v'+(i+1)+',fallback'+i+');';
+    }
+    css += '--v100:final;}';
+    css += '#css-test{width:var(--v0);}';
+    style.textContent = css;
+    document.head.appendChild(style);
+    var testEl = document.createElement('div');
+    testEl.id = 'css-test';
+    arena.appendChild(testEl);
+    var computed = getComputedStyle(testEl).width;
+    arena.removeChild(testEl);
+    document.head.removeChild(style);
+    res.tests++;
+  } catch(e){ res.errors++; }
+
+  // Test 3: @supports nesting
+  try {
+    var style2 = document.createElement('style');
+    var supCss = '';
+    var depth = 20;
+    for(var i=0; i<depth; i++) supCss += '@supports (display:block){';
+    supCss += '.deep-test{color:red}';
+    for(var i=0; i<depth; i++) supCss += '}';
+    style2.textContent = supCss;
+    document.head.appendChild(style2);
+    document.head.removeChild(style2);
+    res.tests++;
+  } catch(e){ res.errors++; }
+
+  // Test 4: Very long selector
+  try {
+    var style3 = document.createElement('style');
+    var longSel = 'div';
+    for(var i=0; i<200; i++) longSel += ' > div';
+    style3.textContent = longSel + '{color:blue}';
+    document.head.appendChild(style3);
+    document.head.removeChild(style3);
+    res.tests++;
+  } catch(e){ res.errors++; }
+
+  // Test 5: CSS with unusual Unicode
+  try {
+    var style4 = document.createElement('style');
+    style4.textContent = '.test\\0041{color:red} .test\\D800{color:blue} .test\\FFFE{color:green} .test\\10FFFF{color:orange}';
+    document.head.appendChild(style4);
+    document.head.removeChild(style4);
+    res.tests++;
+  } catch(e){ res.errors++; }
+
+  // Test 6: Rapid stylesheet add/remove
+  try {
+    for(var i=0; i<100; i++){
+      var s = document.createElement('style');
+      s.textContent = '.rapid-'+i+'{background:rgb('+i+','+i+','+i+')}';
+      document.head.appendChild(s);
+      // Force style recalc
+      void document.body.offsetHeight;
+      document.head.removeChild(s);
+    }
+    res.tests++;
+  } catch(e){ res.errors++; }
+
+  // Test 7: @font-face with unusual values
+  try {
+    var style5 = document.createElement('style');
+    var fontCSS = '@font-face{font-family:"';
+    for(var i=0; i<500; i++) fontCSS += 'A';
+    fontCSS += '";src:local("serif")}';
+    fontCSS += '\n@font-face{font-family:"test";src:url("data:font/woff2;base64,AAAA");unicode-range:U+0000-FFFF}';
+    fontCSS += '\n@font-face{font-family:"size-test";size-adjust:200%;ascent-override:150%;descent-override:50%}';
+    style5.textContent = fontCSS;
+    document.head.appendChild(style5);
+    void document.body.offsetHeight;
+    document.head.removeChild(style5);
+    res.tests++;
+  } catch(e){ res.errors++; }
+
+  // Test 8: @container query (if supported)
+  try {
+    var style6 = document.createElement('style');
+    style6.textContent = '.container{container-type:inline-size;width:300px}' +
+      '@container (min-width:100px){.child{color:red}}' +
+      '@container (min-width:200px){.child{color:blue}}';
+    document.head.appendChild(style6);
+    var cEl = document.createElement('div');
+    cEl.className = 'container';
+    cEl.innerHTML = '<div class="child">test</div>';
+    arena.appendChild(cEl);
+    void cEl.offsetHeight;
+    var color = getComputedStyle(cEl.firstChild).color;
+    arena.removeChild(cEl);
+    document.head.removeChild(style6);
+    res.tests++;
+    res.containerQuery = color;
+  } catch(e){ res.errors++; res.containerQuery = 'error'; }
+
+  // Test 9: @layer rules
+  try {
+    var style7 = document.createElement('style');
+    style7.textContent = '@layer base,override;@layer base{.layer-test{color:red}}@layer override{.layer-test{color:blue}}';
+    document.head.appendChild(style7);
+    var lEl = document.createElement('div');
+    lEl.className = 'layer-test';
+    arena.appendChild(lEl);
+    var lColor = getComputedStyle(lEl).color;
+    arena.removeChild(lEl);
+    document.head.removeChild(style7);
+    res.tests++;
+    res.layer = lColor;
+  } catch(e){ res.errors++; res.layer = 'error'; }
+
+  // Test 10: CSS nesting (if supported)
+  try {
+    var style8 = document.createElement('style');
+    style8.textContent = '.nest-parent{color:red; & .nest-child{color:blue; & .nest-deep{color:green}}}';
+    document.head.appendChild(style8);
+    var nEl = document.createElement('div');
+    nEl.className = 'nest-parent';
+    nEl.innerHTML = '<div class="nest-child"><div class="nest-deep">deep</div></div>';
+    arena.appendChild(nEl);
+    var deepColor = getComputedStyle(nEl.querySelector('.nest-deep')).color;
+    arena.removeChild(nEl);
+    document.head.removeChild(style8);
+    res.tests++;
+    res.nesting = deepColor;
+  } catch(e){ res.errors++; res.nesting = 'error'; }
+
+  var msg = 'tests='+res.tests+'|errors='+res.errors+'|anomalies='+res.anomalies+
+    '|container='+(res.containerQuery||'?')+'|layer='+(res.layer||'?')+'|nesting='+(res.nesting||'?');
+  bn('D-CSSDEEP', msg);
+  lg('[D] CSS deep: '+msg, res.anomalies>0?'warn':'pass');
+  setTimeout(phaseE, 10);
+}
+
+// ======================================================================
+// PHASE E: Memory pressure + GC timing attack
+// Fill memory to trigger GC, then access objects that should survive.
+// If GC collects something it shouldn't, we get UAF.
+// ======================================================================
+function phaseE(){
+  lg('<h2>[E] GC Pressure + Survival Check</h2>');
+  var res = {rounds:0, errors:0, anomalies:0, collected:0, survived:0};
+
+  try {
+    for(var round=0; round<20; round++){
+      // Create target objects we want to survive
+      var targets = [];
+      for(var i=0; i<50; i++){
+        var ab = new ArrayBuffer(1024);
+        var view = new Uint8Array(ab);
+        view[0] = 0xDE; view[1] = 0xAD; view[2] = 0xBE; view[3] = 0xEF;
+        view[1020] = round & 0xFF;
+        targets.push({ab: ab, view: view, marker: 0xDEADBEEF});
+      }
+
+      // Create massive garbage to trigger GC
+      for(var i=0; i<5000; i++){
+        var garbage = new ArrayBuffer(4096);
+        new Uint8Array(garbage)[0] = i & 0xFF;
+      }
+
+      // Force GC by allocation pressure
+      var garbageArrays = [];
+      try {
+        for(var i=0; i<1000; i++){
+          garbageArrays.push(new ArrayBuffer(65536));
+        }
+      } catch(e){} // May OOM — that's fine
+      garbageArrays = null; // Release
+
+      // Check if targets survived
+      for(var i=0; i<targets.length; i++){
+        try {
+          var t = targets[i];
+          if(t.view[0] !== 0xDE || t.view[1] !== 0xAD || t.view[2] !== 0xBE || t.view[3] !== 0xEF){
+            res.anomalies++;
+            anomalies.push('E-gc-corrupt:r'+round+'i'+i+':'+t.view[0]+','+t.view[1]+','+t.view[2]+','+t.view[3]);
+          } else {
+            res.survived++;
+          }
+          if(t.marker !== 0xDEADBEEF){
+            res.anomalies++;
+            anomalies.push('E-gc-marker:r'+round+'i'+i+':'+t.marker);
+          }
+        } catch(e){
+          res.collected++;
+        }
+      }
+
+      targets = null;
+      res.rounds++;
+    }
+  } catch(e){ res.errors++; }
+
+  bn('E-GCPRESS', 'rounds='+res.rounds+'|survived='+res.survived+'|collected='+res.collected+'|anomalies='+res.anomalies);
+  lg('[E] GC pressure: survived='+res.survived+' collected='+res.collected+' anomalies='+res.anomalies, res.anomalies>0?'warn':'pass');
+  setTimeout(phaseFinal, 10);
+}
+
+// ======================================================================
+// FINAL: Summary
+// ======================================================================
+function phaseFinal(){
+  var msg = 'anomalies='+anomalies.length;
+  if(anomalies.length > 0){
+    msg += '|details='+anomalies.join(';').slice(0,1500);
+  }
+  bn('DONE', msg);
+  lg('<h2>COMPLETE</h2>'+
+    (anomalies.length > 0
+      ? '<span class="warn">ANOMALIES: '+anomalies.join(', ')+'</span>'
+      : '<span class="pass">All phases clean</span>'),
+    anomalies.length > 0 ? 'warn' : 'pass');
+}
+</script></body></html>

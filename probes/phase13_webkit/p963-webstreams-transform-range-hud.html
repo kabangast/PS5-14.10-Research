@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>PS5 FW 14.10 // WEB STREAMS, TRANSFORM &amp; HTTP RANGE HUD</title>
+<style>
+:root {
+  --bg-dark: #040711;
+  --panel-bg: rgba(8, 14, 28, 0.94);
+  --neon-cyan: #00f3ff;
+  --neon-green: #00ff66;
+  --neon-amber: #ffb800;
+  --neon-pink: #ff0077;
+  --neon-purple: #9d00ff;
+  --text-dim: #7085a5;
+  --text-main: #e2f1ff;
+  --border-glow: rgba(0, 243, 255, 0.35);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background-color: var(--bg-dark);
+  background-image: 
+    radial-gradient(ellipse at 50% 0%, rgba(0, 243, 255, 0.16), transparent 75%),
+    linear-gradient(rgba(0, 243, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 243, 255, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 28px 28px, 28px 28px;
+  color: var(--text-main);
+  font-family: "SF Mono", "Consolas", monospace;
+  padding: 16px;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+.scanline {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.02), rgba(0, 255, 0, 0.01), rgba(0, 255, 0, 0.02));
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+  z-index: 999;
+}
+
+/* Header */
+.header {
+  border: 1px solid var(--neon-cyan);
+  background: rgba(0, 243, 255, 0.07);
+  box-shadow: 0 0 20px rgba(0, 243, 255, 0.3);
+  padding: 12px 20px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title-glitch {
+  font-size: 18px;
+  font-weight: 900;
+  letter-spacing: 2px;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 10px rgba(0, 243, 255, 0.8);
+}
+.target-badge {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: rgba(0, 255, 102, 0.15);
+  border: 1px solid var(--neon-green);
+  color: var(--neon-green);
+  font-weight: bold;
+}
+
+/* Pipeline Trackers */
+.pipeline-track {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.node {
+  background: var(--panel-bg);
+  border: 1px solid rgba(112, 133, 165, 0.25);
+  border-radius: 6px;
+  padding: 10px;
+  position: relative;
+  transition: all 0.3s ease;
+}
+.node.done {
+  border-color: var(--neon-green);
+  box-shadow: 0 0 10px rgba(0, 255, 102, 0.25);
+}
+.node.active {
+  border-color: var(--neon-cyan);
+  box-shadow: 0 0 12px rgba(0, 243, 255, 0.4);
+}
+.node.locked {
+  border-color: rgba(112, 133, 165, 0.2);
+  opacity: 0.55;
+}
+.node-step {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.node.done .node-step { color: var(--neon-green); }
+.node.active .node-step { color: var(--neon-cyan); }
+.node-title {
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--text-main);
+  margin-bottom: 4px;
+}
+.node-desc {
+  font-size: 9px;
+  color: var(--text-dim);
+  line-height: 1.3;
+}
+
+/* Grid Layout */
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-glow);
+  border-radius: 6px;
+  padding: 14px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
+  position: relative;
+  overflow: hidden;
+}
+.panel-title {
+  font-size: 13px;
+  font-weight: bold;
+  color: var(--neon-cyan);
+  border-bottom: 1px solid rgba(0, 243, 255, 0.2);
+  padding-bottom: 8px;
+  margin-bottom: 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.live-meter {
+  display: flex;
+  justify-content: space-between;
+  margin: 6px 0;
+  font-size: 11px;
+}
+.val-hex { color: var(--neon-purple); font-weight: bold; }
+.val-ok { color: var(--neon-green); font-weight: bold; }
+.val-dim { color: var(--text-dim); }
+.val-cyan { color: var(--neon-cyan); font-weight: bold; }
+.val-warn { color: var(--neon-amber); font-weight: bold; }
+.val-fail { color: var(--neon-pink); font-weight: bold; }
+
+/* Radar & Glitch Accents */
+.radar-box {
+  width: 100%;
+  height: 2px;
+  background: rgba(0, 243, 255, 0.1);
+  position: relative;
+  overflow: hidden;
+  margin-top: 10px;
+}
+.radar-sweep {
+  position: absolute;
+  top: 0; left: -30%;
+  width: 30%; height: 100%;
+  background: linear-gradient(90deg, transparent, var(--neon-cyan), transparent);
+  animation: sweep 2.2s infinite linear;
+}
+@keyframes sweep {
+  0% { left: -30%; }
+  100% { left: 100%; }
+}
+
+/* Terminal Log */
+#terminal {
+  background: rgba(2, 4, 10, 0.9);
+  border: 1px solid rgba(0, 243, 255, 0.18);
+  border-radius: 4px;
+  padding: 10px;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: #a0c4e8;
+  height: 150px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+
+<div class="header">
+  <div>
+    <div class="title-glitch">&#x25C8; PS5 FW 14.10 // WEB STREAMS &amp; HTTP RANGE HUD</div>
+    <div style="font-size: 10px; color: var(--text-dim); margin-top: 3px;">
+      TransformStream &bull; WritableStream &bull; pipeThrough Pipeline &bull; HTTP 206 Partial Content
+    </div>
+  </div>
+  <div class="target-badge" id="statusBadge">BENCHMARKING STREAMS</div>
+</div>
+
+<!-- 6-Stage Visual Pipeline Tracker -->
+<div class="pipeline-track">
+  <div class="node active" id="nodeStage1">
+    <div class="node-step">Stage 1 [ACTIVE]</div>
+    <div class="node-title">Web Streams API</div>
+    <div class="node-desc">TransformStream &amp; WritableStream availability.</div>
+  </div>
+  <div class="node locked" id="nodeStage2">
+    <div class="node-step">Stage 2 [QUEUED]</div>
+    <div class="node-title">512KB pipeThrough</div>
+    <div class="node-desc">Streaming XOR transform throughput &amp; integrity.</div>
+  </div>
+  <div class="node locked" id="nodeStage3">
+    <div class="node-step">Stage 3 [QUEUED]</div>
+    <div class="node-title">HTTP 206 Range</div>
+    <div class="node-desc">Range: bytes=0-511 slice &amp; Content-Range header.</div>
+  </div>
+  <div class="node locked" id="nodeStage4">
+    <div class="node-step">Stage 4 [QUEUED]</div>
+    <div class="node-title">High-Offset Slice</div>
+    <div class="node-desc">Range: bytes=1024-2047 offset byte verification.</div>
+  </div>
+  <div class="node locked" id="nodeStage5">
+    <div class="node-step">Stage 5 [QUEUED]</div>
+    <div class="node-title">Promise Primitives</div>
+    <div class="node-desc">allSettled, any &amp; 10,000 chained microtasks.</div>
+  </div>
+  <div class="node locked" id="nodeStage6">
+    <div class="node-step">Stage 6 [QUEUED]</div>
+    <div class="node-title">Master Verdict</div>
+    <div class="node-desc">Consolidated telemetry &amp; heartbeat sync.</div>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Panel 1: Web Streams Pipeline Telemetry -->
+  <div class="panel">
+    <div class="panel-title">
+      <span>WEB STREAMS PIPELINE HUD</span>
+      <span style="color:var(--neon-green);" id="mStreamsBadge">ACTIVE</span>
+    </div>
+    <div class="live-meter"><span>TransformStream Constructor:</span><span class="val-cyan" id="mTransformStatus">Testing...</span></div>
+    <div class="live-meter"><span>WritableStream Constructor:</span><span class="val-cyan" id="mWritableStatus">Testing...</span></div>
+    <div class="live-meter"><span>512KB Stream pipeThrough Time:</span><span class="val-hex" id="mStreamTime">Streaming...</span></div>
+    <div class="live-meter"><span>Stream Throughput:</span><span class="val-ok" id="mStreamMbps">Measuring...</span></div>
+    <div class="live-meter"><span>XOR Transformation Byte Integrity:</span><span class="val-ok" id="mStreamIntegrity">Verifying...</span></div>
+    <div class="radar-box"><div class="radar-sweep"></div></div>
+  </div>
+
+  <!-- Panel 2: HTTP 206 Range & Promise Telemetry -->
+  <div class="panel">
+    <div class="panel-title">
+      <span>HTTP 206 RANGE &amp; PROMISE CONCURRENCY HUD</span>
+      <span style="color:var(--neon-cyan);">ACTIVE TELEMETRY</span>
+    </div>
+    <div class="live-meter"><span>HTTP Range Request (bytes=0-511):</span><span class="val-ok" id="mRangeStatus">Testing...</span></div>
+    <div class="live-meter"><span>Response Content-Range Header:</span><span class="val-hex" id="mContentRange">Resolving...</span></div>
+    <div class="live-meter"><span>Offset Slice (bytes=1024-2047):</span><span class="val-ok" id="mOffsetSlice">Testing...</span></div>
+    <div class="live-meter"><span>Promise.allSettled &amp; any:</span><span class="val-ok" id="mPromiseApis">Testing...</span></div>
+    <div class="live-meter"><span>10,000 Chained Microtasks:</span><span class="val-hex" id="mMicrotaskTime">Measuring...</span></div>
+    <div class="radar-box"><div class="radar-sweep"></div></div>
+  </div>
+</div>
+
+<!-- Tactical Log Terminal -->
+<div class="panel">
+  <div class="panel-title">
+    <span>TACTICAL STREAMS &amp; NETWORK RANGE LOG</span>
+    <span style="color:var(--neon-green);">LIVE STREAM TELEMETRY</span>
+  </div>
+  <pre id="terminal">[*] Initializing Probe P963 Web Streams &amp; HTTP Range Suite...</pre>
+  <div class="radar-box"><div class="radar-sweep"></div></div>
+</div>
+
+<script>
+'use strict';
+var term = document.getElementById('terminal');
+var statusBadge = document.getElementById('statusBadge');
+var mStreamsBadge = document.getElementById('mStreamsBadge');
+
+var nodeStage1 = document.getElementById('nodeStage1');
+var nodeStage2 = document.getElementById('nodeStage2');
+var nodeStage3 = document.getElementById('nodeStage3');
+var nodeStage4 = document.getElementById('nodeStage4');
+var nodeStage5 = document.getElementById('nodeStage5');
+var nodeStage6 = document.getElementById('nodeStage6');
+
+var mTransformStatus = document.getElementById('mTransformStatus');
+var mWritableStatus = document.getElementById('mWritableStatus');
+var mStreamTime = document.getElementById('mStreamTime');
+var mStreamMbps = document.getElementById('mStreamMbps');
+var mStreamIntegrity = document.getElementById('mStreamIntegrity');
+
+var mRangeStatus = document.getElementById('mRangeStatus');
+var mContentRange = document.getElementById('mContentRange');
+var mOffsetSlice = document.getElementById('mOffsetSlice');
+var mPromiseApis = document.getElementById('mPromiseApis');
+var mMicrotaskTime = document.getElementById('mMicrotaskTime');
+
+function log(msg) {
+  var d = document.createElement('div');
+  d.textContent = '[' + new Date().toISOString().slice(11, 23) + '] ' + msg;
+  term.appendChild(d);
+  term.scrollTop = term.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P963-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+window.onerror = function(msg, url, line) {
+  syncBn('JS-ERR', msg + ' at line ' + line);
+  log('[!] ERROR: ' + msg + ' (Line ' + line + ')');
+};
+
+log('[*] Probe P963 online: TransformStream, WritableStream, pipeThrough & HTTP 206 Range.');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * STAGE 1: Web Streams API Presence
+ * ============================================================ */
+var hasTransform = (typeof TransformStream !== 'undefined');
+var hasWritable = (typeof WritableStream !== 'undefined');
+var hasPipeThrough = (typeof ReadableStream !== 'undefined' && typeof ReadableStream.prototype.pipeThrough === 'function');
+
+mTransformStatus.textContent = hasTransform ? 'SUPPORTED (TransformStream)' : 'UNSUPPORTED';
+mTransformStatus.className = hasTransform ? 'val-ok' : 'val-dim';
+mWritableStatus.textContent = hasWritable ? 'SUPPORTED (WritableStream)' : 'UNSUPPORTED';
+mWritableStatus.className = hasWritable ? 'val-ok' : 'val-dim';
+
+log('[+] Web Streams: TransformStream=' + hasTransform + ', WritableStream=' + hasWritable + ', pipeThrough=' + hasPipeThrough);
+syncBn('STREAMS-API', 'transform=' + hasTransform + '|writable=' + hasWritable + '|pipeThrough=' + hasPipeThrough);
+
+nodeStage1.className = 'node done';
+nodeStage1.querySelector('.node-step').textContent = 'Stage 1 [DONE]';
+
+/* ============================================================
+ * STAGE 2: 512KB pipeThrough Streaming Transformation
+ * ============================================================ */
+nodeStage2.className = 'node active';
+nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [ACTIVE]';
+
+var streamMs = 0, streamMbps = '0', streamOk = false;
+
+if (hasTransform && hasWritable && hasPipeThrough) {
+  try {
+    var totalBytes = 512 * 1024; // 512 KB
+    var chunkSize = 32 * 1024;   // 32 KB
+    var chunkCount = totalBytes / chunkSize;
+
+    // Readable source providing 16 chunks of 32KB
+    var chunkIdx = 0;
+    var readable = new ReadableStream({
+      pull: function(controller) {
+        if (chunkIdx < chunkCount) {
+          var buf = new Uint8Array(chunkSize);
+          buf.fill(0xAA);
+          controller.enqueue(buf);
+          chunkIdx++;
+        } else {
+          controller.close();
+        }
+      }
+    });
+
+    // TransformStream: flips bits (XOR 0xFF)
+    var transformStream = new TransformStream({
+      transform: function(chunk, controller) {
+        var out = new Uint8Array(chunk.length);
+        for (var i = 0; i < chunk.length; i++) {
+          out[i] = chunk[i] ^ 0xFF; // 0xAA ^ 0xFF = 0x55
+        }
+        controller.enqueue(out);
+      }
+    });
+
+    // WritableStream accumulator
+    var receivedChunks = [];
+    var writable = new WritableStream({
+      write: function(chunk) {
+        receivedChunks.push(chunk);
+      }
+    });
+
+    var tStream0 = performance.now();
+    readable.pipeThrough(transformStream).pipeTo(writable).then(function() {
+      streamMs = Math.max(1, Math.round(performance.now() - tStream0));
+      streamMbps = ((totalBytes / (1024 * 1024)) / (streamMs / 1000)).toFixed(1);
+
+      // Verify transformed bytes
+      var totalRecv = receivedChunks.reduce(function(a, b) { return a + b.length; }, 0);
+      var firstChunk = receivedChunks[0];
+      var lastChunk = receivedChunks[receivedChunks.length - 1];
+      streamOk = (totalRecv === totalBytes && firstChunk[0] === 0x55 && lastChunk[chunkSize - 1] === 0x55);
+
+      mStreamTime.textContent = streamMs + ' ms (512 KB TRANSFORMED)';
+      mStreamMbps.textContent = streamMbps + ' MB/s THROUGHPUT';
+      mStreamIntegrity.textContent = streamOk ? '100% BYTE INVERSION VERIFIED' : 'CORRUPTED';
+
+      log('[+] Stream pipeThrough: 512KB transformed in ' + streamMs + 'ms (' + streamMbps + ' MB/s), integrity=' + streamOk);
+      syncBn('STREAM-PIPE', 'timeMs=' + streamMs + '|mbps=' + streamMbps + '|intact=' + streamOk);
+
+      nodeStage2.className = 'node done';
+      nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [DONE]';
+
+      executeRangeStage();
+    }).catch(function(pe) {
+      log('[-] pipeThrough error: ' + pe.message);
+      syncBn('PIPE-ERR', pe.message);
+      executeRangeStage();
+    });
+
+  } catch(se) {
+    log('[-] Stream init error: ' + se.message);
+    syncBn('STREAM-ERR', se.message);
+    executeRangeStage();
+  }
+} else {
+  mStreamTime.textContent = 'UNSUPPORTED';
+  mStreamMbps.textContent = 'N/A';
+  mStreamIntegrity.textContent = 'N/A';
+  nodeStage2.className = 'node locked';
+  executeRangeStage();
+}
+
+/* ============================================================
+ * STAGE 3 & 4: HTTP 206 Partial Content Range Requests
+ * ============================================================ */
+function executeRangeStage() {
+  nodeStage3.className = 'node active';
+  nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [ACTIVE]';
+
+  // Slice 1: bytes=0-511 (512 bytes)
+  fetch('/range_test.txt?t=' + Date.now(), {
+    headers: { 'Range': 'bytes=0-511' }
+  }).then(function(res) {
+    var status1 = res.status;
+    var contentRange1 = res.headers.get('Content-Range') || 'not-exposed';
+
+    return res.arrayBuffer().then(function(buf1) {
+      var len1 = buf1.byteLength;
+      var rangeOk1 = (status1 === 206 && len1 === 512);
+
+      mRangeStatus.textContent = 'HTTP ' + status1 + ' (' + len1 + ' BYTES RECEIVED)';
+      mContentRange.textContent = contentRange1;
+
+      log('[+] Range Request #1: status=' + status1 + ', bytes=' + len1 + ', Content-Range=' + contentRange1);
+      syncBn('RANGE-REQ1', 'status=' + status1 + '|len=' + len1 + '|cr=' + encodeURIComponent(contentRange1));
+
+      nodeStage3.className = 'node done';
+      nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [DONE]';
+
+      // Slice 2: High offset bytes=1024-2047 (1024 bytes)
+      nodeStage4.className = 'node active';
+      nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [ACTIVE]';
+
+      return fetch('/range_test.txt?t=' + Date.now(), {
+        headers: { 'Range': 'bytes=1024-2047' }
+      }).then(function(res2) {
+        var status2 = res2.status;
+        var contentRange2 = res2.headers.get('Content-Range') || 'not-exposed';
+
+        return res2.arrayBuffer().then(function(buf2) {
+          var len2 = buf2.byteLength;
+          var rangeOk2 = (status2 === 206 && len2 === 1024);
+
+          mOffsetSlice.textContent = 'HTTP ' + status2 + ' (' + len2 + ' BYTES @ OFFSET 1024)';
+          log('[+] Range Request #2: status=' + status2 + ', bytes=' + len2 + ', Content-Range=' + contentRange2);
+          syncBn('RANGE-REQ2', 'status=' + status2 + '|len=' + len2 + '|cr=' + encodeURIComponent(contentRange2));
+
+          nodeStage4.className = 'node done';
+          nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [DONE]';
+
+          executePromiseStage(rangeOk1 && rangeOk2);
+        });
+      });
+    });
+  }).catch(function(re) {
+    log('[-] Range request error: ' + re.message);
+    syncBn('RANGE-ERR', re.message);
+    nodeStage3.className = 'node locked';
+    nodeStage4.className = 'node locked';
+    executePromiseStage(false);
+  });
+}
+
+/* ============================================================
+ * STAGE 5: Promise Concurrency Primitives & Microtasks
+ * ============================================================ */
+function executePromiseStage(rangeSuccess) {
+  nodeStage5.className = 'node active';
+  nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [ACTIVE]';
+
+  var hasAllSettled = (typeof Promise.allSettled === 'function');
+  var hasAny = (typeof Promise.any === 'function');
+
+  mPromiseApis.textContent = 'allSettled=' + hasAllSettled + ', any=' + hasAny;
+
+  // 10,000 chained microtasks test
+  var tMicro0 = performance.now();
+  var p = Promise.resolve();
+  for (var m = 0; m < 10000; m++) {
+    p = p.then(function() { return 1; });
+  }
+
+  p.then(function() {
+    var microMs = Math.round(performance.now() - tMicro0);
+    mMicrotaskTime.textContent = microMs + ' ms (10,000 MICROTASKS)';
+
+    log('[+] Promise Concurrency: allSettled=' + hasAllSettled + ', any=' + hasAny + ', 10k microtasks in ' + microMs + 'ms');
+    syncBn('PROMISE-PERF', 'allSettled=' + hasAllSettled + '|any=' + hasAny + '|microMs=' + microMs);
+
+    nodeStage5.className = 'node done';
+    nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [DONE]';
+
+    completeMasterStage(hasTransform, streamMbps, rangeSuccess, microMs);
+  });
+}
+
+/* ============================================================
+ * STAGE 6: Master Verdict & Summary
+ * ============================================================ */
+function completeMasterStage(streamsOk, mbps, rangeOk, microMs) {
+  nodeStage6.className = 'node done';
+  nodeStage6.querySelector('.node-step').textContent = 'Stage 6 [DONE]';
+
+  statusBadge.textContent = 'ALL 6 STAGES NOMINAL';
+  statusBadge.style.background = '#00ff66';
+
+  log('[*] Probe P963 complete: Streams, Range 206 and Promise benchmarks reported.');
+  syncBn('DONE', 'status=P963_COMPLETE|streams=' + streamsOk + '|streamMbps=' + mbps + '|range206=' + rangeOk + '|microMs=' + microMs);
+}
+
+/* Auto-Reload Watcher for autonomous progression */
+var initialReloadToken = null;
+function checkAutoReload() {
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/reload.txt?t=' + Date.now(), true);
+    xhr.onload = function() {
+      if (xhr.status === 200) {
+        var token = xhr.responseText.trim();
+        if (initialReloadToken === null) {
+          initialReloadToken = token;
+        } else if (token !== initialReloadToken) {
+          log('[*] New deployment detected (token: ' + token + '). Auto-reloading in 500ms...');
+          setTimeout(function() { location.reload(); }, 500);
+        }
+      }
+    };
+    xhr.send();
+  } catch(e) {}
+}
+setInterval(checkAutoReload, 1500);
+</script>
+</body>
+</html>

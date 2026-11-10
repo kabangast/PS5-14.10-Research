@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P1061</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#22c55e}.fail{color:#ef4444}.warn{color:#f59e0b}.info{color:#38bdf8}
+</style></head><body>
+<div id="hud"><div id="log"></div></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1061-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+var L=document.getElementById('log');
+function log(m,c){var d=document.createElement('div');if(c)d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+
+bn('BOOT','ts='+Date.now().toString(36));
+log('=== P1061: MSE MP4 Parser Fuzz ===','info');
+
+var totalAnomalies=0;
+var anomalyItems=[];
+var results=[];
+
+// Helper: create minimal valid-looking ftyp box
+function mkFtyp(){
+  // ftyp box: [size:4][type:4('ftyp')][major:4][minor:4][compatible:4*n]
+  var data=new Uint8Array(20);
+  var dv=new DataView(data.buffer);
+  dv.setUint32(0,20); // size
+  data[4]=0x66;data[5]=0x74;data[6]=0x79;data[7]=0x70; // 'ftyp'
+  data[8]=0x69;data[9]=0x73;data[10]=0x6F;data[11]=0x6D; // 'isom'
+  dv.setUint32(12,0x200); // minor version
+  data[16]=0x69;data[17]=0x73;data[18]=0x6F;data[19]=0x6D; // 'isom' compat
+  return data;
+}
+
+// Helper: create an MP4 box with given type and payload
+function mkBox(type,payload){
+  var typeBytes=[];
+  for(var i=0;i<4;i++) typeBytes.push(type.charCodeAt(i));
+  var size=8+(payload?payload.length:0);
+  var data=new Uint8Array(size);
+  var dv=new DataView(data.buffer);
+  dv.setUint32(0,size);
+  data[4]=typeBytes[0];data[5]=typeBytes[1];data[6]=typeBytes[2];data[7]=typeBytes[3];
+  if(payload){
+    for(var i=0;i<payload.length;i++) data[8+i]=payload[i];
+  }
+  return data;
+}
+
+// Helper: create minimal moov with track
+function mkMoov(){
+  // mvhd box (simplified, 108 bytes version 0)
+  var mvhd=new Uint8Array(108);
+  var mv=new DataView(mvhd.buffer);
+  mv.setUint32(0,108);
+  mvhd[4]=0x6D;mvhd[5]=0x76;mvhd[6]=0x68;mvhd[7]=0x64; // 'mvhd'
+  mv.setUint32(12,90000); // timescale
+  mv.setUint32(16,90000); // duration (1 sec)
+  mv.setUint32(20,0x00010000); // rate 1.0
+  mv.setUint16(24,0x0100); // volume 1.0
+
+  // trak > tkhd
+  var tkhd=new Uint8Array(92);
+  var tk=new DataView(tkhd.buffer);
+  tk.setUint32(0,92);
+  tkhd[4]=0x74;tkhd[5]=0x6B;tkhd[6]=0x68;tkhd[7]=0x64; // 'tkhd'
+  tk.setUint32(8,3); // flags: track_enabled | track_in_movie
+  tk.setUint32(20,1); // track_ID
+  tk.setUint32(28,90000); // duration
+  tk.setUint32(76,0x01400000); // width 320
+  tk.setUint32(80,0x00F00000); // height 240
+
+  // mdia > mdhd
+  var mdhd=new Uint8Array(32);
+  var md=new DataView(mdhd.buffer);
+  md.setUint32(0,32);
+  mdhd[4]=0x6D;mdhd[5]=0x64;mdhd[6]=0x68;mdhd[7]=0x64; // 'mdhd'
+  md.setUint32(12,90000); // timescale
+  md.setUint32(16,90000); // duration
+
+  // hdlr
+  var hdlr=new Uint8Array(33);
+  var hd=new DataView(hdlr.buffer);
+  hd.setUint32(0,33);
+  hdlr[4]=0x68;hdlr[5]=0x64;hdlr[6]=0x6C;hdlr[7]=0x72; // 'hdlr'
+  hdlr[16]=0x76;hdlr[17]=0x69;hdlr[18]=0x64;hdlr[19]=0x65; // 'vide'
+
+  // stbl with stsd containing avc1
+  // Minimal avc1 sample entry
+  var avc1=new Uint8Array(86);
+  var av=new DataView(avc1.buffer);
+  av.setUint32(0,86);
+  avc1[4]=0x61;avc1[5]=0x76;avc1[6]=0x63;avc1[7]=0x31; // 'avc1'
+  av.setUint16(14,1); // data_ref_index
+  av.setUint16(32,320); // width
+  av.setUint16(34,240); // height
+  av.setUint32(36,0x00480000); // horiz resolution
+  av.setUint32(40,0x00480000); // vert resolution
+  av.setUint16(48,1); // frame count
+  av.setUint16(82,0x0018); // depth
+
+  // avcC (AVCDecoderConfigurationRecord)
+  var avcC=new Uint8Array(19);
+  var ac=new DataView(avcC.buffer);
+  ac.setUint32(0,19);
+  avcC[4]=0x61;avcC[5]=0x76;avcC[6]=0x63;avcC[7]=0x43; // 'avcC'
+  avcC[8]=1; // configurationVersion
+  avcC[9]=0x42; // profile (Baseline)
+  avcC[10]=0xE0; // profile compat
+  avcC[11]=0x1E; // level 3.0
+  avcC[12]=0xFF; // NAL unit length size minus 1 = 3
+  avcC[13]=0xE1; // numSPS = 1
+  ac.setUint16(14,3); // SPS length
+  avcC[16]=0x67;avcC[17]=0x42;avcC[18]=0xE0; // minimal SPS bytes
+
+  var stsd=mkBox('stsd',concat([new Uint8Array([0,0,0,0,0,0,0,1]),avc1]));
+  var stts=mkBox('stts',new Uint8Array([0,0,0,0,0,0,0,0]));
+  var stsc=mkBox('stsc',new Uint8Array([0,0,0,0,0,0,0,0]));
+  var stsz=mkBox('stsz',new Uint8Array([0,0,0,0,0,0,0,0,0,0,0,0]));
+  var stco=mkBox('stco',new Uint8Array([0,0,0,0,0,0,0,0]));
+
+  var stbl=mkBox('stbl',concat([stsd,stts,stsc,stsz,stco]));
+  var minf=mkBox('minf',stbl);
+  var mdia=mkBox('mdia',concat([mdhd,hdlr,minf]));
+  var trak=mkBox('trak',concat([tkhd,mdia]));
+  var moov=mkBox('moov',concat([mvhd,trak]));
+  return moov;
+}
+
+function concat(arrays){
+  var total=0;
+  for(var i=0;i<arrays.length;i++) total+=arrays[i].length;
+  var result=new Uint8Array(total);
+  var offset=0;
+  for(var i=0;i<arrays.length;i++){
+    result.set(arrays[i],offset);
+    offset+=arrays[i].length;
+  }
+  return result;
+}
+
+// ============================================================
+// Test runner: append data to SourceBuffer and report
+// ============================================================
+function testAppend(label,data,codec){
+  return new Promise(function(resolve){
+    var info={label:label,size:data.length};
+    try{
+      var ms=new MediaSource();
+      var video=document.createElement('video');
+      video.src=URL.createObjectURL(ms);
+
+      ms.addEventListener('sourceopen',function(){
+        try{
+          var sb=ms.addSourceBuffer(codec||'video/mp4; codecs="avc1.42E01E"');
+          sb.addEventListener('updateend',function(){
+            info.result='OK';
+            info.buffered=sb.buffered.length>0?sb.buffered.start(0)+'-'+sb.buffered.end(0):'empty';
+            try{ms.endOfStream();}catch(e){}
+            URL.revokeObjectURL(video.src);
+            resolve(info);
+          });
+          sb.addEventListener('error',function(e){
+            info.result='SB-ERROR';
+            try{ms.endOfStream();}catch(e2){}
+            URL.revokeObjectURL(video.src);
+            resolve(info);
+          });
+          sb.appendBuffer(data);
+        }catch(e){
+          info.result='CATCH:'+e.name;
+          URL.revokeObjectURL(video.src);
+          resolve(info);
+        }
+      });
+
+      ms.addEventListener('error',function(){
+        info.result='MS-ERROR';
+        URL.revokeObjectURL(video.src);
+        resolve(info);
+      });
+
+      setTimeout(function(){
+        if(!info.result){info.result='TIMEOUT';resolve(info);}
+      },3000);
+    }catch(e){
+      info.result='ERR:'+e.name;
+      resolve(info);
+    }
+  });
+}
+
+// ============================================================
+// PHASE A: Valid-ish MP4 init segments
+// ============================================================
+function phaseA(){
+  log('--- Phase A: MP4 Init Segment Parsing ---','info');
+  var tests=[];
+
+  // A1: Minimal ftyp + moov
+  var initSeg=concat([mkFtyp(),mkMoov()]);
+  tests.push(testAppend('A1-init',initSeg));
+
+  // A2: Just ftyp
+  tests.push(testAppend('A2-ftyp-only',mkFtyp()));
+
+  // A3: Zero-length ftyp box
+  var zeroFtyp=new Uint8Array([0,0,0,0,0x66,0x74,0x79,0x70]);
+  tests.push(testAppend('A3-zero-ftyp',zeroFtyp));
+
+  // A4: Box with size=1 (64-bit extended size, but truncated)
+  var extBox=new Uint8Array(16);
+  var ev=new DataView(extBox.buffer);
+  ev.setUint32(0,1); // size=1 means 64-bit extended
+  extBox[4]=0x66;extBox[5]=0x74;extBox[6]=0x79;extBox[7]=0x70; // 'ftyp'
+  ev.setUint32(8,0); // extended size hi
+  ev.setUint32(12,0x100); // extended size lo (claims 256 bytes, only 16 provided)
+  tests.push(testAppend('A4-ext-trunc',extBox));
+
+  // A5: Box with size > actual data
+  var overBox=new Uint8Array(20);
+  var ov=new DataView(overBox.buffer);
+  ov.setUint32(0,0xFFFFFFFF); // huge size
+  overBox[4]=0x66;overBox[5]=0x74;overBox[6]=0x79;overBox[7]=0x70; // 'ftyp'
+  tests.push(testAppend('A5-huge-size',overBox));
+
+  // A6: Nested boxes with wrong sizes
+  var nestedBad=new Uint8Array(32);
+  var nb=new DataView(nestedBad.buffer);
+  nb.setUint32(0,32);
+  nestedBad[4]=0x6D;nestedBad[5]=0x6F;nestedBad[6]=0x6F;nestedBad[7]=0x76; // 'moov'
+  // Inner box claims size extending past parent
+  nb.setUint32(8,100); // inner size = 100, parent only has 24 bytes left
+  nestedBad[12]=0x6D;nestedBad[13]=0x76;nestedBad[14]=0x68;nestedBad[15]=0x64; // 'mvhd'
+
+  tests.push(testAppend('A6-nested-overflow',nestedBad));
+
+  return Promise.all(tests).then(function(results){
+    var summary=results.map(function(r){return r.label+'='+r.result;}).join('|');
+    log('Phase A: '+summary,'info');
+    bn('A-INIT',summary);
+  });
+}
+
+// ============================================================
+// PHASE B: Malformed MP4 atom fuzzing
+// ============================================================
+function phaseB(){
+  log('');log('--- Phase B: Malformed Atoms ---','info');
+  var tests=[];
+
+  // B1: Deeply nested boxes (50 levels)
+  try{
+    var inner=new Uint8Array(8);
+    inner[4]=0x66;inner[5]=0x72;inner[6]=0x65;inner[7]=0x65; // 'free'
+    new DataView(inner.buffer).setUint32(0,8);
+    for(var i=0;i<50;i++){
+      var outer=new Uint8Array(8+inner.length);
+      var dv2=new DataView(outer.buffer);
+      dv2.setUint32(0,8+inner.length);
+      outer[4]=0x6D;outer[5]=0x6F;outer[6]=0x6F;outer[7]=0x76; // 'moov'
+      outer.set(inner,8);
+      inner=outer;
+    }
+    tests.push(testAppend('B1-deep50',inner));
+  }catch(e){results.push('B1-err='+e.name);}
+
+  // B2: Unknown box types
+  var unknownBoxes=['AAAA','ZZZZ','0000','\xFF\xFF\xFF\xFF'];
+  for(var i=0;i<unknownBoxes.length;i++){
+    var ub=new Uint8Array(12);
+    new DataView(ub.buffer).setUint32(0,12);
+    for(var j=0;j<4;j++) ub[4+j]=unknownBoxes[i].charCodeAt(j)&0xFF;
+    ub[8]=0xDE;ub[9]=0xAD;ub[10]=0xBE;ub[11]=0xEF;
+    tests.push(testAppend('B2-unk'+i,ub));
+  }
+
+  // B3: stsd with entry_count=0xFFFFFFFF
+  try{
+    var bigStsd=new Uint8Array(16);
+    var bs=new DataView(bigStsd.buffer);
+    bs.setUint32(0,16);
+    bigStsd[4]=0x73;bigStsd[5]=0x74;bigStsd[6]=0x73;bigStsd[7]=0x64; // 'stsd'
+    bs.setUint32(8,0); // version + flags
+    bs.setUint32(12,0xFFFFFFFF); // entry_count = max
+    tests.push(testAppend('B3-stsd-max',concat([mkFtyp(),mkBox('moov',mkBox('trak',mkBox('mdia',mkBox('minf',mkBox('stbl',bigStsd)))))])));
+  }catch(e){}
+
+  // B4: Fragmented MP4 (moof+mdat) without init
+  try{
+    // mfhd
+    var mfhd=new Uint8Array(16);
+    new DataView(mfhd.buffer).setUint32(0,16);
+    mfhd[4]=0x6D;mfhd[5]=0x66;mfhd[6]=0x68;mfhd[7]=0x64; // 'mfhd'
+    new DataView(mfhd.buffer).setUint32(12,1); // sequence_number
+
+    // tfhd
+    var tfhd=new Uint8Array(16);
+    new DataView(tfhd.buffer).setUint32(0,16);
+    tfhd[4]=0x74;tfhd[5]=0x66;tfhd[6]=0x68;tfhd[7]=0x64; // 'tfhd'
+    new DataView(tfhd.buffer).setUint32(12,1); // track_ID
+
+    var traf=mkBox('traf',tfhd);
+    var moof=mkBox('moof',concat([mfhd,traf]));
+    var mdat=mkBox('mdat',new Uint8Array(64));
+    tests.push(testAppend('B4-frag-noinit',concat([moof,mdat])));
+  }catch(e){}
+
+  // B5: mdat with huge claimed size
+  try{
+    var hugeMdat=new Uint8Array(16);
+    var hm=new DataView(hugeMdat.buffer);
+    hm.setUint32(0,1); // extended size marker
+    hugeMdat[4]=0x6D;hugeMdat[5]=0x64;hugeMdat[6]=0x61;hugeMdat[7]=0x74; // 'mdat'
+    hm.setUint32(8,0x7FFFFFFF); // hi
+    hm.setUint32(12,0xFFFFFFFF); // lo (claims ~2^63 bytes)
+    tests.push(testAppend('B5-mdat-huge',hugeMdat));
+  }catch(e){}
+
+  return Promise.all(tests).then(function(r){
+    var summary=r.map(function(x){return x.label+'='+x.result;}).join('|');
+    log('Phase B: '+summary.slice(0,200),'info');
+    bn('B-MALFORM',summary);
+  });
+}
+
+// ============================================================
+// PHASE C: SourceBuffer abuse patterns
+// ============================================================
+function phaseC(){
+  log('');log('--- Phase C: SourceBuffer Abuse ---','info');
+  return new Promise(function(resolve){
+    var details=[];
+
+    try{
+      var ms=new MediaSource();
+      var video=document.createElement('video');
+      video.src=URL.createObjectURL(ms);
+
+      ms.addEventListener('sourceopen',function(){
+        try{
+          var sb=ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+
+          // C1: appendBuffer while updating
+          var initSeg=concat([mkFtyp(),mkMoov()]);
+          sb.appendBuffer(initSeg);
+          details.push('C1-firstAppend=updating:'+sb.updating);
+
+          // Try to append while first is still updating
+          try{
+            sb.appendBuffer(new Uint8Array(64));
+            details.push('C1-secondAppend=ACCEPTED');
+            totalAnomalies++;
+            anomalyItems.push('C1-double-append');
+          }catch(e){
+            details.push('C1-secondAppend='+e.name);
+          }
+
+          sb.addEventListener('updateend',function onFirst(){
+            sb.removeEventListener('updateend',onFirst);
+
+            // C2: Remove with invalid ranges
+            try{
+              sb.remove(-1,0);
+              details.push('C2-negStart=ACCEPTED');
+            }catch(e){
+              details.push('C2-negStart='+e.name);
+            }
+
+            try{
+              sb.remove(0,-1);
+              details.push('C2-negEnd=ACCEPTED');
+            }catch(e){
+              details.push('C2-negEnd='+e.name);
+            }
+
+            try{
+              sb.remove(100,50); // end < start
+              details.push('C2-endLtStart=ACCEPTED');
+            }catch(e){
+              details.push('C2-endLtStart='+e.name);
+            }
+
+            try{
+              sb.remove(0,Infinity);
+              details.push('C2-infinity=ACCEPTED');
+              sb.addEventListener('updateend',function onRemove(){
+                sb.removeEventListener('updateend',onRemove);
+                finishC();
+              });
+            }catch(e){
+              details.push('C2-infinity='+e.name);
+              finishC();
+            }
+
+            // C3: changeType
+            try{
+              sb.changeType('video/webm; codecs="vp9"');
+              details.push('C3-changeType=OK');
+            }catch(e){
+              details.push('C3-changeType='+e.name);
+            }
+
+            // C4: abort during update
+            try{
+              sb.appendBuffer(new Uint8Array(128));
+              if(sb.updating){
+                sb.abort();
+                details.push('C4-abortDuringUpdate=OK');
+              }else{
+                details.push('C4-notUpdating');
+              }
+            }catch(e){
+              details.push('C4-abort='+e.name);
+            }
+          });
+        }catch(e){
+          details.push('C-err='+e.name);
+          finishC();
+        }
+      });
+
+      var cDone=false;
+      function finishC(){
+        if(cDone)return;cDone=true;
+        log('Phase C: '+details.slice(0,5).join(' | '),'info');
+        bn('C-ABUSE',details.join('|'));
+        URL.revokeObjectURL(video.src);
+        resolve();
+      }
+      setTimeout(finishC,5000);
+    }catch(e){
+      details.push('C-fatal='+e.name);
+      log('Phase C: '+details[0],'fail');
+      bn('C-ABUSE','fatal:'+e.name);
+      resolve();
+    }
+  });
+}
+
+// ============================================================
+// PHASE D: WebM container fuzzing
+// ============================================================
+function phaseD(){
+  log('');log('--- Phase D: WebM Container Fuzz ---','info');
+  var tests=[];
+
+  // D1: Minimal EBML header
+  var ebml=new Uint8Array([
+    0x1A,0x45,0xDF,0xA3, // EBML element ID
+    0x93, // size = 19 bytes
+    0x42,0x86,0x81,0x01, // EBMLVersion = 1
+    0x42,0xF7,0x81,0x01, // EBMLReadVersion = 1
+    0x42,0xF2,0x81,0x04, // EBMLMaxIDLength = 4
+    0x42,0xF3,0x81,0x08, // EBMLMaxSizeLength = 8
+    0x42,0x82,0x84,0x77,0x65,0x62,0x6D // DocType = "webm"
+  ]);
+  tests.push(testAppend('D1-ebml',ebml,'video/webm; codecs="vp9"'));
+
+  // D2: EBML with invalid version
+  var ebmlBad=new Uint8Array(ebml);
+  ebmlBad[8]=0xFF; // EBMLVersion = 255
+  tests.push(testAppend('D2-badver',ebmlBad,'video/webm; codecs="vp9"'));
+
+  // D3: WebM segment with no tracks
+  var segHdr=new Uint8Array([
+    0x18,0x53,0x80,0x67, // Segment element ID
+    0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00 // size = unknown
+  ]);
+  tests.push(testAppend('D3-nosegment',concat([ebml,segHdr]),'video/webm; codecs="vp9"'));
+
+  // D4: Cluster without init
+  var cluster=new Uint8Array([
+    0x1F,0x43,0xB6,0x75, // Cluster element ID
+    0x88, // size = 8
+    0xE7,0x81,0x00, // Timestamp = 0
+    0xA3,0x83,0x81,0x00,0x00 // SimpleBlock: track 1, timestamp 0, no data
+  ]);
+  tests.push(testAppend('D4-cluster-raw',cluster,'video/webm; codecs="vp9"'));
+
+  // D5: Element with size 0x01FFFFFFFFFFFFFF (max VINT)
+  var hugeEl=new Uint8Array([
+    0x18,0x53,0x80,0x67, // Segment
+    0x01,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF // max size
+  ]);
+  tests.push(testAppend('D5-maxsize',concat([ebml,hugeEl]),'video/webm; codecs="vp9"'));
+
+  return Promise.all(tests).then(function(r){
+    var summary=r.map(function(x){return x.label+'='+x.result;}).join('|');
+    log('Phase D: '+summary,'info');
+    bn('D-WEBM',summary);
+  });
+}
+
+// ============================================================
+// Run
+// ============================================================
+setTimeout(function(){
+  phaseA().then(function(){
+    return phaseB();
+  }).then(function(){
+    return phaseC();
+  }).then(function(){
+    return phaseD();
+  }).then(function(){
+    log('');
+    log('=== P1061 COMPLETE: anomalies='+totalAnomalies+' ===',totalAnomalies>0?'fail':'ok');
+    if(anomalyItems.length>0) log('Items: '+anomalyItems.join(', '),'warn');
+    bn('DONE','anomalies='+totalAnomalies+'|items='+anomalyItems.join(';'));
+  }).catch(function(e){
+    log('FATAL: '+e.message,'fail');
+    bn('FATAL',e.message);
+  });
+},200);
+</script></body></html>

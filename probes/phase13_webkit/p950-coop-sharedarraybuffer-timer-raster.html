@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>PS5 FW 14.10 // COOP ISOLATION, SAB & RASTER PROFILER</title>
+<style>
+:root {
+  --bg-dark: #040711;
+  --panel-bg: rgba(8, 14, 28, 0.94);
+  --neon-cyan: #00f3ff;
+  --neon-green: #00ff66;
+  --neon-amber: #ffb800;
+  --neon-pink: #ff0077;
+  --neon-purple: #9d00ff;
+  --text-dim: #7085a5;
+  --text-main: #e2f1ff;
+  --border-glow: rgba(0, 243, 255, 0.35);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background-color: var(--bg-dark);
+  background-image: 
+    radial-gradient(ellipse at 50% 0%, rgba(0, 243, 255, 0.16), transparent 75%),
+    linear-gradient(rgba(0, 243, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 243, 255, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 28px 28px, 28px 28px;
+  color: var(--text-main);
+  font-family: "SF Mono", "Consolas", monospace;
+  padding: 16px;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+.scanline {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.02), rgba(0, 255, 0, 0.01), rgba(0, 255, 0, 0.02));
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+  z-index: 999;
+}
+
+/* Header */
+.header {
+  border: 1px solid var(--neon-cyan);
+  background: rgba(0, 243, 255, 0.07);
+  box-shadow: 0 0 20px rgba(0, 243, 255, 0.3);
+  padding: 12px 20px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title-glitch {
+  font-size: 18px;
+  font-weight: 900;
+  letter-spacing: 2px;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 12px rgba(0, 243, 255, 0.8), 0 0 24px rgba(0, 243, 255, 0.4);
+}
+.cyber-badge {
+  background: var(--neon-amber);
+  color: #040711;
+  font-weight: bold;
+  padding: 5px 14px;
+  border-radius: 3px;
+  font-size: 12px;
+  letter-spacing: 1px;
+  box-shadow: 0 0 12px rgba(255, 184, 0, 0.4);
+}
+
+/* 4-Stage Test Progression Bar */
+.chain-container {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+.node {
+  flex: 1;
+  min-width: 130px;
+  background: var(--panel-bg);
+  border: 1px solid #1c2d42;
+  border-radius: 4px;
+  padding: 8px 10px;
+  position: relative;
+  transition: all 0.3s;
+}
+.node.done {
+  border-color: var(--neon-green);
+  background: rgba(0, 255, 102, 0.08);
+  box-shadow: 0 0 10px rgba(0, 255, 102, 0.2);
+}
+.node.active {
+  border-color: var(--neon-amber);
+  background: rgba(255, 184, 0, 0.12);
+  box-shadow: 0 0 16px rgba(255, 184, 0, 0.35);
+  animation: pulse 1.5s infinite;
+}
+.node.future {
+  border-color: #24354a;
+  color: #4b627d;
+}
+@keyframes pulse {
+  0% { box-shadow: 0 0 6px rgba(255,184,0,0.3); }
+  50% { box-shadow: 0 0 20px rgba(255,184,0,0.7); }
+  100% { box-shadow: 0 0 6px rgba(255,184,0,0.3); }
+}
+.node-step { font-size: 10px; text-transform: uppercase; font-weight: bold; }
+.node-title { font-size: 12px; font-weight: bold; margin: 3px 0; color: #fff; }
+.node-desc { font-size: 10px; opacity: 0.85; }
+
+/* Grid Dashboard */
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-glow);
+  border-radius: 6px;
+  padding: 14px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+.panel-title {
+  color: var(--neon-cyan);
+  font-size: 13px;
+  font-weight: bold;
+  border-bottom: 1px dashed rgba(0, 243, 255, 0.3);
+  padding-bottom: 6px;
+  margin-bottom: 10px;
+  display: flex;
+  justify-content: space-between;
+}
+pre#terminal {
+  background: #020409;
+  border: 1px solid #162436;
+  padding: 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: #7ee787;
+  max-height: 220px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 0;
+}
+.live-meter {
+  display: flex;
+  justify-content: space-between;
+  margin: 6px 0;
+  font-size: 12px;
+}
+.val-hex { color: var(--neon-amber); font-weight: bold; font-family: monospace; }
+.val-ok { color: var(--neon-green); font-weight: bold; }
+.val-cyan { color: var(--neon-cyan); font-weight: bold; }
+.val-dim { color: var(--text-dim); }
+
+.radar-box {
+  position: relative;
+  width: 100%; height: 3px;
+  background: rgba(0, 243, 255, 0.1);
+  overflow: hidden;
+  margin-top: 10px;
+  border-radius: 2px;
+}
+.radar-sweep {
+  position: absolute;
+  top: 0; left: -30%; width: 30%; height: 100%;
+  background: linear-gradient(90deg, transparent, var(--neon-cyan), transparent);
+  animation: sweep 2s infinite linear;
+}
+@keyframes sweep { 0% { left: -30%; } 100% { left: 100%; } }
+
+canvas#benchCanvas {
+  width: 100%;
+  height: 60px;
+  background: #000;
+  border: 1px solid #162436;
+  border-radius: 4px;
+  margin-top: 6px;
+}
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+
+<div class="header">
+  <div class="title-glitch">&#9889; PS5 FW 14.10 // COOP ISOLATION, SAB &amp; RASTER ORACLE</div>
+  <div class="cyber-badge" id="statusBadge">BENCHMARKING ISOLATION &amp; SAB</div>
+</div>
+
+<!-- 4-Stage Test Nodes -->
+<div class="chain-container">
+  <div class="node active" id="nodeStage1">
+    <div class="node-step">Stage 1 [ACTIVE]</div>
+    <div class="node-title">COOP Isolation</div>
+    <div class="node-desc">Cross-Origin-Opener-Policy &amp; window.crossOriginIsolated status.</div>
+  </div>
+  <div class="node future" id="nodeStage2">
+    <div class="node-step">Stage 2 [PENDING]</div>
+    <div class="node-title">SharedArrayBuffer</div>
+    <div class="node-desc">SAB constructor, allocation, and cross-thread Atomics.wait/notify.</div>
+  </div>
+  <div class="node future" id="nodeStage3">
+    <div class="node-step">Stage 3 [PENDING]</div>
+    <div class="node-title">Timer Resolution</div>
+    <div class="node-desc">performance.now() microsecond quantization delta audit.</div>
+  </div>
+  <div class="node future" id="nodeStage4">
+    <div class="node-step">Stage 4 [PENDING]</div>
+    <div class="node-title">Canvas 2D Raster</div>
+    <div class="node-desc">Complex vector bezier curves &amp; requestAnimationFrame FPS.</div>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Panel 1: Cross-Origin Isolation & Shared Memory -->
+  <div class="panel">
+    <div class="panel-title">
+      <span>CROSS-ORIGIN ISOLATION &amp; SHARED MEMORY</span>
+      <span style="color:var(--neon-cyan);">ACTIVE TELEMETRY</span>
+    </div>
+    <div class="live-meter"><span>window.crossOriginIsolated:</span><span class="val-hex" id="mCoopIso">Testing...</span></div>
+    <div class="live-meter"><span>typeof SharedArrayBuffer:</span><span class="val-hex" id="mSabType">Testing...</span></div>
+    <div class="live-meter"><span>SAB 1KB Instantiation:</span><span class="val-ok" id="mSabAlloc">Pending</span></div>
+    <div class="live-meter"><span>Worker SAB Concurrency:</span><span class="val-ok" id="mWorkerSab">Pending</span></div>
+    <div class="live-meter"><span>Atomics.wait / notify:</span><span class="val-hex" id="mAtomicsWait">Pending</span></div>
+    <div class="live-meter"><span>Spectre Timer Quantization:</span><span class="val-cyan" id="mTimerQuant">Measuring...</span></div>
+    <div class="radar-box"><div class="radar-sweep"></div></div>
+  </div>
+
+  <!-- Panel 2: Canvas 2D Graphics Engine & FPS -->
+  <div class="panel">
+    <div class="panel-title">
+      <span>CANVAS 2D RASTERIZER &amp; FRAME METRICS</span>
+      <span style="color:var(--neon-green);" id="mFpsBadge">PROFILING</span>
+    </div>
+    <div class="live-meter"><span>Frames Rendered:</span><span class="val-hex" id="mFrameCount">0 / 60</span></div>
+    <div class="live-meter"><span>Average Frame Time:</span><span class="val-hex" id="mAvgFrameTime">Measuring...</span></div>
+    <div class="live-meter"><span>Realized Display FPS:</span><span class="val-ok" id="mRealizedFps">Measuring...</span></div>
+    <div class="live-meter"><span>Complex Curves / Frame:</span><span class="val-cyan">200 QUAD BEZIERS</span></div>
+    <div class="live-meter"><span>Hardware Acceleration:</span><span class="val-ok" id="mHwRaster">Evaluating...</span></div>
+    <canvas id="benchCanvas" width="400" height="60"></canvas>
+    <div class="radar-box"><div class="radar-sweep"></div></div>
+  </div>
+</div>
+
+<!-- Tactical Log Terminal -->
+<div class="panel">
+  <div class="panel-title">
+    <span>TACTICAL EMPIRICAL AUDIT LOG</span>
+    <span style="color:var(--neon-green);">LIVE STREAM TELEMETRY</span>
+  </div>
+  <pre id="terminal">[*] Initializing Probe P950 Cross-Origin Isolation &amp; Raster Suite...</pre>
+  <div class="radar-box"><div class="radar-sweep"></div></div>
+</div>
+
+<script>
+'use strict';
+var term = document.getElementById('terminal');
+var statusBadge = document.getElementById('statusBadge');
+var nodeStage1 = document.getElementById('nodeStage1');
+var nodeStage2 = document.getElementById('nodeStage2');
+var nodeStage3 = document.getElementById('nodeStage3');
+var nodeStage4 = document.getElementById('nodeStage4');
+var mCoopIso = document.getElementById('mCoopIso');
+var mSabType = document.getElementById('mSabType');
+var mSabAlloc = document.getElementById('mSabAlloc');
+var mWorkerSab = document.getElementById('mWorkerSab');
+var mAtomicsWait = document.getElementById('mAtomicsWait');
+var mTimerQuant = document.getElementById('mTimerQuant');
+var mFrameCount = document.getElementById('mFrameCount');
+var mAvgFrameTime = document.getElementById('mAvgFrameTime');
+var mRealizedFps = document.getElementById('mRealizedFps');
+var mHwRaster = document.getElementById('mHwRaster');
+var mFpsBadge = document.getElementById('mFpsBadge');
+var cvs = document.getElementById('benchCanvas');
+var ctx = cvs.getContext('2d');
+
+function log(msg) {
+  var d = document.createElement('div');
+  d.textContent = '[' + new Date().toISOString().slice(11, 23) + '] ' + msg;
+  term.appendChild(d);
+  term.scrollTop = term.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P950-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+window.onerror = function(msg, url, line) {
+  syncBn('JS-ERR', msg + ' at line ' + line);
+  log('[!] ERROR: ' + msg + ' (Line ' + line + ')');
+};
+
+log('[*] Probe P950 online: testing COOP, SharedArrayBuffer, timer quantization, and Canvas 2D raster.');
+syncBn('BOOT', 'start');
+
+async function runStage1And2() {
+  // Stage 1: Cross-Origin Isolation
+  var isCoopIso = (window.crossOriginIsolated === true);
+  mCoopIso.textContent = isCoopIso ? 'TRUE (COOP/COEP ACTIVE)' : 'FALSE (UNISOLATED)';
+  mCoopIso.className = isCoopIso ? 'val-ok' : 'val-hex';
+  log('[+] Cross-Origin Isolation: window.crossOriginIsolated=' + isCoopIso);
+  syncBn('COOP-ISO', 'isolated=' + isCoopIso);
+
+  nodeStage1.className = 'node done';
+  nodeStage1.querySelector('.node-step').textContent = 'Stage 1 [DONE]';
+
+  // Stage 2: SharedArrayBuffer
+  nodeStage2.className = 'node active';
+  nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [ACTIVE]';
+
+  var hasSab = (typeof SharedArrayBuffer !== 'undefined');
+  mSabType.textContent = hasSab ? 'FUNCTION (DEFINED)' : 'UNDEFINED';
+  mSabType.className = hasSab ? 'val-ok' : 'val-hex';
+
+  var sabAllocOk = false;
+  var sabWorkerOk = false;
+  var sabErr = 'none';
+
+  if (hasSab) {
+    try {
+      var sab = new SharedArrayBuffer(1024);
+      sabAllocOk = (sab.byteLength === 1024);
+      mSabAlloc.textContent = sabAllocOk ? '1024B ALLOCATED' : 'FAIL';
+      mSabAlloc.className = 'val-ok';
+
+      // Test worker shared memory
+      var wPromise = new Promise(function(resolve) {
+        var w = new Worker('/worker.js');
+        w.onmessage = function(e) {
+          if (e.data && e.data.type === 'SAB_TEST_DONE') {
+            sabWorkerOk = e.data.ok;
+            resolve();
+          }
+        };
+        w.postMessage({ type: 'SHARED_ARRAY_BUFFER_TEST', sab: sab });
+        setTimeout(resolve, 1200);
+      });
+      await wPromise;
+      mWorkerSab.textContent = sabWorkerOk ? 'CROSS-THREAD R/W OK' : 'WORKER FAILED';
+      mWorkerSab.className = sabWorkerOk ? 'val-ok' : 'val-hex';
+    } catch(e) {
+      sabErr = e.name + ': ' + e.message;
+      mSabAlloc.textContent = 'BLOCKED (' + e.name + ')';
+      mWorkerSab.textContent = 'N/A';
+    }
+  } else {
+    mSabAlloc.textContent = 'DISABLED (UNSUPPORTED)';
+    mWorkerSab.textContent = 'N/A';
+  }
+
+  var hasAtomicsWait = (typeof Atomics !== 'undefined' && typeof Atomics.wait === 'function');
+  mAtomicsWait.textContent = hasAtomicsWait ? 'API DEFINED' : 'UNDEFINED';
+  mAtomicsWait.className = hasAtomicsWait ? 'val-ok' : 'val-hex';
+
+  log('[+] SharedArrayBuffer: defined=' + hasSab + ', alloc=' + sabAllocOk + ', workerSync=' + sabWorkerOk + ', waitApi=' + hasAtomicsWait);
+  syncBn('SAB-ORACLE', 'hasSab=' + hasSab + '|alloc=' + sabAllocOk + '|workerSync=' + sabWorkerOk + '|waitApi=' + hasAtomicsWait + '|err=' + sabErr);
+
+  nodeStage2.className = 'node done';
+  nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [DONE]';
+
+  // Stage 3: Timer Quantization
+  nodeStage3.className = 'node active';
+  nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [ACTIVE]';
+
+  var minDelta = 999999;
+  for (var i = 0; i < 5000; i++) {
+    var ta = performance.now();
+    var tb = performance.now();
+    var dt = (tb - ta);
+    if (dt > 0 && dt < minDelta) minDelta = dt;
+  }
+  var minDeltaUs = (minDelta * 1000).toFixed(1);
+  mTimerQuant.textContent = minDeltaUs + ' µs (' + minDelta.toFixed(3) + ' ms)';
+  mTimerQuant.className = (minDelta < 0.1) ? 'val-ok' : 'val-hex';
+  log('[+] Spectre Timer Quantization: minDelta=' + minDeltaUs + ' µs');
+  syncBn('TIMER-QUANT', 'minDeltaUs=' + minDeltaUs + '|minDeltaMs=' + minDelta.toFixed(4));
+
+  nodeStage3.className = 'node done';
+  nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [DONE]';
+
+  // Stage 4: Canvas 2D Raster & FPS Benchmark
+  nodeStage4.className = 'node active';
+  nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [ACTIVE]';
+  log('[+] Initiating 60-frame Canvas 2D complex vector rasterization benchmark...');
+
+  var frameTarget = 60;
+  var currentFrame = 0;
+  var frameTimes = [];
+  var lastTime = performance.now();
+  var benchStartTime = performance.now();
+
+  function renderFrame(now) {
+    var dt = now - lastTime;
+    lastTime = now;
+    if (currentFrame > 0) frameTimes.push(dt);
+    currentFrame++;
+
+    mFrameCount.textContent = currentFrame + ' / ' + frameTarget;
+
+    // Complex path rendering
+    ctx.clearRect(0, 0, cvs.width, cvs.height);
+    for (var c = 0; c < 200; c++) {
+      ctx.beginPath();
+      ctx.strokeStyle = (c % 2 === 0) ? '#00f3ff' : '#ff0077';
+      ctx.lineWidth = 1.5;
+      ctx.moveTo((c * 7) % cvs.width, 0);
+      ctx.quadraticCurveTo(cvs.width / 2, ((c * 13) + (currentFrame * 3)) % cvs.height, cvs.width - ((c * 7) % cvs.width), cvs.height);
+      ctx.stroke();
+    }
+
+    if (currentFrame < frameTarget) {
+      requestAnimationFrame(renderFrame);
+    } else {
+      var totalBenchMs = performance.now() - benchStartTime;
+      var sumFt = frameTimes.reduce(function(a, b) { return a + b; }, 0);
+      var avgFt = (sumFt / frameTimes.length).toFixed(2);
+      var fps = (1000 / parseFloat(avgFt)).toFixed(1);
+
+      mAvgFrameTime.textContent = avgFt + ' ms / frame';
+      mRealizedFps.textContent = fps + ' FPS';
+      mHwRaster.textContent = (parseFloat(fps) >= 55) ? 'HARDWARE ACCELERATED (60 FPS)' : ('COMPOSITING OK (' + fps + ' FPS)');
+
+      log('[+] Canvas 2D Raster Complete: avgFrameTime=' + avgFt + 'ms, realizedFps=' + fps + ' FPS');
+      syncBn('CANVAS-RASTER', 'frames=' + frameTarget + '|avgMs=' + avgFt + '|fps=' + fps + '|totalMs=' + totalBenchMs.toFixed(1));
+
+      nodeStage4.className = 'node done';
+      nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [DONE]';
+
+      mFpsBadge.textContent = 'STABLE ' + fps + ' FPS';
+      statusBadge.textContent = 'P950 COMPLETE';
+      statusBadge.style.background = '#00ff66';
+      log('[+] Probe P950 complete.');
+      syncBn('DONE', 'status=P950_COMPLETE');
+    }
+  }
+
+  requestAnimationFrame(renderFrame);
+}
+
+window.addEventListener('load', function() {
+  runStage1And2();
+});
+
+/* Auto-Reload Watcher for hands-free autonomous progression */
+var initialReloadToken = null;
+function checkAutoReload() {
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/reload.txt?t=' + Date.now(), true);
+    xhr.onload = function() {
+      if (xhr.status === 200) {
+        var token = xhr.responseText.trim();
+        if (initialReloadToken === null) {
+          initialReloadToken = token;
+        } else if (token !== initialReloadToken) {
+          log('[*] New deployment detected (token: ' + token + '). Auto-reloading in 500ms...');
+          setTimeout(function() { location.reload(); }, 500);
+        }
+      }
+    };
+    xhr.send();
+  } catch(e) {}
+}
+setInterval(checkAutoReload, 1500);
+</script>
+</body>
+</html>

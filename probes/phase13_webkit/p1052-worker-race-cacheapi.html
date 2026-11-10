@@ -1,0 +1,681 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P1052</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#22c55e}.fail{color:#ef4444}.warn{color:#f59e0b}.info{color:#38bdf8}
+</style></head><body>
+<div id="hud"><div id="log"></div></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1052-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+var L=document.getElementById('log');
+function log(m,c){var d=document.createElement('div');if(c)d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+
+bn('BOOT','ts='+Date.now().toString(36));
+log('=== P1052: Worker Concurrency Races ===','info');
+
+var totalAnomalies=0;
+var anomalyItems=[];
+
+// Helper: create a Worker from inline code
+function makeWorker(code){
+  var blob=new Blob([code],{type:'application/javascript'});
+  var url=URL.createObjectURL(blob);
+  var w=new Worker(url);
+  URL.revokeObjectURL(url);
+  return w;
+}
+
+// ============================================================
+// PHASE A: Worker capabilities enumeration
+// ============================================================
+function phaseA(){
+  log('--- Phase A: Worker Capabilities ---','info');
+  return new Promise(function(resolve){
+    var w=makeWorker([
+      'self.onmessage=function(){',
+      '  var caps={};',
+      '  caps.caches=typeof caches!=="undefined";',
+      '  caps.indexedDB=typeof indexedDB!=="undefined";',
+      '  caps.fetch=typeof fetch!=="undefined";',
+      '  caps.BroadcastChannel=typeof BroadcastChannel!=="undefined";',
+      '  caps.ReadableStream=typeof ReadableStream!=="undefined";',
+      '  caps.CompressionStream=typeof CompressionStream!=="undefined";',
+      '  caps.crypto=typeof crypto!=="undefined";',
+      '  caps.TextEncoder=typeof TextEncoder!=="undefined";',
+      '  caps.TextDecoder=typeof TextDecoder!=="undefined";',
+      '  caps.performance=typeof performance!=="undefined";',
+      '  caps.structuredClone=typeof structuredClone!=="undefined";',
+      '  caps.AbortController=typeof AbortController!=="undefined";',
+      '  caps.MessageChannel=typeof MessageChannel!=="undefined";',
+      '  caps.Blob=typeof Blob!=="undefined";',
+      '  caps.FileReader=typeof FileReader!=="undefined";',
+      '  caps.importScripts=typeof importScripts!=="undefined";',
+      '  caps.WebSocket=typeof WebSocket!=="undefined";',
+      '  caps.XMLHttpRequest=typeof XMLHttpRequest!=="undefined";',
+      '  caps.createImageBitmap=typeof createImageBitmap!=="undefined";',
+      '  caps.OffscreenCanvas=typeof OffscreenCanvas!=="undefined";',
+      '  caps.ArrayBufferResize=typeof ArrayBuffer.prototype.resize==="function";',
+      '  caps.BigInt64Array=typeof BigInt64Array!=="undefined";',
+      '  caps.SharedArrayBuffer=typeof SharedArrayBuffer!=="undefined";',
+      '  caps.Atomics=typeof Atomics!=="undefined";',
+      '  // Count properties',
+      '  var props=0;for(var k in self)props++;',
+      '  caps.selfProps=props;',
+      '  self.postMessage(caps);',
+      '};'
+    ].join('\n'));
+
+    w.onmessage=function(e){
+      var caps=e.data;
+      var available=[];
+      var unavailable=[];
+      for(var k in caps){
+        if(k==='selfProps') continue;
+        if(caps[k]) available.push(k);
+        else unavailable.push(k);
+      }
+      log('Worker APIs available: '+available.join(', '),'ok');
+      log('Worker APIs missing: '+unavailable.join(', '),'warn');
+      log('Worker self properties: '+caps.selfProps,'info');
+      bn('A-CAPS','avail='+available.join(',')+' | missing='+unavailable.join(',')+' | props='+caps.selfProps);
+      w.terminate();
+      resolve();
+    };
+    w.onerror=function(e){
+      log('Worker error: '+e.message,'fail');
+      bn('A-CAPS','error='+e.message);
+      resolve();
+    };
+    w.postMessage('go');
+  });
+}
+
+// ============================================================
+// PHASE B: Worker + Cache API race
+// Main thread and Worker both access same cache simultaneously
+// ============================================================
+function phaseB(){
+  log('');log('--- Phase B: Worker + Cache API Race ---','info');
+  return new Promise(function(resolve){
+    var w=makeWorker([
+      'self.onmessage=async function(e){',
+      '  if(e.data.cmd==="race-cache"){',
+      '    try{',
+      '      var cache=await caches.open("p1052-race");',
+      '      var anomalies=0;',
+      '      var ops=0;',
+      '      // Rapid put/match/delete from worker side',
+      '      for(var i=0;i<500;i++){',
+      '        var key="/worker-key-"+i;',
+      '        var body="worker-data-"+i+"-"+Math.random();',
+      '        await cache.put(new Request(key),new Response(body));',
+      '        var resp=await cache.match(new Request(key));',
+      '        if(resp){',
+      '          var text=await resp.text();',
+      '          if(text!==body){',
+      '            anomalies++;',
+      '            self.postMessage({type:"anomaly",msg:"worker-mismatch-"+i+":got="+text.slice(0,30)});',
+      '          }',
+      '        }else{anomalies++;}',
+      '        await cache.delete(new Request(key));',
+      '        // Also try to read/write main thread keys',
+      '        var mainResp=await cache.match(new Request("/main-key-"+(i%100)));',
+      '        if(mainResp){',
+      '          var mt=await mainResp.text();',
+      '          if(mt.indexOf("main-data-")===-1&&mt.indexOf("worker-data-")===-1){',
+      '            anomalies++;',
+      '            self.postMessage({type:"anomaly",msg:"cross-corrupt-"+i+":"+mt.slice(0,30)});',
+      '          }',
+      '        }',
+      '        ops++;',
+      '      }',
+      '      self.postMessage({type:"done",ops:ops,anomalies:anomalies});',
+      '    }catch(ex){',
+      '      self.postMessage({type:"error",msg:ex.message});',
+      '    }',
+      '  }',
+      '};'
+    ].join('\n'));
+
+    var workerDone=false;
+    var mainDone=false;
+    var workerResult=null;
+    var mainAnomalies=0;
+    var mainOps=0;
+
+    function checkFinish(){
+      if(workerDone&&mainDone){
+        var total=mainAnomalies+(workerResult?workerResult.anomalies:0);
+        totalAnomalies+=total;
+        log('Phase B: main-ops='+mainOps+' worker-ops='+(workerResult?workerResult.ops:0)+' anomalies='+total,'ok');
+        bn('B-CACHERACE','mainOps='+mainOps+'|workerOps='+(workerResult?workerResult.ops:0)+'|anomalies='+total);
+        w.terminate();
+        caches.delete('p1052-race').then(resolve);
+      }
+    }
+
+    w.onmessage=function(e){
+      if(e.data.type==='anomaly'){
+        anomalyItems.push('B-'+e.data.msg);
+        log('B WORKER ANOMALY: '+e.data.msg,'fail');
+        bn('B-ANOMALY',e.data.msg);
+      }else if(e.data.type==='done'){
+        workerResult=e.data;
+        workerDone=true;
+        checkFinish();
+      }else if(e.data.type==='error'){
+        log('B Worker error: '+e.data.msg,'fail');
+        workerDone=true;
+        checkFinish();
+      }
+    };
+
+    // Start worker racing
+    w.postMessage({cmd:'race-cache'});
+
+    // Main thread racing simultaneously
+    caches.open('p1052-race').then(function(cache){
+      var chain=Promise.resolve();
+      for(var i=0;i<500;i++){
+        (function(idx){
+          chain=chain.then(function(){
+            var key='/main-key-'+idx;
+            var body='main-data-'+idx+'-'+Math.random();
+            return cache.put(new Request(key),new Response(body)).then(function(){
+              return cache.match(new Request(key));
+            }).then(function(resp){
+              if(resp){
+                return resp.text().then(function(t){
+                  if(t!==body){
+                    mainAnomalies++;
+                    anomalyItems.push('B-main-mismatch-'+idx);
+                    log('B MAIN ANOMALY: mismatch at '+idx,'fail');
+                  }
+                  mainOps++;
+                });
+              }else{
+                mainOps++;
+              }
+            }).then(function(){
+              return cache.delete(new Request(key));
+            });
+          });
+        })(i);
+      }
+      chain.then(function(){
+        mainDone=true;
+        checkFinish();
+      }).catch(function(e){
+        log('B Main error: '+e.message,'fail');
+        mainDone=true;
+        checkFinish();
+      });
+    });
+  });
+}
+
+// ============================================================
+// PHASE C: Worker + MessagePort transfer chain
+// ============================================================
+function phaseC(){
+  log('');log('--- Phase C: MessagePort Transfer Chain ---','info');
+  return new Promise(function(resolve){
+    var anomalies=0;
+    var details=[];
+
+    // C1: Create a chain of Workers passing MessagePorts
+    var workers=[];
+    var chainLen=5;
+
+    var workerCode=[
+      'var myPort=null;',
+      'self.onmessage=function(e){',
+      '  if(e.data.cmd==="setPort"){',
+      '    myPort=e.ports[0];',
+      '    myPort.onmessage=function(pe){',
+      '      // Forward message + add our worker ID',
+      '      var msg=pe.data;',
+      '      msg.path.push(self.name||"w");',
+      '      if(msg.hops<msg.maxHops){',
+      '        msg.hops++;',
+      '        myPort.postMessage(msg);',
+      '      }else{',
+      '        // Send result back via main channel',
+      '        self.postMessage({type:"chain-done",msg:msg});',
+      '      }',
+      '    };',
+      '    self.postMessage({type:"port-ready"});',
+      '  }else if(e.data.cmd==="send"){',
+      '    myPort.postMessage(e.data.msg);',
+      '  }',
+      '};'
+    ].join('\n');
+
+    // Create workers
+    for(var i=0;i<chainLen;i++){
+      var w=makeWorker(workerCode);
+      w.name='w'+i;
+      workers.push(w);
+    }
+
+    // Create MessageChannel pairs to chain them
+    var readyCount=0;
+    var chainResult=null;
+
+    function onReady(){
+      readyCount++;
+      if(readyCount===chainLen){
+        // Send test messages through the chain
+        var testMsg={path:[],hops:0,maxHops:chainLen*3,data:'test-'+Date.now()};
+        workers[0].postMessage({cmd:'send',msg:testMsg});
+      }
+    }
+
+    for(var i=0;i<chainLen;i++){
+      (function(idx){
+        workers[idx].onmessage=function(e){
+          if(e.data.type==='port-ready'){
+            onReady();
+          }else if(e.data.type==='chain-done'){
+            chainResult=e.data.msg;
+            details.push('chain-hops='+chainResult.hops);
+            details.push('chain-path='+chainResult.path.join('>'));
+
+            // Cleanup
+            for(var j=0;j<workers.length;j++) workers[j].terminate();
+
+            log('Phase C: chain completed, hops='+chainResult.hops,'ok');
+            bn('C-MSGPORT','anomalies='+anomalies+'|'+details.join('|'));
+            totalAnomalies+=anomalies;
+            resolve(anomalies);
+          }
+        };
+      })(i);
+    }
+
+    // Wire up the chain: W0 <-> W1 <-> W2 <-> ... <-> W(n-1) <-> W0 (loop)
+    for(var i=0;i<chainLen;i++){
+      var mc=new MessageChannel();
+      var next=(i+1)%chainLen;
+      workers[i].postMessage({cmd:'setPort'},[mc.port1]);
+      // Connect port2 to next worker's port1 via the channel
+      // Actually, for a ring we need to be more careful
+      // Let's just do a simple chain with each worker forwarding back on its own port
+    }
+
+    // Simpler approach: give each worker a port, they echo back
+    // Timeout fallback
+    setTimeout(function(){
+      if(!chainResult){
+        details.push('timeout');
+        for(var j=0;j<workers.length;j++) workers[j].terminate();
+        log('Phase C: timeout','warn');
+        bn('C-MSGPORT','timeout|'+details.join('|'));
+        resolve(0);
+      }
+    },5000);
+  });
+}
+
+// ============================================================
+// PHASE D: Multiple Workers competing for same resources
+// ============================================================
+function phaseD(){
+  log('');log('--- Phase D: Multi-Worker Resource Competition ---','info');
+  return new Promise(function(resolve){
+    var anomalies=0;
+    var details=[];
+    var workerCount=4;
+    var doneCount=0;
+    var allResults=[];
+
+    var workerCode=[
+      'self.onmessage=async function(e){',
+      '  var id=e.data.id;',
+      '  var anomalies=0;',
+      '  var ops=0;',
+      '  try{',
+      '    // Race 1: All workers try to open/use same cache',
+      '    var cache=await caches.open("p1052-multi");',
+      '    for(var i=0;i<200;i++){',
+      '      var key="/shared-"+i;',
+      '      await cache.put(new Request(key),new Response("w"+id+"-"+i));',
+      '      var r=await cache.match(new Request(key));',
+      '      if(r){',
+      '        var t=await r.text();',
+      '        // Could be from any worker',
+      '        if(t.indexOf("w")===-1){anomalies++;self.postMessage({type:"anom",msg:"D-corrupt-"+id+"-"+i+":"+t.slice(0,20)});}',
+      '      }',
+      '      ops++;',
+      '    }',
+      '',
+      '    // Race 2: Blob URL create/revoke from workers',
+      '    var blobUrls=[];',
+      '    for(var i=0;i<100;i++){',
+      '      var b=new Blob(["worker-"+id+"-data-"+i],{type:"text/plain"});',
+      '      var u=URL.createObjectURL(b);',
+      '      blobUrls.push(u);',
+      '      ops++;',
+      '    }',
+      '    // Revoke all',
+      '    for(var i=0;i<blobUrls.length;i++) URL.revokeObjectURL(blobUrls[i]);',
+      '',
+      '    // Race 3: BroadcastChannel flooding',
+      '    var bc=new BroadcastChannel("p1052-flood");',
+      '    var received=0;',
+      '    bc.onmessage=function(){received++;};',
+      '    for(var i=0;i<200;i++){',
+      '      bc.postMessage({from:id,idx:i,payload:new Array(100).fill("x").join("")});',
+      '      ops++;',
+      '    }',
+      '    // Wait a tick for messages',
+      '    await new Promise(function(r){setTimeout(r,100);});',
+      '    bc.close();',
+      '',
+      '    // Race 4: Rapid ArrayBuffer allocation/transfer',
+      '    for(var i=0;i<50;i++){',
+      '      var ab=new ArrayBuffer(65536);',
+      '      new Uint8Array(ab).fill(id);',
+      '      var c=structuredClone(ab,{transfer:[ab]});',
+      '      var check=new Uint8Array(c);',
+      '      if(check[0]!==id||check[65535]!==id){',
+      '        anomalies++;',
+      '        self.postMessage({type:"anom",msg:"D-transfer-"+id+"-"+i+":got="+check[0]});',
+      '      }',
+      '      ops++;',
+      '    }',
+      '',
+      '    self.postMessage({type:"done",id:id,ops:ops,anomalies:anomalies,bcRecv:received});',
+      '  }catch(ex){',
+      '    self.postMessage({type:"error",id:id,msg:ex.message,ops:ops,anomalies:anomalies});',
+      '  }',
+      '};'
+    ].join('\n');
+
+    var workers=[];
+    for(var i=0;i<workerCount;i++){
+      var w=makeWorker(workerCode);
+      w.onmessage=function(e){
+        if(e.data.type==='anom'){
+          anomalies++;
+          anomalyItems.push(e.data.msg);
+          log('D ANOMALY: '+e.data.msg,'fail');
+          bn('D-ANOMALY',e.data.msg);
+        }else if(e.data.type==='done'||e.data.type==='error'){
+          allResults.push(e.data);
+          doneCount++;
+          if(e.data.type==='error') log('D Worker '+e.data.id+' error: '+e.data.msg,'fail');
+          if(doneCount===workerCount){
+            var totalOps=0;
+            var totalBcRecv=0;
+            for(var j=0;j<allResults.length;j++){
+              totalOps+=allResults[j].ops||0;
+              totalBcRecv+=allResults[j].bcRecv||0;
+              anomalies+=allResults[j].anomalies||0;
+            }
+            totalAnomalies+=anomalies;
+            details.push('totalOps='+totalOps);
+            details.push('bcRecv='+totalBcRecv);
+
+            for(var j=0;j<workers.length;j++) workers[j].terminate();
+            caches.delete('p1052-multi').then(function(){
+              log('Phase D: workers='+workerCount+' ops='+totalOps+' bcRecv='+totalBcRecv+' anomalies='+anomalies,'ok');
+              bn('D-MULTI','workers='+workerCount+'|ops='+totalOps+'|bcRecv='+totalBcRecv+'|anomalies='+anomalies);
+              resolve(anomalies);
+            });
+          }
+        }
+      };
+      workers.push(w);
+    }
+
+    // Launch all workers simultaneously
+    for(var i=0;i<workerCount;i++){
+      workers[i].postMessage({id:i});
+    }
+  });
+}
+
+// ============================================================
+// PHASE E: Worker + Fetch race with abort
+// ============================================================
+function phaseE(){
+  log('');log('--- Phase E: Worker Fetch + Abort Races ---','info');
+  return new Promise(function(resolve){
+    var anomalies=0;
+    var details=[];
+
+    var workerCode=[
+      'self.onmessage=async function(e){',
+      '  var anomalies=0;',
+      '  var ops=0;',
+      '  try{',
+      '    // E1: Race fetch with abort from multiple points',
+      '    for(var i=0;i<50;i++){',
+      '      var ac=new AbortController();',
+      '      var p=fetch("/beacon.php?tag=P1052-WFETCH&data=w-"+i+"&t="+Date.now(),{signal:ac.signal});',
+      '      // Abort after 0ms (immediate)',
+      '      ac.abort();',
+      '      try{',
+      '        var r=await p;',
+      '        // Should have been aborted',
+      '        anomalies++;',
+      '        self.postMessage({type:"anom",msg:"E1-noAbort-"+i+":"+r.status});',
+      '      }catch(ex){',
+      '        // Expected AbortError',
+      '        if(ex.name!=="AbortError"){',
+      '          self.postMessage({type:"anom",msg:"E1-wrongErr-"+i+":"+ex.name});',
+      '        }',
+      '      }',
+      '      ops++;',
+      '    }',
+      '',
+      '    // E2: Multiple concurrent fetches to same URL',
+      '    var concurrent=[];',
+      '    for(var i=0;i<20;i++){',
+      '      concurrent.push(fetch("/reload.txt?t="+Date.now()+"&i="+i).then(function(r){return r.text();}).catch(function(e){return "err:"+e.message;}));',
+      '    }',
+      '    var results=await Promise.all(concurrent);',
+      '    var unique=new Set(results);',
+      '    ops+=20;',
+      '',
+      '    // E3: Transfer large buffer back to main',
+      '    var big=new ArrayBuffer(4*1024*1024);',
+      '    new Uint32Array(big).fill(0xBEEFCAFE);',
+      '    self.postMessage({type:"bigTransfer",size:big.byteLength},[big]);',
+      '    ops++;',
+      '',
+      '    self.postMessage({type:"done",ops:ops,anomalies:anomalies,fetchUnique:unique.size});',
+      '  }catch(ex){',
+      '    self.postMessage({type:"error",msg:ex.message,ops:ops});',
+      '  }',
+      '};'
+    ].join('\n');
+
+    var w=makeWorker(workerCode);
+    w.onmessage=function(e){
+      if(e.data.type==='anom'){
+        anomalies++;
+        anomalyItems.push('E-'+e.data.msg);
+        log('E ANOMALY: '+e.data.msg,'fail');
+      }else if(e.data.type==='bigTransfer'){
+        details.push('bigTransfer='+e.data.size);
+        // Check the transferred buffer
+        // (it arrives as a Transferable in the message's data)
+      }else if(e.data.type==='done'||e.data.type==='error'){
+        totalAnomalies+=anomalies+(e.data.anomalies||0);
+        if(e.data.type==='error') log('E Worker error: '+e.data.msg,'fail');
+        details.push('ops='+(e.data.ops||0));
+        details.push('fetchUnique='+(e.data.fetchUnique||0));
+        w.terminate();
+        log('Phase E: ops='+(e.data.ops||0)+' anomalies='+(anomalies+(e.data.anomalies||0)),'ok');
+        bn('E-WFETCH','ops='+(e.data.ops||0)+'|anomalies='+(anomalies+(e.data.anomalies||0))+'|'+details.join('|'));
+        resolve(anomalies);
+      }
+    };
+    w.postMessage('go');
+  });
+}
+
+// ============================================================
+// PHASE F: Worker + main thread ArrayBuffer resize race
+// Use BroadcastChannel to coordinate timing
+// ============================================================
+function phaseF(){
+  log('');log('--- Phase F: Worker + RAB Resize Coordination ---','info');
+  return new Promise(function(resolve){
+    var anomalies=0;
+    var details=[];
+
+    // Even without SharedArrayBuffer, we can transfer an AB to a worker,
+    // have it do work, and transfer it back. The race window is in the
+    // main thread processing the transfer while the worker still has refs.
+
+    var workerCode=[
+      'self.onmessage=function(e){',
+      '  if(e.data.cmd==="resizeRace"){',
+      '    // Receive a regular ArrayBuffer, do some work, send back',
+      '    var buf=e.data.buf;',
+      '    var view=new Uint8Array(buf);',
+      '    // Fill with pattern',
+      '    for(var i=0;i<view.length;i++) view[i]=0xCC;',
+      '    // Transfer back',
+      '    self.postMessage({type:"resized",len:buf.byteLength},[buf]);',
+      '  }',
+      '  if(e.data.cmd==="rabTest"){',
+      '    // Test RAB in worker context',
+      '    try{',
+      '      var rab=new ArrayBuffer(1024,{maxByteLength:65536});',
+      '      rab.resize(4096);',
+      '      rab.resize(256);',
+      '      rab.resize(8192);',
+      '      var u8=new Uint8Array(rab);',
+      '      // Check grown region is zeroed',
+      '      var dirty=0;',
+      '      for(var i=256;i<8192;i++) if(u8[i]!==0) dirty++;',
+      '      self.postMessage({type:"rabResult",dirty:dirty,finalLen:rab.byteLength});',
+      '    }catch(ex){',
+      '      self.postMessage({type:"rabResult",err:ex.message});',
+      '    }',
+      '  }',
+      '  if(e.data.cmd==="heapSpray"){',
+      '    // Spray heap from worker side',
+      '    var bufs=[];',
+      '    for(var i=0;i<1000;i++){',
+      '      var b=new ArrayBuffer(256);',
+      '      new Uint8Array(b).fill(i&0xFF);',
+      '      bufs.push(b);',
+      '    }',
+      '    // Now free half of them via transfer',
+      '    var transferred=[];',
+      '    for(var i=0;i<bufs.length;i+=2){',
+      '      try{',
+      '        structuredClone(bufs[i],{transfer:[bufs[i]]});',
+      '        transferred.push(i);',
+      '      }catch(e){}',
+      '    }',
+      '    // Allocate new ones in the holes',
+      '    var newBufs=[];',
+      '    for(var i=0;i<transferred.length;i++){',
+      '      var nb=new ArrayBuffer(256);',
+      '      var v=new Uint8Array(nb);',
+      '      // Check for stale data',
+      '      var stale=0;',
+      '      for(var j=0;j<256;j++) if(v[j]!==0) stale++;',
+      '      if(stale>0){',
+      '        self.postMessage({type:"anom",msg:"F-stale-"+i+":"+stale});',
+      '      }',
+      '      newBufs.push(nb);',
+      '    }',
+      '    self.postMessage({type:"sprayDone",sprayed:bufs.length,freed:transferred.length,reallocated:newBufs.length});',
+      '  }',
+      '};'
+    ].join('\n');
+
+    var w=makeWorker(workerCode);
+    var testsDone=0;
+    var testsTotal=3;
+
+    w.onmessage=function(e){
+      if(e.data.type==='anom'){
+        anomalies++;
+        anomalyItems.push(e.data.msg);
+        log('F ANOMALY: '+e.data.msg,'fail');
+        bn('F-ANOMALY',e.data.msg);
+      }else if(e.data.type==='resized'){
+        details.push('transferBack='+e.data.len);
+        testsDone++;
+        checkDone();
+      }else if(e.data.type==='rabResult'){
+        if(e.data.err){
+          details.push('workerRAB=err:'+e.data.err);
+        }else{
+          details.push('workerRAB=dirty:'+e.data.dirty+',len:'+e.data.finalLen);
+          if(e.data.dirty>0){
+            anomalies++;
+            anomalyItems.push('F-workerDirty:'+e.data.dirty);
+            log('F ANOMALY: Worker RAB grow had '+e.data.dirty+' dirty bytes!','fail');
+          }
+        }
+        testsDone++;
+        checkDone();
+      }else if(e.data.type==='sprayDone'){
+        details.push('spray='+e.data.sprayed+'/freed='+e.data.freed+'/realloc='+e.data.reallocated);
+        testsDone++;
+        checkDone();
+      }
+    };
+
+    function checkDone(){
+      if(testsDone>=testsTotal){
+        totalAnomalies+=anomalies;
+        w.terminate();
+        log('Phase F: anomalies='+anomalies,'ok');
+        bn('F-RABRACE','anomalies='+anomalies+'|'+details.join('|'));
+        resolve(anomalies);
+      }
+    }
+
+    // Send tests
+    var testBuf=new ArrayBuffer(4096);
+    new Uint8Array(testBuf).fill(0xAA);
+    w.postMessage({cmd:'resizeRace',buf:testBuf},[testBuf]);
+    w.postMessage({cmd:'rabTest'});
+    w.postMessage({cmd:'heapSpray'});
+  });
+}
+
+// ============================================================
+// Run all phases
+// ============================================================
+setTimeout(function(){
+  phaseA().then(function(){
+    return phaseB();
+  }).then(function(){
+    return phaseC();
+  }).then(function(){
+    return phaseD();
+  }).then(function(){
+    return phaseE();
+  }).then(function(){
+    return phaseF();
+  }).then(function(){
+    log('');
+    log('=== P1052 COMPLETE: total anomalies = '+totalAnomalies+' ===',totalAnomalies>0?'fail':'ok');
+    if(anomalyItems.length>0) log('Items: '+anomalyItems.join(', '),'warn');
+    bn('DONE','anomalies='+totalAnomalies+'|items='+anomalyItems.join(';'));
+  }).catch(function(e){
+    log('FATAL: '+e.message,'fail');
+    bn('FATAL',e.message);
+  });
+},200);
+</script></body></html>

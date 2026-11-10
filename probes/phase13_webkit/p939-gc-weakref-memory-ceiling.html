@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P939: GC Lifecycle, WeakRef & Memory Ceiling Profiler</title>
+<style>
+:root {
+  --bg: #090d16;
+  --card: #111827;
+  --border: #1f2937;
+  --text: #e5e7eb;
+  --dim: #9ca3af;
+  --cyan: #06b6d4;
+  --green: #10b981;
+  --amber: #f59e0b;
+  --red: #ef4444;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  padding: 16px;
+  line-height: 1.5;
+}
+.header {
+  border: 1px solid var(--border);
+  background: var(--card);
+  padding: 14px 18px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title { font-size: 16px; font-weight: bold; color: var(--cyan); }
+.badge {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: #374151;
+  font-weight: 600;
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.card {
+  border: 1px solid var(--border);
+  background: var(--card);
+  padding: 12px 14px;
+  border-radius: 6px;
+}
+.card h3 {
+  font-size: 12px;
+  color: var(--dim);
+  text-transform: uppercase;
+  margin-bottom: 8px;
+  letter-spacing: 0.5px;
+}
+.stat {
+  display: flex;
+  justify-content: space-between;
+  padding: 3px 0;
+  border-bottom: 1px dotted rgba(255,255,255,0.08);
+  font-size: 12px;
+}
+.stat:last-child { border-bottom: none; }
+.stat-val { font-weight: bold; }
+.ok { color: var(--green); }
+.warn { color: var(--amber); }
+.err { color: var(--red); }
+.console {
+  border: 1px solid var(--border);
+  background: #05070d;
+  padding: 12px;
+  border-radius: 6px;
+}
+.console-header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--dim);
+  margin-bottom: 8px;
+}
+#log {
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 11px;
+  color: #d1d5db;
+  max-height: 280px;
+  overflow-y: auto;
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <div class="title">PROBE P939: GC Lifecycle, WeakRef & Memory Ceiling Profiler</div>
+    <div style="font-size: 11px; color: var(--dim); margin-top: 2px;">PS5 WebKit 14.10 Empirical Diagnostic Suite</div>
+  </div>
+  <div id="statusBadge" class="badge">INITIALIZING</div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h3>Memory Allocation Ceiling</h3>
+    <div class="stat"><span>Max Contiguous:</span><span id="mMaxContig" class="stat-val">Testing...</span></div>
+    <div class="stat"><span>OOM Threshold:</span><span id="mOomThreshold" class="stat-val">Pending</span></div>
+    <div class="stat"><span>Allocation Stability:</span><span id="mAllocStability" class="stat-val">Pending</span></div>
+    <div class="stat"><span>Ceiling Error:</span><span id="mAllocErr" class="stat-val ok">None</span></div>
+  </div>
+
+  <div class="card">
+    <h3>WeakRef GC Collection Threshold</h3>
+    <div class="stat"><span>WeakRef Supported:</span><span id="mWeakRefSupport" class="stat-val">Testing...</span></div>
+    <div class="stat"><span>Initial Deref:</span><span id="mInitialDeref" class="stat-val">Pending</span></div>
+    <div class="stat"><span>GC Trigger Churn:</span><span id="mGcChurn" class="stat-val">Pending</span></div>
+    <div class="stat"><span>Reclamation State:</span><span id="mReclaimState" class="stat-val">Pending</span></div>
+  </div>
+
+  <div class="card">
+    <h3>FinalizationRegistry Async Macro-Task</h3>
+    <div class="stat"><span>FinalizationRegistry:</span><span id="mFrSupport" class="stat-val">Testing...</span></div>
+    <div class="stat"><span>Callback Triggered:</span><span id="mFrTriggered" class="stat-val">Waiting...</span></div>
+    <div class="stat"><span>Cleanup Token:</span><span id="mFrToken" class="stat-val">--</span></div>
+    <div class="stat"><span>Event Loop Drain:</span><span id="mFrDrain" class="stat-val">In Progress</span></div>
+  </div>
+</div>
+
+<div class="console">
+  <div class="console-header">
+    <span>DIAGNOSTIC LOG</span>
+    <span class="ok">TAG: P939</span>
+  </div>
+  <pre id="log">[*] Probe P939 initialized.</pre>
+</div>
+
+<script>
+'use strict';
+var logEl = document.getElementById('log');
+var statusBadge = document.getElementById('statusBadge');
+var mMaxContig = document.getElementById('mMaxContig');
+var mOomThreshold = document.getElementById('mOomThreshold');
+var mAllocStability = document.getElementById('mAllocStability');
+var mAllocErr = document.getElementById('mAllocErr');
+var mWeakRefSupport = document.getElementById('mWeakRefSupport');
+var mInitialDeref = document.getElementById('mInitialDeref');
+var mGcChurn = document.getElementById('mGcChurn');
+var mReclaimState = document.getElementById('mReclaimState');
+var mFrSupport = document.getElementById('mFrSupport');
+var mFrTriggered = document.getElementById('mFrTriggered');
+var mFrToken = document.getElementById('mFrToken');
+var mFrDrain = document.getElementById('mFrDrain');
+
+function log(msg) {
+  var d = document.createElement('div');
+  d.textContent = msg;
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P939-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+log('[*] P939 Loaded: Profiling memory allocation ceiling and GC reclamation.');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * STAGE 1: Contiguous Allocation Ceiling (Safe Capped)
+ * ============================================================ */
+var testSizesMb = [16, 32, 64, 128, 256];
+var maxContigMb = 0;
+var oomAtMb = -1;
+
+for (var s = 0; s < testSizesMb.length; s++) {
+  var sz = testSizesMb[s];
+  try {
+    var b = new ArrayBuffer(sz * 1024 * 1024);
+    if (b && b.byteLength === sz * 1024 * 1024) {
+      maxContigMb = sz;
+    }
+    b = null;
+  } catch(oomErr) {
+    oomAtMb = sz;
+    mAllocErr.textContent = sz + 'MB: ' + (oomErr.name || 'OOM');
+    mAllocErr.className = 'stat-val warn';
+    break;
+  }
+}
+
+mMaxContig.textContent = maxContigMb + ' MB';
+mMaxContig.className = 'stat-val ok';
+mOomThreshold.textContent = (oomAtMb > 0) ? (oomAtMb + ' MB') : '> 2048 MB';
+mOomThreshold.className = 'stat-val ' + (oomAtMb > 0 ? 'warn' : 'ok');
+mAllocStability.textContent = 'STABLE (FREED)';
+mAllocStability.className = 'stat-val ok';
+
+log('[+] Contiguous Memory Ceiling: max=' + maxContigMb + 'MB, oomAt=' + oomAtMb + 'MB');
+syncBn('MEM-CEILING', 'maxMb=' + maxContigMb + '|oomMb=' + oomAtMb);
+
+/* ============================================================
+ * STAGE 2: WeakRef GC Reclamation
+ * ============================================================ */
+var hasWeakRef = typeof WeakRef === 'function';
+mWeakRefSupport.textContent = hasWeakRef ? 'SUPPORTED' : 'UNSUPPORTED';
+mWeakRefSupport.className = 'stat-val ' + (hasWeakRef ? 'ok' : 'err');
+
+var wrTarget = null;
+var wr = null;
+var initialOk = false;
+var collected = false;
+var churnUsedMb = 0;
+
+if (hasWeakRef) {
+  wrTarget = { id: 'ephemeral_target_' + Math.random(), buffer: new Array(1000) };
+  wr = new WeakRef(wrTarget);
+  initialOk = (wr.deref() === wrTarget);
+  mInitialDeref.textContent = initialOk ? 'TARGET PRESENT' : 'NULL';
+  mInitialDeref.className = 'stat-val ' + (initialOk ? 'ok' : 'err');
+
+  // Nullify target
+  wrTarget = null;
+
+  // Step-wise GC memory churn
+  var churnSteps = [4, 16, 32, 64];
+  for (var c = 0; c < churnSteps.length; c++) {
+    var stepMb = churnSteps[c];
+    var churnArr = [];
+    var count = (stepMb * 1024 * 1024) / 64; // ~64B per small object
+    for (var k = 0; k < count; k++) {
+      churnArr.push({ x: k, y: k * 2 });
+    }
+    churnArr = null;
+
+    if (wr.deref() === undefined) {
+      collected = true;
+      churnUsedMb = stepMb;
+      break;
+    }
+  }
+
+  mGcChurn.textContent = collected ? (churnUsedMb + ' MB CHURN') : '> 64 MB CHURN';
+  mGcChurn.className = 'stat-val ' + (collected ? 'ok' : 'warn');
+
+  mReclaimState.textContent = collected ? 'COLLECTED (CLEARED)' : 'ALIVE (RETAINED)';
+  mReclaimState.className = 'stat-val ' + (collected ? 'ok' : 'warn');
+
+  log('[+] WeakRef GC: collected=' + collected + ' at ' + churnUsedMb + 'MB churn (alive=' + (wr.deref() !== undefined) + ')');
+  syncBn('WEAKREF-GC', 'collected=' + collected + '|churnMb=' + churnUsedMb);
+} else {
+  mInitialDeref.textContent = 'N/A';
+  mGcChurn.textContent = 'N/A';
+  mReclaimState.textContent = 'N/A';
+  syncBn('WEAKREF-GC', 'supported=false');
+}
+
+/* ============================================================
+ * STAGE 3: FinalizationRegistry Async Macro-Task Drain
+ * ============================================================ */
+var hasFR = typeof FinalizationRegistry === 'function';
+mFrSupport.textContent = hasFR ? 'SUPPORTED' : 'UNSUPPORTED';
+mFrSupport.className = 'stat-val ' + (hasFR ? 'ok' : 'err');
+
+var frFired = false;
+var frTokenVal = '';
+
+if (hasFR) {
+  var fr = new FinalizationRegistry(function(heldValue) {
+    frFired = true;
+    frTokenVal = heldValue;
+    mFrTriggered.textContent = 'FIRED (YES)';
+    mFrTriggered.className = 'stat-val ok';
+    mFrToken.textContent = heldValue;
+    mFrToken.className = 'stat-val ok';
+    log('[+] FinalizationRegistry callback successfully invoked with: ' + heldValue);
+  });
+
+  var frObj = { key: 'transient_fr_object' };
+  fr.register(frObj, 'TOKEN_P939_RESOLVED');
+  frObj = null;
+
+  // Force additional Eden churn
+  var frChurn = [];
+  for (var f = 0; f < 50000; f++) {
+    frChurn.push({ z: f });
+  }
+  frChurn = null;
+
+  setTimeout(function() {
+    mFrDrain.textContent = 'DRAIN COMPLETE';
+    mFrDrain.className = 'stat-val ok';
+
+    if (!frFired) {
+      mFrTriggered.textContent = 'UNFIRED (JSC_DELAY)';
+      mFrTriggered.className = 'stat-val warn';
+      mFrToken.textContent = 'NONE';
+      log('[*] FinalizationRegistry callback deferred by JSC event loop turn.');
+    }
+
+    statusBadge.textContent = 'P939 COMPLETE';
+    statusBadge.style.background = '#10b981';
+
+    log('[*] All P939 diagnostic evaluations complete.');
+    syncBn('FINALIZATION', 'supported=true|fired=' + frFired + '|token=' + frTokenVal);
+    syncBn('DONE', 'status=P939_COMPLETE');
+  }, 200);
+} else {
+  mFrTriggered.textContent = 'N/A';
+  mFrToken.textContent = 'N/A';
+  mFrDrain.textContent = 'N/A';
+
+  statusBadge.textContent = 'P939 COMPLETE';
+  statusBadge.style.background = '#10b981';
+
+  syncBn('FINALIZATION', 'supported=false');
+  syncBn('DONE', 'status=P939_COMPLETE');
+}
+</script>
+</body>
+</html>

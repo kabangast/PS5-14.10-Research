@@ -1,0 +1,727 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1067</title>
+<style>
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px;margin:0}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#4ec9b0}.err{color:#f44747}.warn{color:#dcdcaa}.hot{color:#ff6b6b;font-weight:bold}
+</style></head><body><div id="hud"><div id="log"></div></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+var L=document.getElementById('log');
+function log(s,c){var d=document.createElement('div');d.className=c||'';d.textContent=s;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1067-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+
+bn('BOOT','dom-uaf-logic-battery');
+log('P1067: DOM UAF + Logic Issue Battery','warn');
+log('Targets: CVE-2023-42852 (logic), CVE-2023-41976 (UAF), CVE-2023-42950 (UAF)','warn');
+
+var tests=[];
+var tidx=0;
+var results=[];
+var crashes=[];
+
+function addTest(id,fn){tests.push({id:id,fn:fn});}
+
+// Sandbox div for DOM tests
+var sandbox=document.createElement('div');
+sandbox.id='sandbox';
+sandbox.style.cssText='position:fixed;left:-9999px;top:0;width:1px;height:1px;overflow:hidden';
+document.body.appendChild(sandbox);
+
+function clearSandbox(){sandbox.innerHTML='';}
+
+// ===========================================================
+// SECTION A: DOM Node Removal During Event Dispatch (UAF class)
+// CVE-2023-41976 / CVE-2023-42950 patterns
+// ===========================================================
+
+// A1: Remove element during its own click handler
+addTest('A1-SELF-REMOVE-CLICK',function(cb){
+  clearSandbox();
+  var btn=document.createElement('button');
+  btn.textContent='test';
+  sandbox.appendChild(btn);
+  var removed=false;
+  btn.addEventListener('click',function(){
+    btn.parentNode.removeChild(btn);
+    removed=true;
+  });
+  btn.click();
+  cb(removed?'OK-removed':'FAIL');
+});
+
+// A2: Remove parent during child event
+addTest('A2-PARENT-REMOVE-CHILD-EVENT',function(cb){
+  clearSandbox();
+  var parent=document.createElement('div');
+  var child=document.createElement('span');
+  child.textContent='x';
+  parent.appendChild(child);
+  sandbox.appendChild(parent);
+  var ok=false;
+  child.addEventListener('click',function(){
+    sandbox.removeChild(parent);
+    ok=true;
+  });
+  child.click();
+  cb(ok?'OK-parent-removed':'FAIL');
+});
+
+// A3: innerHTML replacement during MutationObserver callback
+addTest('A3-MUTATION-INNERHTML',function(cb){
+  clearSandbox();
+  var container=document.createElement('div');
+  sandbox.appendChild(container);
+  container.innerHTML='<p>initial</p>';
+  var count=0;
+  var obs=new MutationObserver(function(muts){
+    count++;
+    if(count<5){
+      container.innerHTML='<span>replaced-'+count+'</span>';
+    }
+  });
+  obs.observe(container,{childList:true,subtree:true});
+  container.innerHTML='<div>trigger</div>';
+  setTimeout(function(){
+    obs.disconnect();
+    cb('OK-mutations:'+count);
+  },100);
+});
+
+// A4: Remove node during NodeIterator traversal
+addTest('A4-NODEITERATOR-REMOVE',function(cb){
+  clearSandbox();
+  var div=document.createElement('div');
+  for(var i=0;i<10;i++){
+    var s=document.createElement('span');
+    s.textContent='n'+i;
+    div.appendChild(s);
+  }
+  sandbox.appendChild(div);
+  var iter=document.createNodeIterator(div,NodeFilter.SHOW_ELEMENT);
+  var visited=0;
+  var node;
+  while(node=iter.nextNode()){
+    visited++;
+    if(visited===3){
+      var next=node.nextSibling;
+      if(next)div.removeChild(next);
+    }
+  }
+  cb('OK-visited:'+visited);
+});
+
+// A5: TreeWalker + remove during walk
+addTest('A5-TREEWALKER-REMOVE',function(cb){
+  clearSandbox();
+  var div=document.createElement('div');
+  div.innerHTML='<ul><li>a<ul><li>b</li><li>c</li></ul></li><li>d</li></ul>';
+  sandbox.appendChild(div);
+  var tw=document.createTreeWalker(div,NodeFilter.SHOW_ELEMENT);
+  var visited=0;
+  while(tw.nextNode()){
+    visited++;
+    if(visited===3){
+      var p=tw.currentNode.parentNode;
+      if(p&&p.parentNode)p.parentNode.removeChild(p);
+    }
+  }
+  cb('OK-visited:'+visited);
+});
+
+// A6: Replace child during Range extraction
+addTest('A6-RANGE-REPLACE',function(cb){
+  clearSandbox();
+  var div=document.createElement('div');
+  div.innerHTML='<p>hello <b>world</b> test</p>';
+  sandbox.appendChild(div);
+  var range=document.createRange();
+  range.selectNodeContents(div.firstChild);
+  try{
+    var frag=range.extractContents();
+    div.innerHTML='<span>replaced</span>';
+    cb('OK-extracted:'+frag.childNodes.length);
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// A7: document.adoptNode during event
+addTest('A7-ADOPTNODE-EVENT',function(cb){
+  clearSandbox();
+  var iframe=document.createElement('iframe');
+  iframe.srcdoc='<div id="t">test</div>';
+  sandbox.appendChild(iframe);
+  setTimeout(function(){
+    try{
+      var el=iframe.contentDocument.getElementById('t');
+      if(!el){cb('SKIP-no-iframe');return;}
+      var adopted=document.adoptNode(el);
+      sandbox.appendChild(adopted);
+      cb('OK-adopted:'+adopted.textContent);
+    }catch(e){cb('ERR:'+e.message);}
+  },200);
+});
+
+// A8: replaceChild during animation frame
+addTest('A8-RAF-REPLACE',function(cb){
+  clearSandbox();
+  var div=document.createElement('div');
+  var children=[];
+  for(var i=0;i<20;i++){
+    var s=document.createElement('div');
+    s.textContent='item-'+i;
+    div.appendChild(s);
+    children.push(s);
+  }
+  sandbox.appendChild(div);
+  var replaced=0;
+  requestAnimationFrame(function frame(){
+    if(replaced<children.length&&children[replaced].parentNode){
+      var newEl=document.createElement('p');
+      newEl.textContent='new-'+replaced;
+      try{div.replaceChild(newEl,children[replaced]);}catch(e){}
+      replaced++;
+      requestAnimationFrame(frame);
+    }else{
+      cb('OK-replaced:'+replaced);
+    }
+  });
+});
+
+// ===========================================================
+// SECTION B: innerHTML/outerHTML Confusion (Logic issue class)
+// CVE-2023-42852 patterns
+// ===========================================================
+
+// B1: innerHTML assignment with script injection during parsing
+addTest('B1-INNERHTML-SCRIPT',function(cb){
+  clearSandbox();
+  var div=document.createElement('div');
+  sandbox.appendChild(div);
+  var ran=false;
+  window._b1_flag=false;
+  div.innerHTML='<img src=x onerror="window._b1_flag=true"><script>window._b1_flag=true<\/script>';
+  setTimeout(function(){
+    cb('OK-flag:'+window._b1_flag);
+  },100);
+});
+
+// B2: Nested innerHTML with document.write-like behavior
+addTest('B2-NESTED-INNERHTML',function(cb){
+  clearSandbox();
+  var div=document.createElement('div');
+  sandbox.appendChild(div);
+  div.innerHTML='<div id="b2a"></div>';
+  var inner=div.querySelector('#b2a');
+  inner.innerHTML='<div id="b2b"></div>';
+  var deeper=inner.querySelector('#b2b');
+  deeper.innerHTML='<div id="b2c"></div>';
+  var deepest=deeper.querySelector('#b2c');
+  deepest.innerHTML='<span>final</span>';
+  cb('OK-depth:4|text:'+deepest.textContent);
+});
+
+// B3: outerHTML self-replacement chain
+addTest('B3-OUTERHTML-CHAIN',function(cb){
+  clearSandbox();
+  var div=document.createElement('div');
+  div.id='b3';
+  div.innerHTML='<span id="b3s">start</span>';
+  sandbox.appendChild(div);
+  for(var i=0;i<10;i++){
+    var el=sandbox.querySelector('#b3s');
+    if(el)el.outerHTML='<span id="b3s">iter-'+i+'</span>';
+  }
+  var final=sandbox.querySelector('#b3s');
+  cb('OK-final:'+(final?final.textContent:'GONE'));
+});
+
+// B4: Prototype pollution on DOM objects
+addTest('B4-PROTO-POLLUTION',function(cb){
+  clearSandbox();
+  var div=document.createElement('div');
+  sandbox.appendChild(div);
+  var res=[];
+  try{
+    // Try to access __proto__ of DOM elements
+    var proto=div.__proto__;
+    res.push('proto:'+typeof proto);
+    // Try to pollute Element prototype
+    var origId=HTMLDivElement.prototype.id;
+    res.push('origId-type:'+typeof origId);
+    // Check if we can define properties on prototypes
+    try{
+      Object.defineProperty(HTMLDivElement.prototype,'__test__',{value:42,configurable:true});
+      var d2=document.createElement('div');
+      res.push('pollution:'+(d2.__test__===42?'YES':'NO'));
+      delete HTMLDivElement.prototype.__test__;
+    }catch(e2){res.push('pollution:BLOCKED');}
+  }catch(e){res.push('ERR:'+e.message);}
+  cb(res.join('|'));
+});
+
+// B5: Symbol.species override on built-in constructors
+addTest('B5-SPECIES-OVERRIDE',function(cb){
+  clearSandbox();
+  var res=[];
+  try{
+    var origSpecies=Array[Symbol.species];
+    res.push('origSpecies:'+(origSpecies===Array?'Array':'other'));
+    // Override Symbol.species for Array subclass
+    function EvilArray(){Array.call(this);this._evil=true;}
+    EvilArray.prototype=Object.create(Array.prototype);
+    EvilArray[Symbol.species]=EvilArray;
+    var arr=[1,2,3];
+    var mapped=arr.map(function(x){return x*2;});
+    res.push('mapped-type:'+(mapped instanceof Array));
+    res.push('mapped-len:'+mapped.length);
+  }catch(e){res.push('ERR:'+e.message);}
+  cb(res.join('|'));
+});
+
+// B6: Getter/setter trap on arguments object
+addTest('B6-ARGUMENTS-TRAP',function(cb){
+  clearSandbox();
+  var res=[];
+  try{
+    function trapTest(a,b){
+      var args=arguments;
+      Object.defineProperty(args,'0',{
+        get:function(){return 'trapped';},
+        configurable:true
+      });
+      res.push('trapped:'+args[0]);
+      res.push('a-val:'+a);
+      res.push('length:'+args.length);
+    }
+    trapTest(1,2);
+  }catch(e){res.push('ERR:'+e.message);}
+  cb(res.join('|'));
+});
+
+// B7: toString/valueOf coercion during comparison
+addTest('B7-COERCION-CONFUSION',function(cb){
+  clearSandbox();
+  var res=[];
+  var callCount=0;
+  var evil={
+    valueOf:function(){callCount++;return callCount;},
+    toString:function(){return 'evil';}
+  };
+  // Multiple comparisons should get different values
+  var a=evil==1;
+  var b=evil==2;
+  var c=evil==3;
+  res.push('calls:'+callCount);
+  res.push('a:'+a+'|b:'+b+'|c:'+c);
+  // Array sort with coercion
+  var arr=[evil,evil,evil];
+  callCount=0;
+  arr.sort();
+  res.push('sort-calls:'+callCount);
+  cb(res.join('|'));
+});
+
+// ===========================================================
+// SECTION C: Event Dispatch UAF (deeper patterns)
+// ===========================================================
+
+// C1: Remove iframe during its load event
+addTest('C1-IFRAME-LOAD-REMOVE',function(cb){
+  clearSandbox();
+  var iframe=document.createElement('iframe');
+  iframe.srcdoc='<p>hello</p>';
+  var removed=false;
+  iframe.addEventListener('load',function(){
+    if(!removed){
+      removed=true;
+      sandbox.removeChild(iframe);
+    }
+  });
+  sandbox.appendChild(iframe);
+  setTimeout(function(){
+    cb('OK-removed:'+removed);
+  },300);
+});
+
+// C2: Custom element with disconnectedCallback UAF
+addTest('C2-CUSTOM-ELEMENT-DISCONNECT',function(cb){
+  clearSandbox();
+  var res=[];
+  try{
+    var name='test-c2-'+Date.now();
+    var disconnectCount=0;
+    function C2Element(){return HTMLElement.call(this)||this;}
+    C2Element.prototype=Object.create(HTMLElement.prototype);
+    C2Element.prototype.constructor=C2Element;
+    C2Element.prototype.connectedCallback=function(){res.push('connected');};
+    C2Element.prototype.disconnectedCallback=function(){
+      disconnectCount++;
+      res.push('disconnected:'+disconnectCount);
+      // Try to re-add self during disconnect
+      if(disconnectCount<3){
+        try{sandbox.appendChild(this);}catch(e){res.push('reattach-err');}
+      }
+    };
+    customElements.define(name,C2Element);
+    var el=document.createElement(name);
+    sandbox.appendChild(el);
+    sandbox.removeChild(el);
+    setTimeout(function(){
+      cb(res.join('|')+'|total-disconnects:'+disconnectCount);
+    },200);
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// C3: Selection + Range manipulation during input event
+addTest('C3-SELECTION-INPUT',function(cb){
+  clearSandbox();
+  var div=document.createElement('div');
+  div.contentEditable=true;
+  div.innerHTML='<p>hello <b>world</b> test</p>';
+  sandbox.appendChild(div);
+  var eventFired=false;
+  div.addEventListener('input',function(){
+    eventFired=true;
+    try{
+      var sel=window.getSelection();
+      if(sel.rangeCount>0){
+        var r=sel.getRangeAt(0);
+        r.deleteContents();
+        r.insertNode(document.createTextNode('injected'));
+      }
+    }catch(e){}
+  });
+  // Simulate edit
+  div.focus();
+  try{document.execCommand('insertText',false,'X');}catch(e){}
+  setTimeout(function(){
+    cb('OK-eventFired:'+eventFired+'|content:'+div.textContent.substring(0,30));
+  },100);
+});
+
+// C4: Promise microtask during DOM mutation
+addTest('C4-PROMISE-MUTATION',function(cb){
+  clearSandbox();
+  var div=document.createElement('div');
+  sandbox.appendChild(div);
+  var steps=[];
+  var obs=new MutationObserver(function(){
+    steps.push('mutation');
+    Promise.resolve().then(function(){
+      steps.push('microtask-in-mutation');
+      div.setAttribute('data-x','changed');
+    });
+  });
+  obs.observe(div,{attributes:true,childList:true});
+  div.setAttribute('data-test','1');
+  Promise.resolve().then(function(){
+    steps.push('outer-microtask');
+    div.innerHTML='<span>new</span>';
+  });
+  setTimeout(function(){
+    obs.disconnect();
+    cb('OK-steps:'+steps.join('>'));
+  },100);
+});
+
+// C5: DOMParser + adoptNode + GC pressure
+addTest('C5-DOMPARSER-ADOPT-GC',function(cb){
+  clearSandbox();
+  var parser=new DOMParser();
+  var docs=[];
+  var adopted=[];
+  // Parse many documents and adopt nodes across them
+  for(var i=0;i<50;i++){
+    var doc=parser.parseFromString('<div class="c5-'+i+'"><span>'+i+'</span></div>','text/html');
+    docs.push(doc);
+    var el=doc.querySelector('.c5-'+i);
+    if(el){
+      var a=document.adoptNode(el);
+      sandbox.appendChild(a);
+      adopted.push(a);
+    }
+  }
+  // Remove half to create GC pressure
+  for(var j=0;j<adopted.length;j+=2){
+    if(adopted[j].parentNode)adopted[j].parentNode.removeChild(adopted[j]);
+  }
+  // Force GC attempt
+  docs=null;
+  var arr=[];
+  for(var k=0;k<10000;k++)arr.push({x:k,y:'padding-'+k});
+  arr=null;
+  setTimeout(function(){
+    var remaining=sandbox.querySelectorAll('[class^="c5-"]').length;
+    cb('OK-adopted:'+adopted.length+'|remaining:'+remaining);
+  },100);
+});
+
+// ===========================================================
+// SECTION D: Type confusion / Logic patterns
+// ===========================================================
+
+// D1: Proxy trap confusion
+addTest('D1-PROXY-TRAP',function(cb){
+  clearSandbox();
+  var res=[];
+  try{
+    var callLog=[];
+    var handler={
+      get:function(t,p,r){callLog.push('get:'+String(p));return Reflect.get(t,p,r);},
+      set:function(t,p,v,r){callLog.push('set:'+String(p));return Reflect.set(t,p,v,r);},
+      has:function(t,p){callLog.push('has:'+String(p));return p in t;},
+      deleteProperty:function(t,p){callLog.push('del:'+String(p));return delete t[p];},
+      getPrototypeOf:function(t){callLog.push('getProto');return Object.getPrototypeOf(t);}
+    };
+    var arr=new Proxy([1,2,3],handler);
+    // Operations that might confuse type checks
+    arr.push(4);
+    arr.splice(1,1);
+    arr.sort();
+    Array.prototype.forEach.call(arr,function(v){});
+    JSON.stringify(arr);
+    res.push('calls:'+callLog.length);
+    res.push('len:'+arr.length);
+  }catch(e){res.push('ERR:'+e.message);}
+  cb(res.join('|'));
+});
+
+// D2: WeakRef resurrection attack
+addTest('D2-WEAKREF-RESURRECT',function(cb){
+  clearSandbox();
+  var res=[];
+  try{
+    var refs=[];
+    var registry=new FinalizationRegistry(function(held){
+      res.push('finalized:'+held);
+    });
+    // Create objects with weak refs
+    for(var i=0;i<100;i++){
+      var obj={id:i,data:new ArrayBuffer(1024)};
+      refs.push(new WeakRef(obj));
+      registry.register(obj,'obj-'+i);
+    }
+    // Let them die
+    // GC pressure
+    var junk=[];
+    for(var j=0;j<50000;j++)junk.push({x:j});
+    junk=null;
+    setTimeout(function(){
+      var alive=0;
+      for(var k=0;k<refs.length;k++){
+        if(refs[k].deref())alive++;
+      }
+      res.push('alive:'+alive+'/'+refs.length);
+      cb(res.join('|'));
+    },200);
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// D3: ArrayBuffer detach + TypedArray access
+addTest('D3-DETACH-ACCESS',function(cb){
+  clearSandbox();
+  var res=[];
+  try{
+    var buf=new ArrayBuffer(256);
+    var view=new Uint32Array(buf);
+    view[0]=0xDEADBEEF;
+    view[1]=0xCAFEBABE;
+    // Try to detach via postMessage transfer
+    var ch=new MessageChannel();
+    ch.port1.onmessage=function(e){
+      res.push('transferred-len:'+e.data.byteLength);
+      // Original should be detached
+      res.push('orig-detached:'+(buf.byteLength===0));
+      try{
+        var val=view[0];
+        res.push('view-after-detach:0x'+val.toString(16));
+      }catch(e2){res.push('view-err:'+e2.name);}
+      cb(res.join('|'));
+    };
+    ch.port2.postMessage(buf,[buf]);
+    res.push('posted-orig-len:'+buf.byteLength);
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// D4: SharedArrayBuffer check (should fail on PS5 but verify)
+addTest('D4-SAB-CHECK',function(cb){
+  var res=[];
+  try{
+    var sab=new SharedArrayBuffer(256);
+    res.push('SAB:YES');
+    res.push('len:'+sab.byteLength);
+    var view=new Int32Array(sab);
+    Atomics.store(view,0,42);
+    res.push('atomic:'+Atomics.load(view,0));
+  }catch(e){res.push('SAB:NO|'+e.name);}
+  cb(res.join('|'));
+});
+
+// D5: Resizable ArrayBuffer edge cases
+addTest('D5-RAB-EDGES',function(cb){
+  var res=[];
+  try{
+    if(!ArrayBuffer.prototype.resize){cb('SKIP-no-RAB');return;}
+    var rab=new ArrayBuffer(64,{maxByteLength:1024});
+    var view=new Uint8Array(rab);
+    view[0]=0xFF;
+    // Resize larger
+    rab.resize(128);
+    res.push('grow:'+rab.byteLength+'|val:0x'+view[0].toString(16));
+    // Resize to 0
+    rab.resize(0);
+    res.push('zero:'+rab.byteLength);
+    try{var v=view[0];res.push('oob-read:0x'+v.toString(16));}
+    catch(e3){res.push('oob-read:'+e3.name);}
+    // Resize back
+    rab.resize(256);
+    res.push('regrow:'+rab.byteLength+'|init:0x'+view[0].toString(16));
+    // Race: resize during typed array operation
+    var rab2=new ArrayBuffer(1024,{maxByteLength:4096});
+    var u32=new Uint32Array(rab2);
+    for(var i=0;i<u32.length;i++)u32[i]=i;
+    // Shrink while iterating
+    var sum=0;
+    for(var j=0;j<u32.length;j++){
+      if(j===128)try{rab2.resize(256);}catch(e4){}
+      try{sum+=u32[j];}catch(e5){break;}
+    }
+    res.push('race-sum:'+sum);
+  }catch(e){res.push('ERR:'+e.name+':'+e.message);}
+  cb(res.join('|'));
+});
+
+// D6: Object.create with exotic prototype chains
+addTest('D6-EXOTIC-PROTO',function(cb){
+  var res=[];
+  try{
+    // Create deep prototype chain
+    var chain={};
+    var cur=chain;
+    for(var i=0;i<100;i++){
+      var next=Object.create(cur);
+      next['prop'+i]=i;
+      cur=next;
+    }
+    // Access properties through the chain
+    var found=0;
+    for(var j=0;j<100;j++){
+      if(cur['prop'+j]!==undefined)found++;
+    }
+    res.push('chain-found:'+found);
+    // Modify prototype mid-lookup
+    var a={x:1};
+    var b=Object.create(a);
+    var c=Object.create(b);
+    res.push('c.x:'+c.x);
+    Object.setPrototypeOf(b,{x:999});
+    res.push('c.x-after:'+c.x);
+  }catch(e){res.push('ERR:'+e.message);}
+  cb(res.join('|'));
+});
+
+// ===========================================================
+// SECTION E: CSS/Layout stress (potential rendering UAF)
+// ===========================================================
+
+// E1: Rapid style changes with forced reflow
+addTest('E1-FORCED-REFLOW-STORM',function(cb){
+  clearSandbox();
+  var div=document.createElement('div');
+  div.style.cssText='width:100px;height:100px;position:absolute;left:-9999px';
+  sandbox.appendChild(div);
+  var heights=[];
+  for(var i=0;i<100;i++){
+    div.style.height=(10+i)+'px';
+    div.style.padding=i+'px';
+    heights.push(div.offsetHeight); // Force reflow
+    div.style.display=i%2?'block':'inline-block';
+    void div.offsetWidth;
+  }
+  cb('OK-reflows:'+heights.length+'|last:'+heights[heights.length-1]);
+});
+
+// E2: CSS animation + element removal
+addTest('E2-ANIMATION-REMOVE',function(cb){
+  clearSandbox();
+  var style=document.createElement('style');
+  style.textContent='@keyframes e2move{from{transform:translateX(0)}to{transform:translateX(100px)}}';
+  document.head.appendChild(style);
+  var els=[];
+  for(var i=0;i<20;i++){
+    var div=document.createElement('div');
+    div.style.cssText='width:10px;height:10px;background:red;animation:e2move 0.1s infinite;position:absolute;left:-9999px';
+    sandbox.appendChild(div);
+    els.push(div);
+  }
+  // Remove elements during animation
+  setTimeout(function(){
+    for(var j=0;j<els.length;j++){
+      if(els[j].parentNode)els[j].parentNode.removeChild(els[j]);
+    }
+    document.head.removeChild(style);
+    cb('OK-removed:'+els.length);
+  },50);
+});
+
+// E3: getComputedStyle during DOM mutation
+addTest('E3-COMPUTED-MUTATION',function(cb){
+  clearSandbox();
+  var div=document.createElement('div');
+  div.style.cssText='width:100px;color:red;font-size:16px';
+  sandbox.appendChild(div);
+  var vals=[];
+  for(var i=0;i<50;i++){
+    div.style.fontSize=(10+i%20)+'px';
+    div.className='c'+i;
+    var cs=getComputedStyle(div);
+    vals.push(cs.fontSize);
+    if(i%10===0){
+      var child=document.createElement('span');
+      div.appendChild(child);
+    }
+    if(i%15===0)div.innerHTML='';
+  }
+  cb('OK-reads:'+vals.length+'|last:'+vals[vals.length-1]);
+});
+
+// Run tests sequentially
+function runNext(){
+  if(tidx>=tests.length){
+    var s=results.map(function(r){return r.id+'='+r.res;}).join('|');
+    bn('DONE','total='+tests.length+'|crashes='+crashes.length+'|'+s);
+    log('COMPLETE: '+tests.length+' tests, '+crashes.length+' crashes','ok');
+    return;
+  }
+  var t=tests[tidx];
+  log('['+tidx+'/'+tests.length+'] '+t.id,'warn');
+  bn('PRE-'+t.id,'starting');
+
+  var done=false;
+  function finish(res){
+    if(done)return;
+    done=true;
+    results.push({id:t.id,res:res});
+    var isErr=res.indexOf('ERR')>=0||res.indexOf('CRASH')>=0;
+    if(isErr)crashes.push(t.id);
+    bn('POST-'+t.id,res);
+    log('  -> '+res,isErr?'hot':'ok');
+    tidx++;
+    setTimeout(runNext,150);
+  }
+
+  try{
+    t.fn(finish);
+    setTimeout(function(){if(!done)finish('TIMEOUT-5s');},5000);
+  }catch(e){
+    finish('EXCEPTION:'+e.name+':'+e.message);
+  }
+}
+
+setTimeout(runNext,300);
+</script></body></html>

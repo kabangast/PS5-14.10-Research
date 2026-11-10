@@ -1,0 +1,535 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1044</title>
+<style>
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px;margin:0}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#4ec9b0}.fail{color:#f44}.warn{color:#dcdcaa}.hit{color:#c084fc;font-weight:bold}
+</style></head><body><div id="hud"></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function log(s){var d=document.getElementById('hud');if(d){var p=document.createElement('div');p.innerHTML=s;d.appendChild(p);d.scrollTop=d.scrollHeight}}
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1044-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+
+log('<b>P1044: Last Chance — RegExp, SVG, Intl, CSS @font-face, createImageBitmap</b>');
+bn('BOOT','ts='+Date.now().toString(36));
+var phase = 0;
+
+// ===== PHASE A: RegExp backtrack/capture overflow =====
+(function(){
+  log('[A] RegExp engine stress tests...');
+  try {
+    var results = [];
+
+    // Test 1: Very large capture group count
+    try {
+      var pattern = '';
+      for(var i=0;i<200;i++) pattern += '(a?)';
+      var re = new RegExp(pattern);
+      var m = re.exec('a'.repeat(200));
+      results.push('captures='+((m&&m.length)||'null'));
+    } catch(e) { results.push('captures_err='+e.name); }
+
+    // Test 2: Lookbehind with backreference
+    try {
+      var re2 = new RegExp('(?<=(\\w+))\\1', 'g');
+      var m2 = re2.exec('abcabc');
+      results.push('lookbehind='+(m2?'match':'null'));
+    } catch(e) { results.push('lookbehind_err='+e.name); }
+
+    // Test 3: Named group collision
+    try {
+      var re3 = /(?<a>\w)(?<b>\w)/;
+      var m3 = re3.exec('xy');
+      results.push('named='+JSON.stringify(m3&&m3.groups));
+    } catch(e) { results.push('named_err='+e.name); }
+
+    // Test 4: RegExp.prototype[Symbol.replace] with very long replacement
+    try {
+      var bigReplace = 'X'.repeat(100000);
+      var src = 'a'.repeat(1000);
+      var result = src.replace(/a/g, bigReplace);
+      results.push('bigreplace='+result.length);
+    } catch(e) { results.push('bigreplace_err='+e.name); }
+
+    // Test 5: Regex matchAll with modified lastIndex
+    try {
+      var re5 = /a/g;
+      var iter = 'aaa'.matchAll(re5);
+      re5.lastIndex = -1;
+      var count = 0;
+      for(var m of iter) count++;
+      results.push('matchall='+count);
+    } catch(e) { results.push('matchall_err='+e.name); }
+
+    // Test 6: String.split with regex that produces empty matches
+    try {
+      var parts = 'abc'.split(/(?=.)/);
+      results.push('split='+parts.length);
+    } catch(e) { results.push('split_err='+e.name); }
+
+    // Test 7: Regex with very long alternation
+    try {
+      var alts = [];
+      for(var i=0;i<5000;i++) alts.push('alt'+i);
+      var re7 = new RegExp(alts.join('|'));
+      var m7 = re7.exec('alt4999');
+      results.push('longalt='+(m7?'match':'null'));
+    } catch(e) { results.push('longalt_err='+e.name); }
+
+    bn('A-REGEX', results.join('|'));
+    log('[A] '+results.join(' | '));
+  } catch(e) {
+    bn('A-ERR', e.name+':'+e.message);
+    log('[A] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE B: SVG processing =====
+(function(){
+  log('[B] SVG memory corruption tests...');
+  try {
+    var results = [];
+
+    // Test 1: Very deep SVG nesting
+    try {
+      var svg = '<svg xmlns="http://www.w3.org/2000/svg">';
+      for(var i=0;i<500;i++) svg += '<g transform="translate(1,1)">';
+      svg += '<rect width="1" height="1"/>';
+      for(var i=0;i<500;i++) svg += '</g>';
+      svg += '</svg>';
+      var div = document.createElement('div');
+      div.innerHTML = svg;
+      document.body.appendChild(div);
+      var rect = div.querySelector('rect');
+      var bbox = rect.getBBox();
+      results.push('deepnest='+bbox.x+','+bbox.y);
+      div.remove();
+    } catch(e) { results.push('deepnest_err='+e.name); }
+
+    // Test 2: SVG use element referencing removed element
+    try {
+      var div2 = document.createElement('div');
+      div2.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg"><defs><circle id="c1" r="10"/></defs><use href="#c1"/></svg>';
+      document.body.appendChild(div2);
+      var defs = div2.querySelector('defs');
+      var use = div2.querySelector('use');
+      // Remove the referenced element
+      defs.remove();
+      // Force layout
+      var bb = use.getBBox();
+      results.push('use_removed='+bb.width+'x'+bb.height);
+      div2.remove();
+    } catch(e) { results.push('use_removed_err='+e.name); }
+
+    // Test 3: SVG filter with extreme values
+    try {
+      var div3 = document.createElement('div');
+      div3.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg"><filter id="f1"><feGaussianBlur stdDeviation="999999"/></filter><rect width="100" height="100" filter="url(#f1)"/></svg>';
+      document.body.appendChild(div3);
+      results.push('filter_extreme=ok');
+      div3.remove();
+    } catch(e) { results.push('filter_err='+e.name); }
+
+    // Test 4: SVG foreignObject with detached elements
+    try {
+      var div4 = document.createElement('div');
+      div4.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg"><foreignObject width="100" height="100"><div xmlns="http://www.w3.org/1999/xhtml" id="fo1">test</div></foreignObject></svg>';
+      document.body.appendChild(div4);
+      var fo = div4.querySelector('#fo1');
+      fo.innerHTML = '<img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7">';
+      results.push('foreignObj=ok');
+      div4.remove();
+    } catch(e) { results.push('foreignObj_err='+e.name); }
+
+    bn('B-SVG', results.join('|'));
+    log('[B] '+results.join(' | '));
+  } catch(e) {
+    bn('B-ERR', e.name+':'+e.message);
+    log('[B] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE C: Intl API overflow =====
+(function(){
+  log('[C] Intl API stress tests...');
+  try {
+    var results = [];
+
+    // Test 1: Very long number format pattern
+    try {
+      var nf = new Intl.NumberFormat('en', {maximumFractionDigits: 340});
+      var s = nf.format(1.23456789e-300);
+      results.push('frac340='+s.length);
+    } catch(e) { results.push('frac340_err='+e.name); }
+
+    // Test 2: Intl.DateTimeFormat with all options
+    try {
+      var df = new Intl.DateTimeFormat('en', {
+        weekday:'long',era:'long',year:'numeric',month:'long',day:'numeric',
+        hour:'numeric',minute:'numeric',second:'numeric',fractionalSecondDigits:3,
+        timeZoneName:'long',hour12:false
+      });
+      var s2 = df.format(new Date());
+      results.push('datefmt='+s2.length);
+    } catch(e) { results.push('datefmt_err='+e.name); }
+
+    // Test 3: Intl.Segmenter (if available)
+    try {
+      if(typeof Intl.Segmenter !== 'undefined') {
+        var seg = new Intl.Segmenter('en', {granularity: 'grapheme'});
+        var segs = Array.from(seg.segment('𐀀'.repeat(10000)));
+        results.push('segmenter='+segs.length);
+      } else {
+        results.push('segmenter=unavailable');
+      }
+    } catch(e) { results.push('segmenter_err='+e.name); }
+
+    // Test 4: Intl.ListFormat with extreme list
+    try {
+      if(typeof Intl.ListFormat !== 'undefined') {
+        var items = [];
+        for(var i=0;i<10000;i++) items.push('item'+i);
+        var lf = new Intl.ListFormat('en');
+        var s4 = lf.format(items);
+        results.push('listfmt='+s4.length);
+      } else {
+        results.push('listfmt=unavailable');
+      }
+    } catch(e) { results.push('listfmt_err='+e.name); }
+
+    // Test 5: toLocaleString with adversarial options
+    try {
+      var n = Number.MAX_VALUE;
+      var s5 = n.toLocaleString('en', {style:'decimal', minimumSignificantDigits:21, maximumSignificantDigits:21});
+      results.push('bignum='+s5.length);
+    } catch(e) { results.push('bignum_err='+e.name); }
+
+    bn('C-INTL', results.join('|'));
+    log('[C] '+results.join(' | '));
+  } catch(e) {
+    bn('C-ERR', e.name+':'+e.message);
+    log('[C] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE D: CSS @font-face via style element =====
+(function(){
+  log('[D] CSS @font-face code path...');
+  try {
+    // Build a minimal WOFF2-like binary as data URL
+    var fontBuf = new ArrayBuffer(512);
+    var u8 = new Uint8Array(fontBuf);
+    // wOFF magic
+    u8[0]=0x77;u8[1]=0x4F;u8[2]=0x46;u8[3]=0x46;
+    // Version 1.0
+    u8[4]=0;u8[5]=1;u8[6]=0;u8[7]=0;
+    // Total length
+    u8[8]=0;u8[9]=0;u8[10]=2;u8[11]=0; // 512
+    // numTables
+    u8[12]=0;u8[13]=0;
+
+    // Convert to base64
+    var binary = '';
+    for(var i=0;i<u8.length;i++) binary += String.fromCharCode(u8[i]);
+    var b64 = btoa(binary);
+
+    // Create sentinel buffers BEFORE font load
+    var sentinels = [];
+    for(var i=0;i<50;i++){
+      var ab = new ArrayBuffer(512);
+      var bv = new BigUint64Array(ab);
+      for(var j=0;j<bv.length;j++) bv[j] = 0xBEEFBEEFBEEFBEEFn;
+      sentinels.push(bv);
+    }
+
+    // Load via CSS @font-face (different code path than JS FontFace API!)
+    var style = document.createElement('style');
+    style.textContent = '@font-face { font-family: "ProbeFontD"; src: url(data:font/woff;base64,'+b64+'); }';
+    document.head.appendChild(style);
+
+    // Force font load by using it
+    var div = document.createElement('div');
+    div.style.fontFamily = '"ProbeFontD", monospace';
+    div.textContent = 'ABCDEFGHIJ';
+    document.body.appendChild(div);
+
+    // Give it a moment to parse
+    setTimeout(function(){
+      // Check sentinel buffers
+      var modified = 0;
+      var values = [];
+      for(var i=0;i<sentinels.length;i++){
+        for(var j=0;j<sentinels[i].length;j++){
+          if(sentinels[i][j] !== 0xBEEFBEEFBEEFBEEFn && sentinels[i][j] !== 0n){
+            modified++;
+            var val = sentinels[i][j];
+            var hi = Number(val >> 32n);
+            var lo = Number(val & 0xFFFFFFFFn);
+            values.push('s'+i+'['+j+']=0x'+hi.toString(16).padStart(8,'0')+lo.toString(16).padStart(8,'0'));
+          }
+        }
+      }
+
+      var res = 'modified='+modified+'|'+values.slice(0,10).join(',');
+      bn('D-CSSFONT', res);
+      log('[D] <span class="'+(modified>0?'hit':'warn')+'">'+res+'</span>');
+
+      phaseE();
+    }, 500);
+  } catch(e) {
+    bn('D-ERR', e.name+':'+e.message);
+    log('[D] Error: '+e.message);
+    phaseE();
+  }
+})();
+
+// ===== PHASE E: createImageBitmap from various blobs =====
+function phaseE(){
+  log('[E] createImageBitmap stress...');
+  if(typeof createImageBitmap === 'undefined'){
+    bn('E-SKIP','no_createImageBitmap');log('[E] Not available');phaseF();return;
+  }
+
+  try {
+    var results = [];
+    var done = 0;
+    var total = 4;
+
+    function check(){
+      done++;
+      if(done >= total){
+        bn('E-BITMAP', results.join('|'));
+        log('[E] '+results.join(' | '));
+        phaseF();
+      }
+    }
+
+    // Test 1: Very large dimensions
+    try {
+      var c = document.createElement('canvas');
+      c.width=1;c.height=1;
+      createImageBitmap(c, {resizeWidth:32767, resizeHeight:32767}).then(function(bmp){
+        results.push('huge='+bmp.width+'x'+bmp.height);check();
+      }).catch(function(e){results.push('huge_err='+e.name);check();});
+    } catch(e){results.push('huge_err='+e.name);check();}
+
+    // Test 2: Zero-size crop
+    try {
+      var c2 = document.createElement('canvas');
+      c2.width=100;c2.height=100;
+      createImageBitmap(c2, 50, 50, 0, 0).then(function(bmp){
+        results.push('zero='+bmp.width+'x'+bmp.height);check();
+      }).catch(function(e){results.push('zero_err='+e.name);check();});
+    } catch(e){results.push('zero_err='+e.name);check();}
+
+    // Test 3: Negative crop offset
+    try {
+      var c3 = document.createElement('canvas');
+      c3.width=100;c3.height=100;
+      createImageBitmap(c3, -50, -50, 200, 200).then(function(bmp){
+        results.push('neg='+bmp.width+'x'+bmp.height);check();
+      }).catch(function(e){results.push('neg_err='+e.name);check();});
+    } catch(e){results.push('neg_err='+e.name);check();}
+
+    // Test 4: ImageBitmap from blob with wrong MIME type
+    try {
+      var blob = new Blob(['not an image'], {type:'image/png'});
+      createImageBitmap(blob).then(function(bmp){
+        results.push('fakeblob='+bmp.width+'x'+bmp.height);check();
+      }).catch(function(e){results.push('fakeblob_err='+e.name);check();});
+    } catch(e){results.push('fakeblob_err='+e.name);check();}
+
+    // Timeout fallback
+    setTimeout(function(){
+      if(done < total){
+        results.push('timeout_remaining='+(total-done));
+        done = total;
+        bn('E-BITMAP', results.join('|'));
+        log('[E] '+results.join(' | '));
+        phaseF();
+      }
+    }, 3000);
+  } catch(e) {
+    bn('E-ERR', e.name+':'+e.message);
+    log('[E] Error: '+e.message);
+    phaseF();
+  }
+}
+
+// ===== PHASE F: TextEncoder/TextDecoder edge cases =====
+function phaseF(){
+  log('[F] TextEncoder/Decoder edge cases...');
+  try {
+    var results = [];
+
+    // Test 1: Encode surrogate pairs
+    try {
+      var enc = new TextEncoder();
+      var buf = enc.encode('𐀀'); // valid surrogate pair
+      results.push('surr_pair='+buf.length);
+    } catch(e) { results.push('surr_pair_err='+e.name); }
+
+    // Test 2: Lone surrogates
+    try {
+      var enc2 = new TextEncoder();
+      var buf2 = enc2.encode('\uD800'); // lone high surrogate
+      results.push('lone_surr='+buf2.length);
+    } catch(e) { results.push('lone_surr_err='+e.name); }
+
+    // Test 3: Decode with fatal option + invalid UTF-8
+    try {
+      var dec = new TextDecoder('utf-8', {fatal: true});
+      var bad = new Uint8Array([0xFF, 0xFE, 0xFD]);
+      try {
+        dec.decode(bad);
+        results.push('fatal_bad=no_throw');
+      } catch(e) {
+        results.push('fatal_bad='+e.name);
+      }
+    } catch(e) { results.push('fatal_err='+e.name); }
+
+    // Test 4: encodeInto with undersized buffer
+    try {
+      var enc4 = new TextEncoder();
+      var dest = new Uint8Array(3);
+      var res4 = enc4.encodeInto('Hello World! This is a long string.', dest);
+      results.push('encodeInto=read:'+res4.read+',written:'+res4.written);
+    } catch(e) { results.push('encodeInto_err='+e.name); }
+
+    // Test 5: Decode large buffer
+    try {
+      var big = new Uint8Array(1048576); // 1MB
+      for(var i=0;i<big.length;i++) big[i] = 0x41; // 'A'
+      var dec5 = new TextDecoder();
+      var str = dec5.decode(big);
+      results.push('bigdec='+str.length);
+    } catch(e) { results.push('bigdec_err='+e.name); }
+
+    bn('F-TEXT', results.join('|'));
+    log('[F] '+results.join(' | '));
+  } catch(e) {
+    bn('F-ERR', e.name+':'+e.message);
+    log('[F] Error: '+e.message);
+  }
+
+  phaseG();
+}
+
+// ===== PHASE G: URL parser edge cases =====
+function phaseG(){
+  log('[G] URL parser stress...');
+  try {
+    var results = [];
+
+    // Test 1: Very long URL
+    try {
+      var longUrl = 'https://example.com/' + 'A'.repeat(100000);
+      var u = new URL(longUrl);
+      results.push('longurl='+u.pathname.length);
+    } catch(e) { results.push('longurl_err='+e.name); }
+
+    // Test 2: URL with many query parameters
+    try {
+      var params = '';
+      for(var i=0;i<10000;i++) params += '&p'+i+'=v'+i;
+      var u2 = new URL('https://example.com/?' + params);
+      results.push('manyparams='+u2.searchParams.toString().length);
+    } catch(e) { results.push('manyparams_err='+e.name); }
+
+    // Test 3: URL with unicode normalization edge case
+    try {
+      var u3 = new URL('https://Å.example.com/'); // A + combining ring = Å
+      results.push('unicode='+u3.hostname);
+    } catch(e) { results.push('unicode_err='+e.name); }
+
+    // Test 4: data URL parsing
+    try {
+      var u4 = new URL('data:text/html;base64,' + btoa('<script>1</script>'.repeat(10000)));
+      results.push('dataurl='+u4.href.length);
+    } catch(e) { results.push('dataurl_err='+e.name); }
+
+    bn('G-URL', results.join('|'));
+    log('[G] '+results.join(' | '));
+  } catch(e) {
+    bn('G-ERR', e.name+':'+e.message);
+    log('[G] Error: '+e.message);
+  }
+
+  phaseH();
+}
+
+// ===== PHASE H: Feature detection sweep =====
+function phaseH(){
+  log('[H] Feature detection (attack surface map)...');
+  try {
+    var features = {};
+
+    // APIs that might provide attack surface
+    features.ServiceWorker = typeof navigator.serviceWorker !== 'undefined';
+    features.CacheAPI = typeof caches !== 'undefined';
+    features.WebRTC = typeof RTCPeerConnection !== 'undefined';
+    features.WebSocket = typeof WebSocket !== 'undefined';
+    features.EventSource = typeof EventSource !== 'undefined';
+    features.BroadcastChannel = typeof BroadcastChannel !== 'undefined';
+    features.MessageChannel = typeof MessageChannel !== 'undefined';
+    features.Blob = typeof Blob !== 'undefined';
+    features.File = typeof File !== 'undefined';
+    features.FileReader = typeof FileReader !== 'undefined';
+    features.FormData = typeof FormData !== 'undefined';
+    features.fetch = typeof fetch !== 'undefined';
+    features.AbortController = typeof AbortController !== 'undefined';
+    features.ReadableStream = typeof ReadableStream !== 'undefined';
+    features.WritableStream = typeof WritableStream !== 'undefined';
+    features.TransformStream = typeof TransformStream !== 'undefined';
+    features.CompressionStream = typeof CompressionStream !== 'undefined';
+    features.DecompressionStream = typeof DecompressionStream !== 'undefined';
+    features.TextDecoderStream = typeof TextDecoderStream !== 'undefined';
+    features.Crypto = typeof crypto !== 'undefined';
+    features.SubtleCrypto = typeof crypto !== 'undefined' && typeof crypto.subtle !== 'undefined';
+    features.Performance = typeof performance !== 'undefined';
+    features.PerformanceObserver = typeof PerformanceObserver !== 'undefined';
+    features.IntersectionObserver = typeof IntersectionObserver !== 'undefined';
+    features.ResizeObserver = typeof ResizeObserver !== 'undefined';
+    features.MutationObserver = typeof MutationObserver !== 'undefined';
+    features.WeakRef = typeof WeakRef !== 'undefined';
+    features.FinalizationRegistry = typeof FinalizationRegistry !== 'undefined';
+    features.Proxy = typeof Proxy !== 'undefined';
+    features.Reflect = typeof Reflect !== 'undefined';
+    features.Symbol = typeof Symbol !== 'undefined';
+    features.BigInt = typeof BigInt !== 'undefined';
+    features.Atomics = typeof Atomics !== 'undefined';
+    features.structuredClone = typeof structuredClone !== 'undefined';
+    features.queueMicrotask = typeof queueMicrotask !== 'undefined';
+    features.requestIdleCallback = typeof requestIdleCallback !== 'undefined';
+    features.Intl_Segmenter = typeof Intl !== 'undefined' && typeof Intl.Segmenter !== 'undefined';
+    features.Intl_ListFormat = typeof Intl !== 'undefined' && typeof Intl.ListFormat !== 'undefined';
+    features.Intl_RelativeTimeFormat = typeof Intl !== 'undefined' && typeof Intl.RelativeTimeFormat !== 'undefined';
+    features.Intl_DisplayNames = typeof Intl !== 'undefined' && typeof Intl.DisplayNames !== 'undefined';
+    features.OffscreenCanvas = typeof OffscreenCanvas !== 'undefined';
+    features.ImageBitmapRenderingContext = typeof ImageBitmapRenderingContext !== 'undefined';
+    features.createImageBitmap = typeof createImageBitmap !== 'undefined';
+    features.ResizableArrayBuffer = typeof ArrayBuffer !== 'undefined' && 'maxByteLength' in ArrayBuffer.prototype;
+    features.ArrayBuffer_transfer = typeof ArrayBuffer !== 'undefined' && typeof ArrayBuffer.prototype.transfer !== 'undefined';
+
+    // Count YES features
+    var yes = Object.entries(features).filter(function(e){return e[1]}).map(function(e){return e[0]});
+    var no = Object.entries(features).filter(function(e){return !e[1]}).map(function(e){return e[0]});
+
+    bn('H-YES', 'count='+yes.length+'|'+yes.join(','));
+    bn('H-NO', 'count='+no.length+'|'+no.join(','));
+    log('[H] YES ('+yes.length+'): '+yes.join(', '));
+    log('[H] <span class="warn">NO ('+no.length+'): '+no.join(', ')+'</span>');
+  } catch(e) {
+    bn('H-ERR', e.name+':'+e.message);
+    log('[H] Error: '+e.message);
+  }
+
+  bn('DONE','ok');
+  log('<b>[DONE] P1044 complete</b>');
+}
+</script></body></html>

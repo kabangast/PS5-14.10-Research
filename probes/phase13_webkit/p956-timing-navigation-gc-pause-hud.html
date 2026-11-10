@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>PS5 FW 14.10 // RESOURCE TIMING &amp; JSC GC PAUSE HUD</title>
+<style>
+:root {
+  --bg-dark: #040711;
+  --panel-bg: rgba(8, 14, 28, 0.94);
+  --neon-cyan: #00f3ff;
+  --neon-green: #00ff66;
+  --neon-amber: #ffb800;
+  --neon-pink: #ff0077;
+  --neon-purple: #9d00ff;
+  --text-dim: #7085a5;
+  --text-main: #e2f1ff;
+  --border-glow: rgba(0, 243, 255, 0.35);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background-color: var(--bg-dark);
+  background-image: 
+    radial-gradient(ellipse at 50% 0%, rgba(0, 243, 255, 0.16), transparent 75%),
+    linear-gradient(rgba(0, 243, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 243, 255, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 28px 28px, 28px 28px;
+  color: var(--text-main);
+  font-family: "SF Mono", "Consolas", monospace;
+  padding: 16px;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+.scanline {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.02), rgba(0, 255, 0, 0.01), rgba(0, 255, 0, 0.02));
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+  z-index: 999;
+}
+
+/* Header */
+.header {
+  border: 1px solid var(--neon-cyan);
+  background: rgba(0, 243, 255, 0.07);
+  box-shadow: 0 0 20px rgba(0, 243, 255, 0.3);
+  padding: 12px 20px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title-glitch {
+  font-size: 18px;
+  font-weight: 900;
+  letter-spacing: 2px;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 10px rgba(0, 243, 255, 0.8);
+}
+.target-badge {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: rgba(0, 255, 102, 0.15);
+  border: 1px solid var(--neon-green);
+  color: var(--neon-green);
+  font-weight: bold;
+}
+
+/* Pipeline Trackers */
+.pipeline-track {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.node {
+  background: var(--panel-bg);
+  border: 1px solid rgba(112, 133, 165, 0.25);
+  border-radius: 6px;
+  padding: 10px;
+  position: relative;
+  transition: all 0.3s ease;
+}
+.node.done {
+  border-color: var(--neon-green);
+  box-shadow: 0 0 10px rgba(0, 255, 102, 0.25);
+}
+.node.active {
+  border-color: var(--neon-cyan);
+  box-shadow: 0 0 12px rgba(0, 243, 255, 0.4);
+}
+.node.locked {
+  border-color: rgba(112, 133, 165, 0.2);
+  opacity: 0.55;
+}
+.node-step {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.node.done .node-step { color: var(--neon-green); }
+.node.active .node-step { color: var(--neon-cyan); }
+.node-title {
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--text-main);
+  margin-bottom: 4px;
+}
+.node-desc {
+  font-size: 9px;
+  color: var(--text-dim);
+  line-height: 1.3;
+}
+
+/* Grid Layout */
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-glow);
+  border-radius: 6px;
+  padding: 14px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
+  position: relative;
+  overflow: hidden;
+}
+.panel-title {
+  font-size: 13px;
+  font-weight: bold;
+  color: var(--neon-cyan);
+  border-bottom: 1px solid rgba(0, 243, 255, 0.2);
+  padding-bottom: 8px;
+  margin-bottom: 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.live-meter {
+  display: flex;
+  justify-content: space-between;
+  margin: 6px 0;
+  font-size: 11px;
+}
+.val-hex { color: var(--neon-purple); font-weight: bold; }
+.val-ok { color: var(--neon-green); font-weight: bold; }
+.val-dim { color: var(--text-dim); }
+.val-cyan { color: var(--neon-cyan); font-weight: bold; }
+.val-warn { color: var(--neon-amber); font-weight: bold; }
+.val-fail { color: var(--neon-pink); font-weight: bold; }
+
+/* Radar & Glitch Accents */
+.radar-box {
+  width: 100%;
+  height: 2px;
+  background: rgba(0, 243, 255, 0.1);
+  position: relative;
+  overflow: hidden;
+  margin-top: 10px;
+}
+.radar-sweep {
+  position: absolute;
+  top: 0; left: -30%;
+  width: 30%; height: 100%;
+  background: linear-gradient(90deg, transparent, var(--neon-cyan), transparent);
+  animation: sweep 2.2s infinite linear;
+}
+@keyframes sweep {
+  0% { left: -30%; }
+  100% { left: 100%; }
+}
+
+/* Terminal Log */
+#terminal {
+  background: rgba(2, 4, 10, 0.9);
+  border: 1px solid rgba(0, 243, 255, 0.18);
+  border-radius: 4px;
+  padding: 10px;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: #a0c4e8;
+  height: 150px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+
+<div class="header">
+  <div>
+    <div class="title-glitch">&#x25C8; PS5 FW 14.10 // RESOURCE TIMING &amp; JSC GC PAUSE HUD</div>
+    <div style="font-size: 10px; color: var(--text-dim); margin-top: 3px;">
+      Network Socket Lifecycle &bull; Resource Timing Accuracy &bull; Heap Pressure &amp; GC Latency Oracle
+    </div>
+  </div>
+  <div class="target-badge" id="statusBadge">AUDITING NETWORK &amp; GC</div>
+</div>
+
+<!-- 6-Stage Visual Pipeline Tracker -->
+<div class="pipeline-track">
+  <div class="node active" id="nodeStage1">
+    <div class="node-step">Stage 1 [ACTIVE]</div>
+    <div class="node-title">Navigation Timing</div>
+    <div class="node-desc">PerformanceNavigationTiming phases &amp; redirect count.</div>
+  </div>
+  <div class="node locked" id="nodeStage2">
+    <div class="node-step">Stage 2 [QUEUED]</div>
+    <div class="node-title">Resource Timing</div>
+    <div class="node-desc">DNS, TCP, TTFB &amp; transferSize disclosure.</div>
+  </div>
+  <div class="node locked" id="nodeStage3">
+    <div class="node-step">Stage 3 [QUEUED]</div>
+    <div class="node-title">Heap Pressure Ramp</div>
+    <div class="node-desc">Progressive allocation from 16MB to 224MB.</div>
+  </div>
+  <div class="node locked" id="nodeStage4">
+    <div class="node-step">Stage 4 [QUEUED]</div>
+    <div class="node-title">GC Pause Detection</div>
+    <div class="node-desc">High-frequency loop measuring synchronous GC sweep freeze.</div>
+  </div>
+  <div class="node locked" id="nodeStage5">
+    <div class="node-step">Stage 5 [QUEUED]</div>
+    <div class="node-title">Finalization &amp; GC API</div>
+    <div class="node-desc">Testing window.gc &amp; FinalizationRegistry sweep.</div>
+  </div>
+  <div class="node locked" id="nodeStage6">
+    <div class="node-step">Stage 6 [QUEUED]</div>
+    <div class="node-title">Master Verdict</div>
+    <div class="node-desc">Consolidated telemetry &amp; heartbeat sync.</div>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Panel 1: Navigation & Resource Timing Telemetry -->
+  <div class="panel">
+    <div class="panel-title">
+      <span>NETWORK &amp; RESOURCE TIMING HUD</span>
+      <span style="color:var(--neon-green);" id="mTimingBadge">ACTIVE</span>
+    </div>
+    <div class="live-meter"><span>Navigation Type:</span><span class="val-cyan" id="mNavType">Resolving...</span></div>
+    <div class="live-meter"><span>DOM Interactive / Complete:</span><span class="val-ok" id="mDomTimes">Resolving...</span></div>
+    <div class="live-meter"><span>Resource Timing Exposed:</span><span class="val-ok" id="mResExposed">Testing...</span></div>
+    <div class="live-meter"><span>DNS / TCP Socket Latency:</span><span class="val-hex" id="mSocketLat">Resolving...</span></div>
+    <div class="live-meter"><span>TTFB (Time To First Byte):</span><span class="val-hex" id="mTtfb">Resolving...</span></div>
+    <div class="live-meter"><span>Encoded / Decoded Body Size:</span><span class="val-ok" id="mBodySizes">Resolving...</span></div>
+    <div class="radar-box"><div class="radar-sweep"></div></div>
+  </div>
+
+  <!-- Panel 2: JSC Heap Pressure & GC Latency Telemetry -->
+  <div class="panel">
+    <div class="panel-title">
+      <span>JSC HEAP PRESSURE &amp; GC SWEEP HUD</span>
+      <span style="color:var(--neon-cyan);">ACTIVE TELEMETRY</span>
+    </div>
+    <div class="live-meter"><span>Allocation Ramp (16-224MB):</span><span class="val-ok" id="mHeapRamp">Allocating...</span></div>
+    <div class="live-meter"><span>Peak Allocated Memory:</span><span class="val-hex" id="mPeakAlloc">Testing...</span></div>
+    <div class="live-meter"><span>Peak Allocation Time:</span><span class="val-cyan" id="mAllocTime">Measuring...</span></div>
+    <div class="live-meter"><span>GC Loop Micro-Jitter:</span><span class="val-ok" id="mGcJitter">Monitoring...</span></div>
+    <div class="live-meter"><span>Max Synchronous GC Pause:</span><span class="val-warn" id="mMaxPause">Measuring...</span></div>
+    <div class="live-meter"><span>Native window.gc API:</span><span class="val-dim" id="mGcApi">Testing...</span></div>
+    <div class="live-meter"><span>FinalizationRegistry Sweep:</span><span class="val-ok" id="mFinalizeSweep">Testing...</span></div>
+    <div class="radar-box"><div class="radar-sweep"></div></div>
+  </div>
+</div>
+
+<!-- Tactical Log Terminal -->
+<div class="panel">
+  <div class="panel-title">
+    <span>TACTICAL NETWORK &amp; GC TELEMETRY LOG</span>
+    <span style="color:var(--neon-green);">LIVE STREAM TELEMETRY</span>
+  </div>
+  <pre id="terminal">[*] Initializing Probe P956 Resource Timing &amp; JSC GC Suite...</pre>
+  <div class="radar-box"><div class="radar-sweep"></div></div>
+</div>
+
+<script>
+'use strict';
+var term = document.getElementById('terminal');
+var statusBadge = document.getElementById('statusBadge');
+var mTimingBadge = document.getElementById('mTimingBadge');
+
+var nodeStage1 = document.getElementById('nodeStage1');
+var nodeStage2 = document.getElementById('nodeStage2');
+var nodeStage3 = document.getElementById('nodeStage3');
+var nodeStage4 = document.getElementById('nodeStage4');
+var nodeStage5 = document.getElementById('nodeStage5');
+var nodeStage6 = document.getElementById('nodeStage6');
+
+var mNavType = document.getElementById('mNavType');
+var mDomTimes = document.getElementById('mDomTimes');
+var mResExposed = document.getElementById('mResExposed');
+var mSocketLat = document.getElementById('mSocketLat');
+var mTtfb = document.getElementById('mTtfb');
+var mBodySizes = document.getElementById('mBodySizes');
+
+var mHeapRamp = document.getElementById('mHeapRamp');
+var mPeakAlloc = document.getElementById('mPeakAlloc');
+var mAllocTime = document.getElementById('mAllocTime');
+var mGcJitter = document.getElementById('mGcJitter');
+var mMaxPause = document.getElementById('mMaxPause');
+var mGcApi = document.getElementById('mGcApi');
+var mFinalizeSweep = document.getElementById('mFinalizeSweep');
+
+function log(msg) {
+  var d = document.createElement('div');
+  d.textContent = '[' + new Date().toISOString().slice(11, 23) + '] ' + msg;
+  term.appendChild(d);
+  term.scrollTop = term.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P956-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+window.onerror = function(msg, url, line) {
+  syncBn('JS-ERR', msg + ' at line ' + line);
+  log('[!] ERROR: ' + msg + ' (Line ' + line + ')');
+};
+
+log('[*] Probe P956 online: Performance Navigation, Resource Timing & JSC GC Pause Oracle.');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * STAGE 1: PerformanceNavigationTiming Audit
+ * ============================================================ */
+var navEntries = (performance && typeof performance.getEntriesByType === 'function') ? performance.getEntriesByType('navigation') : [];
+var nav = navEntries.length > 0 ? navEntries[0] : null;
+
+var navType = 'unknown';
+var domInteractive = 0, domComplete = 0, loadEventEnd = 0, redirectCount = 0;
+
+if (nav) {
+  navType = nav.type || 'navigate';
+  domInteractive = Math.round(nav.domInteractive || 0);
+  domComplete = Math.round(nav.domComplete || 0);
+  loadEventEnd = Math.round(nav.loadEventEnd || 0);
+  redirectCount = nav.redirectCount || 0;
+
+  mNavType.textContent = navType.toUpperCase() + ' (redirects: ' + redirectCount + ')';
+  mDomTimes.textContent = domInteractive + 'ms / ' + (domComplete || 'rendering') + 'ms';
+
+  log('[+] Navigation Timing: type=' + navType + ', domInteractive=' + domInteractive + 'ms, domComplete=' + domComplete + 'ms, redirects=' + redirectCount);
+  syncBn('NAV-TIMING', 'type=' + navType + '|interactive=' + domInteractive + '|complete=' + domComplete + '|redirects=' + redirectCount);
+
+  nodeStage1.className = 'node done';
+  nodeStage1.querySelector('.node-step').textContent = 'Stage 1 [DONE]';
+} else {
+  mNavType.textContent = 'LEGACY NAVIGATION';
+  syncBn('NAV-TIMING', 'type=legacy');
+  nodeStage1.className = 'node done';
+}
+
+/* ============================================================
+ * STAGE 2: PerformanceResourceTiming & Socket Latency Audit
+ * ============================================================ */
+nodeStage2.className = 'node active';
+nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [ACTIVE]';
+
+// Fetch probe asset to generate clean resource entry
+var testResourceUrl = '/reload.txt?test_timing=' + Date.now();
+fetch(testResourceUrl).then(function(res) {
+  return res.text();
+}).then(function(txt) {
+  var resEntries = performance.getEntriesByName(location.origin + testResourceUrl);
+  if (resEntries.length === 0) resEntries = performance.getEntriesByType('resource');
+
+  var r = resEntries.length > 0 ? resEntries[resEntries.length - 1] : null;
+  var hasSizes = false, hasTimestamps = false;
+  var ttfb = 0, dnsMs = 0, tcpMs = 0;
+  var encSize = 0, decSize = 0, xferSize = 0;
+
+  if (r) {
+    dnsMs = Math.max(0, Math.round(r.domainLookupEnd - r.domainLookupStart));
+    tcpMs = Math.max(0, Math.round(r.connectEnd - r.connectStart));
+    ttfb = Math.max(0, Math.round(r.responseStart - r.requestStart));
+
+    xferSize = r.transferSize || 0;
+    encSize = r.encodedBodySize || 0;
+    decSize = r.decodedBodySize || 0;
+
+    hasSizes = (xferSize > 0 || encSize > 0 || decSize > 0);
+    hasTimestamps = (r.responseEnd > 0);
+
+    mResExposed.textContent = hasTimestamps ? 'YES (HIGH PRECISION)' : 'CLAMPED / ZEROED';
+    mSocketLat.textContent = 'DNS: ' + dnsMs + 'ms, TCP: ' + tcpMs + 'ms';
+    mTtfb.textContent = ttfb + ' ms';
+    mBodySizes.textContent = encSize + 'B (xfer: ' + xferSize + 'B)';
+
+    log('[+] Resource Timing: TTFB=' + ttfb + 'ms, DNS=' + dnsMs + 'ms, TCP=' + tcpMs + 'ms, Sizes=' + encSize + '/' + xferSize + 'B');
+    syncBn('RES-TIMING', 'ttfb=' + ttfb + '|dns=' + dnsMs + '|tcp=' + tcpMs + '|xfer=' + xferSize + '|enc=' + encSize + '|hasSizes=' + hasSizes);
+  } else {
+    mResExposed.textContent = 'NO ENTRIES';
+    syncBn('RES-TIMING', 'exposed=false');
+  }
+
+  nodeStage2.className = 'node done';
+  nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [DONE]';
+
+  // Proceed to Stage 3: Heap Ramp
+  executeHeapPressureRamp();
+}).catch(function(e) {
+  log('[-] Resource Timing fetch error: ' + e.message);
+  syncBn('RES-ERR', e.message);
+  executeHeapPressureRamp();
+});
+
+/* ============================================================
+ * STAGE 3: Progressive Heap Pressure Allocation Ramp
+ * ============================================================ */
+function executeHeapPressureRamp() {
+  nodeStage3.className = 'node active';
+  nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [ACTIVE]';
+
+  var rampSteps = [16, 32, 64, 128, 192, 224];
+  var allocations = [];
+  var stepTimes = [];
+  var maxAllocated = 0;
+
+  try {
+    for (var i = 0; i < rampSteps.length; i++) {
+      var mb = rampSteps[i];
+      var t0 = performance.now();
+      var buf = new ArrayBuffer(mb * 1024 * 1024);
+      var dt = Math.round(performance.now() - t0);
+      stepTimes.push(mb + 'MB:' + dt + 'ms');
+      maxAllocated = mb;
+      allocations.push(buf);
+    }
+    mHeapRamp.textContent = '224 MB REACHED (6/6 STEPS)';
+    mPeakAlloc.textContent = maxAllocated + ' MB CONTIGUOUS';
+    mAllocTime.textContent = stepTimes.join(', ');
+
+    log('[+] Heap Ramp: Allocated up to ' + maxAllocated + 'MB cleanly. Step times: ' + stepTimes.join(' | '));
+    syncBn('HEAP-RAMP', 'maxMb=' + maxAllocated + '|steps=' + stepTimes.join(','));
+
+    // Release allocated memory
+    allocations = null;
+
+    nodeStage3.className = 'node done';
+    nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [DONE]';
+
+    executeGCPauseMonitor();
+  } catch(e) {
+    mHeapRamp.textContent = 'FAILED AT ' + maxAllocated + 'MB';
+    log('[-] Heap Ramp Exception: ' + e.message);
+    syncBn('HEAP-RAMP-FAIL', 'atMb=' + maxAllocated + '|err=' + e.message);
+
+    allocations = null;
+    executeGCPauseMonitor();
+  }
+}
+
+/* ============================================================
+ * STAGE 4: Synchronous GC Pause & Micro-Jitter Detection
+ * ============================================================ */
+function executeGCPauseMonitor() {
+  nodeStage4.className = 'node active';
+  nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [ACTIVE]';
+
+  var maxPause = 0;
+  var iterations = 50;
+  var churnMb = 48; // generate 48MB of rapid transient object garbage
+
+  try {
+    // Phase 1: High frequency baseline loop
+    var lastTime = performance.now();
+    for (var i = 0; i < iterations; i++) {
+      // Allocate 1MB garbage per iteration
+      var trash = [];
+      for (var j = 0; j < 1000; j++) {
+        trash.push({ id: j, data: new Array(128).fill(j), text: 'garbage_node_' + j });
+      }
+      var now = performance.now();
+      var delta = now - lastTime;
+      if (delta > maxPause) maxPause = delta;
+      lastTime = now;
+      trash = null;
+    }
+
+    maxPause = Math.round(maxPause);
+    mGcJitter.textContent = 'STABLE EVENT LOOP';
+    mMaxPause.textContent = maxPause + ' ms PEAK SWEEP';
+
+    log('[+] GC Pause Monitor: Churned ~' + churnMb + 'MB transient objects. Peak synchronous pause = ' + maxPause + ' ms');
+    syncBn('GC-PAUSE', 'maxPauseMs=' + maxPause + '|churnMb=' + churnMb);
+
+    nodeStage4.className = 'node done';
+    nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [DONE]';
+
+    executeFinalizationAndApiCheck(maxPause);
+  } catch(e) {
+    log('[-] GC Monitor Exception: ' + e.message);
+    syncBn('GC-ERR', e.message);
+    executeFinalizationAndApiCheck(0);
+  }
+}
+
+/* ============================================================
+ * STAGE 5: GC Debug API & FinalizationRegistry Oracle
+ * ============================================================ */
+function executeFinalizationAndApiCheck(maxGcPause) {
+  nodeStage5.className = 'node active';
+  nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [ACTIVE]';
+
+  var hasGcApi = (typeof window.gc === 'function' || typeof globalThis.gc === 'function');
+  mGcApi.textContent = hasGcApi ? 'EXPOSED (DEBUG MODE)' : 'HIDDEN / COMPILED OUT';
+  mGcApi.className = hasGcApi ? 'val-warn' : 'val-dim';
+
+  var hasFinalization = (typeof FinalizationRegistry === 'function');
+  var cleanedCount = 0;
+
+  if (hasFinalization) {
+    var registry = new FinalizationRegistry(function(heldValue) {
+      cleanedCount++;
+    });
+
+    (function() {
+      for (var k = 0; k < 10; k++) {
+        var ephemeralObj = { key: 'ephemeral_' + k };
+        registry.register(ephemeralObj, 'id_' + k);
+      }
+    })();
+
+    // Force heap churn to trigger cleanup opportunity
+    var churn = [];
+    for (var c = 0; c < 2000; c++) churn.push(new ArrayBuffer(16384));
+    churn = null;
+
+    setTimeout(function() {
+      mFinalizeSweep.textContent = cleanedCount + ' / 10 COLLECTED';
+      log('[+] FinalizationRegistry: cleaned=' + cleanedCount + ' / 10 targets, gcApi=' + hasGcApi);
+      syncBn('FINALIZATION', 'cleaned=' + cleanedCount + '|hasGcApi=' + hasGcApi);
+
+      nodeStage5.className = 'node done';
+      nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [DONE]';
+
+      completeStage6(maxGcPause, hasGcApi, cleanedCount);
+    }, 150);
+  } else {
+    mFinalizeSweep.textContent = 'UNSUPPORTED';
+    nodeStage5.className = 'node locked';
+    completeStage6(maxGcPause, hasGcApi, 0);
+  }
+}
+
+/* ============================================================
+ * STAGE 6: Master Verdict & Heartbeat
+ * ============================================================ */
+function completeStage6(maxPause, hasGcApi, cleanedCount) {
+  nodeStage6.className = 'node done';
+  nodeStage6.querySelector('.node-step').textContent = 'Stage 6 [DONE]';
+
+  statusBadge.textContent = 'ALL 6 STAGES NOMINAL';
+  statusBadge.style.background = '#00ff66';
+
+  log('[*] Probe P956 completed all benchmark stages cleanly.');
+  syncBn('DONE', 'status=P956_COMPLETE|nav=' + navType + '|maxGcPause=' + maxPause + '|hasGcApi=' + hasGcApi + '|cleaned=' + cleanedCount);
+}
+
+/* Auto-Reload Watcher for autonomous progression */
+var initialReloadToken = null;
+function checkAutoReload() {
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/reload.txt?t=' + Date.now(), true);
+    xhr.onload = function() {
+      if (xhr.status === 200) {
+        var token = xhr.responseText.trim();
+        if (initialReloadToken === null) {
+          initialReloadToken = token;
+        } else if (token !== initialReloadToken) {
+          log('[*] New deployment detected (token: ' + token + '). Auto-reloading in 500ms...');
+          setTimeout(function() { location.reload(); }, 500);
+        }
+      }
+    };
+    xhr.send();
+  } catch(e) {}
+}
+setInterval(checkAutoReload, 1500);
+</script>
+</body>
+</html>

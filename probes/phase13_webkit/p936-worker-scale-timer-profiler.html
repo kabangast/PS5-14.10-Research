@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P936: Worker Scale, Transferable Throughput & Timer Profiler</title>
+<style>
+:root {
+  --bg: #090d16;
+  --card: #111827;
+  --border: #1f2937;
+  --text: #e5e7eb;
+  --dim: #9ca3af;
+  --cyan: #06b6d4;
+  --green: #10b981;
+  --amber: #f59e0b;
+  --red: #ef4444;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  padding: 16px;
+  line-height: 1.5;
+}
+.header {
+  border: 1px solid var(--border);
+  background: var(--card);
+  padding: 14px 18px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title { font-size: 16px; font-weight: bold; color: var(--cyan); }
+.badge {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: #374151;
+  font-weight: 600;
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.card {
+  border: 1px solid var(--border);
+  background: var(--card);
+  padding: 12px 14px;
+  border-radius: 6px;
+}
+.card h3 {
+  font-size: 12px;
+  color: var(--dim);
+  text-transform: uppercase;
+  margin-bottom: 8px;
+  letter-spacing: 0.5px;
+}
+.stat {
+  display: flex;
+  justify-content: space-between;
+  padding: 3px 0;
+  border-bottom: 1px dotted rgba(255,255,255,0.08);
+  font-size: 12px;
+}
+.stat:last-child { border-bottom: none; }
+.stat-val { font-weight: bold; }
+.ok { color: var(--green); }
+.warn { color: var(--amber); }
+.err { color: var(--red); }
+.console {
+  border: 1px solid var(--border);
+  background: #05070d;
+  padding: 12px;
+  border-radius: 6px;
+}
+.console-header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--dim);
+  margin-bottom: 8px;
+}
+#log {
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 11px;
+  color: #d1d5db;
+  max-height: 280px;
+  overflow-y: auto;
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <div class="title">PROBE P936: Worker Scale, 1MB Transfer & Timer Profiler</div>
+    <div style="font-size: 11px; color: var(--dim); margin-top: 2px;">PS5 WebKit 14.10 Empirical Diagnostic Suite</div>
+  </div>
+  <div id="statusBadge" class="badge">INITIALIZING</div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h3>Worker Pool Scaling (8x)</h3>
+    <div class="stat"><span>Target Workers:</span><span class="stat-val ok">8 Workers</span></div>
+    <div class="stat"><span>Responses:</span><span id="mPoolResp" class="stat-val">0 / 8</span></div>
+    <div class="stat"><span>Min Latency:</span><span id="mMinLat" class="stat-val">--</span></div>
+    <div class="stat"><span>Max Latency:</span><span id="mMaxLat" class="stat-val">--</span></div>
+  </div>
+
+  <div class="card">
+    <h3>1MB Transferable Throughput</h3>
+    <div class="stat"><span>1MB Transfer:</span><span id="mTransferStatus" class="stat-val">Testing...</span></div>
+    <div class="stat"><span>Roundtrip Latency:</span><span id="mTransferLat" class="stat-val">Pending</span></div>
+    <div class="stat"><span>Source Detach:</span><span id="mSourceDetach" class="stat-val">Pending</span></div>
+    <div class="stat"><span>Integrity Verified:</span><span id="mBufIntact" class="stat-val">Pending</span></div>
+  </div>
+
+  <div class="card">
+    <h3>Timer Precision & Complex Clone</h3>
+    <div class="stat"><span>Timer Min Step:</span><span id="mTimerRes" class="stat-val">Measuring...</span></div>
+    <div class="stat"><span>performance.memory:</span><span id="mPerfMem" class="stat-val">Testing...</span></div>
+    <div class="stat"><span>Circular Clone:</span><span id="mCircularClone" class="stat-val">Testing...</span></div>
+    <div class="stat"><span>Map/Set/BigInt:</span><span id="mComplexClone" class="stat-val">Testing...</span></div>
+  </div>
+</div>
+
+<div class="console">
+  <div class="console-header">
+    <span>DIAGNOSTIC LOG</span>
+    <span class="ok">TAG: P936</span>
+  </div>
+  <pre id="log">[*] Probe P936 initialized.</pre>
+</div>
+
+<script>
+'use strict';
+var logEl = document.getElementById('log');
+var statusBadge = document.getElementById('statusBadge');
+var mPoolResp = document.getElementById('mPoolResp');
+var mMinLat = document.getElementById('mMinLat');
+var mMaxLat = document.getElementById('mMaxLat');
+var mTransferStatus = document.getElementById('mTransferStatus');
+var mTransferLat = document.getElementById('mTransferLat');
+var mSourceDetach = document.getElementById('mSourceDetach');
+var mBufIntact = document.getElementById('mBufIntact');
+var mTimerRes = document.getElementById('mTimerRes');
+var mPerfMem = document.getElementById('mPerfMem');
+var mCircularClone = document.getElementById('mCircularClone');
+var mComplexClone = document.getElementById('mComplexClone');
+
+function log(msg) {
+  var d = document.createElement('div');
+  d.textContent = msg;
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P936-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+log('[*] P936 Loaded: Scaling worker pool to 8, testing 1MB transfer & timer resolution.');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * STAGE 1: Timer Resolution & Serialization Profiling
+ * ============================================================ */
+var minStep = Infinity;
+var t0 = performance.now();
+for (var i = 0; i < 2000; i++) {
+  var t1 = performance.now();
+  var dt = t1 - t0;
+  if (dt > 0 && dt < minStep) {
+    minStep = dt;
+  }
+  t0 = t1;
+}
+
+var timerResStr = (minStep < Infinity) ? (minStep * 1000).toFixed(1) + ' µs (' + minStep.toFixed(4) + ' ms)' : 'COARSE';
+mTimerRes.textContent = timerResStr;
+mTimerRes.className = 'stat-val ok';
+log('[+] Timer resolution: min step = ' + timerResStr);
+
+var hasPerfMem = (typeof performance !== 'undefined' && typeof performance.memory === 'object' && performance.memory !== null);
+mPerfMem.textContent = hasPerfMem ? 'EXPOSED' : 'HIDDEN (STANDARD)';
+mPerfMem.className = 'stat-val ' + (hasPerfMem ? 'ok' : 'warn');
+
+// Complex Object Serialization (Circular, Map, Set, BigInt)
+var circularOk = false;
+try {
+  var circ = { name: 'root' };
+  circ.self = circ;
+  var clonedCirc = structuredClone(circ);
+  circularOk = (clonedCirc !== circ && clonedCirc.self === clonedCirc);
+  mCircularClone.textContent = circularOk ? 'PASSED (SELF_REF)' : 'FAIL';
+  mCircularClone.className = 'stat-val ' + (circularOk ? 'ok' : 'err');
+} catch(e) {
+  mCircularClone.textContent = 'ERROR (' + e.message + ')';
+  mCircularClone.className = 'stat-val err';
+}
+
+var complexOk = false;
+try {
+  var testMap = new Map([['alpha', 100], ['beta', 200]]);
+  var testSet = new Set(['x', 'y', 'z']);
+  var testBigInt = [1n, 2n ** 60n];
+  var pack = structuredClone({ m: testMap, s: testSet, b: testBigInt });
+
+  var mapPreserved = (pack.m instanceof Map && pack.m.get('alpha') === 100);
+  var setPreserved = (pack.s instanceof Set && pack.s.has('y'));
+  var bigIntPreserved = (typeof pack.b[0] === 'bigint' && pack.b[1] === (2n ** 60n));
+
+  complexOk = (mapPreserved && setPreserved && bigIntPreserved);
+  mComplexClone.textContent = complexOk ? 'ALL PRESERVED' : 'PARTIAL';
+  mComplexClone.className = 'stat-val ' + (complexOk ? 'ok' : 'warn');
+  log('[+] Complex clone test: circular=' + circularOk + ', map=' + mapPreserved + ', set=' + setPreserved + ', bigInt=' + bigIntPreserved);
+} catch(e) {
+  mComplexClone.textContent = 'ERROR (' + e.message + ')';
+  mComplexClone.className = 'stat-val err';
+}
+
+syncBn('PROFILE', 'timerUs=' + (minStep * 1000).toFixed(1) + '|perfMem=' + hasPerfMem + '|circular=' + circularOk + '|complex=' + complexOk);
+
+/* ============================================================
+ * STAGE 2: 1MB Transferable ArrayBuffer Roundtrip
+ * ============================================================ */
+try {
+  var echoWorker = new Worker('/worker.js');
+  var mbBuf = new ArrayBuffer(1024 * 1024); // Exactly 1MB
+  var mbView = new Uint32Array(mbBuf);
+  mbView[0] = 0x1337BABE;
+  mbView[mbView.length - 1] = 0xCAFEBABE;
+
+  var transferSendTime = performance.now();
+
+  echoWorker.onmessage = function(e) {
+    var transferRecvTime = performance.now();
+    var rtt = (transferRecvTime - transferSendTime).toFixed(2);
+    mTransferLat.textContent = rtt + ' ms';
+    mTransferLat.className = 'stat-val ok';
+
+    var retBuf = e.data ? e.data.buffer : null;
+    var intact = false;
+    if (retBuf && retBuf.byteLength === 1024 * 1024) {
+      var retView = new Uint32Array(retBuf);
+      intact = (retView[0] === 0x1337BABE && retView[retView.length - 1] === 0xCAFEBABE);
+    }
+
+    mTransferStatus.textContent = 'ECHO SUCCESS';
+    mTransferStatus.className = 'stat-val ok';
+    mBufIntact.textContent = intact ? '100% MATCH (1MB)' : 'MISMATCH';
+    mBufIntact.className = 'stat-val ' + (intact ? 'ok' : 'err');
+
+    log('[+] 1MB Transferable roundtrip: latency=' + rtt + 'ms, intact=' + intact);
+    syncBn('TRANSFER-1MB', 'rttMs=' + rtt + '|intact=' + intact + '|retBytes=' + (retBuf ? retBuf.byteLength : 0));
+    echoWorker.terminate();
+  };
+
+  echoWorker.postMessage({ type: 'ECHO_TRANSFER', id: 'mb_test', buffer: mbBuf }, [mbBuf]);
+  var isSourceDetached = (mbBuf.byteLength === 0);
+  mSourceDetach.textContent = isSourceDetached ? 'DETACHED (0B)' : 'FAIL';
+  mSourceDetach.className = 'stat-val ' + (isSourceDetached ? 'ok' : 'err');
+  log('[+] 1MB send: source immediately detached=' + isSourceDetached);
+} catch(e) {
+  mTransferStatus.textContent = 'EXCEPTION (' + e.message + ')';
+  mTransferStatus.className = 'stat-val err';
+  log('[-] 1MB transfer error: ' + e.message);
+  syncBn('TRANSFER-ERR', 'err=' + e.message);
+}
+
+/* ============================================================
+ * STAGE 3: Worker Pool Scaling (8x Workers)
+ * ============================================================ */
+var POOL_SIZE = 8;
+var workers = [];
+var responses = 0;
+var latencies = [];
+
+for (var w = 0; w < POOL_SIZE; w++) {
+  (function(workerId) {
+    try {
+      var wrk = new Worker('/worker.js');
+      var sendTime = performance.now();
+
+      wrk.onmessage = function(e) {
+        var lat = performance.now() - sendTime;
+        responses++;
+        latencies.push(lat);
+
+        mPoolResp.textContent = responses + ' / ' + POOL_SIZE;
+        log('[+] Worker #' + workerId + ' responded in ' + lat.toFixed(1) + 'ms');
+
+        if (responses === POOL_SIZE) {
+          var minL = Math.min.apply(null, latencies).toFixed(1);
+          var maxL = Math.max.apply(null, latencies).toFixed(1);
+          mMinLat.textContent = minL + ' ms';
+          mMinLat.className = 'stat-val ok';
+          mMaxLat.textContent = maxL + ' ms';
+          mMaxLat.className = 'stat-val ok';
+
+          statusBadge.textContent = 'P936 COMPLETE';
+          statusBadge.style.background = '#10b981';
+
+          log('[*] 8-Worker scaling complete: all 8 responded. Min=' + minL + 'ms, Max=' + maxL + 'ms');
+          syncBn('WORKER-POOL-8', 'total=8|minLat=' + minL + '|maxLat=' + maxL + '|lats=' + latencies.map(function(l){ return l.toFixed(1); }).join(','));
+          syncBn('DONE', 'status=P936_COMPLETE');
+
+          // Clean up pool
+          for (var k = 0; k < workers.length; k++) {
+            try { workers[k].terminate(); } catch(x) {}
+          }
+        }
+      };
+
+      wrk.onerror = function(err) {
+        responses++;
+        log('[-] Worker #' + workerId + ' error: ' + (err.message || 'Error'));
+        if (responses === POOL_SIZE) {
+          syncBn('DONE', 'status=P936_PARTIAL');
+        }
+      };
+
+      wrk.postMessage({ type: 'PING', id: workerId });
+      workers.push(wrk);
+    } catch(spawnErr) {
+      log('[-] Failed to spawn worker #' + workerId + ': ' + spawnErr.message);
+    }
+  })(w);
+}
+</script>
+</body>
+</html>

@@ -8,7 +8,7 @@ CLAUDE.md evidence ledger, JAILBREAK_CHAIN_14_10.md, tools/browser_runner/beacon
 ROADMAP (35 steps)
 ==================
 
-PHASE A: WEBKIT EXPLOITATION (Browser → Native Code)
+PHASE A: WEBKIT EXPLOITATION (Browser -> Native Code)
 -----------------------------------------------------
 1.  Find a WebKit bug (memory corruption - UAF, OOB, type confusion)
 2.  Trigger the bug (craft JS/HTML that hits the vulnerable code path)
@@ -26,11 +26,11 @@ PHASE A: WEBKIT EXPLOITATION (Browser → Native Code)
 14. Hijack control flow (overwrite a function pointer or vtable)
 15. Execute userland shellcode (native code in WebProcess)
 
-PHASE B: SANDBOX ESCAPE (WebProcess → Full Userland)
+PHASE B: SANDBOX ESCAPE (WebProcess -> Full Userland)
 -----------------------------------------------------
 16. Escape WebKit sandbox (syscall or IPC escape)
 
-PHASE C: KERNEL EXPLOITATION (Userland → Ring 0)
+PHASE C: KERNEL EXPLOITATION (Userland -> Ring 0)
 -------------------------------------------------
 17. Leak kernel ASLR slide (find kernel base address from userland)
 18. Find a kernel bug (race condition, UAF, overflow in a syscall)
@@ -38,7 +38,7 @@ PHASE C: KERNEL EXPLOITATION (Userland → Ring 0)
 20. Get kernel read primitive
 21. Get kernel write primitive
 
-PHASE D: PRIVILEGE ESCALATION (Ring 0 → Root/Unrestricted)
+PHASE D: PRIVILEGE ESCALATION (Ring 0 -> Root/Unrestricted)
 -----------------------------------------------------------
 22. Find kernel credentials struct (locate process ucred)
 23. Escalate privileges (uid=0, capabilities/authid)
@@ -47,7 +47,7 @@ PHASE D: PRIVILEGE ESCALATION (Ring 0 → Root/Unrestricted)
 26. Map kernel as RW from userland (or keep kernel R/W primitive)
 27. Patch kernel to allow unsigned code
 
-PHASE E: HYPERVISOR BYPASS (Ring 0 → Ring -1)
+PHASE E: HYPERVISOR BYPASS (Ring 0 -> Ring -1)
 ----------------------------------------------
 28. Defeat hypervisor checks (HV monitors kernel integrity)
 29. Find hypervisor bug (separate vuln in the HV layer)
@@ -82,9 +82,12 @@ PHASE A — WEBKIT EXPLOITATION
       desync getter creates two contexts, crashes on stale access (P605v1,
       2026-11-03). Independent same-type reclaim (P605v2, P606).
     - B2 compositor layer crash: MutationObserver + will-change:transform +
-      RAF removal = RELIABLE CRASH 5/5 (P1070, 2026-11-10 06:34 UTC; beacon
-      log shows PRE-B2 then immediate browser BOOT every run). Possibly
-      CVE-2023-40447/CVE-2023-41976 class. Unexploited.
+      RAF removal = RELIABLE CRASH 5/5 (P1070). Further investigation
+      (P1083-P1086, 2026-11-10) proved this is DOM/compositor EXHAUSTION,
+      not a UAF. C1-none (no removal at all) still crashes instantly — the
+      mere creation of 20 will-change layers inside a mutation callback
+      kills the WebProcess. No corruption, no info leak, no primitive.
+      **DEAD as exploitable (P1086).**
     - CVE-2025-31277 RegExp HABT OOB: TESTED 2026-11-10 09:23 UTC — DEAD.
       P1077 first run (beacon path fixed to /beacon.php, crash-resume state
       machine added): HABT triggers fine (A1:true), but post-HABT match
@@ -93,7 +96,7 @@ PHASE A — WEBKIT EXPLOITATION
       with clean readback; section C: 200/200 OOB writes, 900 buffers
       scanned, 0 corruption; section D: 0 leaks. DONE VULN:false. The
       engine respects have-a-bad-time for match results — Sony backported
-      the fix or equivalent. Upstream bug 291745/fix commit 716536ce98d6
+      or equivalent. Upstream bug 291745/fix commit 716536ce98d6
       verified real (runtime path, not JIT); the PS5 build is not
       vulnerable to it. Lead CLOSED.
     - CVE-2026-28847 YARR stack overflow: P607 deployed 2026-11-03, no
@@ -123,10 +126,8 @@ PHASE A — WEBKIT EXPLOITATION
     - P1069v3 finished 2026-11-10 08:27 UTC with DONE att=1 leak=yes
       (READY.txt) — leak content undocumented/unconfirmed; P1069v7
       "Fresh Leak + Size Scan" deployed 10:59 local to re-measure; no
-      beacons yet. P1069v6 size-scan ended mid-run (all sizes 384-2048
-      previously CRASHED; UAF-OK + spray n=600, no reclaim verdict).
-    - P1069v7 LIVE RESULTS (2026-11-10 09:01-09:02 UTC): the "fresh
-      FontFace leak" section is a DIFFERENT mechanism than the retracted
+      beacons yet. P1069v7 LIVE RESULTS (2026-11-10 09:01-09:02 UTC): the
+      "fresh FontFace leak" section is a DIFFERENT mechanism than the retracted
       P1043 case — FontFace.prototype 'then' getter fires during
       document.fonts.load(), removes the @font-face style node, deletes
       the font, forces layout, then sprays ZERO-INITIALIZED ArrayBuffers
@@ -291,22 +292,45 @@ COMPLETED: P1069v9 (FL leak stabilized ~100%; 4/4 lineWidth crashes —
            P693-P705 matrix in docs/WEBKIT_STEP4_STATUS_14_10.md).
 COMPLETED: P1077 (CVE-2025-31277 RegExp HABT OOB) — DEAD, VULN:false
            (2026-11-10 09:23 UTC). Top lead closed.
-QUEUED:    P1071-P1075 (B2 layer-UAF exploitation variants), P1076
-           (structuredClone UAF, likely fixed), P1078-P1082 (mega/chain
-           variants — review before running; several predate the v9 fixes).
+COMPLETED: P1086 (B2 capped-removal discriminator) — DEAD as exploitable;
+           DOM/compositor exhaustion, not UAF (2026-11-10 09:45-09:47 UTC).
+QUEUED:    P1076 (structuredClone UAF, likely fixed — quick test only),
+           P1078-P1082 (mega/chain variants — review beacon paths before
+           running; several predate the v9 fixes).
+CLOSED:    P1071-P1075 (B2 exploitation variants — underlying crash is
+           exhaustion, not UAF; no primitive possible).
 NOTE:      keep deployed probes on /beacon.php (the /en/ps5/beacon.gif
            endpoint does not exist — P1077's original beacons were
            silently dropped until fixed).
 
-NEXT RESEARCH ACTIONS (priority order)
-======================================
-1. Exploit B2 compositor crash (P1074/P1075): GraphicsLayer is fastMalloc,
-   Gigacage OFF — AB sprays share that heap. This is now the ONLY live
-   WebKit memory-corruption lead: reliable 5/5 crash, unexploited.
-2. Widen the FL leak: scan ALL spray size classes (not just 192) for
-   recurring qwords at offset 0 across reloads — vtable/code-pointer
-   candidates (per-size-class segregation means other freed objects may
-   leak code pointers even though the 192B font object doesn't).
-3. Kernel side (parallel, from Lua entry): only new-bug hunting remains —
-   13.60 static capture diffing and untested argument contracts, per
-   JAILBREAK_CHAIN_14_10.md gates. Do not rerun documented dead ends.
+NEXT RESEARCH ACTIONS (priority order) — POST-P1086
+====================================================
+**ALL WebKit memory-corruption vectors on PS5 14.10 are DEAD.**
+Browser-based entry to kernel is blocked at Phase A step 4
+(no addrOf -> no arbitrary R/W -> no code exec -> no sandbox escape).
+
+1. Widen the FL leak (browser side, ONLY remaining WebKit primitive):
+   Scan ALL spray size classes (not just 192) for recurring offset-0
+   qwords = vtable/code-pointer candidates. Per-size-class segregation
+   means other freed objects may leak code pointers even though the
+   192B font object doesn't. If ANY size-class yields a stable code
+   pointer, addrOf/fakeObj become possible and Phase A re-opens.
+   Otherwise: browser path is permanently blocked.
+
+2. Kernel side (from Lua entry — the ONLY viable path to kernel R/W):
+   - 13.60 static capture diffing: look for argument-contract gaps
+     not exercised by our syscall sweeps (focus: real-handlers above
+     676 that may exist in 14.10 despite the kill-range observation).
+   - Untested syscall shapes: 275a identified real handlers for 538/540/
+     557/598/659/572 with real args; extend to other "-1" rows in
+     docs/SYSENT_PRESENCE_14_10.md. The "-1" verdict from six-zero
+     sweeps is NOT a verdict — real-args probes are needed.
+   - thr_new(455) child thread races: the child has NO TLS and NO
+     sandbox restrictions beyond the parent; explore multi-thread
+     syscall races not yet tested (e.g., concurrent mmap/mprotect
+     on overlapping regions, races between shm_open and mmap).
+   - Do NOT rerun documented dead ends (AIO double-free, msync CVE,
+     netcontrol, kqueue ZDI, UMTX_SHM, kld*, sysctl kptr scans, etc).
+
+3. Hypervisor side: no interface or bug candidate exists. Blocked
+   until kernel R/W is achieved.

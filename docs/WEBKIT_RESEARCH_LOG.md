@@ -343,8 +343,54 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 - The engine respects have-a-bad-time for match results — Sony backported the fix or equivalent. Upstream bug 291745 is real (fix commit 716536ce98d6 verified) but the PS5 build is not vulnerable.
 - **Lead CLOSED.** This was the #1 priority lead.
 
-## Priority leads — UPDATED 2026-11-10 (post-P1077)
-1. **B2 Compositor Layer UAF** — Reliable crash (5/5), GraphicsLayer is fastMalloc + Gigacage OFF → AB sprays share the heap. ONLY live WebKit memory-corruption lead. (P1074/P1075 ready)
-2. **FL leak widening** — scan all spray size classes for recurring offset-0 qwords (vtable/code-pointer candidates)
+## 2026-11-10 — P1074/P1083/P1084: B2 Crash Characterization — NOT a clean UAF
+- **P1074** (hidden arena, observer removes the ADDED node, `{childList:true}` NO subtree): did NOT reproduce the crash — A1-A10 all survived 30 cycles, B/C sprays 0 corruption, D finalizer never fired, E survived 40. DONE clean.
+- **P1083** (P1070's EXACT B2 trigger: observer CREATES a fresh will-change layer inside the mutation callback, `{childList:true,subtree:true}`, RAF removal, 5ms cadence): crash reproduces 6/6. Wall time 4.7-22s, high variance; pre-spray and in-RAF spray don't prevent it. Image beacons dropped during the tight loop (0 CYC beacons in ~4000 cycles).
+- **P1084** (single-size timing oracle, cycles via localStorage surviving crashes): **ALL 8 sizes CRASH@1** (0/384/448/512/576/640/768/2048). The JS trigger loop runs ONCE, then the process dies 16-25s later ASYNCHRONOUSLY. No size class delays the crash — the free→use window is not JS-scheduled.
+- **Root-cause hypothesis**: the observer uses `subtree:true` and appends a NEW will-change layer INSIDE the mutation callback — that append is itself a subtree mutation → the observer CASCADES unboundedly, creating layers while RAF removals never fire (page occluded → RAF throttled). P1074 (no subtree) didn't crash; P1070/P1083/P1084 (subtree:true) crash. **The "B2 UAF" may be a mutation-cascade resource-exhaustion crash, not a use-after-free.** P1085 discriminates (capped cascade vs no-subtree vs no-will-change).
+
+## 2026-11-10 — P1085: B2 Cascade Discriminator — TWO crash modes separated
+- Design: observer appends a will-change layer inside the mutation callback (cascade), RAF removal; vary subtree/cap/will-change. Heartbeat to localStorage measures wall-time-to-death; created-count survives crashes.
+- **Results (DONE 09:43 UTC)**:
+  - T0 subtree+uncapped: DIED, created=629,513 (cascade starves event loop, aliveSec=0)
+  - T1 subtree+cap20: DIED@1s, created=20 (cap respected — STILL dies)
+  - T2 subtree+cap200: DIED@1s, created=200
+  - T3 NO-subtree+uncapped: DIED, created=467,994 (cascade exists without subtree — observer's own append is a direct child mutation)
+  - T4 subtree+NO-will-change (plain divs): DIED, created=913,658
+- **Conclusion**: TWO crash modes. (a) Uncapped cascade → death at 450k-900k nodes = DOM/memory exhaustion, not interesting. (b) **Capped cascade (20-200 will-change layers + RAF removal) → death in ~1s = candidate REAL layer-lifecycle bug.** The cascade comes from the observer APPENDING (not from subtree); my earlier P1074-vs-P1070 subtree correlation was wrong.
+- Next: P1086 isolates mode (b): cap=20, vary removal timing (RAF/none/sync/setTimeout) + spray.
+
+## 2026-11-10 — P1086: B2 Capped-Removal Discriminator — B2 is DEAD
+- **Design**: 6 tests isolating mode-(b) crash (cap=20 will-change layers + varied removal timing): C0-raf (RAF removal), C1-none (no removal), C2-sync (sync removal), C3-raf-pre-spray (300 ABs before trigger), C4-raf-inraf-spray (10 ABs/removal inside RAF), C5-timeout (setTimeout removal). Heartbeat + created-count to localStorage; 20s survival → spray scan.
+- **Results (4 complete cycles + partial 5th, 09:45–09:47 UTC)**:
+  - Cycle 1: C0-raf SURVIVED 20s | C1-none DIED@2s | C2-sync DIED@1s | C3 DIED@1s | C4 DIED@1s | C5 DIED@2s
+  - Cycle 2: ALL DIED (C0raf 10s, C1none 2s, C2sync 1s, C3 1s, C4 1s, C5 2s)
+  - Cycle 3: C0-raf SURVIVED 20s | C1-none DIED@4s | C2-sync DIED@1s | C3 DIED@0s | C4 DIED@0s | C5 DIED@0s
+  - Cycle 4: ALL DIED instantly (C0raf 0s, C1none 0s, C2sync 0s, C3 0s, C4 0s, C5 0s)
+- **Critical finding**: C1-none has NO element removal whatsoever — it only creates 20 will-change layers inside the MutationObserver callback and then waits. It still crashes. The crash is NOT caused by removal timing or a layer-lifecycle UAF.
+- **Verdict**: B2 is a DOM / compositor EXHAUSTION crash, not a use-after-free. Creating will-change:transform layers inside a mutation callback generates compositor pressure that kills the WebProcess at small scale. The cap=20 variant (P1085 "mode-b") is just faster exhaustion; the RAF removal is irrelevant. No corruption, no info leak, no reliable primitive.
+- **Status**: B2 compositor layer crash → **DEAD as exploitable primitive**. All WebKit memory-corruption leads now closed.
+
+## Confirmed DEAD vectors (WebKit) — FINAL UPDATE 2026-11-10
+- Canvas UAF (CVE-2026-43720) cross-type reclaim — IsoHeap/TZone blocks ArrayBuffer spray
+- **B2 Compositor Layer crash** — DOM/compositor exhaustion, not UAF; removal timing irrelevant (P1086)
+- WSA-2026-0003 UAFs — 3 of 4 require absent APIs (WebAssembly/AudioWorklet/WebGL)
+- content-visibility layer tree UAF (Bug #287908) — CSS property not implemented
+- FontFaceSet::load() UAF (CVE-2026-43715) — C++ DeferredPromise skips JS thenable check
+- CVE-2025-31277 RegExp HABT OOB — engine respects HABT, Sony backported or equivalent (P1077)
+- TypedArray/DataView integer overflow — bounds checked
+- BMP RLE8 OOB read — decoder patched
+- JSC JIT bugs — no JIT (LLInt only)
+- WebAssembly bugs — no WebAssembly
+- SharedArrayBuffer races — no SharedArrayBuffer
+- structuredClone transfer — transfer list ignored, always deep copy
+- Worker transfer — deep copy, no crash
+- All P595 logic bugs — clean
+- Custom element innerHTML re-entrancy — children detached before callbacks
+
+## Priority leads — UPDATED 2026-11-10 (post-P1086)
+**ALL WebKit memory-corruption vectors are DEAD on PS5 14.10.**
+1. **FL leak widening** — scan all spray size classes for recurring offset-0 qwords (vtable/code-pointer candidates). This is the ONLY remaining WebKit-side primitive.
+2. **CVE-2023-28205 structuredClone UAF** — Likely fixed but worth a quick test (P1076 ready); low probability.
 3. **CVE-2026-43720 same-type reclaim** — faithful alias but no pointer control (P702/P703); byte-write into the 768B object not reachable (P693-P705 matrix)
-4. **CVE-2023-28205 structuredClone UAF** — Likely fixed but worth testing (P1076 ready)
+4. **Kernel side (from Lua entry)** — only new-bug hunting remains: 13.60 static capture diffing, untested argument contracts. Browser path to kernel is blocked at Phase A step 4 (no addrOf/code-pointer leak).

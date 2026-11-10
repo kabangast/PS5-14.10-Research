@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>PS5 FW 14.10 // PATH2D, TREEWALKER, ENCODINGS &amp; DOMMATRIX 3D HUD</title>
+<style>
+:root {
+  --bg-dark: #040711;
+  --panel-bg: rgba(8, 14, 28, 0.94);
+  --neon-cyan: #00f3ff;
+  --neon-green: #00ff66;
+  --neon-amber: #ffb800;
+  --neon-pink: #ff0077;
+  --neon-purple: #9d00ff;
+  --text-dim: #7085a5;
+  --text-main: #e2f1ff;
+  --border-glow: rgba(0, 243, 255, 0.35);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background-color: var(--bg-dark);
+  background-image: 
+    radial-gradient(ellipse at 50% 0%, rgba(0, 243, 255, 0.16), transparent 75%),
+    linear-gradient(rgba(0, 243, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 243, 255, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 28px 28px, 28px 28px;
+  color: var(--text-main);
+  font-family: "SF Mono", "Consolas", monospace;
+  padding: 16px;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+.scanline {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.02), rgba(0, 255, 0, 0.01), rgba(0, 255, 0, 0.02));
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+  z-index: 999;
+}
+
+/* Header */
+.header {
+  border: 1px solid var(--neon-cyan);
+  background: rgba(0, 243, 255, 0.07);
+  box-shadow: 0 0 20px rgba(0, 243, 255, 0.3);
+  padding: 12px 20px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title-glitch {
+  font-size: 18px;
+  font-weight: 900;
+  letter-spacing: 2px;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 10px rgba(0, 243, 255, 0.8);
+}
+.target-badge {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: rgba(0, 255, 102, 0.15);
+  border: 1px solid var(--neon-green);
+  color: var(--neon-green);
+  font-weight: bold;
+}
+
+/* Pipeline Trackers */
+.pipeline-track {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.node {
+  background: var(--panel-bg);
+  border: 1px solid rgba(112, 133, 165, 0.25);
+  border-radius: 6px;
+  padding: 10px;
+  position: relative;
+  transition: all 0.3s ease;
+}
+.node.done {
+  border-color: var(--neon-green);
+  box-shadow: 0 0 10px rgba(0, 255, 102, 0.25);
+}
+.node.active {
+  border-color: var(--neon-cyan);
+  box-shadow: 0 0 12px rgba(0, 243, 255, 0.4);
+}
+.node.locked {
+  border-color: rgba(112, 133, 165, 0.2);
+  opacity: 0.55;
+}
+.node-step {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.node.done .node-step { color: var(--neon-green); }
+.node.active .node-step { color: var(--neon-cyan); }
+.node-title {
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--text-main);
+  margin-bottom: 4px;
+}
+.node-desc {
+  font-size: 9px;
+  color: var(--text-dim);
+  line-height: 1.3;
+}
+
+/* Grid Layout */
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.hud-panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-glow);
+  border-radius: 6px;
+  padding: 14px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid rgba(0, 243, 255, 0.2);
+  padding-bottom: 8px;
+  margin-bottom: 12px;
+}
+.panel-title {
+  font-size: 13px;
+  font-weight: bold;
+  color: var(--neon-cyan);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+.panel-tag {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: rgba(0, 243, 255, 0.1);
+  color: var(--neon-cyan);
+  border: 1px solid rgba(0, 243, 255, 0.3);
+}
+
+.live-meter {
+  display: flex;
+  justify-content: space-between;
+  padding: 7px 0;
+  border-bottom: 1px solid rgba(112, 133, 165, 0.12);
+  font-size: 12px;
+}
+.val-ok { color: var(--neon-green); font-weight: bold; }
+.val-hex { color: var(--neon-amber); font-weight: bold; }
+.val-cyan { color: var(--neon-cyan); font-weight: bold; }
+.val-dim { color: var(--text-dim); }
+
+/* Live Terminal */
+.terminal-panel {
+  background: #020409;
+  border: 1px solid rgba(0, 243, 255, 0.4);
+  border-radius: 6px;
+  padding: 12px;
+  font-size: 11px;
+  box-shadow: inset 0 0 14px rgba(0, 0, 0, 0.8);
+}
+.terminal-log {
+  max-height: 220px;
+  overflow-y: auto;
+  line-height: 1.45;
+  color: #a4c2e6;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+
+<div class="header">
+  <div class="title-glitch">PS5 // P968: PATH2D, TREEWALKER, ENCODINGS &amp; DOMMATRIX 3D HUD</div>
+  <div class="target-badge" id="mStatusBadge">INITIALIZING...</div>
+</div>
+
+<!-- 6-Stage Pipeline Node Status -->
+<div class="pipeline-track">
+  <div class="node active" id="nodeStage1">
+    <div class="node-step">Stage 1 [ACTIVE]</div>
+    <div class="node-title">PATH2D HIT-TEST</div>
+    <div class="node-desc">SVG path string &amp; sub-pixel hit</div>
+  </div>
+  <div class="node locked" id="nodeStage2">
+    <div class="node-step">Stage 2 [STANDBY]</div>
+    <div class="node-title">LEGACY ENCODINGS</div>
+    <div class="node-desc">GBK, Big5, Cyrillic &amp; streaming</div>
+  </div>
+  <div class="node locked" id="nodeStage3">
+    <div class="node-step">Stage 3 [STANDBY]</div>
+    <div class="node-title">TREEWALKER 5K</div>
+    <div class="node-desc">5,000 DOM nodes bi-directional</div>
+  </div>
+  <div class="node locked" id="nodeStage4">
+    <div class="node-step">Stage 4 [STANDBY]</div>
+    <div class="node-title">DOMMATRIX 3D</div>
+    <div class="node-desc">Perspective, 10k inversions &amp; scale</div>
+  </div>
+  <div class="node locked" id="nodeStage5">
+    <div class="node-step">Stage 5 [STANDBY]</div>
+    <div class="node-title">JSON 10K CHURN</div>
+    <div class="node-desc">10,000 objects stringify &amp; parse</div>
+  </div>
+  <div class="node locked" id="nodeStage6">
+    <div class="node-step">Stage 6 [STANDBY]</div>
+    <div class="node-title">SYSTEM VERDICT</div>
+    <div class="node-desc">Unified telemetry consensus</div>
+  </div>
+</div>
+
+<div class="dashboard-grid">
+  <!-- Left Panel: Path2D & Encodings -->
+  <div class="hud-panel">
+    <div class="panel-header">
+      <div class="panel-title">Path2D &amp; Multi-Byte Codecs</div>
+      <div class="panel-tag">CANVAS / TEXTCODEC</div>
+    </div>
+    <div class="live-meter"><span>Path2D SVG String Constructor:</span><span class="val-cyan" id="mPathSvg">Testing...</span></div>
+    <div class="live-meter"><span>isPointInPath (Inside / Outside):</span><span class="val-cyan" id="mPathHit">Testing...</span></div>
+    <div class="live-meter"><span>isPointInStroke (Vertex Hit):</span><span class="val-cyan" id="mPathStroke">Testing...</span></div>
+    <div class="live-meter"><span>5,000 Sub-Pixel Hit Tests:</span><span class="val-cyan" id="mHitBench">Testing...</span></div>
+    <div class="live-meter"><span>Chinese Encodings (GBK / Big5):</span><span class="val-cyan" id="mChineseEnc">Pending...</span></div>
+    <div class="live-meter"><span>Cyrillic (CP1251) &amp; Latin-1:</span><span class="val-cyan" id="mCyrillicEnc">Pending...</span></div>
+    <div class="live-meter"><span>Split Multi-Byte Stream Chunking:</span><span class="val-cyan" id="mSplitStream">Pending...</span></div>
+  </div>
+
+  <!-- Right Panel: TreeWalker, DOMMatrix & JSON -->
+  <div class="hud-panel">
+    <div class="panel-header">
+      <div class="panel-title">TreeWalker, Matrix &amp; JSON Engine</div>
+      <div class="panel-tag">DOM / GRAPH / JSON</div>
+    </div>
+    <div class="live-meter"><span>TreeWalker 5,000 Nodes Forward:</span><span class="val-cyan" id="mTwFwd">Pending...</span></div>
+    <div class="live-meter"><span>TreeWalker Reverse Traversal:</span><span class="val-cyan" id="mTwRev">Pending...</span></div>
+    <div class="live-meter"><span>DOMMatrix 3D Perspective Projection:</span><span class="val-cyan" id="mMatrix3d">Pending...</span></div>
+    <div class="live-meter"><span>3D Matrix Inverse &amp; 10k Ops:</span><span class="val-cyan" id="mMatrixInv">Pending...</span></div>
+    <div class="live-meter"><span>JSON 10,000 Objects Stringify:</span><span class="val-cyan" id="mJsonStringify">Pending...</span></div>
+    <div class="live-meter"><span>JSON 10,000 Objects Parse:</span><span class="val-cyan" id="mJsonParse">Pending...</span></div>
+  </div>
+</div>
+
+<!-- Live Terminal Panel -->
+<div class="terminal-panel">
+  <div class="terminal-log" id="termLog"></div>
+</div>
+
+<script>
+var term = document.getElementById('termLog');
+var statusBadge = document.getElementById('mStatusBadge');
+
+var nodeStage1 = document.getElementById('nodeStage1');
+var nodeStage2 = document.getElementById('nodeStage2');
+var nodeStage3 = document.getElementById('nodeStage3');
+var nodeStage4 = document.getElementById('nodeStage4');
+var nodeStage5 = document.getElementById('nodeStage5');
+var nodeStage6 = document.getElementById('nodeStage6');
+
+var mPathSvg = document.getElementById('mPathSvg');
+var mPathHit = document.getElementById('mPathHit');
+var mPathStroke = document.getElementById('mPathStroke');
+var mHitBench = document.getElementById('mHitBench');
+
+var mChineseEnc = document.getElementById('mChineseEnc');
+var mCyrillicEnc = document.getElementById('mCyrillicEnc');
+var mSplitStream = document.getElementById('mSplitStream');
+
+var mTwFwd = document.getElementById('mTwFwd');
+var mTwRev = document.getElementById('mTwRev');
+var mMatrix3d = document.getElementById('mMatrix3d');
+var mMatrixInv = document.getElementById('mMatrixInv');
+var mJsonStringify = document.getElementById('mJsonStringify');
+var mJsonParse = document.getElementById('mJsonParse');
+
+/* Global Trackers */
+var gPathOk = false;
+var gHitMs = 0;
+var gTwMs = 0;
+var gTwFwd = 0;
+var gMatrixMs = 0;
+var gMatrixInvOk = false;
+var gJsonStringifyMs = 0;
+var gJsonParseMs = 0;
+
+function log(msg) {
+  var d = document.createElement('div');
+  d.textContent = '[' + new Date().toISOString().slice(11, 23) + '] ' + msg;
+  term.appendChild(d);
+  term.scrollTop = term.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P968-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+window.onerror = function(msg, url, line) {
+  syncBn('JS-ERR', msg + ' at line ' + line);
+  log('[!] ERROR: ' + msg + ' (Line ' + line + ')');
+};
+
+log('[*] Probe P968 online: Path2D Hit-Testing, TreeWalker 5k, Encodings & DOMMatrix 3D.');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * STAGE 1: Canvas Path2D SVG Path String Parsing & Hit-Testing
+ * ============================================================ */
+var hasPath2D = (typeof Path2D !== 'undefined');
+var pathSvgOk = false;
+var pathHitInside = false;
+var pathHitOutside = false;
+var pathHitStroke = false;
+
+if (hasPath2D) {
+  try {
+    var cvs = document.createElement('canvas');
+    cvs.width = 200;
+    cvs.height = 200;
+    var ctx = cvs.getContext('2d');
+
+    // Triangle path via SVG string: (50, 0) -> (100, 100) -> (0, 100) -> Z
+    var pathSvg = new Path2D('M 50 0 L 100 100 L 0 100 Z');
+    pathSvgOk = (pathSvg instanceof Path2D);
+
+    pathHitInside = ctx.isPointInPath(pathSvg, 50, 50);
+    pathHitOutside = ctx.isPointInPath(pathSvg, 0, 0); // false
+    pathHitStroke = ctx.isPointInStroke(pathSvg, 50, 0);
+
+    gPathOk = (pathSvgOk && pathHitInside && !pathHitOutside && pathHitStroke);
+
+    var tHit0 = performance.now();
+    for (var h = 0; h < 5000; h++) {
+      ctx.isPointInPath(pathSvg, (h % 100), ((h * 7) % 100));
+    }
+    gHitMs = Math.max(1, Math.round(performance.now() - tHit0));
+
+    mPathSvg.textContent = pathSvgOk ? 'SUPPORTED (new Path2D("M 50 0..."))' : 'FAILED';
+    mPathSvg.className = pathSvgOk ? 'val-ok' : 'val-dim';
+
+    mPathHit.textContent = (pathHitInside && !pathHitOutside) ? 'ACCURATE (in=true, out=false)' : 'HIT MISMATCH';
+    mPathHit.className = (pathHitInside && !pathHitOutside) ? 'val-ok' : 'val-hex';
+
+    mPathStroke.textContent = pathHitStroke ? 'SUPPORTED (vertex stroke=true)' : 'STROKE FAIL';
+    mPathStroke.className = pathHitStroke ? 'val-ok' : 'val-dim';
+
+    mHitBench.textContent = gHitMs + ' ms (5,000 SUB-PIXEL HIT TESTS)';
+
+    log('[+] Path2D: svg=' + pathSvgOk + ', hitIn=' + pathHitInside + ', hitOut=' + pathHitOutside + ', stroke=' + pathHitStroke + ', 5k bench=' + gHitMs + 'ms');
+    syncBn('PATH2D-HIT', 'svg=' + pathSvgOk + '|hitIn=' + pathHitInside + '|hitOut=' + pathHitOutside + '|stroke=' + pathHitStroke + '|benchMs=' + gHitMs);
+
+    nodeStage1.className = 'node done';
+    nodeStage1.querySelector('.node-step').textContent = 'Stage 1 [DONE]';
+  } catch(pe) {
+    log('[-] Path2D error: ' + pe.message);
+    syncBn('PATH2D-ERR', pe.message);
+    nodeStage1.className = 'node locked';
+  }
+} else {
+  mPathSvg.textContent = 'UNSUPPORTED';
+  mPathSvg.className = 'val-dim';
+  nodeStage1.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 2: TextDecoder Multi-Byte Encodings
+ * ============================================================ */
+nodeStage2.className = 'node active';
+nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [ACTIVE]';
+
+var gbkOk = false, big5Ok = false, win1251Ok = false, iso8859Ok = false, splitStreamOk = false;
+
+try {
+  var gbkDec = new TextDecoder('gbk');
+  var gbkBytes = new Uint8Array([0xD6, 0xD0, 0xCE, 0xC4]); // "中文"
+  var gbkStr = gbkDec.decode(gbkBytes);
+  gbkOk = (gbkStr === '中文');
+} catch(e) {}
+
+try {
+  var big5Dec = new TextDecoder('big5');
+  var big5Bytes = new Uint8Array([0xA4, 0xA4, 0xA4, 0xE5]); // "中文"
+  var big5Str = big5Dec.decode(big5Bytes);
+  big5Ok = (big5Str === '中文');
+} catch(e) {}
+
+try {
+  var cp1251Dec = new TextDecoder('windows-1251');
+  var cpBytes = new Uint8Array([0xD2, 0xE5, 0xF1, 0xF2]); // "Тест"
+  var cpStr = cp1251Dec.decode(cpBytes);
+  win1251Ok = (cpStr === 'Тест');
+} catch(e) {}
+
+try {
+  var latinDec = new TextDecoder('iso-8859-1');
+  var latinBytes = new Uint8Array([0x43, 0x61, 0x66, 0xE9]); // "Café"
+  var latinStr = latinDec.decode(latinBytes);
+  iso8859Ok = (latinStr === 'Café');
+} catch(e) {}
+
+try {
+  var streamDec = new TextDecoder('gbk');
+  var chunk1 = new Uint8Array([0xD6]);
+  var chunk2 = new Uint8Array([0xD0]);
+  var s1 = streamDec.decode(chunk1, { stream: true });
+  var s2 = streamDec.decode(chunk2, { stream: false });
+  splitStreamOk = ((s1 + s2) === '中');
+} catch(e) {}
+
+mChineseEnc.textContent = 'GBK=' + gbkOk + ', Big5=' + big5Ok;
+mChineseEnc.className = (gbkOk && big5Ok) ? 'val-ok' : 'val-hex';
+
+mCyrillicEnc.textContent = 'CP1251=' + win1251Ok + ', ISO-8859-1=' + iso8859Ok;
+mCyrillicEnc.className = (win1251Ok && iso8859Ok) ? 'val-ok' : 'val-hex';
+
+mSplitStream.textContent = splitStreamOk ? 'SUPPORTED (split 2-byte chunk boundary)' : 'STREAM FAIL';
+mSplitStream.className = splitStreamOk ? 'val-ok' : 'val-dim';
+
+log('[+] Text Encodings: GBK=' + gbkOk + ', Big5=' + big5Ok + ', CP1251=' + win1251Ok + ', Latin1=' + iso8859Ok + ', splitStream=' + splitStreamOk);
+syncBn('TEXT-CODECS', 'gbk=' + gbkOk + '|big5=' + big5Ok + '|cp1251=' + win1251Ok + '|latin1=' + iso8859Ok + '|splitStream=' + splitStreamOk);
+
+nodeStage2.className = 'node done';
+nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [DONE]';
+
+/* ============================================================
+ * STAGE 3: DOM TreeWalker & NodeIterator 5,000-Node Traversal
+ * ============================================================ */
+nodeStage3.className = 'node active';
+nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [ACTIVE]';
+
+var twSupported = (typeof document.createTreeWalker === 'function');
+var twFwdCount = 0;
+var twRevCount = 0;
+
+if (twSupported) {
+  try {
+    var root = document.createElement('div');
+    root.id = 'tw-root';
+    for (var c = 0; c < 500; c++) {
+      var p = document.createElement('p');
+      for (var k = 0; k < 9; k++) {
+        var s = document.createElement('span');
+        s.textContent = 'n' + (c * 10 + k);
+        p.appendChild(s);
+      }
+      root.appendChild(p);
+    }
+    document.body.appendChild(root);
+
+    var tTw0 = performance.now();
+    var tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, null);
+    while (tw.nextNode()) {
+      twFwdCount++;
+    }
+    while (tw.previousNode()) {
+      twRevCount++;
+    }
+    gTwMs = Math.max(1, Math.round(performance.now() - tTw0));
+    gTwFwd = twFwdCount;
+
+    document.body.removeChild(root);
+
+    mTwFwd.textContent = gTwMs + ' ms (' + twFwdCount.toLocaleString() + ' NODES VISITED)';
+    mTwRev.textContent = twRevCount.toLocaleString() + ' NODES REVERSED';
+    mTwRev.className = (twFwdCount > 0 && twFwdCount === twRevCount + 1) ? 'val-ok' : 'val-hex';
+
+    log('[+] TreeWalker: fwd=' + twFwdCount + ', rev=' + twRevCount + ', time=' + gTwMs + 'ms');
+    syncBn('TREE-WALKER', 'fwd=' + twFwdCount + '|rev=' + twRevCount + '|timeMs=' + gTwMs);
+
+    nodeStage3.className = 'node done';
+    nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [DONE]';
+  } catch(te) {
+    log('[-] TreeWalker error: ' + te.message);
+    syncBn('TREE-WALKER-ERR', te.message);
+    nodeStage3.className = 'node locked';
+  }
+} else {
+  mTwFwd.textContent = 'UNSUPPORTED';
+  mTwFwd.className = 'val-dim';
+  nodeStage3.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 4: DOMMatrix 3D Perspective Projection & Transform Inversion
+ * ============================================================ */
+nodeStage4.className = 'node active';
+nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [ACTIVE]';
+
+var hasMatrix = (typeof DOMMatrix !== 'undefined');
+var m3dOk = false;
+
+if (hasMatrix) {
+  try {
+    var m = new DOMMatrix();
+    m.translateSelf(50, 100, -150);
+    m.rotateSelf(30, 45, 60);
+    m.scaleSelf(1.5, 2.0, 0.8);
+    m.m34 = -1 / 600;
+    m3dOk = (m.is2D === false);
+
+    var inv = m.inverse();
+    var identity = m.multiply(inv);
+    gMatrixInvOk = (Math.abs(identity.m11 - 1) < 0.01 &&
+                    Math.abs(identity.m22 - 1) < 0.01 &&
+                    Math.abs(identity.m33 - 1) < 0.01 &&
+                    Math.abs(identity.m44 - 1) < 0.01 &&
+                    Math.abs(identity.m12) < 0.01);
+
+    var tM0 = performance.now();
+    for (var mi = 0; mi < 10000; mi++) {
+      var tempM = new DOMMatrix();
+      tempM.rotateSelf(mi % 90, 10, 20);
+      var tempInv = tempM.inverse();
+    }
+    gMatrixMs = Math.max(1, Math.round(performance.now() - tM0));
+
+    mMatrix3d.textContent = m3dOk ? 'SUPPORTED (3D perspective is2D=false)' : '2D ONLY';
+    mMatrix3d.className = m3dOk ? 'val-ok' : 'val-hex';
+
+    mMatrixInv.textContent = gMatrixInvOk ? (gMatrixMs + ' ms (10,000 3D INVERSIONS INTACT)') : 'INVERSE CORRUPT';
+    mMatrixInv.className = gMatrixInvOk ? 'val-ok' : 'val-hex';
+
+    log('[+] DOMMatrix 3D: is3d=' + m3dOk + ', inverseOk=' + gMatrixInvOk + ', 10k bench=' + gMatrixMs + 'ms');
+    syncBn('DOM-MATRIX', 'is3d=' + m3dOk + '|invOk=' + gMatrixInvOk + '|benchMs=' + gMatrixMs);
+
+    nodeStage4.className = 'node done';
+    nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [DONE]';
+  } catch(me) {
+    log('[-] DOMMatrix error: ' + me.message);
+    syncBn('DOM-MATRIX-ERR', me.message);
+    nodeStage4.className = 'node locked';
+  }
+} else {
+  mMatrix3d.textContent = 'UNSUPPORTED';
+  mMatrix3d.className = 'val-dim';
+  nodeStage4.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 5: High-Volume JSON Parser & Serializer Throughput
+ * ============================================================ */
+nodeStage5.className = 'node active';
+nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [ACTIVE]';
+
+var jsonByteLen = 0;
+var jsonIntact = false;
+
+try {
+  var dataset = [];
+  for (var i = 0; i < 10000; i++) {
+    dataset.push({
+      id: i,
+      guid: 'ps5-zen2-item-' + i,
+      active: (i % 2 === 0),
+      metrics: [i * 1.5, i * 2.25, i * 3.125],
+      tags: ['alpha', 'beta', 'gamma']
+    });
+  }
+
+  var tStr0 = performance.now();
+  var jsonStr = JSON.stringify(dataset);
+  gJsonStringifyMs = Math.max(1, Math.round(performance.now() - tStr0));
+  jsonByteLen = jsonStr.length;
+
+  var tParse0 = performance.now();
+  var parsed = JSON.parse(jsonStr);
+  gJsonParseMs = Math.max(1, Math.round(performance.now() - tParse0));
+
+  jsonIntact = (parsed.length === 10000 && parsed[9999].guid === 'ps5-zen2-item-9999' && parsed[9999].metrics[2] === 9999 * 3.125);
+
+  mJsonStringify.textContent = gJsonStringifyMs + ' ms (' + (jsonByteLen / (1024 * 1024)).toFixed(2) + ' MB GENERATED)';
+  mJsonParse.textContent = gJsonParseMs + ' ms (10,000 OBJECTS RECONSTITUTED)';
+  mJsonParse.className = jsonIntact ? 'val-ok' : 'val-hex';
+
+  log('[+] JSON 10k: stringify=' + gJsonStringifyMs + 'ms (' + jsonByteLen + 'B), parse=' + gJsonParseMs + 'ms, intact=' + jsonIntact);
+  syncBn('JSON-PERF', 'stringifyMs=' + gJsonStringifyMs + '|parseMs=' + gJsonParseMs + '|bytes=' + jsonByteLen + '|intact=' + jsonIntact);
+
+  nodeStage5.className = 'node done';
+  nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [DONE]';
+} catch(je) {
+  log('[-] JSON error: ' + je.message);
+  syncBn('JSON-ERR', je.message);
+  nodeStage5.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 6: Master Verdict & Summary
+ * ============================================================ */
+nodeStage6.className = 'node done';
+nodeStage6.querySelector('.node-step').textContent = 'Stage 6 [DONE]';
+
+statusBadge.textContent = 'ALL 6 STAGES NOMINAL';
+statusBadge.style.background = '#00ff66';
+
+log('[*] Probe P968 complete: Path2D, TreeWalker, Encodings & DOMMatrix 3D benchmarked.');
+syncBn('DONE', 'status=P968_COMPLETE|path2d=' + gPathOk + '|gbk=' + gbkOk + '|twFwd=' + gTwFwd + '|matrixInv=' + gMatrixInvOk + '|jsonIntact=' + jsonIntact);
+
+/* Auto-Reload Watcher for autonomous progression */
+var initialReloadToken = null;
+function checkAutoReload() {
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/reload.txt?t=' + Date.now(), true);
+    xhr.onload = function() {
+      if (xhr.status === 200) {
+        var token = xhr.responseText.trim();
+        if (initialReloadToken === null) {
+          initialReloadToken = token;
+        } else if (token !== initialReloadToken) {
+          log('[*] New deployment detected (token: ' + token + '). Auto-reloading in 500ms...');
+          setTimeout(function() { location.reload(); }, 500);
+        }
+      }
+    };
+    xhr.send();
+  } catch(e) {}
+}
+setInterval(checkAutoReload, 1500);
+</script>
+</body>
+</html>

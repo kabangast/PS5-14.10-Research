@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>PS5 FW 14.10 // WEBGL, GPU &amp; HARDWARE ACCELERATION HUD</title>
+<style>
+:root {
+  --bg-dark: #040711;
+  --panel-bg: rgba(8, 14, 28, 0.94);
+  --neon-cyan: #00f3ff;
+  --neon-green: #00ff66;
+  --neon-amber: #ffb800;
+  --neon-pink: #ff0077;
+  --neon-purple: #9d00ff;
+  --text-dim: #7085a5;
+  --text-main: #e2f1ff;
+  --border-glow: rgba(0, 243, 255, 0.35);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background-color: var(--bg-dark);
+  background-image: 
+    radial-gradient(ellipse at 50% 0%, rgba(0, 243, 255, 0.16), transparent 75%),
+    linear-gradient(rgba(0, 243, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 243, 255, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 28px 28px, 28px 28px;
+  color: var(--text-main);
+  font-family: "SF Mono", "Consolas", monospace;
+  padding: 16px;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+.scanline {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.02), rgba(0, 255, 0, 0.01), rgba(0, 255, 0, 0.02));
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+  z-index: 999;
+}
+
+/* Header */
+.header {
+  border: 1px solid var(--neon-cyan);
+  background: rgba(0, 243, 255, 0.07);
+  box-shadow: 0 0 20px rgba(0, 243, 255, 0.3);
+  padding: 12px 20px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title-glitch {
+  font-size: 18px;
+  font-weight: 900;
+  letter-spacing: 2px;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 10px rgba(0, 243, 255, 0.8);
+}
+.target-badge {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: rgba(0, 255, 102, 0.15);
+  border: 1px solid var(--neon-green);
+  color: var(--neon-green);
+  font-weight: bold;
+}
+
+/* Pipeline Stage Trackers */
+.pipeline-track {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.node {
+  background: var(--panel-bg);
+  border: 1px solid rgba(112, 133, 165, 0.25);
+  border-radius: 6px;
+  padding: 10px;
+  position: relative;
+  transition: all 0.3s ease;
+}
+.node.done {
+  border-color: var(--neon-green);
+  box-shadow: 0 0 10px rgba(0, 255, 102, 0.25);
+}
+.node.active {
+  border-color: var(--neon-cyan);
+  box-shadow: 0 0 12px rgba(0, 243, 255, 0.4);
+}
+.node.locked {
+  border-color: rgba(112, 133, 165, 0.2);
+  opacity: 0.55;
+}
+.node-step {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.node.done .node-step { color: var(--neon-green); }
+.node.active .node-step { color: var(--neon-cyan); }
+.node-title {
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--text-main);
+  margin-bottom: 4px;
+}
+.node-desc {
+  font-size: 9px;
+  color: var(--text-dim);
+  line-height: 1.3;
+}
+
+/* Grid Layout */
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-glow);
+  border-radius: 6px;
+  padding: 14px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
+  position: relative;
+  overflow: hidden;
+}
+.panel-title {
+  font-size: 13px;
+  font-weight: bold;
+  color: var(--neon-cyan);
+  border-bottom: 1px solid rgba(0, 243, 255, 0.2);
+  padding-bottom: 8px;
+  margin-bottom: 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.live-meter {
+  display: flex;
+  justify-content: space-between;
+  margin: 6px 0;
+  font-size: 11px;
+}
+.val-hex { color: var(--neon-purple); font-weight: bold; }
+.val-ok { color: var(--neon-green); font-weight: bold; }
+.val-dim { color: var(--text-dim); }
+.val-cyan { color: var(--neon-cyan); font-weight: bold; }
+.val-warn { color: var(--neon-amber); font-weight: bold; }
+.val-fail { color: var(--neon-pink); font-weight: bold; }
+
+/* Radar & Glitch Accents */
+.radar-box {
+  width: 100%;
+  height: 2px;
+  background: rgba(0, 243, 255, 0.1);
+  position: relative;
+  overflow: hidden;
+  margin-top: 10px;
+}
+.radar-sweep {
+  position: absolute;
+  top: 0; left: -30%;
+  width: 30%; height: 100%;
+  background: linear-gradient(90deg, transparent, var(--neon-cyan), transparent);
+  animation: sweep 2.2s infinite linear;
+}
+@keyframes sweep {
+  0% { left: -30%; }
+  100% { left: 100%; }
+}
+
+/* Terminal Log */
+#terminal {
+  background: rgba(2, 4, 10, 0.9);
+  border: 1px solid rgba(0, 243, 255, 0.18);
+  border-radius: 4px;
+  padding: 10px;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: #a0c4e8;
+  height: 150px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* 3D Canvas / Demo Stage */
+#renderStage {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  justify-content: center;
+  margin-top: 8px;
+}
+#glCanvas {
+  border: 1px solid var(--neon-cyan);
+  border-radius: 4px;
+  box-shadow: 0 0 10px rgba(0, 243, 255, 0.3);
+  background: #000;
+}
+.cube3d-container {
+  width: 80px; height: 80px;
+  perspective: 400px;
+}
+.cube3d {
+  width: 100%; height: 100%;
+  position: relative;
+  transform-style: preserve-3d;
+  animation: spin3d 4s infinite linear;
+}
+.cube-face {
+  position: absolute;
+  width: 80px; height: 80px;
+  border: 1px solid var(--neon-cyan);
+  background: rgba(0, 243, 255, 0.12);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: bold; color: var(--neon-cyan);
+}
+@keyframes spin3d {
+  0% { transform: rotateX(0deg) rotateY(0deg); }
+  100% { transform: rotateX(360deg) rotateY(360deg); }
+}
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+
+<div class="header">
+  <div>
+    <div class="title-glitch">&#x25C8; PS5 FW 14.10 // GPU &amp; WEBGL ACCELERATION HUD</div>
+    <div style="font-size: 10px; color: var(--text-dim); margin-top: 3px;">
+      WebKit Engine Subsystem Discovery &bull; Direct Hardware vs Software Raster Oracle
+    </div>
+  </div>
+  <div class="target-badge" id="statusBadge">BENCHMARKING GPU</div>
+</div>
+
+<!-- 6-Stage Visual Pipeline Tracker -->
+<div class="pipeline-track">
+  <div class="node active" id="nodeStage1">
+    <div class="node-step">Stage 1 [ACTIVE]</div>
+    <div class="node-title">WebGL Context Init</div>
+    <div class="node-desc">Probing webgl, webgl2, experimental-webgl &amp; WebGPU APIs.</div>
+  </div>
+  <div class="node locked" id="nodeStage2">
+    <div class="node-step">Stage 2 [QUEUED]</div>
+    <div class="node-title">GPU Driver Unmasking</div>
+    <div class="node-desc">Querying WEBGL_debug_renderer_info &amp; RDNA2 unmasked vendor.</div>
+  </div>
+  <div class="node locked" id="nodeStage3">
+    <div class="node-step">Stage 3 [QUEUED]</div>
+    <div class="node-title">GL Limits &amp; Features</div>
+    <div class="node-desc">MAX_TEXTURE_SIZE, uniform vectors &amp; extension catalog.</div>
+  </div>
+  <div class="node locked" id="nodeStage4">
+    <div class="node-step">Stage 4 [QUEUED]</div>
+    <div class="node-title">Shader Compilation</div>
+    <div class="node-desc">Compiling GLSL vertex/fragment shaders and VBO draw pipeline.</div>
+  </div>
+  <div class="node locked" id="nodeStage5">
+    <div class="node-step">Stage 5 [QUEUED]</div>
+    <div class="node-title">Pixel Readback Oracle</div>
+    <div class="node-desc">gl.readPixels() framebuffer color integrity &amp; raster latency.</div>
+  </div>
+  <div class="node locked" id="nodeStage6">
+    <div class="node-step">Stage 6 [QUEUED]</div>
+    <div class="node-title">CSS 3D Compositor</div>
+    <div class="node-desc">CSS 3D transform matrix rotation, filters &amp; realized FPS.</div>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Panel 1: WebGL & GPU Hardware Profile -->
+  <div class="panel">
+    <div class="panel-title">
+      <span>WEBGL &amp; HARDWARE ACCELERATION ORACLE</span>
+      <span style="color:var(--neon-green);" id="mGpuBadge">PROBING...</span>
+    </div>
+    <div class="live-meter"><span>WebGL 1.0 Support:</span><span class="val-cyan" id="mWebGl1">Probing...</span></div>
+    <div class="live-meter"><span>WebGL 2.0 (ES 3.0):</span><span class="val-cyan" id="mWebGl2">Probing...</span></div>
+    <div class="live-meter"><span>WebGPU (navigator.gpu):</span><span class="val-cyan" id="mWebGpu">Probing...</span></div>
+    <div class="live-meter"><span>Masked GL Renderer:</span><span class="val-dim" id="mGlRenderer">Resolving...</span></div>
+    <div class="live-meter"><span>Unmasked GPU Vendor:</span><span class="val-hex" id="mUnmaskedVendor">Resolving...</span></div>
+    <div class="live-meter"><span>Unmasked GPU Renderer:</span><span class="val-hex" id="mUnmaskedRenderer">Resolving...</span></div>
+    <div class="live-meter"><span>GLSL Shading Language:</span><span class="val-ok" id="mShadingLang">Resolving...</span></div>
+    <div class="live-meter"><span>Supported Extensions:</span><span class="val-ok" id="mExtensions">Counting...</span></div>
+    <div class="radar-box"><div class="radar-sweep"></div></div>
+  </div>
+
+  <!-- Panel 2: Pipeline Execution & Readback -->
+  <div class="panel">
+    <div class="panel-title">
+      <span>SHADER PIPELINE &amp; 3D COMPOSITING</span>
+      <span style="color:var(--neon-cyan);">LIVE RASTER</span>
+    </div>
+    <div class="live-meter"><span>Max Texture Dimension:</span><span class="val-hex" id="mMaxTex">Measuring...</span></div>
+    <div class="live-meter"><span>Max Renderbuffer Size:</span><span class="val-hex" id="mMaxRb">Measuring...</span></div>
+    <div class="live-meter"><span>GLSL Shader Compilation:</span><span class="val-ok" id="mShaderStatus">Testing...</span></div>
+    <div class="live-meter"><span>Draw Call &amp; Readback:</span><span class="val-ok" id="mDrawStatus">Executing...</span></div>
+    <div class="live-meter"><span>Framebuffer Pixel Match:</span><span class="val-ok" id="mPixelMatch">Verifying...</span></div>
+    <div class="live-meter"><span>CSS 3D Transforms Support:</span><span class="val-cyan" id="mCss3d">Testing...</span></div>
+    <div class="live-meter"><span>Compositor Realized FPS:</span><span class="val-hex" id="mFps">Benchmarking...</span></div>
+
+    <!-- Active Hardware Rendering Test Surface -->
+    <div id="renderStage">
+      <canvas id="glCanvas" width="80" height="80"></canvas>
+      <div class="cube3d-container">
+        <div class="cube3d" id="cube">
+          <div class="cube-face" style="transform: translateZ(40px);">PS5</div>
+          <div class="cube-face" style="transform: rotateY(180deg) translateZ(40px);">GPU</div>
+          <div class="cube-face" style="transform: rotateY(90deg) translateZ(40px);">GL</div>
+          <div class="cube-face" style="transform: rotateY(-90deg) translateZ(40px);">HUD</div>
+          <div class="cube-face" style="transform: rotateX(90deg) translateZ(40px);">3D</div>
+          <div class="cube-face" style="transform: rotateX(-90deg) translateZ(40px);">14.10</div>
+        </div>
+      </div>
+    </div>
+    <div class="radar-box"><div class="radar-sweep"></div></div>
+  </div>
+</div>
+
+<!-- Tactical Log Terminal -->
+<div class="panel">
+  <div class="panel-title">
+    <span>TACTICAL GPU &amp; HARDWARE TELEMETRY LOG</span>
+    <span style="color:var(--neon-green);">LIVE STREAM TELEMETRY</span>
+  </div>
+  <pre id="terminal">[*] Initializing Probe P953 GPU &amp; Hardware Acceleration Suite...</pre>
+  <div class="radar-box"><div class="radar-sweep"></div></div>
+</div>
+
+<script>
+'use strict';
+var term = document.getElementById('terminal');
+var statusBadge = document.getElementById('statusBadge');
+var mGpuBadge = document.getElementById('mGpuBadge');
+
+var nodeStage1 = document.getElementById('nodeStage1');
+var nodeStage2 = document.getElementById('nodeStage2');
+var nodeStage3 = document.getElementById('nodeStage3');
+var nodeStage4 = document.getElementById('nodeStage4');
+var nodeStage5 = document.getElementById('nodeStage5');
+var nodeStage6 = document.getElementById('nodeStage6');
+
+var mWebGl1 = document.getElementById('mWebGl1');
+var mWebGl2 = document.getElementById('mWebGl2');
+var mWebGpu = document.getElementById('mWebGpu');
+var mGlRenderer = document.getElementById('mGlRenderer');
+var mUnmaskedVendor = document.getElementById('mUnmaskedVendor');
+var mUnmaskedRenderer = document.getElementById('mUnmaskedRenderer');
+var mShadingLang = document.getElementById('mShadingLang');
+var mExtensions = document.getElementById('mExtensions');
+
+var mMaxTex = document.getElementById('mMaxTex');
+var mMaxRb = document.getElementById('mMaxRb');
+var mShaderStatus = document.getElementById('mShaderStatus');
+var mDrawStatus = document.getElementById('mDrawStatus');
+var mPixelMatch = document.getElementById('mPixelMatch');
+var mCss3d = document.getElementById('mCss3d');
+var mFps = document.getElementById('mFps');
+
+function log(msg) {
+  var d = document.createElement('div');
+  d.textContent = '[' + new Date().toISOString().slice(11, 23) + '] ' + msg;
+  term.appendChild(d);
+  term.scrollTop = term.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P953-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+window.onerror = function(msg, url, line) {
+  syncBn('JS-ERR', msg + ' at line ' + line);
+  log('[!] ERROR: ' + msg + ' (Line ' + line + ')');
+};
+
+log('[*] Probe P953 online: WebGL 1.0/2.0, GPU driver unmasking & hardware pipeline.');
+syncBn('BOOT', 'start');
+
+var canvas = document.getElementById('glCanvas');
+var gl = null;
+var isWebGl2 = false;
+var hasWebGl1 = false;
+var hasWebGl2 = false;
+var hasWebGpu = (typeof navigator !== 'undefined' && 'gpu' in navigator);
+
+mWebGpu.textContent = hasWebGpu ? 'ACTIVE (WebGPU)' : 'DISABLED';
+mWebGpu.className = hasWebGpu ? 'val-ok' : 'val-dim';
+
+/* ============================================================
+ * STAGE 1: WebGL Context Acquisition
+ * ============================================================ */
+try {
+  var gl2 = canvas.getContext('webgl2') || canvas.getContext('experimental-webgl2');
+  if (gl2) {
+    hasWebGl2 = true;
+    gl = gl2;
+    isWebGl2 = true;
+    mWebGl2.textContent = 'SUPPORTED (ES 3.0)';
+    mWebGl2.className = 'val-ok';
+  } else {
+    mWebGl2.textContent = 'DISABLED';
+    mWebGl2.className = 'val-dim';
+  }
+
+  var gl1 = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+  if (gl1) {
+    hasWebGl1 = true;
+    if (!gl) gl = gl1;
+    mWebGl1.textContent = 'SUPPORTED (ES 2.0)';
+    mWebGl1.className = 'val-ok';
+  } else {
+    mWebGl1.textContent = 'DISABLED';
+    mWebGl1.className = 'val-dim';
+  }
+
+  log('[+] Context Acquisition: WebGL1=' + hasWebGl1 + ', WebGL2=' + hasWebGl2 + ', WebGPU=' + hasWebGpu);
+  syncBn('WEBGL-INIT', 'webgl1=' + hasWebGl1 + '|webgl2=' + hasWebGl2 + '|webgpu=' + hasWebGpu);
+
+  nodeStage1.className = 'node done';
+  nodeStage1.querySelector('.node-step').textContent = 'Stage 1 [DONE]';
+} catch(e) {
+  log('[-] Context Acquisition Exception: ' + e.message);
+  syncBn('INIT-ERR', e.message);
+}
+
+/* ============================================================
+ * STAGE 2 & 3: Driver Unmasking & Hardware Limits
+ * ============================================================ */
+var vendorStr = 'NONE', rendererStr = 'NONE';
+var unmaskedVendorStr = 'NONE', unmaskedRendererStr = 'NONE';
+var shadingLangStr = 'NONE', extCount = 0;
+var maxTex = 0, maxRb = 0;
+
+if (gl) {
+  nodeStage2.className = 'node active';
+  nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [ACTIVE]';
+
+  try {
+    vendorStr = gl.getParameter(gl.VENDOR) || 'unknown';
+    rendererStr = gl.getParameter(gl.RENDERER) || 'unknown';
+    shadingLangStr = gl.getParameter(gl.SHADING_LANGUAGE_VERSION) || 'unknown';
+
+    mGlRenderer.textContent = rendererStr;
+    mShadingLang.textContent = shadingLangStr;
+
+    // Check WEBGL_debug_renderer_info
+    var dbgExt = gl.getExtension('WEBGL_debug_renderer_info');
+    if (dbgExt) {
+      unmaskedVendorStr = gl.getParameter(dbgExt.UNMASKED_VENDOR_WEBGL) || 'unreported';
+      unmaskedRendererStr = gl.getParameter(dbgExt.UNMASKED_RENDERER_WEBGL) || 'unreported';
+    } else {
+      unmaskedVendorStr = 'EXT_BLOCKED';
+      unmaskedRendererStr = 'EXT_BLOCKED';
+    }
+
+    mUnmaskedVendor.textContent = unmaskedVendorStr;
+    mUnmaskedRenderer.textContent = unmaskedRendererStr;
+    mGpuBadge.textContent = 'HARDWARE ACTIVE';
+
+    log('[+] GPU Identity: Masked=' + rendererStr + ', Unmasked=' + unmaskedRendererStr + ' (' + unmaskedVendorStr + ')');
+    syncBn('GPU-IDENTITY', 'vendor=' + vendorStr + '|renderer=' + rendererStr + '|unVendor=' + unmaskedVendorStr + '|unRenderer=' + unmaskedRendererStr + '|glsl=' + shadingLangStr);
+
+    nodeStage2.className = 'node done';
+    nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [DONE]';
+
+    // Stage 3: Limits & Extensions
+    nodeStage3.className = 'node active';
+    nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [ACTIVE]';
+
+    var exts = gl.getSupportedExtensions() || [];
+    extCount = exts.length;
+    mExtensions.textContent = extCount + ' EXTENSIONS';
+
+    maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 0;
+    maxRb = gl.getParameter(gl.MAX_RENDERBUFFER_SIZE) || 0;
+    var maxAttribs = gl.getParameter(gl.MAX_VERTEX_ATTRIBS) || 0;
+    var maxVarying = gl.getParameter(gl.MAX_VARYING_VECTORS) || 0;
+
+    mMaxTex.textContent = maxTex + ' x ' + maxTex;
+    mMaxRb.textContent = maxRb + ' x ' + maxRb;
+
+    log('[+] GL Limits: MaxTex=' + maxTex + ', MaxRb=' + maxRb + ', MaxAttribs=' + maxAttribs + ', ExtCount=' + extCount);
+    syncBn('GL-LIMITS', 'maxTex=' + maxTex + '|maxRb=' + maxRb + '|attribs=' + maxAttribs + '|varying=' + maxVarying + '|exts=' + extCount);
+
+    nodeStage3.className = 'node done';
+    nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [DONE]';
+  } catch(e) {
+    log('[-] GPU Query Exception: ' + e.message);
+    syncBn('PARAM-ERR', e.message);
+  }
+} else {
+  mGpuBadge.textContent = 'SOFTWARE ONLY / DISABLED';
+  mGpuBadge.className = 'val-dim';
+  mGlRenderer.textContent = 'N/A (DISABLED)';
+  mUnmaskedVendor.textContent = 'N/A';
+  mUnmaskedRenderer.textContent = 'N/A';
+  mShadingLang.textContent = 'N/A';
+  mExtensions.textContent = '0 (DISABLED)';
+  mMaxTex.textContent = 'N/A';
+  mMaxRb.textContent = 'N/A';
+  mShaderStatus.textContent = 'N/A (NO GL)';
+  mDrawStatus.textContent = 'N/A (NO GL)';
+  mPixelMatch.textContent = 'N/A (NO GL)';
+
+  log('[-] WebGL is completely disabled or unexposed in this WebProcess.');
+  syncBn('NO-WEBGL', 'disabled=true');
+
+  nodeStage2.className = 'node locked';
+  nodeStage3.className = 'node locked';
+  nodeStage4.className = 'node locked';
+  nodeStage5.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 4 & 5: Shader Compilation & Pixel Readback Oracle
+ * ============================================================ */
+var shaderOk = false, drawOk = false, pixelOk = false;
+var pixelDataStr = 'none';
+
+if (gl) {
+  nodeStage4.className = 'node active';
+  nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [ACTIVE]';
+
+  try {
+    var vsSrc = 'attribute vec2 pos; void main() { gl_Position = vec4(pos, 0.0, 1.0); }';
+    var fsSrc = 'precision mediump float; void main() { gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0); }';
+
+    var vs = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vs, vsSrc);
+    gl.compileShader(vs);
+    var vsCompiled = gl.getShaderParameter(vs, gl.COMPILE_STATUS);
+
+    var fs = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fs, fsSrc);
+    gl.compileShader(fs);
+    var fsCompiled = gl.getShaderParameter(fs, gl.COMPILE_STATUS);
+
+    var prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    var linked = gl.getProgramParameter(prog, gl.LINK_STATUS);
+
+    if (vsCompiled && fsCompiled && linked) {
+      shaderOk = true;
+      mShaderStatus.textContent = 'COMPILED & LINKED 100%';
+      log('[+] Shader Pipeline: GLSL Vertex & Fragment compiled and linked successfully.');
+
+      nodeStage4.className = 'node done';
+      nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [DONE]';
+
+      // Draw Call
+      nodeStage5.className = 'node active';
+      nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [ACTIVE]';
+
+      var tDrawStart = performance.now();
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.clearColor(0.0, 0.0, 0.0, 1.0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+
+      gl.useProgram(prog);
+      var vbo = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      var verts = new Float32Array([-1.0, -1.0,  3.0, -1.0,  -1.0, 3.0]);
+      gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+
+      var posLoc = gl.getAttribLocation(prog, 'pos');
+      gl.enableVertexAttribArray(posLoc);
+      gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      gl.finish();
+      var drawMs = (performance.now() - tDrawStart).toFixed(2);
+      drawOk = true;
+      mDrawStatus.textContent = drawMs + ' ms (TRIANGLE RENDERED)';
+
+      // Pixel Readback
+      var px = new Uint8Array(4);
+      gl.readPixels(canvas.width / 2, canvas.height / 2, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      pixelDataStr = px[0] + ',' + px[1] + ',' + px[2] + ',' + px[3];
+
+      // Pure Green: RGBA [0, 255, 0, 255]
+      if (px[0] === 0 && px[1] === 255 && px[2] === 0 && px[3] === 255) {
+        pixelOk = true;
+        mPixelMatch.textContent = 'VERIFIED [0,255,0,255]';
+        log('[+] Pixel Readback Oracle: 100% exact color match (RGBA: ' + pixelDataStr + ') in ' + drawMs + 'ms');
+      } else {
+        mPixelMatch.textContent = 'MISMATCH (' + pixelDataStr + ')';
+        mPixelMatch.className = 'val-warn';
+        log('[!] Pixel Readback Discrepancy: RGBA = ' + pixelDataStr);
+      }
+
+      syncBn('SHADER-PIPE', 'compiled=true|linked=true|drawMs=' + drawMs + '|pixelOk=' + pixelOk + '|px=' + pixelDataStr);
+
+      nodeStage5.className = 'node done';
+      nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [DONE]';
+    } else {
+      var errLog = gl.getProgramInfoLog(prog) || 'Link failure';
+      mShaderStatus.textContent = 'FAILED';
+      mShaderStatus.className = 'val-fail';
+      log('[-] Shader Link Failed: ' + errLog);
+      syncBn('SHADER-FAIL', 'err=' + encodeURIComponent(errLog));
+    }
+  } catch(e) {
+    log('[-] Shader Pipeline Exception: ' + e.message);
+    syncBn('PIPE-ERR', e.message);
+  }
+}
+
+/* ============================================================
+ * STAGE 6: CSS 3D Transforms & Compositor Benchmarking
+ * ============================================================ */
+nodeStage6.className = 'node active';
+nodeStage6.querySelector('.node-step').textContent = 'Stage 6 [ACTIVE]';
+
+var hasCss3d = ('perspective' in document.body.style || 'webkitPerspective' in document.body.style);
+mCss3d.textContent = hasCss3d ? 'HARDWARE 3D COMPATIBLE' : 'FALLBACK';
+mCss3d.className = hasCss3d ? 'val-ok' : 'val-dim';
+
+var cubeEl = document.getElementById('cube');
+var frameCount = 0;
+var maxFrames = 30;
+var tStart = performance.now();
+
+function animateCompositor(now) {
+  frameCount++;
+  var angle = (frameCount * 12) % 360;
+  if (cubeEl) {
+    cubeEl.style.transform = 'rotateX(' + angle + 'deg) rotateY(' + (angle * 1.5) + 'deg)';
+  }
+
+  if (frameCount < maxFrames) {
+    requestAnimationFrame(animateCompositor);
+  } else {
+    var totalTime = performance.now() - tStart;
+    var avgFrameMs = (totalTime / maxFrames).toFixed(2);
+    var fps = (1000 / (totalTime / maxFrames)).toFixed(1);
+
+    mFps.textContent = fps + ' FPS (' + avgFrameMs + ' ms/frame)';
+    log('[+] Compositor Benchmark: ' + maxFrames + ' frames in ' + totalTime.toFixed(0) + 'ms (' + fps + ' FPS)');
+    syncBn('COMPOSITOR-3D', 'fps=' + fps + '|avgMs=' + avgFrameMs + '|css3d=' + hasCss3d);
+
+    nodeStage6.className = 'node done';
+    nodeStage6.querySelector('.node-step').textContent = 'Stage 6 [DONE]';
+
+    statusBadge.textContent = 'BENCHMARK COMPLETE';
+    statusBadge.style.background = '#00ff66';
+
+    syncBn('DONE', 'status=P953_COMPLETE|hasGl=' + (gl !== null) + '|hasGl2=' + hasWebGl2 + '|fps=' + fps);
+  }
+}
+
+requestAnimationFrame(animateCompositor);
+
+/* Auto-Reload Watcher for autonomous progression */
+var initialReloadToken = null;
+function checkAutoReload() {
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/reload.txt?t=' + Date.now(), true);
+    xhr.onload = function() {
+      if (xhr.status === 200) {
+        var token = xhr.responseText.trim();
+        if (initialReloadToken === null) {
+          initialReloadToken = token;
+        } else if (token !== initialReloadToken) {
+          log('[*] New deployment detected (token: ' + token + '). Auto-reloading in 500ms...');
+          setTimeout(function() { location.reload(); }, 500);
+        }
+      }
+    };
+    xhr.send();
+  } catch(e) {}
+}
+setInterval(checkAutoReload, 1500);
+</script>
+</body>
+</html>

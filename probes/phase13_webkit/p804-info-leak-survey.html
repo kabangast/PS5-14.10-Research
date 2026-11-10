@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P804 — Info leak survey</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; color: #7ee787; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+</style>
+<script>
+'use strict';
+/* ============================================================
+ * P804 — Info leak survey
+ *
+ * Test every quick JS/CSS API that might leak a code or heap
+ * address into observable JS values.  Each section beacons its
+ * result independently.
+ *
+ * Sections:
+ *   A: Error.stack from native calls
+ *   B: Function.toString on builtins
+ *   C: performance.memory / mozMemory
+ *   D: CSS getComputedStyle on font objects
+ *   E: Symbol.toPrimitive / valueOf on engine objects
+ *   F: Proxy traps on DOM objects
+ *   G: toString of ArrayBuffer / DataView internals
+ *   H: crypto.getRandomValues seeding (timing)
+ *   I: Navigation / location internals
+ *   J: WebKit-specific: window.internals, GCController
+ *   K: FontFace internals inspection
+ *   L: Object property enumeration on special objects
+ *
+ * CRASH_CLASS: LOW — read-only inspection, no UAF
+ * ============================================================ */
+
+window.onerror = function(msg, url, line){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P804-JSERR&data=' + encodeURIComponent((msg||'') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+};
+
+function b(tag, data){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P804-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+}
+
+var out;
+function log(s){ if(out) out.textContent += s + '\n'; }
+
+function run(){
+  out = document.getElementById('out');
+  out.textContent = '';
+  log('P804 — Info Leak Survey\n');
+
+  b('BOOT', 'starting');
+
+  /* ===== A: Error.stack ===== */
+  try {
+    var stacks = [];
+
+    // Stack from TypeError
+    try { null.x; } catch(e1){
+      stacks.push('TypeError:' + (e1.stack || 'NO_STACK'));
+    }
+
+    // Stack from RangeError
+    try { new Array(-1); } catch(e2){
+      stacks.push('RangeError:' + (e2.stack || 'NO_STACK'));
+    }
+
+    // Stack from recursive overflow
+    try {
+      (function recurse(){ recurse(); })();
+    } catch(e3){
+      stacks.push('Overflow:' + (e3.stack || 'NO_STACK').slice(0, 300));
+    }
+
+    // Stack from native function error
+    try { decodeURIComponent('%'); } catch(e4){
+      stacks.push('URIErr:' + (e4.stack || 'NO_STACK'));
+    }
+
+    // Stack from eval error
+    try { eval('}{'); } catch(e5){
+      stacks.push('SyntaxErr:' + (e5.stack || 'NO_STACK'));
+    }
+
+    var stackStr = stacks.join('|||').slice(0, 900);
+    b('A-STACK', stackStr);
+    log('A: ' + stackStr.slice(0, 200));
+  } catch(e){ b('A-ERR', e.message); }
+
+  /* ===== B: Function.toString on builtins ===== */
+  try {
+    var fns = [];
+    fns.push('eval:' + eval.toString().slice(0, 80));
+    fns.push('parseInt:' + parseInt.toString().slice(0, 80));
+    fns.push('Array.push:' + Array.prototype.push.toString().slice(0, 80));
+    fns.push('Object.create:' + Object.create.toString().slice(0, 80));
+    try { fns.push('gc:' + (typeof gc !== 'undefined' ? gc.toString() : 'undef')); } catch(e){}
+    try { fns.push('print:' + (typeof print !== 'undefined' ? print.toString().slice(0, 80) : 'undef')); } catch(e){}
+    b('B-TOSTR', fns.join('|').slice(0, 900));
+    log('B: ' + fns[0]);
+  } catch(e){ b('B-ERR', e.message); }
+
+  /* ===== C: performance.memory ===== */
+  try {
+    var mem = {};
+    if (performance.memory) {
+      mem.jsHeapSizeLimit = performance.memory.jsHeapSizeLimit;
+      mem.totalJSHeapSize = performance.memory.totalJSHeapSize;
+      mem.usedJSHeapSize = performance.memory.usedJSHeapSize;
+    }
+    mem.timeOrigin = performance.timeOrigin;
+    mem.now = performance.now();
+    mem.hasMozMemory = typeof performance.mozMemory !== 'undefined';
+    b('C-PERF', JSON.stringify(mem).slice(0, 900));
+    log('C: ' + JSON.stringify(mem).slice(0, 200));
+  } catch(e){ b('C-ERR', e.message); }
+
+  /* ===== D: CSS computed style on font ===== */
+  try {
+    var st = document.createElement('style');
+    st.textContent = '@font-face{font-family:leak1;src:local(Arial);}';
+    document.head.appendChild(st);
+
+    var sp = document.createElement('span');
+    sp.style.fontFamily = 'leak1, serif';
+    sp.textContent = 'ABCDEF';
+    document.body.appendChild(sp);
+    document.body.offsetHeight;
+
+    var cs = getComputedStyle(sp);
+    var csData = [];
+    csData.push('font:' + cs.font);
+    csData.push('ff:' + cs.fontFamily);
+    csData.push('fs:' + cs.fontSize);
+    csData.push('fw:' + cs.fontWeight);
+    csData.push('fk:' + cs.fontKerning);
+    csData.push('ffs:' + cs.fontFeatureSettings);
+    csData.push('fvs:' + cs.fontVariationSettings);
+    csData.push('fa:' + cs.fontSizeAdjust);
+    b('D-CSS', csData.join('|').slice(0, 900));
+    log('D: ' + csData[0]);
+
+    st.remove();
+    sp.remove();
+  } catch(e){ b('D-ERR', e.message); }
+
+  /* ===== E: Symbol.toPrimitive / valueOf on special objects ===== */
+  try {
+    var eData = [];
+
+    // FontFace valueOf
+    var face = new FontFace('tp1', 'local(Arial)');
+    try { eData.push('face+0:' + (face + 0)); } catch(e){ eData.push('face+0:ERR:' + e.message); }
+    try { eData.push('face*1:' + (face * 1)); } catch(e){ eData.push('face*1:ERR:' + e.message); }
+    try { eData.push('face|0:' + (face | 0)); } catch(e){ eData.push('face|0:ERR:' + e.message); }
+    try { eData.push('face>>0:' + (face >>> 0)); } catch(e){ eData.push('face>>0:ERR:' + e.message); }
+
+    // CSSStyleSheet valueOf
+    var ss = document.styleSheets[0];
+    if (ss) {
+      try { eData.push('ss+0:' + (ss + 0)); } catch(e){ eData.push('ss+0:ERR:' + e.message); }
+    }
+
+    // document.fonts valueOf
+    try { eData.push('fonts+0:' + (document.fonts + 0)); } catch(e){ eData.push('fonts+0:ERR:' + e.message); }
+
+    b('E-PRIM', eData.join('|').slice(0, 900));
+    log('E: ' + eData[0]);
+  } catch(e){ b('E-ERR', e.message); }
+
+  /* ===== F: Proxy traps on DOM ===== */
+  try {
+    var fData = [];
+
+    // Can we wrap DOM objects in Proxy?
+    try {
+      var p = new Proxy(document, {
+        get: function(t, prop) {
+          if (prop === '__secret') return 'PROXY_WORKS';
+          return t[prop];
+        }
+      });
+      fData.push('proxy_doc:' + p.__secret);
+    } catch(e){ fData.push('proxy_doc:ERR:' + e.message); }
+
+    // Proxy on FontFace
+    try {
+      var face2 = new FontFace('px1', 'local(Arial)');
+      var keys = Object.getOwnPropertyNames(face2);
+      fData.push('face_keys:' + keys.join(','));
+    } catch(e){ fData.push('face_keys:ERR:' + e.message); }
+
+    // Reflect.ownKeys on FontFace.prototype
+    try {
+      var protoKeys = Reflect.ownKeys(FontFace.prototype);
+      fData.push('proto_keys:' + protoKeys.join(','));
+    } catch(e){ fData.push('proto_keys:ERR:' + e.message); }
+
+    b('F-PROXY', fData.join('|').slice(0, 900));
+    log('F: ' + fData[0]);
+  } catch(e){ b('F-ERR', e.message); }
+
+  /* ===== G: ArrayBuffer / DataView internals ===== */
+  try {
+    var gData = [];
+    var ab1 = new ArrayBuffer(256);
+    gData.push('ab_str:' + ab1.toString());
+    gData.push('ab_ctor:' + ab1.constructor.name);
+
+    var dv = new DataView(ab1);
+    gData.push('dv_str:' + dv.toString());
+    gData.push('dv_bo:' + dv.byteOffset);
+    gData.push('dv_bl:' + dv.byteLength);
+
+    // Check if ArrayBuffer has transfer
+    gData.push('has_transfer:' + (typeof ab1.transfer));
+    gData.push('has_resize:' + (typeof ab1.resize));
+    gData.push('has_detached:' + (typeof ab1.detached));
+    gData.push('maxByteLen:' + ab1.maxByteLength);
+
+    // BigInt64Array capabilities
+    var b64 = new BigUint64Array(ab1);
+    gData.push('b64_ctor:' + b64.constructor.name);
+    gData.push('b64_BYPE:' + BigUint64Array.BYTES_PER_ELEMENT);
+
+    b('G-AB', gData.join('|').slice(0, 900));
+    log('G: ' + gData[0]);
+  } catch(e){ b('G-ERR', e.message); }
+
+  /* ===== H: WebKit-specific globals ===== */
+  try {
+    var hData = [];
+
+    // Check for debug/internal APIs
+    var debugAPIs = [
+      'internals', 'GCController', 'testRunner', 'accessibilityController',
+      'layoutTestController', 'eventSender', 'textInputController',
+      'objCController', 'applePaySession', 'WebKitPoint',
+      'webkitURL', 'webkitRequestAnimationFrame', 'webkitCancelAnimationFrame',
+      'WebKitCSSMatrix', 'WebKitMutationObserver', 'webkitAudioContext',
+      'webkitRTCPeerConnection', 'webkitSpeechRecognition',
+      'webkitIndexedDB', 'WebKitPlaybackTargetAvailabilityEvent',
+      'gc', '$vm', 'debug', 'jscOptions', 'noInline', 'OSRExit',
+      'drainMicrotasks', 'releaseWeakRefs', 'fullGC'
+    ];
+
+    for (var i = 0; i < debugAPIs.length; i++) {
+      try {
+        var val = window[debugAPIs[i]];
+        if (typeof val !== 'undefined') {
+          hData.push(debugAPIs[i] + ':' + typeof val);
+        }
+      } catch(e){}
+    }
+
+    hData.push('total_found:' + hData.length);
+    b('H-GLOBALS', hData.join('|').slice(0, 900));
+    log('H: found ' + hData.length + ' webkit globals');
+  } catch(e){ b('H-ERR', e.message); }
+
+  /* ===== I: Constructor / prototype chain exploration ===== */
+  try {
+    var iData = [];
+
+    // Walk up prototype chains looking for hidden properties
+    var face3 = new FontFace('ch1', 'local(Arial)');
+    var proto = Object.getPrototypeOf(face3);
+    var chain = [];
+    while (proto) {
+      var name = proto.constructor ? proto.constructor.name : 'anon';
+      var props = Object.getOwnPropertyNames(proto);
+      chain.push(name + '(' + props.length + ')');
+      proto = Object.getPrototypeOf(proto);
+    }
+    iData.push('face_chain:' + chain.join('->'));
+
+    // document.fonts chain
+    proto = Object.getPrototypeOf(document.fonts);
+    chain = [];
+    while (proto) {
+      var name2 = proto.constructor ? proto.constructor.name : 'anon';
+      var props2 = Object.getOwnPropertyNames(proto);
+      chain.push(name2 + '(' + props2.length + ')');
+      proto = Object.getPrototypeOf(proto);
+    }
+    iData.push('fontset_chain:' + chain.join('->'));
+
+    // Canvas context chain
+    try {
+      var c = document.createElement('canvas').getContext('2d');
+      proto = Object.getPrototypeOf(c);
+      chain = [];
+      while (proto) {
+        var name3 = proto.constructor ? proto.constructor.name : 'anon';
+        chain.push(name3 + '(' + Object.getOwnPropertyNames(proto).length + ')');
+        proto = Object.getPrototypeOf(proto);
+      }
+      iData.push('ctx2d_chain:' + chain.join('->'));
+    } catch(e){}
+
+    b('I-CHAIN', iData.join('|||').slice(0, 900));
+    log('I: ' + iData[0]);
+  } catch(e){ b('I-ERR', e.message); }
+
+  /* ===== J: WeakRef + FinalizationRegistry (GC timing) ===== */
+  try {
+    var jData = [];
+    jData.push('has_WeakRef:' + (typeof WeakRef));
+    jData.push('has_FinReg:' + (typeof FinalizationRegistry));
+
+    if (typeof WeakRef !== 'undefined') {
+      var target = { marker: 42 };
+      var wr = new WeakRef(target);
+      jData.push('wr_deref:' + (wr.deref() ? 'alive' : 'collected'));
+      target = null;
+      // Force GC attempt
+      for (var gi = 0; gi < 100; gi++) { new ArrayBuffer(65536); }
+      jData.push('after_gc:' + (wr.deref() ? 'alive' : 'collected'));
+    }
+
+    if (typeof FinalizationRegistry !== 'undefined') {
+      jData.push('finreg:available');
+    }
+
+    b('J-GC', jData.join('|').slice(0, 900));
+    log('J: ' + jData.join(' '));
+  } catch(e){ b('J-ERR', e.message); }
+
+  /* ===== K: FontFace status + loaded promise internals ===== */
+  try {
+    var kData = [];
+    var face4 = new FontFace('ki1', 'local(Arial)', { unicodeRange: 'U+0041' });
+
+    kData.push('status:' + face4.status);
+    kData.push('family:' + face4.family);
+    kData.push('unicodeRange:' + face4.unicodeRange);
+    kData.push('display:' + face4.display);
+    kData.push('weight:' + face4.weight);
+    kData.push('style:' + face4.style);
+    kData.push('stretch:' + face4.stretch);
+
+    // loaded promise
+    var lp = face4.loaded;
+    kData.push('loaded_type:' + typeof lp);
+    kData.push('loaded_ctor:' + (lp ? lp.constructor.name : 'null'));
+
+    // Can we get promise internal state?
+    try {
+      var pStr = lp.toString();
+      kData.push('promise_str:' + pStr);
+    } catch(e){}
+
+    // Try JSON.stringify
+    try {
+      kData.push('face_json:' + JSON.stringify(face4).slice(0, 100));
+    } catch(e){
+      kData.push('face_json:ERR:' + e.message);
+    }
+
+    // Properties via for...in
+    var faceProps = [];
+    for (var key in face4) { faceProps.push(key); }
+    kData.push('forin:' + faceProps.join(','));
+
+    b('K-FACE', kData.join('|').slice(0, 900));
+    log('K: ' + kData[0]);
+  } catch(e){ b('K-ERR', e.message); }
+
+  /* ===== L: Check for address-leaking toString ===== */
+  try {
+    var lData = [];
+
+    // Some engines include addresses in Object.prototype.toString for host objects
+    var hostObjs = [
+      ['document', document],
+      ['body', document.body],
+      ['head', document.head],
+      ['fonts', document.fonts],
+      ['location', location],
+      ['navigator', navigator],
+      ['screen', screen],
+      ['history', history],
+      ['crypto', crypto],
+      ['performance', performance]
+    ];
+
+    for (var hi = 0; hi < hostObjs.length; hi++) {
+      var hname = hostObjs[hi][0];
+      var hobj = hostObjs[hi][1];
+      if (!hobj) continue;
+      try {
+        var s = Object.prototype.toString.call(hobj);
+        lData.push(hname + ':' + s);
+      } catch(e){}
+    }
+
+    // Check if any object.toSource exists (SpiderMonkey)
+    try {
+      if (typeof Object.prototype.toSource !== 'undefined') {
+        lData.push('toSource:EXISTS');
+      }
+    } catch(e){}
+
+    b('L-TOSTR', lData.join('|').slice(0, 900));
+    log('L: ' + lData[0]);
+  } catch(e){ b('L-ERR', e.message); }
+
+  /* ===== M: structuredClone + transfer edge cases ===== */
+  try {
+    var mData = [];
+    mData.push('has_sClone:' + (typeof structuredClone));
+
+    if (typeof structuredClone !== 'undefined') {
+      // Clone AB and check if address info leaks
+      var mAb = new ArrayBuffer(64);
+      var mView = new BigUint64Array(mAb);
+      mView[0] = 0xDEADBEEFn;
+
+      var mClone = structuredClone(mAb);
+      var mCloneView = new BigUint64Array(mClone);
+      mData.push('clone_q0:0x' + mCloneView[0].toString(16));
+
+      // Transfer
+      var mAb2 = new ArrayBuffer(64);
+      var mView2 = new BigUint64Array(mAb2);
+      mView2[0] = 0xCAFEBABEn;
+      var mTransferred = structuredClone(mAb2, { transfer: [mAb2] });
+      var mTView = new BigUint64Array(mTransferred);
+      mData.push('transfer_q0:0x' + mTView[0].toString(16));
+      mData.push('orig_detached:' + (mAb2.byteLength === 0));
+
+      // Transfer preserves bytes?
+      mData.push('transfer_match:' + (mTView[0] === 0xCAFEBABEn));
+    }
+
+    b('M-CLONE', mData.join('|').slice(0, 900));
+    log('M: ' + mData.join(' '));
+  } catch(e){ b('M-ERR', e.message); }
+
+  /* ===== N: CSS font metrics side channel ===== */
+  try {
+    var nData = [];
+
+    // Measure text with different fonts
+    var nSpan = document.createElement('span');
+    nSpan.style.fontFamily = 'serif';
+    nSpan.style.fontSize = '100px';
+    nSpan.style.position = 'absolute';
+    nSpan.style.visibility = 'hidden';
+    nSpan.textContent = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    document.body.appendChild(nSpan);
+    document.body.offsetHeight;
+    nData.push('serif_w:' + nSpan.offsetWidth + '_h:' + nSpan.offsetHeight);
+
+    nSpan.style.fontFamily = 'sans-serif';
+    document.body.offsetHeight;
+    nData.push('sans_w:' + nSpan.offsetWidth + '_h:' + nSpan.offsetHeight);
+
+    nSpan.style.fontFamily = 'monospace';
+    document.body.offsetHeight;
+    nData.push('mono_w:' + nSpan.offsetWidth + '_h:' + nSpan.offsetHeight);
+
+    // Create canvas for precise text measurement
+    try {
+      var nc = document.createElement('canvas');
+      nc.width = 800; nc.height = 200;
+      var nctx = nc.getContext('2d');
+      nctx.font = '48px serif';
+      var m1 = nctx.measureText('Test');
+      nData.push('canvas_w:' + m1.width);
+      if (m1.actualBoundingBoxAscent !== undefined) {
+        nData.push('asc:' + m1.actualBoundingBoxAscent);
+        nData.push('desc:' + m1.actualBoundingBoxDescent);
+      }
+      if (m1.fontBoundingBoxAscent !== undefined) {
+        nData.push('fasc:' + m1.fontBoundingBoxAscent);
+        nData.push('fdesc:' + m1.fontBoundingBoxDescent);
+      }
+    } catch(e){ nData.push('canvas:ERR:' + e.message); }
+
+    nSpan.remove();
+    b('N-METRICS', nData.join('|').slice(0, 900));
+    log('N: ' + nData[0]);
+  } catch(e){ b('N-ERR', e.message); }
+
+  /* ===== O: Feature detection dump ===== */
+  try {
+    var oData = [];
+    oData.push('Worker:' + (typeof Worker));
+    oData.push('SAB:' + (typeof SharedArrayBuffer));
+    oData.push('Atomics:' + (typeof Atomics));
+    oData.push('Wasm:' + (typeof WebAssembly));
+    oData.push('BigInt:' + (typeof BigInt));
+    oData.push('Symbol:' + (typeof Symbol));
+    oData.push('Proxy:' + (typeof Proxy));
+    oData.push('Reflect:' + (typeof Reflect));
+    oData.push('WeakRef:' + (typeof WeakRef));
+    oData.push('FinReg:' + (typeof FinalizationRegistry));
+    oData.push('queueMT:' + (typeof queueMicrotask));
+    oData.push('AbortCtrl:' + (typeof AbortController));
+    oData.push('fetch:' + (typeof fetch));
+    oData.push('TextEnc:' + (typeof TextEncoder));
+    oData.push('TextDec:' + (typeof TextDecoder));
+    oData.push('Intl:' + (typeof Intl));
+    oData.push('Iterator:' + (typeof Iterator));
+    oData.push('AggErr:' + (typeof AggregateError));
+    oData.push('Temporal:' + (typeof Temporal));
+    oData.push('Iterator:' + (typeof Iterator));
+    oData.push('structC:' + (typeof structuredClone));
+    oData.push('reportErr:' + (typeof reportError));
+    oData.push('assert:' + (typeof console.assert));
+    b('O-FEAT', oData.join('|').slice(0, 900));
+    log('O: features dumped');
+  } catch(e){ b('O-ERR', e.message); }
+
+  b('DONE', 'all_sections_complete');
+  log('\nAll sections complete!');
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') setTimeout(run, 100);
+else document.addEventListener('DOMContentLoaded', run);
+</script>
+</head>
+<body>
+  <pre id="out">P804 — Info Leak Survey — Loading...</pre>
+</body>
+</html>

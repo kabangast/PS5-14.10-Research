@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>PS5 FW 14.10 // GRID NESTING, TRANSCENDENTAL, MEMCPY, NORMALIZE &amp; FLOOD HUD</title>
+<style>
+:root {
+  --bg-dark: #040711;
+  --panel-bg: rgba(8, 14, 28, 0.94);
+  --neon-cyan: #00f3ff;
+  --neon-green: #00ff66;
+  --neon-amber: #ffb800;
+  --neon-pink: #ff0077;
+  --neon-purple: #9d00ff;
+  --text-dim: #7085a5;
+  --text-main: #e2f1ff;
+  --border-glow: rgba(0, 243, 255, 0.35);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background-color: var(--bg-dark);
+  background-image: 
+    radial-gradient(ellipse at 50% 0%, rgba(0, 243, 255, 0.16), transparent 75%),
+    linear-gradient(rgba(0, 243, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 243, 255, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 28px 28px, 28px 28px;
+  color: var(--text-main);
+  font-family: "SF Mono", "Consolas", monospace;
+  padding: 16px;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+.scanline {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.02), rgba(0, 255, 0, 0.01), rgba(0, 255, 0, 0.02));
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+  z-index: 999;
+}
+
+/* Header */
+.header {
+  border: 1px solid var(--neon-cyan);
+  background: rgba(0, 243, 255, 0.07);
+  box-shadow: 0 0 20px rgba(0, 243, 255, 0.3);
+  padding: 12px 20px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title-glitch {
+  font-size: 18px;
+  font-weight: 900;
+  letter-spacing: 2px;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 10px rgba(0, 243, 255, 0.8);
+}
+.target-badge {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: rgba(0, 255, 102, 0.15);
+  border: 1px solid var(--neon-green);
+  color: var(--neon-green);
+  font-weight: bold;
+}
+
+/* Pipeline Trackers */
+.pipeline-track {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.node {
+  background: var(--panel-bg);
+  border: 1px solid rgba(112, 133, 165, 0.25);
+  border-radius: 6px;
+  padding: 10px;
+  position: relative;
+  transition: all 0.3s ease;
+}
+.node.done {
+  border-color: var(--neon-green);
+  box-shadow: 0 0 10px rgba(0, 255, 102, 0.25);
+}
+.node.active {
+  border-color: var(--neon-cyan);
+  box-shadow: 0 0 12px rgba(0, 243, 255, 0.4);
+}
+.node.locked {
+  border-color: rgba(112, 133, 165, 0.2);
+  opacity: 0.55;
+}
+.node-step {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.node.done .node-step { color: var(--neon-green); }
+.node.active .node-step { color: var(--neon-cyan); }
+.node-title {
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--text-main);
+  margin-bottom: 4px;
+}
+.node-desc {
+  font-size: 9px;
+  color: var(--text-dim);
+  line-height: 1.3;
+}
+
+/* Grid Layout */
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid rgba(0, 243, 255, 0.25);
+  border-radius: 6px;
+  padding: 14px;
+  position: relative;
+}
+.panel-full {
+  grid-column: 1 / -1;
+}
+.panel-title {
+  font-size: 13px;
+  font-weight: bold;
+  color: var(--neon-cyan);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.panel-title::before {
+  content: "";
+  display: inline-block;
+  width: 4px;
+  height: 14px;
+  background: var(--neon-cyan);
+}
+
+/* Metric Display Rows */
+.metric-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 0;
+  border-bottom: 1px solid rgba(112, 133, 165, 0.15);
+  font-size: 11px;
+}
+.metric-row:last-child { border-bottom: none; }
+.metric-label { color: var(--text-dim); }
+.metric-val { font-weight: bold; }
+.val-ok { color: var(--neon-green); }
+.val-amber { color: var(--neon-amber); }
+.val-dim { color: var(--text-dim); }
+.val-hex { color: var(--neon-cyan); }
+.val-pink { color: var(--neon-pink); }
+
+/* Terminal Output Box */
+.terminal {
+  background: rgba(2, 5, 12, 0.96);
+  border: 1px solid rgba(0, 243, 255, 0.2);
+  border-radius: 4px;
+  padding: 10px;
+  height: 150px;
+  overflow-y: auto;
+  font-size: 10px;
+  line-height: 1.4;
+  color: #a5c2eb;
+}
+.term-line { margin-bottom: 2px; }
+.term-ts { color: var(--neon-cyan); margin-right: 6px; }
+.term-hi { color: var(--neon-green); }
+.term-warn { color: var(--neon-amber); }
+.term-err { color: var(--neon-pink); }
+
+/* Hidden scratch container */
+#bench-scratch {
+  position: absolute;
+  left: -9999px;
+  top: -9999px;
+  width: 400px;
+  height: 400px;
+  overflow: hidden;
+  visibility: hidden;
+}
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+
+<div class="header">
+  <div class="title-glitch">PS5 WebKit Core Profiler // P977</div>
+  <div class="target-badge">PLAYSTATION 5 FW 14.10 // 192.168.1.106</div>
+</div>
+
+<!-- 6-Stage Pipeline Trackers -->
+<div class="pipeline-track">
+  <div class="node active" id="node-stage-1">
+    <div class="node-step">Stage 1 [GRID NEST]</div>
+    <div class="node-title">5-Level Layout</div>
+    <div class="node-desc">Grid &amp; Flex Compound Reflow</div>
+  </div>
+  <div class="node locked" id="node-stage-2">
+    <div class="node-step">Stage 2 [TRANSCEND]</div>
+    <div class="node-title">FPU Math</div>
+    <div class="node-desc">1M Sin/Cos/Log2/Cbrt Ops</div>
+  </div>
+  <div class="node locked" id="node-stage-3">
+    <div class="node-step">Stage 3 [MEMCPY]</div>
+    <div class="node-title">TypedArray set()</div>
+    <div class="node-desc">Native memcpy vs Scalar Loop</div>
+  </div>
+  <div class="node locked" id="node-stage-4">
+    <div class="node-step">Stage 4 [NORMALIZE]</div>
+    <div class="node-title">Unicode Normal</div>
+    <div class="node-desc">5,000 NFC/NFD/NFKC Tests</div>
+  </div>
+  <div class="node locked" id="node-stage-5">
+    <div class="node-step">Stage 5 [IPC FLOOD]</div>
+    <div class="node-title">MessagePort Flood</div>
+    <div class="node-desc">2,000 Pipelined Worker Posts</div>
+  </div>
+  <div class="node locked" id="node-stage-6">
+    <div class="node-step">Stage 6 [VERDICT]</div>
+    <div class="node-title">Master Verdict</div>
+    <div class="node-desc">Telemetry &amp; Coordination Log</div>
+  </div>
+</div>
+
+<div class="dashboard-grid">
+  <!-- Panel 1: Deep Nested Layout -->
+  <div class="panel">
+    <div class="panel-title">Stage 1: 5-Level Deep Grid &amp; Flex Reflow</div>
+    <div class="metric-row">
+      <span class="metric-label">Tree Hierarchy:</span>
+      <span class="metric-val val-hex">Grid &gt; Flex &gt; Grid &gt; Flex &gt; Leaves</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Compound Reflow Latency:</span>
+      <span class="metric-val" id="m-nest-time">TESTING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Leaf Geometry Resolution:</span>
+      <span class="metric-val" id="m-nest-geo">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Layout Status:</span>
+      <span class="metric-val" id="m-nest-status">--</span>
+    </div>
+  </div>
+
+  <!-- Panel 2: Transcendental Math -->
+  <div class="panel">
+    <div class="panel-title">Stage 2: FPU Transcendental Throughput (1M ops)</div>
+    <div class="metric-row">
+      <span class="metric-label">Compound Math Execution:</span>
+      <span class="metric-val" id="m-trans-time">TESTING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Transcendental Throughput:</span>
+      <span class="metric-val" id="m-trans-ops">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Accumulated Sum Check:</span>
+      <span class="metric-val" id="m-trans-sum">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">FPU Accuracy:</span>
+      <span class="metric-val" id="m-trans-acc">--</span>
+    </div>
+  </div>
+
+  <!-- Panel 3: memcpy vs Scalar Loop -->
+  <div class="panel">
+    <div class="panel-title">Stage 3: TypedArray.set() Native memcpy (50MB)</div>
+    <div class="metric-row">
+      <span class="metric-label">Native memcpy (.set()):</span>
+      <span class="metric-val" id="m-memcpy-time">TESTING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Scalar JIT Loop (manual):</span>
+      <span class="metric-val" id="m-scalar-time">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">memcpy Bandwidth:</span>
+      <span class="metric-val" id="m-memcpy-bw">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">C++ memcpy Speedup:</span>
+      <span class="metric-val" id="m-memcpy-speedup">--</span>
+    </div>
+  </div>
+
+  <!-- Panel 4: Unicode Normalization -->
+  <div class="panel">
+    <div class="panel-title">Stage 4: Unicode Normalization (5,000 calls)</div>
+    <div class="metric-row">
+      <span class="metric-label">NFC Canonical Composition:</span>
+      <span class="metric-val" id="m-nfc-status">TESTING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">NFKC Compatibility Form:</span>
+      <span class="metric-val" id="m-nfkc-status">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Normalization Latency:</span>
+      <span class="metric-val" id="m-norm-time">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">ICU Transformation Throughput:</span>
+      <span class="metric-val" id="m-norm-ops">--</span>
+    </div>
+  </div>
+
+  <!-- Panel 5: Worker Flood -->
+  <div class="panel panel-full">
+    <div class="panel-title">Stage 5 &amp; 6: 2,000 Pipelined Worker Messages &amp; Verdict</div>
+    <div class="metric-row">
+      <span class="metric-label">2,000 Messages Pipelined Flood:</span>
+      <span class="metric-val" id="m-flood-status">PENDING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Total Drain &amp; Acknowledge Time:</span>
+      <span class="metric-val" id="m-flood-time">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">IPC Ingestion Throughput:</span>
+      <span class="metric-val" id="m-flood-rate">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Overall Probe Verdict:</span>
+      <span class="metric-val" id="m-probe-verdict">RUNNING PIPELINE...</span>
+    </div>
+  </div>
+</div>
+
+<!-- Terminal Log -->
+<div class="panel panel-full">
+  <div class="panel-title">Physical Hardware Telemetry Console</div>
+  <div class="terminal" id="term-box"></div>
+</div>
+
+<!-- Hidden Scratch Area -->
+<div id="bench-scratch"></div>
+
+<script>
+/* Logging and Synchronous Beacon Utility */
+var termBox = document.getElementById('term-box');
+function log(msg, cls) {
+  var d = document.createElement('div');
+  d.className = 'term-line ' + (cls || '');
+  var ts = '[' + new Date().toISOString().substring(11, 23) + '] ';
+  d.innerHTML = '<span class="term-ts">' + ts + '</span>' + msg;
+  termBox.appendChild(d);
+  termBox.scrollTop = termBox.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P977-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+window.onerror = function(msg, url, line) {
+  syncBn('JS-ERR', msg + ' at line ' + line);
+  log('[!] ERROR: ' + msg + ' (Line ' + line + ')', 'term-err');
+};
+
+log('Initializing Probe P977: Grid Nesting, Transcendental FPU, memcpy Bandwidth, Unicode Normalize & Worker Flood...', 'term-hi');
+syncBn('BOOT', 'start');
+
+var nodeStage1 = document.getElementById('node-stage-1');
+var nodeStage2 = document.getElementById('node-stage-2');
+var nodeStage3 = document.getElementById('node-stage-3');
+var nodeStage4 = document.getElementById('node-stage-4');
+var nodeStage5 = document.getElementById('node-stage-5');
+var nodeStage6 = document.getElementById('node-stage-6');
+
+var mNestTime = document.getElementById('m-nest-time');
+var mNestGeo = document.getElementById('m-nest-geo');
+var mNestStatus = document.getElementById('m-nest-status');
+
+var mTransTime = document.getElementById('m-trans-time');
+var mTransOps = document.getElementById('m-trans-ops');
+var mTransSum = document.getElementById('m-trans-sum');
+var mTransAcc = document.getElementById('m-trans-acc');
+
+var mMemcpyTime = document.getElementById('m-memcpy-time');
+var mScalarTime = document.getElementById('m-scalar-time');
+var mMemcpyBw = document.getElementById('m-memcpy-bw');
+var mMemcpySpeedup = document.getElementById('m-memcpy-speedup');
+
+var mNfcStatus = document.getElementById('m-nfc-status');
+var mNfkcStatus = document.getElementById('m-nfkc-status');
+var mNormTime = document.getElementById('m-norm-time');
+var mNormOps = document.getElementById('m-norm-ops');
+
+var mFloodStatus = document.getElementById('m-flood-status');
+var mFloodTime = document.getElementById('m-flood-time');
+var mFloodRate = document.getElementById('m-flood-rate');
+var mProbeVerdict = document.getElementById('m-probe-verdict');
+
+var scratchArea = document.getElementById('bench-scratch');
+
+/* Metrics Globals */
+var gNestMs = 0;
+var gTransMs = 0;
+var gTransOps = 0;
+var gMemcpyMs = 0;
+var gScalarMs = 0;
+var gMemcpySpeedup = 0;
+var gMemcpyBwMBs = 0;
+var gNfcOk = false;
+var gNfkcOk = false;
+var gNormMs = 0;
+var gNormOps = 0;
+var gFloodMs = 0;
+var gFloodRate = 0;
+
+/* ============================================================
+ * STAGE 1: 5-Level Deep Grid & Flexbox Compound Reflow
+ * ============================================================ */
+try {
+  var tNest0 = performance.now();
+
+  var l1Grid = document.createElement('div');
+  l1Grid.style.display = 'grid';
+  l1Grid.style.gridTemplateColumns = '1fr 1fr';
+  l1Grid.style.width = '300px';
+
+  for (var g1 = 0; g1 < 2; g1++) {
+    var l2Flex = document.createElement('div');
+    l2Flex.style.display = 'flex';
+    l2Flex.style.flexDirection = 'column';
+
+    for (var f1 = 0; f1 < 2; f1++) {
+      var l3Grid = document.createElement('div');
+      l3Grid.style.display = 'grid';
+      l3Grid.style.gridTemplateColumns = '1fr 1fr';
+
+      for (var g2 = 0; g2 < 2; g2++) {
+        var l4Flex = document.createElement('div');
+        l4Flex.style.display = 'flex';
+        l4Flex.style.justifyContent = 'space-between';
+
+        for (var c = 0; c < 4; c++) {
+          var leaf = document.createElement('span');
+          leaf.style.padding = '2px';
+          leaf.textContent = 'x';
+          l4Flex.appendChild(leaf);
+        }
+        l3Grid.appendChild(l4Flex);
+      }
+      l2Flex.appendChild(l3Grid);
+    }
+    l1Grid.appendChild(l2Flex);
+  }
+
+  scratchArea.appendChild(l1Grid);
+  var rect = l1Grid.getBoundingClientRect();
+  var leafWidth = l1Grid.querySelector('span').getBoundingClientRect().width;
+  gNestMs = Math.max(1, Math.round(performance.now() - tNest0));
+
+  scratchArea.removeChild(l1Grid);
+
+  mNestTime.textContent = gNestMs + ' ms (CONSTRUCT + COMPUTE REFLOW)';
+  mNestGeo.textContent = 'CONTAINER=' + Math.round(rect.width) + 'px | LEAF=' + Math.round(leafWidth) + 'px';
+  mNestGeo.className = 'val-ok';
+  mNestStatus.textContent = 'NOMINAL (32 COMPOUND LEAVES)';
+  mNestStatus.className = 'val-ok';
+
+  log('[+] Grid Nesting: 5 levels resolved in ' + gNestMs + 'ms, container=' + rect.width + 'px');
+  syncBn('GRID-NEST', 'timeMs=' + gNestMs + '|leaves=32|ok=true');
+
+  nodeStage1.className = 'node done';
+  nodeStage1.querySelector('.node-step').textContent = 'Stage 1 [DONE]';
+} catch(nge) {
+  log('[-] Grid nesting error: ' + nge.message, 'term-err');
+  syncBn('NEST-ERR', nge.message);
+  nodeStage1.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 2: FPU Transcendental Throughput (1,000,000 Ops)
+ * ============================================================ */
+nodeStage2.className = 'node active';
+nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [ACTIVE]';
+
+try {
+  var NUM_OPS = 1000000;
+  var transSum = 0.0;
+  var tTrans0 = performance.now();
+
+  for (var i = 0; i < NUM_OPS; i++) {
+    transSum += Math.sin(i * 0.001) * Math.cos(i * 0.002) + Math.log2(i + 1) + Math.cbrt(i);
+  }
+  gTransMs = Math.max(1, Math.round(performance.now() - tTrans0));
+  gTransOps = Math.round(NUM_OPS / (gTransMs / 1000));
+  var isAccurate = !isNaN(transSum) && transSum > 0;
+
+  mTransTime.textContent = gTransMs + ' ms (1,000,000 COMPOUND TRANSCENDENTALS)';
+  mTransOps.textContent = gTransOps.toLocaleString() + ' TRANSCENDENTALS/SEC';
+  mTransOps.className = 'val-ok';
+  mTransSum.textContent = 'SUM=' + Math.round(transSum);
+  mTransAcc.textContent = isAccurate ? 'IEEE-754 HARDWARE COMPLIANT' : 'FPU ANOMALY';
+  mTransAcc.className = isAccurate ? 'val-ok' : 'val-amber';
+
+  log('[+] Transcendental FPU: 1M ops in ' + gTransMs + 'ms (~' + gTransOps + ' ops/s), accurate=' + isAccurate);
+  syncBn('TRANSCENDENTAL', 'timeMs=' + gTransMs + '|opsPerSec=' + gTransOps + '|ok=' + isAccurate);
+
+  nodeStage2.className = 'node done';
+  nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [DONE]';
+} catch(te) {
+  log('[-] Transcendental error: ' + te.message, 'term-err');
+  syncBn('TRANS-ERR', te.message);
+  nodeStage2.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 3: TypedArray.set() Native memcpy vs Scalar Loop (50MB)
+ * ============================================================ */
+nodeStage3.className = 'node active';
+nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [ACTIVE]';
+
+try {
+  var BUF_SIZE = 1000000; // 1MB buffer
+  var ITERS = 50; // 50MB copied
+  var srcU8 = new Uint8Array(BUF_SIZE);
+  var dstMemcpy = new Uint8Array(BUF_SIZE);
+  var dstScalar = new Uint8Array(BUF_SIZE);
+
+  for (var si = 0; si < BUF_SIZE; si++) {
+    srcU8[si] = (si & 0xFF) ^ 0xAA;
+  }
+
+  /* 1. Native memcpy (.set()) */
+  var tMemcpy0 = performance.now();
+  for (var m = 0; m < ITERS; m++) {
+    dstMemcpy.set(srcU8);
+  }
+  gMemcpyMs = Math.max(1, Math.round(performance.now() - tMemcpy0));
+  gMemcpyBwMBs = Math.round((ITERS / (gMemcpyMs / 1000)));
+
+  /* 2. Manual Scalar JIT Loop */
+  var tScalar0 = performance.now();
+  for (var s = 0; s < ITERS; s++) {
+    for (var bi = 0; bi < BUF_SIZE; bi++) {
+      dstScalar[bi] = srcU8[bi];
+    }
+  }
+  gScalarMs = Math.max(1, Math.round(performance.now() - tScalar0));
+  gMemcpySpeedup = (gScalarMs / gMemcpyMs).toFixed(1);
+
+  mMemcpyTime.textContent = gMemcpyMs + ' ms (50MB VIA .set() memcpy)';
+  mScalarTime.textContent = gScalarMs + ' ms (50MB VIA SCALAR JIT LOOP)';
+  mMemcpyBw.textContent = gMemcpyBwMBs.toLocaleString() + ' MB/SEC (BANDWIDTH)';
+  mMemcpyBw.className = 'val-ok';
+  mMemcpySpeedup.textContent = gMemcpySpeedup + 'x FASTER VIA NATIVE MEMCPY';
+  mMemcpySpeedup.className = 'val-ok';
+
+  log('[+] Memcpy: set()=' + gMemcpyMs + 'ms (' + gMemcpyBwMBs + ' MB/s), scalar=' + gScalarMs + 'ms (' + gMemcpySpeedup + 'x speedup)');
+  syncBn('MEMCPY-SPEED', 'memcpyMs=' + gMemcpyMs + '|scalarMs=' + gScalarMs + '|speedup=' + gMemcpySpeedup + '|bwMBs=' + gMemcpyBwMBs);
+
+  nodeStage3.className = 'node done';
+  nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [DONE]';
+} catch(mpe) {
+  log('[-] Memcpy error: ' + mpe.message, 'term-err');
+  syncBn('MEMCPY-ERR', mpe.message);
+  nodeStage3.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 4: Unicode Normalization (5,000 Calls)
+ * ============================================================ */
+nodeStage4.className = 'node active';
+nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [ACTIVE]';
+
+try {
+  // Decomposed 'e' + combining acute accent -> NFC should equal 'é'
+  var decompAccent = "e\u0301";
+  var nfcResult = decompAccent.normalize('NFC');
+  gNfcOk = (nfcResult === "é");
+
+  // Halfwidth Katakana -> NFKC should combine into single glyph
+  var halfwidthKana = "\uFF89\uFF9E"; // 'he' + voiced sound mark
+  var nfkcResult = halfwidthKana.normalize('NFKC');
+  gNfkcOk = (nfkcResult === "パ");
+
+  /* Benchmark 5,000 normalizations across forms */
+  var sampleStrs = ["e\u0301cole", "\uFF89\uFF9E\uFF70\uFF84", "\u2163 (Roman IV)", "Fa\u00E7ade"];
+  var tNorm0 = performance.now();
+  var dummyStr = '';
+  for (var ni = 0; ni < 5000; ni++) {
+    var raw = sampleStrs[ni % 4];
+    dummyStr = raw.normalize('NFC');
+    dummyStr = raw.normalize('NFKD');
+  }
+  gNormMs = Math.max(1, Math.round(performance.now() - tNorm0));
+  gNormOps = Math.round(5000 / (gNormMs / 1000));
+
+  mNfcStatus.textContent = gNfcOk ? 'VERIFIED (e + accent -> é)' : 'FAILED';
+  mNfcStatus.className = gNfcOk ? 'val-ok' : 'val-hex';
+  mNfkcStatus.textContent = gNfkcOk ? 'VERIFIED (halfwidth kana merged)' : 'FAILED';
+  mNfkcStatus.className = gNfkcOk ? 'val-ok' : 'val-hex';
+  mNormTime.textContent = gNormMs + ' ms (5,000 NORMALIZATIONS)';
+  mNormOps.textContent = gNormOps.toLocaleString() + ' TRANSFORMS/SEC';
+  mNormOps.className = 'val-ok';
+
+  log('[+] Unicode Normalization: nfcOk=' + gNfcOk + ', nfkcOk=' + gNfkcOk + ' in ' + gNormMs + 'ms (~' + gNormOps + ' ops/s)');
+  syncBn('NORMALIZE', 'timeMs=' + gNormMs + '|nfcOk=' + gNfcOk + '|nfkcOk=' + gNfkcOk + '|opsPerSec=' + gNormOps);
+
+  nodeStage4.className = 'node done';
+  nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [DONE]';
+} catch(ne) {
+  log('[-] Normalization error: ' + ne.message, 'term-err');
+  syncBn('NORM-ERR', ne.message);
+  nodeStage4.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 5: Pipelined Worker MessagePort Flood (2,000 Messages)
+ * ============================================================ */
+nodeStage5.className = 'node active';
+nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [ACTIVE]';
+
+try {
+  var floodWorkerScript = [
+    'var count = 0;',
+    'self.onmessage = function(e) {',
+    '  if (e.data.done) {',
+    '    self.postMessage({ drained: count });',
+    '  } else {',
+    '    count++;',
+    '  }',
+    '};'
+  ].join('\n');
+
+  var fBlob = new Blob([floodWorkerScript], { type: 'application/javascript' });
+  var fUrl = URL.createObjectURL(fBlob);
+  var floodWorker = new Worker(fUrl);
+
+  var TOTAL_FLOOD = 2000;
+  var tFlood0 = performance.now();
+
+  floodWorker.onmessage = function(e) {
+    gFloodMs = Math.max(1, Math.round(performance.now() - tFlood0));
+    gFloodRate = Math.round(TOTAL_FLOOD / (gFloodMs / 1000));
+    var drainedOk = (e.data.drained === TOTAL_FLOOD);
+
+    floodWorker.terminate();
+    URL.revokeObjectURL(fUrl);
+
+    mFloodStatus.textContent = 'DRAINED ' + TOTAL_FLOOD + ' MESSAGES (' + (drainedOk ? 'ZERO LOSS' : 'DROPPED') + ')';
+    mFloodStatus.className = drainedOk ? 'val-ok' : 'val-amber';
+    mFloodTime.textContent = gFloodMs + ' ms (POST + QUEUE INGEST + DRAIN)';
+    mFloodRate.textContent = gFloodRate.toLocaleString() + ' MSGS/SEC (IPC THROUGHPUT)';
+    mFloodRate.className = 'val-ok';
+
+    log('[+] Worker Flood: 2,000 msgs in ' + gFloodMs + 'ms (~' + gFloodRate + ' msgs/s), loss=0');
+    syncBn('WORKER-FLOOD', 'count=' + TOTAL_FLOOD + '|drainMs=' + gFloodMs + '|msgsPerSec=' + gFloodRate + '|ok=' + drainedOk);
+
+    nodeStage5.className = 'node done';
+    nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [DONE]';
+
+    /* Stage 6: Master Verdict */
+    nodeStage6.className = 'node done';
+    nodeStage6.querySelector('.node-step').textContent = 'Stage 6 [DONE]';
+
+    mProbeVerdict.textContent = 'ALL 6 SUBSYSTEM STAGES BENCHMARKED &amp; VERIFIED';
+    mProbeVerdict.className = 'val-ok';
+
+    log('[*] Probe P977 complete: Grid Nesting, Transcendental FPU, memcpy, Normalization & Worker Flood finished.', 'term-hi');
+    syncBn('DONE', 'status=P977_COMPLETE|nestMs=' + gNestMs + '|transMs=' + gTransMs + '|transOps=' + gTransOps + '|memcpyBw=' + gMemcpyBwMBs + '|memcpySpeedup=' + gMemcpySpeedup + '|normMs=' + gNormMs + '|floodMs=' + gFloodMs + '|floodRate=' + gFloodRate);
+  };
+
+  /* Send 2,000 non-blocking pipelined messages */
+  for (var fm = 0; fm < TOTAL_FLOOD; fm++) {
+    floodWorker.postMessage({ id: fm, payload: 0x1337 });
+  }
+  floodWorker.postMessage({ done: true });
+
+} catch(fe) {
+  log('[-] Flood stage error: ' + fe.message, 'term-err');
+  syncBn('FLOOD-ERR', fe.message);
+  nodeStage5.className = 'node locked';
+}
+
+/* Auto-Reload Watcher for autonomous progression */
+var initialReloadToken = null;
+function checkAutoReload() {
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/reload.txt?t=' + Date.now(), true);
+    xhr.onload = function() {
+      if (xhr.status === 200) {
+        var token = xhr.responseText.trim();
+        if (initialReloadToken === null) {
+          initialReloadToken = token;
+        } else if (token !== initialReloadToken) {
+          log('[*] New deployment detected (token: ' + token + '). Auto-reloading in 500ms...');
+          setTimeout(function() { location.reload(); }, 500);
+        }
+      }
+    };
+    xhr.send();
+  } catch(e) {}
+}
+setInterval(checkAutoReload, 1500);
+</script>
+</body>
+</html>

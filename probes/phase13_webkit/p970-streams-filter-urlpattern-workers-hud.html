@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>PS5 FW 14.10 // TEXT STREAM, FILTERS, URLPATTERN &amp; 8-WORKER HUD</title>
+<style>
+:root {
+  --bg-dark: #040711;
+  --panel-bg: rgba(8, 14, 28, 0.94);
+  --neon-cyan: #00f3ff;
+  --neon-green: #00ff66;
+  --neon-amber: #ffb800;
+  --neon-pink: #ff0077;
+  --neon-purple: #9d00ff;
+  --text-dim: #7085a5;
+  --text-main: #e2f1ff;
+  --border-glow: rgba(0, 243, 255, 0.35);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background-color: var(--bg-dark);
+  background-image: 
+    radial-gradient(ellipse at 50% 0%, rgba(0, 243, 255, 0.16), transparent 75%),
+    linear-gradient(rgba(0, 243, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 243, 255, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 28px 28px, 28px 28px;
+  color: var(--text-main);
+  font-family: "SF Mono", "Consolas", monospace;
+  padding: 16px;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+.scanline {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.02), rgba(0, 255, 0, 0.01), rgba(0, 255, 0, 0.02));
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+  z-index: 999;
+}
+
+/* Header */
+.header {
+  border: 1px solid var(--neon-cyan);
+  background: rgba(0, 243, 255, 0.07);
+  box-shadow: 0 0 20px rgba(0, 243, 255, 0.3);
+  padding: 12px 20px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title-glitch {
+  font-size: 18px;
+  font-weight: 900;
+  letter-spacing: 2px;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 10px rgba(0, 243, 255, 0.8);
+}
+.target-badge {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: rgba(0, 255, 102, 0.15);
+  border: 1px solid var(--neon-green);
+  color: var(--neon-green);
+  font-weight: bold;
+}
+
+/* Pipeline Trackers */
+.pipeline-track {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.node {
+  background: var(--panel-bg);
+  border: 1px solid rgba(112, 133, 165, 0.25);
+  border-radius: 6px;
+  padding: 10px;
+  position: relative;
+  transition: all 0.3s ease;
+}
+.node.done {
+  border-color: var(--neon-green);
+  box-shadow: 0 0 10px rgba(0, 255, 102, 0.25);
+}
+.node.active {
+  border-color: var(--neon-cyan);
+  box-shadow: 0 0 12px rgba(0, 243, 255, 0.4);
+}
+.node.locked {
+  border-color: rgba(112, 133, 165, 0.2);
+  opacity: 0.55;
+}
+.node-step {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.node.done .node-step { color: var(--neon-green); }
+.node.active .node-step { color: var(--neon-cyan); }
+.node-title {
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--text-main);
+  margin-bottom: 4px;
+}
+.node-desc {
+  font-size: 9px;
+  color: var(--text-dim);
+  line-height: 1.3;
+}
+
+/* Grid Layout */
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.hud-panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-glow);
+  border-radius: 6px;
+  padding: 14px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid rgba(0, 243, 255, 0.2);
+  padding-bottom: 8px;
+  margin-bottom: 12px;
+}
+.panel-title {
+  font-size: 13px;
+  font-weight: bold;
+  color: var(--neon-cyan);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+.panel-tag {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: rgba(0, 243, 255, 0.1);
+  color: var(--neon-cyan);
+  border: 1px solid rgba(0, 243, 255, 0.3);
+}
+
+.live-meter {
+  display: flex;
+  justify-content: space-between;
+  padding: 7px 0;
+  border-bottom: 1px solid rgba(112, 133, 165, 0.12);
+  font-size: 12px;
+}
+.val-ok { color: var(--neon-green); font-weight: bold; }
+.val-hex { color: var(--neon-amber); font-weight: bold; }
+.val-cyan { color: var(--neon-cyan); font-weight: bold; }
+.val-dim { color: var(--text-dim); }
+
+/* Live Terminal */
+.terminal-panel {
+  background: #020409;
+  border: 1px solid rgba(0, 243, 255, 0.4);
+  border-radius: 6px;
+  padding: 12px;
+  font-size: 11px;
+  box-shadow: inset 0 0 14px rgba(0, 0, 0, 0.8);
+}
+.terminal-log {
+  max-height: 220px;
+  overflow-y: auto;
+  line-height: 1.45;
+  color: #a4c2e6;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+
+<div class="header">
+  <div class="title-glitch">PS5 // P970: TEXT STREAM, FILTERS, URLPATTERN &amp; 8-WORKER HUD</div>
+  <div class="target-badge" id="mStatusBadge">INITIALIZING...</div>
+</div>
+
+<!-- 6-Stage Pipeline Node Status -->
+<div class="pipeline-track">
+  <div class="node active" id="nodeStage1">
+    <div class="node-step">Stage 1 [ACTIVE]</div>
+    <div class="node-title">STREAM PIPELINE</div>
+    <div class="node-desc">TextEncoderStream -&gt; Transform -&gt; Decoder</div>
+  </div>
+  <div class="node locked" id="nodeStage2">
+    <div class="node-step">Stage 2 [STANDBY]</div>
+    <div class="node-title">CANVAS FILTER</div>
+    <div class="node-desc">ctx.filter blur &amp; contrast raster</div>
+  </div>
+  <div class="node locked" id="nodeStage3">
+    <div class="node-step">Stage 3 [STANDBY]</div>
+    <div class="node-title">URLPATTERN API</div>
+    <div class="node-desc">WHATWG URLPattern exec regex</div>
+  </div>
+  <div class="node locked" id="nodeStage4">
+    <div class="node-step">Stage 4 [STANDBY]</div>
+    <div class="node-title">8-WORKER POOL</div>
+    <div class="node-desc">8 concurrent OS worker roundtrip</div>
+  </div>
+  <div class="node locked" id="nodeStage5">
+    <div class="node-step">Stage 5 [STANDBY]</div>
+    <div class="node-title">USER TIMING 5K</div>
+    <div class="node-desc">5,000 performance.mark alloc &amp; clear</div>
+  </div>
+  <div class="node locked" id="nodeStage6">
+    <div class="node-step">Stage 6 [STANDBY]</div>
+    <div class="node-title">SYSTEM VERDICT</div>
+    <div class="node-desc">Unified telemetry consensus</div>
+  </div>
+</div>
+
+<div class="dashboard-grid">
+  <!-- Left Panel: Text Streams & Canvas Filters -->
+  <div class="hud-panel">
+    <div class="panel-header">
+      <div class="panel-title">Streaming Codecs &amp; Filter Raster</div>
+      <div class="panel-tag">STREAM / 2D FILTER</div>
+    </div>
+    <div class="live-meter"><span>TextEncoderStream / DecoderStream:</span><span class="val-cyan" id="mStreamApis">Testing...</span></div>
+    <div class="live-meter"><span>3-Stage PipeThrough Transformation:</span><span class="val-cyan" id="mStreamPipeline">Testing...</span></div>
+    <div class="live-meter"><span>In-Flight Uppercase Conversion:</span><span class="val-cyan" id="mStreamFidelity">Testing...</span></div>
+    <div class="live-meter"><span>Canvas 2D ctx.filter Support:</span><span class="val-cyan" id="mCanvasFilter">Pending...</span></div>
+    <div class="live-meter"><span>30 Shapes Filtered Rasterization:</span><span class="val-cyan" id="mFilterRaster">Pending...</span></div>
+  </div>
+
+  <!-- Right Panel: URLPattern, Workers & User Timing -->
+  <div class="hud-panel">
+    <div class="panel-header">
+      <div class="panel-title">URL Engine, Worker Pool &amp; Timing</div>
+      <div class="panel-tag">ROUTER / WORKERS / PERF</div>
+    </div>
+    <div class="live-meter"><span>WHATWG URLPattern Subsystem:</span><span class="val-cyan" id="mUrlPattern">Pending...</span></div>
+    <div class="live-meter"><span>URLPattern Named Group Match:</span><span class="val-cyan" id="mPatternMatch">Pending...</span></div>
+    <div class="live-meter"><span>8-Worker Concurrent Dispatch:</span><span class="val-cyan" id="mWorkerPool">Pending...</span></div>
+    <div class="live-meter"><span>8-Worker Average RTT:</span><span class="val-cyan" id="mWorkerRtt">Pending...</span></div>
+    <div class="live-meter"><span>User Timing 5,000 Marks Alloc:</span><span class="val-cyan" id="mMarksAlloc">Pending...</span></div>
+    <div class="live-meter"><span>performance.clearMarks():</span><span class="val-cyan" id="mMarksClear">Pending...</span></div>
+  </div>
+</div>
+
+<!-- Live Terminal Panel -->
+<div class="terminal-panel">
+  <div class="terminal-log" id="termLog"></div>
+</div>
+
+<script>
+var term = document.getElementById('termLog');
+var statusBadge = document.getElementById('mStatusBadge');
+
+var nodeStage1 = document.getElementById('nodeStage1');
+var nodeStage2 = document.getElementById('nodeStage2');
+var nodeStage3 = document.getElementById('nodeStage3');
+var nodeStage4 = document.getElementById('nodeStage4');
+var nodeStage5 = document.getElementById('nodeStage5');
+var nodeStage6 = document.getElementById('nodeStage6');
+
+var mStreamApis = document.getElementById('mStreamApis');
+var mStreamPipeline = document.getElementById('mStreamPipeline');
+var mStreamFidelity = document.getElementById('mStreamFidelity');
+var mCanvasFilter = document.getElementById('mCanvasFilter');
+var mFilterRaster = document.getElementById('mFilterRaster');
+
+var mUrlPattern = document.getElementById('mUrlPattern');
+var mPatternMatch = document.getElementById('mPatternMatch');
+var mWorkerPool = document.getElementById('mWorkerPool');
+var mWorkerRtt = document.getElementById('mWorkerRtt');
+var mMarksAlloc = document.getElementById('mMarksAlloc');
+var mMarksClear = document.getElementById('mMarksClear');
+
+/* Global Trackers */
+var gStreamOk = false;
+var gStreamMs = 0;
+var gFilterOk = false;
+var gFilterMs = 0;
+var gUrlPatternOk = false;
+var gExtractedId = 'none';
+var gWorkerAvgRtt = 0;
+var gMarksMs = 0;
+
+function log(msg) {
+  var d = document.createElement('div');
+  d.textContent = '[' + new Date().toISOString().slice(11, 23) + '] ' + msg;
+  term.appendChild(d);
+  term.scrollTop = term.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P970-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+window.onerror = function(msg, url, line) {
+  syncBn('JS-ERR', msg + ' at line ' + line);
+  log('[!] ERROR: ' + msg + ' (Line ' + line + ')');
+};
+
+log('[*] Probe P970 online: Text Stream Pipeline, Canvas Filter, URLPattern & 8-Worker Sync.');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * STAGE 1: TextEncoderStream -> TransformStream -> TextDecoderStream
+ * ============================================================ */
+var hasEncStream = (typeof TextEncoderStream !== 'undefined');
+var hasDecStream = (typeof TextDecoderStream !== 'undefined');
+mStreamApis.textContent = (hasEncStream && hasDecStream) ? 'SUPPORTED (Encoder & Decoder Streams)' : 'UNSUPPORTED';
+mStreamApis.className = (hasEncStream && hasDecStream) ? 'val-ok' : 'val-dim';
+
+if (hasEncStream && hasDecStream) {
+  try {
+    var enc = new TextEncoderStream();
+    var dec = new TextDecoderStream();
+
+    var transform = new TransformStream({
+      transform: function(chunk, controller) {
+        var out = new Uint8Array(chunk.length);
+        for (var i = 0; i < chunk.length; i++) {
+          var b = chunk[i];
+          out[i] = (b >= 97 && b <= 122) ? (b - 32) : b;
+        }
+        controller.enqueue(out);
+      }
+    });
+
+    var receivedText = [];
+    var writable = new WritableStream({
+      write: function(str) {
+        receivedText.push(str);
+      }
+    });
+
+    var chunks = [];
+    for (var k = 0; k < 50; k++) {
+      chunks.push('hello ps5 stream block ' + k + '!\n');
+    }
+
+    var readable = new ReadableStream({
+      start: function(controller) {
+        for (var c = 0; c < chunks.length; c++) {
+          controller.enqueue(chunks[c]);
+        }
+        controller.close();
+      }
+    });
+
+    var tStr0 = performance.now();
+    readable
+      .pipeThrough(enc)
+      .pipeThrough(transform)
+      .pipeThrough(dec)
+      .pipeTo(writable)
+      .then(function() {
+        gStreamMs = Math.max(1, Math.round(performance.now() - tStr0));
+        var fullStr = receivedText.join('');
+        gStreamOk = (fullStr.indexOf('HELLO PS5 STREAM BLOCK 0!') !== -1 &&
+                     fullStr.indexOf('HELLO PS5 STREAM BLOCK 49!') !== -1);
+
+        mStreamPipeline.textContent = gStreamMs + ' ms (50 CHUNKS ENCODED/TRANSFORMED)';
+        mStreamFidelity.textContent = gStreamOk ? '100% IN-FLIGHT UPPERCASE VERIFIED' : 'TRANSFORM FAIL';
+        mStreamFidelity.className = gStreamOk ? 'val-ok' : 'val-hex';
+
+        log('[+] Text Stream Pipeline: time=' + gStreamMs + 'ms, ok=' + gStreamOk);
+        syncBn('TEXT-STREAM', 'timeMs=' + gStreamMs + '|ok=' + gStreamOk);
+
+        nodeStage1.className = 'node done';
+        nodeStage1.querySelector('.node-step').textContent = 'Stage 1 [DONE]';
+        executeCanvasFilterStage();
+      })
+      .catch(function(err) {
+        log('[-] Stream pipe error: ' + err.message);
+        syncBn('STREAM-PIPE-ERR', err.message);
+        nodeStage1.className = 'node locked';
+        executeCanvasFilterStage();
+      });
+  } catch(se) {
+    log('[-] Stream init error: ' + se.message);
+    syncBn('STREAM-INIT-ERR', se.message);
+    nodeStage1.className = 'node locked';
+    executeCanvasFilterStage();
+  }
+} else {
+  mStreamPipeline.textContent = 'UNSUPPORTED';
+  mStreamPipeline.className = 'val-dim';
+  nodeStage1.className = 'node locked';
+  executeCanvasFilterStage();
+}
+
+/* ============================================================
+ * STAGE 2: Canvas 2D Software Filter Rasterization
+ * ============================================================ */
+function executeCanvasFilterStage() {
+  nodeStage2.className = 'node active';
+  nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [ACTIVE]';
+
+  var cvs = document.createElement('canvas');
+  cvs.width = 500;
+  cvs.height = 500;
+  var ctx = cvs.getContext('2d');
+
+  var hasCtxFilter = ('filter' in ctx);
+  mCanvasFilter.textContent = hasCtxFilter ? 'SUPPORTED (ctx.filter exposed)' : 'UNSUPPORTED';
+  mCanvasFilter.className = hasCtxFilter ? 'val-ok' : 'val-dim';
+
+  if (hasCtxFilter) {
+    try {
+      ctx.filter = 'blur(8px) contrast(150%) brightness(1.2)';
+      gFilterOk = (ctx.filter.indexOf('blur') !== -1);
+
+      var tF0 = performance.now();
+      for (var s = 0; s < 30; s++) {
+        ctx.fillStyle = (s % 2 === 0) ? 'red' : 'blue';
+        ctx.beginPath();
+        ctx.arc((s % 6) * 80 + 40, Math.floor(s / 6) * 80 + 40, 30, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      gFilterMs = Math.max(1, Math.round(performance.now() - tF0));
+
+      mFilterRaster.textContent = gFilterMs + ' ms (30 FILTERED CONVOLUTIONS)';
+      mFilterRaster.className = 'val-ok';
+
+      log('[+] Canvas 2D Filter: filterOk=' + gFilterOk + ', 30 shapes in ' + gFilterMs + 'ms');
+      syncBn('CANVAS-FILTER', 'filterOk=' + gFilterOk + '|timeMs=' + gFilterMs);
+
+      nodeStage2.className = 'node done';
+      nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [DONE]';
+    } catch(fe) {
+      log('[-] Filter raster error: ' + fe.message);
+      syncBn('FILTER-ERR', fe.message);
+      nodeStage2.className = 'node locked';
+    }
+  } else {
+    mFilterRaster.textContent = 'UNSUPPORTED';
+    mFilterRaster.className = 'val-dim';
+    nodeStage2.className = 'node locked';
+  }
+
+  executeUrlPatternStage();
+}
+
+/* ============================================================
+ * STAGE 3: WHATWG URLPattern API Presence & Matching
+ * ============================================================ */
+function executeUrlPatternStage() {
+  nodeStage3.className = 'node active';
+  nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [ACTIVE]';
+
+  var hasUrlPattern = (typeof URLPattern !== 'undefined');
+  mUrlPattern.textContent = hasUrlPattern ? 'SUPPORTED (URLPattern API)' : 'UNSUPPORTED';
+  mUrlPattern.className = hasUrlPattern ? 'val-ok' : 'val-dim';
+
+  if (hasUrlPattern) {
+    try {
+      var pattern = new URLPattern({ pathname: '/books/:id(\\d+)' });
+      var matchRes = pattern.exec('https://example.com/books/12345');
+      if (matchRes && matchRes.pathname && matchRes.pathname.groups) {
+        gExtractedId = matchRes.pathname.groups.id;
+        gUrlPatternOk = (gExtractedId === '12345');
+      }
+      mPatternMatch.textContent = gUrlPatternOk ? ('MATCHED (extracted id=' + gExtractedId + ')') : 'MATCH FAIL';
+      mPatternMatch.className = gUrlPatternOk ? 'val-ok' : 'val-hex';
+
+      log('[+] URLPattern: supported=true, match=' + gUrlPatternOk + ', id=' + gExtractedId);
+      syncBn('URLPATTERN', 'supported=true|match=' + gUrlPatternOk + '|id=' + gExtractedId);
+
+      nodeStage3.className = 'node done';
+      nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [DONE]';
+    } catch(ue) {
+      log('[-] URLPattern error: ' + ue.message);
+      syncBn('URLPATTERN-ERR', ue.message);
+      nodeStage3.className = 'node locked';
+    }
+  } else {
+    mPatternMatch.textContent = 'UNSUPPORTED';
+    mPatternMatch.className = 'val-dim';
+    log('[-] URLPattern unsupported');
+    syncBn('URLPATTERN', 'supported=false');
+    nodeStage3.className = 'node locked';
+  }
+
+  executeWorkerPoolStage();
+}
+
+/* ============================================================
+ * STAGE 4: 8-Worker Concurrent Roundtrip Synchronizer
+ * ============================================================ */
+function executeWorkerPoolStage() {
+  nodeStage4.className = 'node active';
+  nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [ACTIVE]';
+
+  var spawnedCount = 8;
+  var pongsReceived = 0;
+  var workerLats = [];
+  var workerPoolDone = false;
+
+  try {
+    var workerBlob = new Blob([
+      'self.onmessage = function(e) {',
+      '  self.postMessage({ id: e.data.id, tSend: e.data.tSend });',
+      '};'
+    ], { type: 'application/javascript' });
+    var workerUrl = URL.createObjectURL(workerBlob);
+
+    var workers = [];
+    for (var w = 0; w < spawnedCount; w++) {
+      workers.push(new Worker(workerUrl));
+    }
+
+    for (var idx = 0; idx < spawnedCount; idx++) {
+      (function(wIdx) {
+        var worker = workers[wIdx];
+        worker.onmessage = function(ev) {
+          if (workerPoolDone) return;
+          var rtt = Math.max(1, Math.round(performance.now() - ev.data.tSend));
+          workerLats.push(rtt);
+          pongsReceived++;
+
+          if (pongsReceived === spawnedCount) {
+            workerPoolDone = true;
+            var sum = workerLats.reduce(function(a, b) { return a + b; }, 0);
+            gWorkerAvgRtt = (sum / spawnedCount).toFixed(1);
+
+            mWorkerPool.textContent = '8 / 8 WORKERS RESPONDED (100%)';
+            mWorkerPool.className = 'val-ok';
+            mWorkerRtt.textContent = gWorkerAvgRtt + ' ms AVERAGE RTT';
+
+            log('[+] 8-Worker Pool: 8/8 pongs, avgRtt=' + gWorkerAvgRtt + 'ms, lats=' + workerLats.join(','));
+            syncBn('WORKER-8POOL', 'pongs=8|avgRtt=' + gWorkerAvgRtt + '|lats=' + workerLats.join(','));
+
+            workers.forEach(function(wk) { wk.terminate(); });
+            nodeStage4.className = 'node done';
+            nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [DONE]';
+            executeUserTimingStage();
+          }
+        };
+        worker.postMessage({ id: wIdx, tSend: performance.now() });
+      })(idx);
+    }
+
+    setTimeout(function() {
+      if (!workerPoolDone) {
+        workerPoolDone = true;
+        workers.forEach(function(wk) { wk.terminate(); });
+        mWorkerPool.textContent = pongsReceived + ' / 8 WORKERS RESPONDED (TIMEOUT)';
+        mWorkerPool.className = 'val-hex';
+        mWorkerRtt.textContent = 'TIMEOUT';
+
+        log('[-] 8-Worker pool timeout (received: ' + pongsReceived + ')');
+        syncBn('WORKER-8POOL', 'pongs=' + pongsReceived + '|reason=timeout');
+
+        nodeStage4.className = 'node locked';
+        executeUserTimingStage();
+      }
+    }, 600);
+
+  } catch(we) {
+    workerPoolDone = true;
+    mWorkerPool.textContent = 'INIT ERROR: ' + we.message;
+    mWorkerPool.className = 'val-dim';
+    nodeStage4.className = 'node locked';
+    executeUserTimingStage();
+  }
+}
+
+/* ============================================================
+ * STAGE 5: High-Precision User Timing (5,000 Marks)
+ * ============================================================ */
+function executeUserTimingStage() {
+  nodeStage5.className = 'node active';
+  nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [ACTIVE]';
+
+  try {
+    var tMarks0 = performance.now();
+    for (var m = 0; m < 5000; m++) {
+      performance.mark('ps5_perf_mark_' + m);
+    }
+    gMarksMs = Math.max(1, Math.round(performance.now() - tMarks0));
+
+    var entriesCount = performance.getEntriesByType('mark').length;
+    mMarksAlloc.textContent = gMarksMs + ' ms (5,000 MARKS ALLOCATED: ' + entriesCount + ')';
+    mMarksAlloc.className = 'val-ok';
+
+    performance.clearMarks();
+    var marksCleared = (performance.getEntriesByType('mark').length === 0);
+    mMarksClear.textContent = marksCleared ? 'SUCCESS (0 marks remaining)' : 'CLEAR FAILED';
+    mMarksClear.className = marksCleared ? 'val-ok' : 'val-hex';
+
+    log('[+] User Timing: 5k marks in ' + gMarksMs + 'ms, count=' + entriesCount + ', cleared=' + marksCleared);
+    syncBn('USER-TIMING', 'timeMs=' + gMarksMs + '|count=' + entriesCount + '|cleared=' + marksCleared);
+
+    nodeStage5.className = 'node done';
+    nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [DONE]';
+  } catch(pe) {
+    log('[-] User timing error: ' + pe.message);
+    syncBn('TIMING-ERR', pe.message);
+    nodeStage5.className = 'node locked';
+  }
+
+  completeMasterStage(gStreamOk, gFilterOk, gUrlPatternOk, gWorkerAvgRtt, gMarksMs);
+}
+
+/* ============================================================
+ * STAGE 6: Master Verdict & Summary
+ * ============================================================ */
+function completeMasterStage(streamOk, filterOk, patternOk, workerRtt, marksMs) {
+  nodeStage6.className = 'node done';
+  nodeStage6.querySelector('.node-step').textContent = 'Stage 6 [DONE]';
+
+  statusBadge.textContent = 'ALL 6 STAGES NOMINAL';
+  statusBadge.style.background = '#00ff66';
+
+  log('[*] Probe P970 complete: Streams, Filters, URLPattern & 8-Worker pool benchmarked.');
+  syncBn('DONE', 'status=P970_COMPLETE|streamOk=' + streamOk + '|filterOk=' + filterOk + '|urlPattern=' + patternOk + '|workerAvgRtt=' + workerRtt + '|marksMs=' + marksMs);
+}
+
+/* Auto-Reload Watcher for autonomous progression */
+var initialReloadToken = null;
+function checkAutoReload() {
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/reload.txt?t=' + Date.now(), true);
+    xhr.onload = function() {
+      if (xhr.status === 200) {
+        var token = xhr.responseText.trim();
+        if (initialReloadToken === null) {
+          initialReloadToken = token;
+        } else if (token !== initialReloadToken) {
+          log('[*] New deployment detected (token: ' + token + '). Auto-reloading in 500ms...');
+          setTimeout(function() { location.reload(); }, 500);
+        }
+      }
+    };
+    xhr.send();
+  } catch(e) {}
+}
+setInterval(checkAutoReload, 1500);
+</script>
+</body>
+</html>

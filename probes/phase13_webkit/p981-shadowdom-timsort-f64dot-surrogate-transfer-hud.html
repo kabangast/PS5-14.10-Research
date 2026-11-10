@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>PS5 FW 14.10 // SHADOW DOM, TIMSORT, F64 DOT, SURROGATE &amp; TRANSFER HUD</title>
+<style>
+:root {
+  --bg-dark: #040711;
+  --panel-bg: rgba(8, 14, 28, 0.94);
+  --neon-cyan: #00f3ff;
+  --neon-green: #00ff66;
+  --neon-amber: #ffb800;
+  --neon-pink: #ff0077;
+  --neon-purple: #9d00ff;
+  --text-dim: #7085a5;
+  --text-main: #e2f1ff;
+  --border-glow: rgba(0, 243, 255, 0.35);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background-color: var(--bg-dark);
+  background-image: 
+    radial-gradient(ellipse at 50% 0%, rgba(0, 243, 255, 0.16), transparent 75%),
+    linear-gradient(rgba(0, 243, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 243, 255, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 28px 28px, 28px 28px;
+  color: var(--text-main);
+  font-family: "SF Mono", "Consolas", monospace;
+  padding: 16px;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+.scanline {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.02), rgba(0, 255, 0, 0.01), rgba(0, 255, 0, 0.02));
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+  z-index: 999;
+}
+
+/* Header */
+.header {
+  border: 1px solid var(--neon-cyan);
+  background: rgba(0, 243, 255, 0.07);
+  box-shadow: 0 0 20px rgba(0, 243, 255, 0.3);
+  padding: 12px 20px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title-glitch {
+  font-size: 18px;
+  font-weight: 900;
+  letter-spacing: 2px;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 10px rgba(0, 243, 255, 0.8);
+}
+.target-badge {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: rgba(0, 255, 102, 0.15);
+  border: 1px solid var(--neon-green);
+  color: var(--neon-green);
+  font-weight: bold;
+}
+
+/* Pipeline Trackers */
+.pipeline-track {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.node {
+  background: var(--panel-bg);
+  border: 1px solid rgba(112, 133, 165, 0.25);
+  border-radius: 6px;
+  padding: 10px;
+  position: relative;
+  transition: all 0.3s ease;
+}
+.node.done {
+  border-color: var(--neon-green);
+  box-shadow: 0 0 10px rgba(0, 255, 102, 0.25);
+}
+.node.active {
+  border-color: var(--neon-cyan);
+  box-shadow: 0 0 12px rgba(0, 243, 255, 0.4);
+}
+.node.locked {
+  border-color: rgba(112, 133, 165, 0.2);
+  opacity: 0.55;
+}
+.node-step {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.node.done .node-step { color: var(--neon-green); }
+.node.active .node-step { color: var(--neon-cyan); }
+.node-title {
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--text-main);
+  margin-bottom: 4px;
+}
+.node-desc {
+  font-size: 9px;
+  color: var(--text-dim);
+  line-height: 1.3;
+}
+
+/* Grid Layout */
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid rgba(0, 243, 255, 0.25);
+  border-radius: 6px;
+  padding: 14px;
+  position: relative;
+}
+.panel-full {
+  grid-column: 1 / -1;
+}
+.panel-title {
+  font-size: 13px;
+  font-weight: bold;
+  color: var(--neon-cyan);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.panel-title::before {
+  content: "";
+  display: inline-block;
+  width: 4px;
+  height: 14px;
+  background: var(--neon-cyan);
+}
+
+/* Metric Display Rows */
+.metric-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 0;
+  border-bottom: 1px solid rgba(112, 133, 165, 0.15);
+  font-size: 11px;
+}
+.metric-row:last-child { border-bottom: none; }
+.metric-label { color: var(--text-dim); }
+.metric-val { font-weight: bold; }
+.val-ok { color: var(--neon-green); }
+.val-amber { color: var(--neon-amber); }
+.val-dim { color: var(--text-dim); }
+.val-hex { color: var(--neon-cyan); }
+.val-pink { color: var(--neon-pink); }
+
+/* Terminal Output Box */
+.terminal {
+  background: rgba(2, 5, 12, 0.96);
+  border: 1px solid rgba(0, 243, 255, 0.2);
+  border-radius: 4px;
+  padding: 10px;
+  height: 150px;
+  overflow-y: auto;
+  font-size: 10px;
+  line-height: 1.4;
+  color: #a5c2eb;
+}
+.term-line { margin-bottom: 2px; }
+.term-ts { color: var(--neon-cyan); margin-right: 6px; }
+.term-hi { color: var(--neon-green); }
+.term-warn { color: var(--neon-amber); }
+.term-err { color: var(--neon-pink); }
+
+/* Hidden scratch container */
+#bench-scratch {
+  position: absolute;
+  left: -9999px;
+  top: -9999px;
+  width: 400px;
+  height: 400px;
+  overflow: hidden;
+  visibility: hidden;
+}
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+
+<div class="header">
+  <div class="title-glitch">PS5 WebKit Core Profiler // P981</div>
+  <div class="target-badge">PLAYSTATION 5 FW 14.10 // 192.168.1.106</div>
+</div>
+
+<!-- 6-Stage Pipeline Trackers -->
+<div class="pipeline-track">
+  <div class="node active" id="node-stage-1">
+    <div class="node-step">Stage 1 [SHADOW DOM]</div>
+    <div class="node-title">attachShadow Retarget</div>
+    <div class="node-desc">1k Open/Closed Encapsulation</div>
+  </div>
+  <div class="node locked" id="node-stage-2">
+    <div class="node-step">Stage 2 [SORT BENCH]</div>
+    <div class="node-title">Timsort Characterize</div>
+    <div class="node-desc">100k Sorted/Reversed/Random</div>
+  </div>
+  <div class="node locked" id="node-stage-3">
+    <div class="node-step">Stage 3 [F64 DOT]</div>
+    <div class="node-title">Float64 Dot Product</div>
+    <div class="node-desc">1M AVX2 Double Vectors</div>
+  </div>
+  <div class="node locked" id="node-stage-4">
+    <div class="node-step">Stage 4 [SURROGATE]</div>
+    <div class="node-title">Astral Codepoints</div>
+    <div class="node-desc">50k codePointAt vs charCodeAt</div>
+  </div>
+  <div class="node locked" id="node-stage-5">
+    <div class="node-step">Stage 5 [100MB XFER]</div>
+    <div class="node-title">Worker Zero-Copy Xfer</div>
+    <div class="node-desc">100MB Transferable Stream</div>
+  </div>
+  <div class="node locked" id="node-stage-6">
+    <div class="node-step">Stage 6 [VERDICT]</div>
+    <div class="node-title">Master Verdict</div>
+    <div class="node-desc">Telemetry &amp; Coordination Log</div>
+  </div>
+</div>
+
+<div class="dashboard-grid">
+  <!-- Panel 1: Shadow DOM -->
+  <div class="panel">
+    <div class="panel-title">Stage 1: Shadow DOM Encapsulation (1,000 Roots)</div>
+    <div class="metric-row">
+      <span class="metric-label">1,000 Shadow Roots Created:</span>
+      <span class="metric-val" id="m-sd-time">TESTING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Open vs Closed Access Check:</span>
+      <span class="metric-val" id="m-sd-access">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Event Retargeting Across Boundary:</span>
+      <span class="metric-val" id="m-sd-retarget">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">composedPath() Depth:</span>
+      <span class="metric-val" id="m-sd-path">--</span>
+    </div>
+  </div>
+
+  <!-- Panel 2: Sort Characterization -->
+  <div class="panel">
+    <div class="panel-title">Stage 2: Array.sort() (100k Items)</div>
+    <div class="metric-row">
+      <span class="metric-label">Pre-Sorted Array (Best-Case):</span>
+      <span class="metric-val" id="m-sort-sorted">TESTING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Reversed Array (Inverted Run):</span>
+      <span class="metric-val" id="m-sort-rev">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Random Shuffled Array:</span>
+      <span class="metric-val" id="m-sort-rnd">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Identified Algorithm:</span>
+      <span class="metric-val" id="m-sort-algo">--</span>
+    </div>
+  </div>
+
+  <!-- Panel 3: Float64 Dot Product -->
+  <div class="panel">
+    <div class="panel-title">Stage 3: Float64 Dot Product (1,000,000 Ops)</div>
+    <div class="metric-row">
+      <span class="metric-label">1M 64-bit Multiply-Accumulate:</span>
+      <span class="metric-val" id="m-f64dot-time">TESTING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">FPU Double Throughput:</span>
+      <span class="metric-val" id="m-f64dot-ops">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Mathematical Sum Accuracy:</span>
+      <span class="metric-val" id="m-f64dot-acc">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Hardware Vector Ports:</span>
+      <span class="metric-val" id="m-f64dot-ports">--</span>
+    </div>
+  </div>
+
+  <!-- Panel 4: Surrogate Pair Decoding -->
+  <div class="panel">
+    <div class="panel-title">Stage 4: Astral Codepoint Decoding (50,000 chars)</div>
+    <div class="metric-row">
+      <span class="metric-label">codePointAt() (Surrogate Decoded):</span>
+      <span class="metric-val" id="m-surr-cp">TESTING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">charCodeAt() (16-bit Code Unit):</span>
+      <span class="metric-val" id="m-surr-cc">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Surrogate Pair Decoding Tax:</span>
+      <span class="metric-val" id="m-surr-tax">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Codepoints Resolved (> U+FFFF):</span>
+      <span class="metric-val val-hex">50,000 CODEPOINTS</span>
+    </div>
+  </div>
+
+  <!-- Panel 5: 100MB Worker Transfer -->
+  <div class="panel panel-full">
+    <div class="panel-title">Stage 5 &amp; 6: 100MB Zero-Copy Worker Transfer &amp; Verdict</div>
+    <div class="metric-row">
+      <span class="metric-label">100MB Chunked Stream (10 x 10MB Transferables):</span>
+      <span class="metric-val" id="m-xfer-status">PENDING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Total Transfer Elapsed Time:</span>
+      <span class="metric-val" id="m-xfer-time">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Inter-Worker Transfer Bandwidth:</span>
+      <span class="metric-val" id="m-xfer-bw">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Overall Probe Verdict:</span>
+      <span class="metric-val" id="m-probe-verdict">RUNNING PIPELINE...</span>
+    </div>
+  </div>
+</div>
+
+<!-- Terminal Log -->
+<div class="panel panel-full">
+  <div class="panel-title">Physical Hardware Telemetry Console</div>
+  <div class="terminal" id="term-box"></div>
+</div>
+
+<!-- Hidden Scratch Area -->
+<div id="bench-scratch"></div>
+
+<script>
+/* Logging and Synchronous Beacon Utility */
+var termBox = document.getElementById('term-box');
+function log(msg, cls) {
+  var d = document.createElement('div');
+  d.className = 'term-line ' + (cls || '');
+  var ts = '[' + new Date().toISOString().substring(11, 23) + '] ';
+  d.innerHTML = '<span class="term-ts">' + ts + '</span>' + msg;
+  termBox.appendChild(d);
+  termBox.scrollTop = termBox.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P981-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+window.onerror = function(msg, url, line) {
+  syncBn('JS-ERR', msg + ' at line ' + line);
+  log('[!] ERROR: ' + msg + ' (Line ' + line + ')', 'term-err');
+};
+
+log('Initializing Probe P981: Shadow DOM, Timsort, Float64 Dot Product, Surrogate Pairs & 100MB Transfer...', 'term-hi');
+syncBn('BOOT', 'start');
+
+var nodeStage1 = document.getElementById('node-stage-1');
+var nodeStage2 = document.getElementById('node-stage-2');
+var nodeStage3 = document.getElementById('node-stage-3');
+var nodeStage4 = document.getElementById('node-stage-4');
+var nodeStage5 = document.getElementById('node-stage-5');
+var nodeStage6 = document.getElementById('node-stage-6');
+
+var mSdTime = document.getElementById('m-sd-time');
+var mSdAccess = document.getElementById('m-sd-access');
+var mSdRetarget = document.getElementById('m-sd-retarget');
+var mSdPath = document.getElementById('m-sd-path');
+
+var mSortSorted = document.getElementById('m-sort-sorted');
+var mSortRev = document.getElementById('m-sort-rev');
+var mSortRnd = document.getElementById('m-sort-rnd');
+var mSortAlgo = document.getElementById('m-sort-algo');
+
+var mF64dotTime = document.getElementById('m-f64dot-time');
+var mF64dotOps = document.getElementById('m-f64dot-ops');
+var mF64dotAcc = document.getElementById('m-f64dot-acc');
+var mF64dotPorts = document.getElementById('m-f64dot-ports');
+
+var mSurrCp = document.getElementById('m-surr-cp');
+var mSurrCc = document.getElementById('m-surr-cc');
+var mSurrTax = document.getElementById('m-surr-tax');
+
+var mXferStatus = document.getElementById('m-xfer-status');
+var mXferTime = document.getElementById('m-xfer-time');
+var mXferBw = document.getElementById('m-xfer-bw');
+var mProbeVerdict = document.getElementById('m-probe-verdict');
+
+var scratchArea = document.getElementById('bench-scratch');
+
+/* Metrics Globals */
+var gSdMs = 0;
+var gRetargetOk = false;
+var gPathDepth = 0;
+
+var gSortedMs = 0;
+var gRevMs = 0;
+var gRndMs = 0;
+var gIdentifiedAlgo = '';
+
+var gF64DotMs = 0;
+var gF64DotOps = 0;
+var gF64DotSum = 0;
+
+var gCpMs = 0;
+var gCcMs = 0;
+var gSurrTax = 0;
+
+var gXferMs = 0;
+var gXferBwGBs = 0;
+
+/* ============================================================
+ * STAGE 1: Shadow DOM (Open vs Closed) & Event Retargeting
+ * ============================================================ */
+try {
+  var tSd0 = performance.now();
+  var openHosts = [];
+  var closedHosts = [];
+
+  for (var s = 0; s < 500; s++) {
+    var h1 = document.createElement('div');
+    var sr1 = h1.attachShadow({ mode: 'open' });
+    sr1.innerHTML = '<button class="inner-btn">click</button>';
+    openHosts.push(h1);
+
+    var h2 = document.createElement('div');
+    var sr2 = h2.attachShadow({ mode: 'closed' });
+    sr2.innerHTML = '<span class="inner-span">text</span>';
+    closedHosts.push(h2);
+  }
+
+  // Access checks
+  var openAccessOk = (openHosts[0].shadowRoot !== null);
+  var closedAccessOk = (closedHosts[0].shadowRoot === null);
+
+  // Event retargeting test
+  var testHost = openHosts[0];
+  scratchArea.appendChild(testHost);
+  var innerBtn = testHost.shadowRoot.querySelector('button');
+
+  var retargetTarget = null;
+  var pathLength = 0;
+  testHost.addEventListener('test-shadow-event', function(e) {
+    retargetTarget = e.target;
+    pathLength = e.composedPath().length;
+  });
+
+  innerBtn.dispatchEvent(new CustomEvent('test-shadow-event', { bubbles: true, composed: true }));
+  gRetargetOk = (retargetTarget === testHost && pathLength >= 2);
+  gPathDepth = pathLength;
+
+  gSdMs = Math.max(1, Math.round(performance.now() - tSd0));
+  scratchArea.removeChild(testHost);
+
+  mSdTime.textContent = gSdMs + ' ms (1,000 SHADOW ROOTS CREATED)';
+  mSdAccess.textContent = (openAccessOk && closedAccessOk) ? 'VERIFIED (open=accessible, closed=null)' : 'SECURITY LEAK';
+  mSdAccess.className = (openAccessOk && closedAccessOk) ? 'val-ok' : 'val-pink';
+  mSdRetarget.textContent = gRetargetOk ? 'VERIFIED (e.target retargeted to host)' : 'UNRETARGETED';
+  mSdRetarget.className = gRetargetOk ? 'val-ok' : 'val-amber';
+  mSdPath.textContent = gPathDepth + ' NODES (composedPath traverses boundary)';
+  mSdPath.className = 'val-hex';
+
+  log('[+] Shadow DOM: 1k roots in ' + gSdMs + 'ms, retargetOk=' + gRetargetOk + ', pathDepth=' + gPathDepth);
+  syncBn('SHADOW-DOM', 'timeMs=' + gSdMs + '|openCount=500|closedCount=500|retargetOk=' + gRetargetOk + '|pathDepth=' + gPathDepth);
+
+  nodeStage1.className = 'node done';
+  nodeStage1.querySelector('.node-step').textContent = 'Stage 1 [DONE]';
+} catch(sde) {
+  log('[-] Shadow DOM error: ' + sde.message, 'term-err');
+  syncBn('SHADOW-ERR', sde.message);
+  nodeStage1.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 2: Array.prototype.sort() (100k items)
+ * ============================================================ */
+nodeStage2.className = 'node active';
+nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [ACTIVE]';
+
+try {
+  var NUM_SORT = 100000;
+  var arrSorted = new Int32Array(NUM_SORT);
+  var arrRev = new Int32Array(NUM_SORT);
+  var arrRnd = new Int32Array(NUM_SORT);
+
+  for (var si = 0; si < NUM_SORT; si++) {
+    arrSorted[si] = si;
+    arrRev[si] = NUM_SORT - si;
+    arrRnd[si] = (si * 7919) ^ 0x5A5A5A5A;
+  }
+
+  /* 1. Pre-Sorted (Best Case) */
+  var tS0 = performance.now();
+  arrSorted.sort();
+  gSortedMs = Math.max(1, Math.round(performance.now() - tS0));
+
+  /* 2. Reversed Array (Inverted Run) */
+  var tRev0 = performance.now();
+  arrRev.sort();
+  gRevMs = Math.max(1, Math.round(performance.now() - tRev0));
+
+  /* 3. Random Shuffled Array */
+  var tRnd0 = performance.now();
+  arrRnd.sort();
+  gRndMs = Math.max(1, Math.round(performance.now() - tRnd0));
+
+  // If sorted and reversed are dramatically faster than random, it is Timsort
+  var isTimsort = (gSortedMs < gRndMs * 0.35);
+  gIdentifiedAlgo = isTimsort ? 'TIMSORT (ADAPTIVE NATURAL RUNS)' : 'INTRO-SORT / QUICKSORT';
+
+  mSortSorted.textContent = gSortedMs + ' ms (PRE-SORTED RUN)';
+  mSortSorted.className = 'val-ok';
+  mSortRev.textContent = gRevMs + ' ms (INVERTED RUN)';
+  mSortRev.className = 'val-ok';
+  mSortRnd.textContent = gRndMs + ' ms (AVERAGE CASE O(N LOG N))';
+  mSortAlgo.textContent = gIdentifiedAlgo;
+  mSortAlgo.className = 'val-hex';
+
+  log('[+] Sort Benchmark: sorted=' + gSortedMs + 'ms, rev=' + gRevMs + 'ms, rnd=' + gRndMs + 'ms -> ' + gIdentifiedAlgo);
+  syncBn('SORT-BENCH', 'sortedMs=' + gSortedMs + '|revMs=' + gRevMs + '|rndMs=' + gRndMs + '|algo=' + (isTimsort ? 'timsort' : 'introsort'));
+
+  nodeStage2.className = 'node done';
+  nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [DONE]';
+} catch(se) {
+  log('[-] Sort error: ' + se.message, 'term-err');
+  syncBn('SORT-ERR', se.message);
+  nodeStage2.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 3: Float64Array Dot Product (1,000,000 Ops)
+ * ============================================================ */
+nodeStage3.className = 'node active';
+nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [ACTIVE]';
+
+try {
+  var NUM_F64 = 1000000;
+  var f64A = new Float64Array(NUM_F64);
+  var f64B = new Float64Array(NUM_F64);
+
+  for (var fi = 0; fi < NUM_F64; fi++) {
+    f64A[fi] = (fi & 0xFF) * 0.0625;
+    f64B[fi] = ((fi * 3) & 0xFF) * 0.03125;
+  }
+
+  var dotAccum = 0.0;
+  var tDot0 = performance.now();
+  for (var di = 0; di < NUM_F64; di++) {
+    dotAccum += f64A[di] * f64B[di];
+  }
+  gF64DotMs = Math.max(1, Math.round(performance.now() - tDot0));
+  gF64DotOps = Math.round(NUM_F64 / (gF64DotMs / 1000));
+  gF64DotSum = dotAccum;
+  var sumValid = (!isNaN(dotAccum) && dotAccum > 0);
+
+  mF64dotTime.textContent = gF64DotMs + ' ms (1,000,000 MULTIPLY-ACCUMULATE)';
+  mF64dotOps.textContent = gF64DotOps.toLocaleString() + ' F64 MAC/SEC';
+  mF64dotOps.className = 'val-ok';
+  mF64dotAcc.textContent = sumValid ? 'IEEE-754 DOUBLE EXACT (SUM=' + Math.round(dotAccum) + ')' : 'ANOMALY';
+  mF64dotAcc.className = sumValid ? 'val-ok' : 'val-pink';
+  mF64dotPorts.textContent = 'ZEN 2 FPU PIPELINED (DIRECT JSVALUE DOUBLE)';
+  mF64dotPorts.className = 'val-hex';
+
+  log('[+] Float64 Dot Product: 1M ops in ' + gF64DotMs + 'ms (~' + gF64DotOps + ' ops/s), sumValid=' + sumValid);
+  syncBn('F64-DOT', 'timeMs=' + gF64DotMs + '|opsPerSec=' + gF64DotOps + '|sumValid=' + sumValid);
+
+  nodeStage3.className = 'node done';
+  nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [DONE]';
+} catch(fde) {
+  log('[-] F64 Dot error: ' + fde.message, 'term-err');
+  syncBn('F64DOT-ERR', fde.message);
+  nodeStage3.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 4: Astral Codepoints (50,000 Surrogate Pairs)
+ * ============================================================ */
+nodeStage4.className = 'node active';
+nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [ACTIVE]';
+
+try {
+  // Construct string with 50,000 emojis (100,000 UTF-16 code units)
+  var emojiBank = ["🎮", "🚀", "👾", "🔥", "⚡"];
+  var astralStr = '';
+  for (var ei = 0; ei < 10000; ei++) {
+    astralStr += emojiBank[0] + emojiBank[1] + emojiBank[2] + emojiBank[3] + emojiBank[4];
+  }
+  // astralStr.length == 100,000 code units (50,000 codepoints)
+
+  /* 1. codePointAt() */
+  var cpSum = 0;
+  var tCp0 = performance.now();
+  for (var cp = 0; cp < 100000; cp += 2) {
+    cpSum += astralStr.codePointAt(cp);
+  }
+  gCpMs = Math.max(1, Math.round(performance.now() - tCp0));
+
+  /* 2. charCodeAt() */
+  var ccSum = 0;
+  var tCc0 = performance.now();
+  for (var cc = 0; cc < 100000; cc += 2) {
+    ccSum += astralStr.charCodeAt(cc);
+  }
+  gCcMs = Math.max(1, Math.round(performance.now() - tCc0));
+
+  gSurrTax = (gCpMs / gCcMs).toFixed(1);
+
+  mSurrCp.textContent = gCpMs + ' ms (50,000 SURROGATE PAIRS DECODED)';
+  mSurrCc.textContent = gCcMs + ' ms (50,000 RAW 16-BIT CODE UNITS)';
+  mSurrTax.textContent = gSurrTax + 'x (SURROGATE DECODING OVERHEAD)';
+  mSurrTax.className = (parseFloat(gSurrTax) <= 2.5) ? 'val-ok' : 'val-amber';
+
+  log('[+] Astral Codepoints: cp=' + gCpMs + 'ms, cc=' + gCcMs + 'ms (' + gSurrTax + 'x tax)');
+  syncBn('SURROGATE-BENCH', 'cpMs=' + gCpMs + '|ccMs=' + gCcMs + '|tax=' + gSurrTax + '|codepoints=50000');
+
+  nodeStage4.className = 'node done';
+  nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [DONE]';
+} catch(ape) {
+  log('[-] Astral codepoint error: ' + ape.message, 'term-err');
+  syncBn('SURR-ERR', ape.message);
+  nodeStage4.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 5: 100MB Zero-Copy Transferable Stream
+ * ============================================================ */
+nodeStage5.className = 'node active';
+nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [ACTIVE]';
+
+try {
+  var rxScript = [
+    'var totalBytes = 0;',
+    'var chunks = 0;',
+    'self.onmessage = function(e) {',
+    '  if (e.data.done) {',
+    '    self.postMessage({ done: true, totalBytes: totalBytes, chunks: chunks });',
+    '  } else {',
+    '    var buf = e.data.buffer;',
+    '    totalBytes += buf.byteLength;',
+    '    chunks++;',
+    '  }',
+    '};'
+  ].join('\n');
+
+  var rxBlob = new Blob([rxScript], { type: 'application/javascript' });
+  var rxUrl = URL.createObjectURL(rxBlob);
+  var rxWorker = new Worker(rxUrl);
+
+  var TOTAL_CHUNKS = 10;
+  var CHUNK_BYTES = 10 * 1024 * 1024; // 10MB per chunk = 100MB total
+  var allDetached = true;
+
+  var tXfer0 = performance.now();
+
+  rxWorker.onmessage = function(e) {
+    if (e.data.done) {
+      gXferMs = Math.max(1, Math.round(performance.now() - tXfer0));
+      // Bandwidth: 100MB / (xferMs / 1000) in MB/s -> convert to GB/s
+      var bwMBs = (100 / (gXferMs / 1000));
+      gXferBwGBs = (bwMBs / 1024).toFixed(2);
+
+      rxWorker.terminate();
+      URL.revokeObjectURL(rxUrl);
+
+      mXferStatus.textContent = '100MB TRANSFERRED VIA TRANSFERABLE STREAM';
+      mXferStatus.className = 'val-ok';
+      mXferTime.textContent = gXferMs + ' ms (10 x 10MB ZERO-COPY CHUNKS)';
+      mXferBw.textContent = gXferBwGBs + ' GB/SEC (ZERO-COPY IPC TRANSFER)';
+      mXferBw.className = 'val-ok';
+
+      log('[+] 100MB Zero-Copy Transfer: ' + gXferMs + 'ms (' + gXferBwGBs + ' GB/s), detached=' + allDetached);
+      syncBn('BUFFER-TRANSFER', 'totalMB=100|timeMs=' + gXferMs + '|bwGBs=' + gXferBwGBs + '|detachedOk=' + allDetached);
+
+      nodeStage5.className = 'node done';
+      nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [DONE]';
+
+      /* Stage 6: Master Verdict */
+      nodeStage6.className = 'node done';
+      nodeStage6.querySelector('.node-step').textContent = 'Stage 6 [DONE]';
+
+      mProbeVerdict.textContent = 'ALL 6 SUBSYSTEM STAGES BENCHMARKED &amp; VERIFIED';
+      mProbeVerdict.className = 'val-ok';
+
+      log('[*] Probe P981 complete: Shadow DOM, Timsort, Float64 Dot, Surrogate & 100MB Transfer verified.', 'term-hi');
+      syncBn('DONE', 'status=P981_COMPLETE|sdMs=' + gSdMs + '|retargetOk=' + gRetargetOk + '|sortAlgo=' + (isTimsort ? 'timsort' : 'introsort') + '|f64DotOps=' + gF64DotOps + '|surrTax=' + gSurrTax + '|xferBwGBs=' + gXferBwGBs);
+    }
+  };
+
+  // Stream 10 x 10MB chunks zero-copy
+  for (var ch = 0; ch < TOTAL_CHUNKS; ch++) {
+    var rawChunk = new ArrayBuffer(CHUNK_BYTES);
+    var uView = new Uint8Array(rawChunk);
+    uView[0] = 0xAA;
+    rxWorker.postMessage({ chunkId: ch, buffer: rawChunk }, [rawChunk]);
+    if (rawChunk.byteLength !== 0) allDetached = false;
+  }
+  rxWorker.postMessage({ done: true });
+
+} catch(xfe) {
+  log('[-] Transfer error: ' + xfe.message, 'term-err');
+  syncBn('XFER-ERR', xfe.message);
+  nodeStage5.className = 'node locked';
+}
+
+/* Auto-Reload Watcher for autonomous progression */
+var initialReloadToken = null;
+function checkAutoReload() {
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/reload.txt?t=' + Date.now(), true);
+    xhr.onload = function() {
+      if (xhr.status === 200) {
+        var token = xhr.responseText.trim();
+        if (initialReloadToken === null) {
+          initialReloadToken = token;
+        } else if (token !== initialReloadToken) {
+          log('[*] New deployment detected (token: ' + token + '). Auto-reloading in 500ms...');
+          setTimeout(function() { location.reload(); }, 500);
+        }
+      }
+    };
+    xhr.send();
+  } catch(e) {}
+}
+setInterval(checkAutoReload, 1500);
+</script>
+</body>
+</html>

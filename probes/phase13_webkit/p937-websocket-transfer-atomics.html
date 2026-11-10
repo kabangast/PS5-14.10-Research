@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P937: WebSocket Pipeline, 1MB Transfer & Atomics Isolation</title>
+<style>
+:root {
+  --bg: #090d16;
+  --card: #111827;
+  --border: #1f2937;
+  --text: #e5e7eb;
+  --dim: #9ca3af;
+  --cyan: #06b6d4;
+  --green: #10b981;
+  --amber: #f59e0b;
+  --red: #ef4444;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  padding: 16px;
+  line-height: 1.5;
+}
+.header {
+  border: 1px solid var(--border);
+  background: var(--card);
+  padding: 14px 18px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title { font-size: 16px; font-weight: bold; color: var(--cyan); }
+.badge {
+  font-size: 11px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: #374151;
+  font-weight: 600;
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.card {
+  border: 1px solid var(--border);
+  background: var(--card);
+  padding: 12px 14px;
+  border-radius: 6px;
+}
+.card h3 {
+  font-size: 12px;
+  color: var(--dim);
+  text-transform: uppercase;
+  margin-bottom: 8px;
+  letter-spacing: 0.5px;
+}
+.stat {
+  display: flex;
+  justify-content: space-between;
+  padding: 3px 0;
+  border-bottom: 1px dotted rgba(255,255,255,0.08);
+  font-size: 12px;
+}
+.stat:last-child { border-bottom: none; }
+.stat-val { font-weight: bold; }
+.ok { color: var(--green); }
+.warn { color: var(--amber); }
+.err { color: var(--red); }
+.console {
+  border: 1px solid var(--border);
+  background: #05070d;
+  padding: 12px;
+  border-radius: 6px;
+}
+.console-header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--dim);
+  margin-bottom: 8px;
+}
+#log {
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 11px;
+  color: #d1d5db;
+  max-height: 280px;
+  overflow-y: auto;
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <div class="title">PROBE P937: WebSocket Pipeline, 1MB Transfer & Atomics Isolation</div>
+    <div style="font-size: 11px; color: var(--dim); margin-top: 2px;">PS5 WebKit 14.10 Empirical Diagnostic Suite</div>
+  </div>
+  <div id="statusBadge" class="badge">INITIALIZING</div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h3>WebSocket Binary Pipeline (:8765)</h3>
+    <div class="stat"><span>Connection:</span><span id="mWsConn" class="stat-val">Connecting...</span></div>
+    <div class="stat"><span>Binary Echo (256B):</span><span id="mWsEcho" class="stat-val">Pending</span></div>
+    <div class="stat"><span>WS Latency:</span><span id="mWsLat" class="stat-val">--</span></div>
+    <div class="stat"><span>Binary Integrity:</span><span id="mWsIntact" class="stat-val">Pending</span></div>
+  </div>
+
+  <div class="card">
+    <h3>1MB Transferable Roundtrip</h3>
+    <div class="stat"><span>Worker Load:</span><span id="mWrkLoad" class="stat-val">Loading...</span></div>
+    <div class="stat"><span>Source Detach:</span><span id="mWrkDetach" class="stat-val">Pending</span></div>
+    <div class="stat"><span>Roundtrip Latency:</span><span id="mWrkLat" class="stat-val">Pending</span></div>
+    <div class="stat"><span>1MB Verification:</span><span id="mWrkIntact" class="stat-val">Pending</span></div>
+  </div>
+
+  <div class="card">
+    <h3>Atomics Spec Compliance</h3>
+    <div class="stat"><span>Atomics Global:</span><span id="mAtomicsGlobal" class="stat-val">Testing...</span></div>
+    <div class="stat"><span>isLockFree(4):</span><span id="mLockFree" class="stat-val">Testing...</span></div>
+    <div class="stat"><span>Non-Shared Load:</span><span id="mNonSharedLoad" class="stat-val">Pending</span></div>
+    <div class="stat"><span>Spec TypeError:</span><span id="mAtomicsErr" class="stat-val">Pending</span></div>
+  </div>
+</div>
+
+<div class="console">
+  <div class="console-header">
+    <span>DIAGNOSTIC LOG</span>
+    <span class="ok">TAG: P937</span>
+  </div>
+  <pre id="log">[*] Probe P937 initialized.</pre>
+</div>
+
+<script>
+'use strict';
+var logEl = document.getElementById('log');
+var statusBadge = document.getElementById('statusBadge');
+var mWsConn = document.getElementById('mWsConn');
+var mWsEcho = document.getElementById('mWsEcho');
+var mWsLat = document.getElementById('mWsLat');
+var mWsIntact = document.getElementById('mWsIntact');
+var mWrkLoad = document.getElementById('mWrkLoad');
+var mWrkDetach = document.getElementById('mWrkDetach');
+var mWrkLat = document.getElementById('mWrkLat');
+var mWrkIntact = document.getElementById('mWrkIntact');
+var mAtomicsGlobal = document.getElementById('mAtomicsGlobal');
+var mLockFree = document.getElementById('mLockFree');
+var mNonSharedLoad = document.getElementById('mNonSharedLoad');
+var mAtomicsErr = document.getElementById('mAtomicsErr');
+
+function log(msg) {
+  var d = document.createElement('div');
+  d.textContent = msg;
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P937-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+log('[*] P937 Loaded: Testing WebSocket binary pipe, 1MB transfer & Atomics.');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * STAGE 1: Atomics Spec Compliance
+ * ============================================================ */
+var hasAtomics = typeof Atomics === 'object' && Atomics !== null;
+mAtomicsGlobal.textContent = hasAtomics ? 'SUPPORTED' : 'UNSUPPORTED';
+mAtomicsGlobal.className = 'stat-val ' + (hasAtomics ? 'ok' : 'err');
+
+var lockFree4 = false;
+var loadThrew = false;
+var loadErrName = '';
+
+if (hasAtomics) {
+  try {
+    lockFree4 = Atomics.isLockFree(4);
+    mLockFree.textContent = lockFree4 ? 'TRUE (4B LOCK_FREE)' : 'FALSE';
+    mLockFree.className = 'stat-val ' + (lockFree4 ? 'ok' : 'warn');
+
+    // Test Atomics.load on a non-shared ArrayBuffer
+    var standardBuf = new ArrayBuffer(16);
+    var i32 = new Int32Array(standardBuf);
+    try {
+      var v = Atomics.load(i32, 0);
+      loadThrew = false;
+      mNonSharedLoad.textContent = 'ALLOWED (' + v + ')';
+      mNonSharedLoad.className = 'stat-val warn';
+      mAtomicsErr.textContent = 'NO_THROW (NON_STANDARD)';
+      mAtomicsErr.className = 'stat-val warn';
+    } catch(aErr) {
+      loadThrew = true;
+      loadErrName = aErr.name || 'Error';
+      mNonSharedLoad.textContent = 'REJECTED';
+      mNonSharedLoad.className = 'stat-val ok';
+      mAtomicsErr.textContent = loadErrName + ' (SPEC_COMPLIANT)';
+      mAtomicsErr.className = 'stat-val ok';
+      log('[+] Atomics.load on non-shared buffer correctly threw ' + loadErrName);
+    }
+  } catch(e) {
+    log('[-] Atomics test error: ' + e.message);
+  }
+} else {
+  mLockFree.textContent = 'N/A';
+  mNonSharedLoad.textContent = 'N/A';
+  mAtomicsErr.textContent = 'N/A';
+}
+
+syncBn('ATOMICS', 'supported=' + hasAtomics + '|lockFree4=' + lockFree4 + '|loadThrew=' + loadThrew + '|err=' + loadErrName);
+
+/* ============================================================
+ * STAGE 2: 1MB Transferable Roundtrip with Cache-Busted Worker
+ * ============================================================ */
+var workerDone = false;
+try {
+  var wrk = new Worker('/worker.js?v=' + Date.now());
+  mWrkLoad.textContent = 'WORKER SPAWNED';
+  mWrkLoad.className = 'stat-val ok';
+
+  var mbBuf = new ArrayBuffer(1024 * 1024);
+  var u32 = new Uint32Array(mbBuf);
+  u32[0] = 0x1337BABE;
+  u32[u32.length - 1] = 0xCAFEBABE;
+
+  var wrkSendTime = performance.now();
+
+  wrk.onmessage = function(e) {
+    var rtt = (performance.now() - wrkSendTime).toFixed(1);
+    mWrkLat.textContent = rtt + ' ms';
+    mWrkLat.className = 'stat-val ok';
+
+    var retBuf = e.data ? e.data.buffer : null;
+    var intact = false;
+    if (retBuf && retBuf.byteLength === 1024 * 1024) {
+      var rView = new Uint32Array(retBuf);
+      intact = (rView[0] === 0x1337BABE && rView[rView.length - 1] === 0xCAFEBABE);
+    }
+
+    mWrkIntact.textContent = intact ? '100% MATCH (1MB)' : 'MISMATCH';
+    mWrkIntact.className = 'stat-val ' + (intact ? 'ok' : 'err');
+
+    log('[+] 1MB Worker Transfer: RTT=' + rtt + 'ms, intact=' + intact);
+    syncBn('TRANSFER-1MB', 'rttMs=' + rtt + '|intact=' + intact + '|bytes=' + (retBuf ? retBuf.byteLength : 0));
+
+    workerDone = true;
+    wrk.terminate();
+    checkAllComplete();
+  };
+
+  wrk.onerror = function(err) {
+    mWrkLoad.textContent = 'ERROR (' + (err.message || 'WorkerError') + ')';
+    mWrkLoad.className = 'stat-val err';
+    log('[-] Worker error: ' + err.message);
+    syncBn('TRANSFER-ERR', 'err=' + (err.message || 'unknown'));
+    workerDone = true;
+    checkAllComplete();
+  };
+
+  wrk.postMessage({ type: 'ECHO_TRANSFER', id: 'p937_1mb', buffer: mbBuf }, [mbBuf]);
+  var detached = (mbBuf.byteLength === 0);
+  mWrkDetach.textContent = detached ? 'DETACHED (0B)' : 'FAIL';
+  mWrkDetach.className = 'stat-val ' + (detached ? 'ok' : 'err');
+  log('[+] 1MB transfer: source detached immediately: ' + detached);
+} catch(e) {
+  mWrkLoad.textContent = 'SPAWN_FAIL';
+  mWrkLoad.className = 'stat-val err';
+  log('[-] Worker spawn error: ' + e.message);
+  workerDone = true;
+  checkAllComplete();
+}
+
+/* ============================================================
+ * STAGE 3: WebSocket Full-Duplex Binary Bridge (:8765)
+ * ============================================================ */
+var wsDone = false;
+try {
+  var wsHost = window.location.hostname || '127.0.0.1';
+  var wsUrl = 'ws://' + wsHost + ':8765';
+  var ws = new WebSocket(wsUrl);
+  ws.binaryType = 'arraybuffer';
+
+  var wsSendTime = 0;
+  var expectedPayload = [];
+
+  ws.onopen = function() {
+    mWsConn.textContent = 'CONNECTED (:8765)';
+    mWsConn.className = 'stat-val ok';
+    log('[+] WebSocket connected to ' + wsUrl);
+    syncBn('WS-CONNECT', 'open=true|host=' + wsHost);
+
+    // Build binary frame: 4 bytes big-endian cmd (1 = Echo), 252 bytes test data
+    var totalLen = 256;
+    var packet = new ArrayBuffer(totalLen);
+    var dv = new DataView(packet);
+    dv.setUint32(0, 1, false); // cmd = 1 (Echo binary)
+
+    var u8 = new Uint8Array(packet, 4);
+    expectedPayload = [];
+    for (var b = 0; b < 252; b++) {
+      var byteVal = (0xA0 + (b % 64)) & 0xFF;
+      u8[b] = byteVal;
+      expectedPayload.push(byteVal);
+    }
+
+    wsSendTime = performance.now();
+    ws.send(packet);
+    log('[+] Sent 256-byte binary echo request (cmd=1)');
+  };
+
+  ws.onmessage = function(e) {
+    var wsRtt = (performance.now() - wsSendTime).toFixed(1);
+    mWsLat.textContent = wsRtt + ' ms';
+    mWsLat.className = 'stat-val ok';
+
+    var recvData = e.data;
+    var recvLen = (recvData && recvData.byteLength) ? recvData.byteLength : (typeof recvData === 'string' ? recvData.length : 0);
+    mWsEcho.textContent = 'ECHO RECV (' + recvLen + 'B)';
+    mWsEcho.className = 'stat-val ok';
+
+    var match = false;
+    if (recvData instanceof ArrayBuffer && recvData.byteLength === 252) {
+      var recvU8 = new Uint8Array(recvData);
+      var allMatch = true;
+      for (var k = 0; k < 252; k++) {
+        if (recvU8[k] !== expectedPayload[k]) { allMatch = false; break; }
+      }
+      match = allMatch;
+    }
+
+    mWsIntact.textContent = match ? '100% MATCH' : 'MISMATCH (' + recvLen + 'B)';
+    mWsIntact.className = 'stat-val ' + (match ? 'ok' : 'warn');
+
+    log('[+] WebSocket echo response received: RTT=' + wsRtt + 'ms, match=' + match);
+    syncBn('WS-ECHO', 'rttMs=' + wsRtt + '|len=' + recvLen + '|intact=' + match);
+
+    wsDone = true;
+    ws.close();
+    checkAllComplete();
+  };
+
+  ws.onerror = function(err) {
+    mWsConn.textContent = 'PORT_CLOSED / ERR';
+    mWsConn.className = 'stat-val warn';
+    log('[-] WebSocket error: could not connect to port 8765');
+    syncBn('WS-ERR', 'status=CONN_FAIL');
+    wsDone = true;
+    checkAllComplete();
+  };
+
+  ws.onclose = function() {
+    log('[*] WebSocket closed.');
+    wsDone = true;
+    checkAllComplete();
+  };
+} catch(e) {
+  mWsConn.textContent = 'EXCEPTION (' + e.message + ')';
+  mWsConn.className = 'stat-val err';
+  log('[-] WebSocket exception: ' + e.message);
+  wsDone = true;
+  checkAllComplete();
+}
+
+function checkAllComplete() {
+  if (workerDone && wsDone) {
+    statusBadge.textContent = 'P937 COMPLETE';
+    statusBadge.style.background = '#10b981';
+    log('[*] All P937 diagnostic pipelines successfully executed.');
+    syncBn('DONE', 'status=P937_COMPLETE');
+  }
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,1184 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P1050</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#22c55e}.fail{color:#ef4444}.warn{color:#f59e0b}.info{color:#38bdf8}
+h2{color:#e2e8f0;font-size:13px;margin:8px 0 4px;border-bottom:1px solid #1e2a3a;padding-bottom:2px}
+</style></head><body>
+<div id="hud"><div id="log"></div></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1050-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+var L=document.getElementById('log');
+function log(m,c){var d=document.createElement('div');if(c)d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+
+bn('BOOT','ts='+Date.now().toString(36));
+log('=== P1050: API Stress + structuredClone + Compression ===','info');
+
+var totalAnomalies=0;
+var anomalyItems=[];
+
+// ============================================================
+// PHASE A: structuredClone transfer races + edge cases
+// ============================================================
+function phaseA(){
+  log('');log('--- Phase A: structuredClone Transfer Stress ---','info');
+  var errors=0, anomalies=0, tests=0;
+
+  // A1: Transfer then access (should throw)
+  try{
+    var ab=new ArrayBuffer(1024);
+    var u8=new Uint8Array(ab);
+    for(var i=0;i<1024;i++) u8[i]=i&0xFF;
+    var clone=structuredClone(ab,{transfer:[ab]});
+    tests++;
+    // Original should be detached
+    if(ab.byteLength!==0){anomalies++;anomalyItems.push('A1-notDetached:'+ab.byteLength);log('A1 ANOMALY: transferred AB not detached, len='+ab.byteLength,'fail');}
+    // Clone should have the data
+    var cu8=new Uint8Array(clone);
+    if(cu8[0]!==0||cu8[255]!==255){anomalies++;log('A1 ANOMALY: clone data wrong','fail');}
+    // Try writing to detached original
+    try{
+      var view=new DataView(ab);
+      view.setUint32(0,0xDEADBEEF);
+      anomalies++;anomalyItems.push('A1-writeDetached');
+      log('A1 ANOMALY: wrote to detached AB!','fail');
+    }catch(e){/* expected */}
+  }catch(e){errors++;}
+
+  // A2: Rapid transfer chain - clone of clone of clone
+  try{
+    var buf=new ArrayBuffer(4096);
+    new Uint32Array(buf).fill(0x41414141);
+    for(var i=0;i<50;i++){
+      var next=structuredClone(buf,{transfer:[buf]});
+      if(buf.byteLength!==0){anomalies++;anomalyItems.push('A2-chain'+i);log('A2 ANOMALY: chain step '+i+' not detached','fail');}
+      buf=next;
+      tests++;
+    }
+    var final32=new Uint32Array(buf);
+    if(final32[0]!==0x41414141){anomalies++;log('A2 ANOMALY: data corrupted after chain','fail');}
+  }catch(e){errors++;}
+
+  // A3: Clone large + small rapidly (heap stress)
+  try{
+    var sizes=[16,64,256,1024,4096,16384,65536,262144];
+    for(var s=0;s<sizes.length;s++){
+      var big=new ArrayBuffer(sizes[s]);
+      new Uint8Array(big).fill(0xBB);
+      var c=structuredClone(big,{transfer:[big]});
+      var v=new Uint8Array(c);
+      if(v[0]!==0xBB||v[sizes[s]-1]!==0xBB){anomalies++;anomalyItems.push('A3-size'+sizes[s]);log('A3 ANOMALY: data wrong at size '+sizes[s],'fail');}
+      tests++;
+    }
+  }catch(e){errors++;}
+
+  // A4: Transfer same buffer twice (should throw)
+  try{
+    var ab2=new ArrayBuffer(512);
+    try{
+      structuredClone(ab2,{transfer:[ab2,ab2]});
+      anomalies++;anomalyItems.push('A4-doubleTxfr');
+      log('A4 ANOMALY: double transfer succeeded!','fail');
+    }catch(e){/* expected DataCloneError */}
+    tests++;
+  }catch(e){errors++;}
+
+  // A5: Clone objects with circular refs
+  try{
+    var obj={a:new ArrayBuffer(100),b:null};
+    obj.b={parent:obj,data:new Uint8Array([1,2,3,4,5])};
+    var c2=structuredClone(obj);
+    if(c2.b.parent!==c2){anomalies++;anomalyItems.push('A5-circular');log('A5 ANOMALY: circular ref broken','fail');}
+    tests++;
+  }catch(e){errors++;}
+
+  // A6: Transfer ArrayBuffer from TypedArray view
+  try{
+    var ab3=new ArrayBuffer(256);
+    var u32=new Uint32Array(ab3);
+    u32[0]=0xCAFEBABE;
+    var c3=structuredClone(ab3,{transfer:[ab3]});
+    // Original view should be detached
+    try{
+      var v2=u32[0];
+      if(typeof v2==='number'&&u32.buffer.byteLength>0){
+        anomalies++;anomalyItems.push('A6-viewAlive');
+        log('A6 ANOMALY: typed array view still reads after transfer!','fail');
+      }
+    }catch(e){/* expected */}
+    tests++;
+  }catch(e){errors++;}
+
+  // A7: Massive clone with MessageChannel (async, but we make it sync-ish)
+  try{
+    var bigBuf=new ArrayBuffer(1024*1024); // 1MB
+    new Uint32Array(bigBuf).fill(0xDEADC0DE);
+    var c4=structuredClone(bigBuf,{transfer:[bigBuf]});
+    var check=new Uint32Array(c4);
+    if(check[0]!==0xDEADC0DE||check[check.length-1]!==0xDEADC0DE){
+      anomalies++;anomalyItems.push('A7-1MB');log('A7 ANOMALY: 1MB transfer data corrupt','fail');
+    }
+    tests++;
+  }catch(e){errors++;}
+
+  // A8: Clone with BigInt64Array if available
+  try{
+    if(typeof BigInt64Array!=='undefined'){
+      var ab4=new ArrayBuffer(64);
+      var bi=new BigInt64Array(ab4);
+      bi[0]=BigInt('0x4141414141414141');
+      bi[7]=BigInt('0xDEADBEEFCAFEBABE');
+      var c5=structuredClone(ab4,{transfer:[ab4]});
+      var biCheck=new BigInt64Array(c5);
+      if(biCheck[0]!==BigInt('0x4141414141414141')){
+        anomalies++;anomalyItems.push('A8-bigint');log('A8 ANOMALY: BigInt64 data corrupt','fail');
+      }
+      tests++;
+    }
+  }catch(e){errors++;}
+
+  // A9: Transfer detached buffer (should throw)
+  try{
+    var ab5=new ArrayBuffer(64);
+    structuredClone(ab5,{transfer:[ab5]}); // detach it
+    try{
+      structuredClone(ab5,{transfer:[ab5]});
+      anomalies++;anomalyItems.push('A9-reTransfer');
+      log('A9 ANOMALY: re-transfer of detached buffer succeeded!','fail');
+    }catch(e){/* expected */}
+    tests++;
+  }catch(e){errors++;}
+
+  // A10: Check if ArrayBuffer.prototype.resize exists
+  var hasResize=typeof ArrayBuffer.prototype.resize==='function';
+  var hasTransfer=typeof ArrayBuffer.prototype.transfer==='function';
+  log('A10: AB.resize='+hasResize+' AB.transfer='+hasTransfer,'info');
+
+  if(hasResize){
+    try{
+      var rab=new ArrayBuffer(256,{maxByteLength:4096});
+      rab.resize(512);
+      var c6=structuredClone(rab);
+      if(c6.byteLength!==512){anomalies++;anomalyItems.push('A10-resize');log('A10 ANOMALY: resized clone wrong size','fail');}
+      // Resize during clone read — timing attack
+      for(var r=0;r<100;r++){
+        var testBuf=new ArrayBuffer(1024,{maxByteLength:65536});
+        new Uint8Array(testBuf).fill(0xCC);
+        // Resize just before clone to try trigger TOCTOU
+        testBuf.resize(64);
+        var c7=structuredClone(testBuf);
+        if(c7.byteLength!==64){anomalies++;anomalyItems.push('A10-toctou'+r);}
+        testBuf.resize(8192);
+        var c8=structuredClone(testBuf);
+        if(c8.byteLength!==8192){anomalies++;anomalyItems.push('A10-grow'+r);}
+        tests++;
+      }
+    }catch(e){errors++;}
+  }
+
+  log('Phase A: tests='+tests+' errors='+errors+' anomalies='+anomalies+(hasResize?' (RESIZE AVAILABLE!)':''),'ok');
+  bn('A-CLONE','tests='+tests+'|errors='+errors+'|anomalies='+anomalies+'|resize='+hasResize+'|transfer='+hasTransfer);
+  totalAnomalies+=anomalies;
+  return anomalies;
+}
+
+// ============================================================
+// PHASE B: CompressionStream / DecompressionStream fuzzing
+// ============================================================
+function phaseB(){
+  log('');log('--- Phase B: CompressionStream Fuzzing ---','info');
+  var errors=0, anomalies=0, tests=0;
+  var results=[];
+
+  if(typeof CompressionStream==='undefined'){
+    log('CompressionStream not available','warn');
+    bn('B-COMPRESS','unavailable');
+    return 0;
+  }
+
+  // Helper: compress then decompress and verify
+  function roundTrip(data,format,label){
+    return new Promise(function(resolve){
+      try{
+        var cs=new CompressionStream(format);
+        var ds=new DecompressionStream(format);
+
+        // Pipe data through compression
+        var writer=cs.writable.getWriter();
+        var reader=cs.readable.getReader();
+
+        var compressed=[];
+        function readCompressed(){
+          return reader.read().then(function(r){
+            if(r.done) return;
+            compressed.push(new Uint8Array(r.value));
+            return readCompressed();
+          });
+        }
+
+        writer.write(data);
+        writer.close();
+
+        readCompressed().then(function(){
+          // Now decompress
+          var dWriter=ds.writable.getWriter();
+          var dReader=ds.readable.getReader();
+          var decompressed=[];
+
+          function readDecomp(){
+            return dReader.read().then(function(r){
+              if(r.done) return;
+              decompressed.push(new Uint8Array(r.value));
+              return readDecomp();
+            });
+          }
+
+          for(var i=0;i<compressed.length;i++){
+            dWriter.write(compressed[i]);
+          }
+          dWriter.close();
+
+          return readDecomp().then(function(){
+            // Verify
+            var totalLen=0;
+            for(var i=0;i<decompressed.length;i++) totalLen+=decompressed[i].length;
+            var result=new Uint8Array(totalLen);
+            var off=0;
+            for(var i=0;i<decompressed.length;i++){
+              result.set(decompressed[i],off);
+              off+=decompressed[i].length;
+            }
+
+            tests++;
+            if(result.length!==data.length){
+              anomalies++;anomalyItems.push('B-'+label+'-len');
+              log('B ANOMALY '+label+': length mismatch in='+data.length+' out='+result.length,'fail');
+            }else{
+              var match=true;
+              for(var i=0;i<data.length;i++){
+                if(result[i]!==data[i]){match=false;break;}
+              }
+              if(!match){
+                anomalies++;anomalyItems.push('B-'+label+'-data');
+                log('B ANOMALY '+label+': data mismatch at byte '+i,'fail');
+              }
+            }
+            results.push(label+':ok('+totalLen+')');
+            resolve();
+          });
+        }).catch(function(e){
+          errors++;
+          results.push(label+':err('+e.message+')');
+          resolve();
+        });
+      }catch(e){
+        errors++;
+        results.push(label+':exn('+e.message+')');
+        resolve();
+      }
+    });
+  }
+
+  // Test patterns
+  var testData=[];
+
+  // B1: Empty data
+  testData.push({data:new Uint8Array(0),label:'empty'});
+
+  // B2: Single byte
+  testData.push({data:new Uint8Array([0x42]),label:'1byte'});
+
+  // B3: Highly compressible (all zeros)
+  var zeros=new Uint8Array(65536);
+  testData.push({data:zeros,label:'64K-zeros'});
+
+  // B4: Random-like data (incompressible)
+  var rand=new Uint8Array(16384);
+  for(var i=0;i<rand.length;i++) rand[i]=(i*7+13)&0xFF;
+  testData.push({data:rand,label:'16K-pseudo'});
+
+  // B5: Repeated pattern (high compression ratio)
+  var pattern=new Uint8Array(131072);
+  for(var i=0;i<pattern.length;i++) pattern[i]=i%4;
+  testData.push({data:pattern,label:'128K-pattern'});
+
+  // B6: All 0xFF
+  var ff=new Uint8Array(32768);
+  ff.fill(0xFF);
+  testData.push({data:ff,label:'32K-FF'});
+
+  // B7: Alternating (pathological for some compressors)
+  var alt=new Uint8Array(65536);
+  for(var i=0;i<alt.length;i++) alt[i]=i%2?0xFF:0x00;
+  testData.push({data:alt,label:'64K-alt'});
+
+  // B8: Large buffer (1MB)
+  var big=new Uint8Array(1024*1024);
+  for(var i=0;i<big.length;i++) big[i]=i&0xFF;
+  testData.push({data:big,label:'1MB-ramp'});
+
+  // Run all tests for each compression format
+  var formats=['gzip','deflate','deflate-raw'];
+  var allTests=[];
+
+  for(var f=0;f<formats.length;f++){
+    for(var t=0;t<testData.length;t++){
+      allTests.push({data:testData[t].data,format:formats[f],label:formats[f]+'-'+testData[t].label});
+    }
+  }
+
+  // Sequential execution
+  var idx=0;
+  function runNext(){
+    if(idx>=allTests.length){
+      log('Phase B: tests='+tests+' errors='+errors+' anomalies='+anomalies,'ok');
+      bn('B-COMPRESS','tests='+tests+'|errors='+errors+'|anomalies='+anomalies+'|results='+results.join(';'));
+      totalAnomalies+=anomalies;
+      return Promise.resolve(anomalies);
+    }
+    var t=allTests[idx++];
+    return roundTrip(t.data,t.format,t.label).then(runNext);
+  }
+
+  return runNext();
+}
+
+// ============================================================
+// PHASE C: Cache API stress
+// ============================================================
+function phaseC(){
+  log('');log('--- Phase C: Cache API Stress ---','info');
+  var errors=0, anomalies=0, tests=0;
+
+  if(typeof caches==='undefined'){
+    log('Cache API not available','warn');
+    bn('C-CACHE','unavailable');
+    return Promise.resolve(0);
+  }
+
+  return caches.open('p1050-stress').then(function(cache){
+    // C1: Rapid put/match/delete cycle
+    var promises=[];
+    for(var i=0;i<100;i++){
+      (function(idx){
+        var url='/test-cache-'+idx+'?v='+Date.now();
+        var body='data-'+idx+'-'+Math.random();
+        promises.push(
+          cache.put(new Request(url),new Response(body)).then(function(){
+            return cache.match(new Request(url));
+          }).then(function(resp){
+            if(!resp){anomalies++;anomalyItems.push('C1-miss'+idx);return;}
+            return resp.text().then(function(t){
+              tests++;
+              if(t!==body){anomalies++;anomalyItems.push('C1-data'+idx);log('C1 ANOMALY: cache data mismatch at '+idx,'fail');}
+            });
+          }).then(function(){
+            return cache.delete(new Request(url));
+          }).then(function(deleted){
+            if(!deleted){anomalies++;anomalyItems.push('C1-nodel'+idx);}
+          }).catch(function(e){errors++;})
+        );
+      })(i);
+    }
+
+    return Promise.all(promises).then(function(){
+      // C2: Put same key rapidly (overwrite race)
+      var raceKey='/race-key-'+Date.now();
+      var racePromises=[];
+      for(var j=0;j<50;j++){
+        racePromises.push(cache.put(new Request(raceKey),new Response('version-'+j)));
+      }
+      return Promise.all(racePromises).then(function(){
+        return cache.match(new Request(raceKey));
+      }).then(function(resp){
+        tests++;
+        if(!resp){anomalies++;anomalyItems.push('C2-noResp');return;}
+        return resp.text().then(function(t){
+          // Should be one of the versions
+          if(!t.startsWith('version-')){anomalies++;anomalyItems.push('C2-corrupt');log('C2 ANOMALY: race data corrupt: '+t,'fail');}
+        });
+      });
+    }).then(function(){
+      // C3: Large responses
+      var bigData=new ArrayBuffer(512*1024);
+      new Uint8Array(bigData).fill(0xAA);
+      return cache.put(new Request('/big-'+Date.now()),new Response(bigData)).then(function(){
+        tests++;
+      });
+    }).then(function(){
+      // C4: Delete non-existent
+      return cache.delete(new Request('/nonexistent-'+Date.now())).then(function(d){
+        tests++;
+        if(d){anomalies++;anomalyItems.push('C4-phantom');log('C4 ANOMALY: deleted nonexistent!','fail');}
+      });
+    }).then(function(){
+      // Cleanup
+      return caches.delete('p1050-stress');
+    }).then(function(){
+      log('Phase C: tests='+tests+' errors='+errors+' anomalies='+anomalies,'ok');
+      bn('C-CACHE','tests='+tests+'|errors='+errors+'|anomalies='+anomalies);
+      totalAnomalies+=anomalies;
+      return anomalies;
+    });
+  }).catch(function(e){
+    errors++;
+    log('Phase C error: '+e.message,'fail');
+    bn('C-CACHE','error='+e.message);
+    return 0;
+  });
+}
+
+// ============================================================
+// PHASE D: CSS @container deep edge cases
+// ============================================================
+function phaseD(){
+  log('');log('--- Phase D: CSS @container / @layer Deep ---','info');
+  var errors=0, anomalies=0, tests=0;
+  var details=[];
+
+  // D1: Deeply nested @container queries
+  try{
+    var div=document.createElement('div');
+    div.style.cssText='container-type:inline-size;width:500px;position:absolute;left:-9999px';
+    document.body.appendChild(div);
+
+    var depth=20;
+    var inner=div;
+    for(var i=0;i<depth;i++){
+      var child=document.createElement('div');
+      child.style.cssText='container-type:inline-size;width:'+(500-i*20)+'px';
+      inner.appendChild(child);
+      inner=child;
+    }
+
+    var target=document.createElement('div');
+    target.className='deep-target';
+    target.textContent='X';
+    inner.appendChild(target);
+
+    var style=document.createElement('style');
+    var css='';
+    for(var i=0;i<depth;i++){
+      css+='@container (min-width:'+(500-i*20-10)+'px){';
+    }
+    css+='.deep-target{color:rgb(0,255,0)}';
+    for(var i=0;i<depth;i++) css+='}';
+    style.textContent=css;
+    document.head.appendChild(style);
+
+    // Force layout
+    void target.offsetHeight;
+    var color=getComputedStyle(target).color;
+    tests++;
+    details.push('nested'+depth+'='+color);
+    if(color!=='rgb(0, 255, 0)'){anomalies++;anomalyItems.push('D1-nested');log('D1: deep nested @container failed: '+color,'warn');}
+
+    document.body.removeChild(div);
+    document.head.removeChild(style);
+  }catch(e){errors++;}
+
+  // D2: @container + @layer interaction
+  try{
+    var div2=document.createElement('div');
+    div2.style.cssText='container-type:inline-size;width:400px;position:absolute;left:-9999px';
+    var span=document.createElement('span');
+    span.className='layer-test';
+    span.textContent='Y';
+    div2.appendChild(span);
+    document.body.appendChild(div2);
+
+    var style2=document.createElement('style');
+    style2.textContent=[
+      '@layer base, override;',
+      '@layer base { @container (min-width:300px) { .layer-test { color: rgb(255,0,0) } } }',
+      '@layer override { @container (min-width:300px) { .layer-test { color: rgb(0,0,255) } } }'
+    ].join('\n');
+    document.head.appendChild(style2);
+
+    void span.offsetHeight;
+    var c2=getComputedStyle(span).color;
+    tests++;
+    details.push('layer-container='+c2);
+    if(c2!=='rgb(0, 0, 255)'){anomalies++;anomalyItems.push('D2-layer');log('D2: @layer+@container priority wrong: '+c2,'warn');}
+
+    document.body.removeChild(div2);
+    document.head.removeChild(style2);
+  }catch(e){errors++;}
+
+  // D3: @container with rapid size changes
+  try{
+    var box=document.createElement('div');
+    box.style.cssText='container-type:inline-size;width:100px;position:absolute;left:-9999px';
+    var inner3=document.createElement('div');
+    inner3.className='resize-target';
+    inner3.textContent='Z';
+    box.appendChild(inner3);
+    document.body.appendChild(box);
+
+    var style3=document.createElement('style');
+    style3.textContent='@container (min-width:200px){.resize-target{color:rgb(255,0,255)}}@container (max-width:150px){.resize-target{color:rgb(0,255,255)}}';
+    document.head.appendChild(style3);
+
+    var mismatch=0;
+    for(var r=0;r<200;r++){
+      box.style.width=(50+Math.floor(Math.random()*400))+'px';
+      void inner3.offsetHeight; // force sync layout
+      var w=parseInt(box.style.width);
+      var c3=getComputedStyle(inner3).color;
+      if(w>=200&&c3!=='rgb(255, 0, 255)') mismatch++;
+      if(w<=150&&c3!=='rgb(0, 255, 255)') mismatch++;
+    }
+    tests++;
+    if(mismatch>0){anomalies++;anomalyItems.push('D3-resize:'+mismatch);log('D3: container resize mismatches: '+mismatch,'warn');}
+    details.push('resize-mismatch='+mismatch);
+
+    document.body.removeChild(box);
+    document.head.removeChild(style3);
+  }catch(e){errors++;}
+
+  // D4: CSS nesting with complex selectors
+  try{
+    var ndiv=document.createElement('div');
+    ndiv.className='nest-root';
+    ndiv.innerHTML='<div class="a"><div class="b"><span class="c">T</span></div></div>';
+    ndiv.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(ndiv);
+
+    var nstyle=document.createElement('style');
+    nstyle.textContent='.nest-root{color:red;& .a{color:blue;& .b{color:green;& .c{color:rgb(128,0,128)}}}}';
+    document.head.appendChild(nstyle);
+
+    void ndiv.offsetHeight;
+    var cSpan=ndiv.querySelector('.c');
+    var nc=getComputedStyle(cSpan).color;
+    tests++;
+    details.push('nesting='+nc);
+    if(nc!=='rgb(128, 0, 128)'){log('D4: nesting selector wrong: '+nc,'warn');}
+
+    document.body.removeChild(ndiv);
+    document.head.removeChild(nstyle);
+  }catch(e){errors++;}
+
+  // D5: @container with dynamic DOM mutations
+  try{
+    var mutBox=document.createElement('div');
+    mutBox.style.cssText='container-type:inline-size;width:300px;position:absolute;left:-9999px';
+    document.body.appendChild(mutBox);
+
+    var mutStyle=document.createElement('style');
+    mutStyle.textContent='@container (min-width:250px){.mut-target{background-color:rgb(255,128,0)}}';
+    document.head.appendChild(mutStyle);
+
+    var crashCount=0;
+    for(var m=0;m<100;m++){
+      var child=document.createElement('div');
+      child.className='mut-target';
+      child.textContent='M'+m;
+      mutBox.appendChild(child);
+      void child.offsetHeight;
+      var bg=getComputedStyle(child).backgroundColor;
+      mutBox.removeChild(child);
+      // Immediately re-add and query
+      mutBox.appendChild(child);
+      void child.offsetHeight;
+      try{
+        var bg2=getComputedStyle(child).backgroundColor;
+      }catch(e){crashCount++;}
+      mutBox.removeChild(child);
+    }
+    tests++;
+    if(crashCount>0){anomalies++;anomalyItems.push('D5-crash:'+crashCount);log('D5: DOM mutation crashes: '+crashCount,'fail');}
+    details.push('mut-crashes='+crashCount);
+
+    document.body.removeChild(mutBox);
+    document.head.removeChild(mutStyle);
+  }catch(e){errors++;}
+
+  log('Phase D: tests='+tests+' errors='+errors+' anomalies='+anomalies,'ok');
+  bn('D-CSSCONT','tests='+tests+'|errors='+errors+'|anomalies='+anomalies+'|'+details.join('|'));
+  totalAnomalies+=anomalies;
+  return anomalies;
+}
+
+// ============================================================
+// PHASE E: TextDecoder/TextEncoder edge cases
+// ============================================================
+function phaseE(){
+  log('');log('--- Phase E: TextDecoder/Encoder Edge Cases ---','info');
+  var errors=0, anomalies=0, tests=0;
+  var details=[];
+
+  // E1: Malformed UTF-8 sequences
+  var malformed=[
+    {name:'overlong-2',bytes:[0xC0,0xAF]},           // overlong encoding of '/'
+    {name:'overlong-3',bytes:[0xE0,0x80,0xAF]},       // overlong 3-byte
+    {name:'overlong-4',bytes:[0xF0,0x80,0x80,0xAF]},  // overlong 4-byte
+    {name:'surrogateHi',bytes:[0xED,0xA0,0x80]},      // U+D800 surrogate
+    {name:'surrogateLo',bytes:[0xED,0xBF,0xBF]},      // U+DFFF surrogate
+    {name:'5byte',bytes:[0xF8,0x80,0x80,0x80,0xAF]},  // 5-byte (invalid UTF-8)
+    {name:'6byte',bytes:[0xFC,0x80,0x80,0x80,0x80,0xAF]}, // 6-byte (invalid)
+    {name:'truncated-2',bytes:[0xC2]},                 // truncated 2-byte
+    {name:'truncated-3',bytes:[0xE2,0x82]},            // truncated 3-byte
+    {name:'truncated-4',bytes:[0xF0,0x9F]},            // truncated 4-byte
+    {name:'FE',bytes:[0xFE]},                          // never valid
+    {name:'FF',bytes:[0xFF]},                          // never valid
+    {name:'maxCodepoint',bytes:[0xF4,0x8F,0xBF,0xBF]},// U+10FFFF (valid!)
+    {name:'tooHigh',bytes:[0xF4,0x90,0x80,0x80]},     // U+110000 (invalid)
+  ];
+
+  // Non-fatal mode (replacement chars)
+  var dec=new TextDecoder('utf-8',{fatal:false});
+  for(var i=0;i<malformed.length;i++){
+    try{
+      var input=new Uint8Array(malformed[i].bytes);
+      var result=dec.decode(input);
+      tests++;
+      // Should contain replacement character(s) for invalid, or actual char for valid
+      if(malformed[i].name==='maxCodepoint'){
+        if(result.length!==2){details.push(malformed[i].name+':len'+result.length);}// surrogate pair
+      }
+    }catch(e){
+      anomalies++;anomalyItems.push('E1-'+malformed[i].name);
+      log('E1 ANOMALY: non-fatal decoder threw on '+malformed[i].name+': '+e.message,'fail');
+    }
+  }
+
+  // Fatal mode (should throw on invalid)
+  var fatalDec=new TextDecoder('utf-8',{fatal:true});
+  for(var i=0;i<malformed.length;i++){
+    if(malformed[i].name==='maxCodepoint') continue; // valid, skip
+    try{
+      var input=new Uint8Array(malformed[i].bytes);
+      fatalDec.decode(input);
+      // Should have thrown!
+      anomalies++;anomalyItems.push('E2-'+malformed[i].name);
+      log('E2 ANOMALY: fatal decoder accepted '+malformed[i].name,'fail');
+    }catch(e){
+      tests++; // expected
+    }
+  }
+
+  // E3: TextDecoderStream with chunked malformed data
+  if(typeof TextDecoderStream!=='undefined'){
+    try{
+      var tds=new TextDecoderStream('utf-8',{fatal:false});
+      var writer=tds.writable.getWriter();
+      var reader=tds.readable.getReader();
+      var output='';
+
+      // Write a multi-byte char split across chunks
+      writer.write(new Uint8Array([0xF0,0x9F])); // first 2 bytes of emoji
+      writer.write(new Uint8Array([0x98,0x80])); // last 2 bytes
+      writer.close();
+
+      function readAll(){
+        return reader.read().then(function(r){
+          if(r.done) return;
+          output+=r.value;
+          return readAll();
+        });
+      }
+
+      // Sync wait via polling isn't possible, just note it
+      tests++;
+      details.push('TDS=available');
+    }catch(e){errors++;}
+  }
+
+  // E4: TextEncoder round-trip with edge cases
+  var enc=new TextEncoder();
+  var edgeCases=[
+    '\u0000',           // null char
+    '�',           // replacement char
+    '﻿',           // BOM
+    '\uD800',           // lone high surrogate (should become replacement)
+    '􏿿',     // max surrogate pair = U+10FFFF
+    'A'.repeat(100000), // 100K ASCII
+  ];
+
+  for(var i=0;i<edgeCases.length;i++){
+    try{
+      var encoded=enc.encode(edgeCases[i]);
+      var decoded=dec.decode(encoded);
+      tests++;
+      // Lone surrogate gets replaced, others should round-trip
+      if(i!==3&&decoded!==edgeCases[i]){
+        anomalies++;anomalyItems.push('E4-rt'+i);
+        log('E4 ANOMALY: round-trip mismatch for case '+i,'fail');
+      }
+    }catch(e){errors++;}
+  }
+
+  log('Phase E: tests='+tests+' errors='+errors+' anomalies='+anomalies,'ok');
+  bn('E-TEXTDEC','tests='+tests+'|errors='+errors+'|anomalies='+anomalies+'|'+details.join('|'));
+  totalAnomalies+=anomalies;
+  return anomalies;
+}
+
+// ============================================================
+// PHASE F: ReadableStream/WritableStream stress + backpressure
+// ============================================================
+function phaseF(){
+  log('');log('--- Phase F: Streams API Stress ---','info');
+  var errors=0, anomalies=0, tests=0;
+  var details=[];
+
+  if(typeof ReadableStream==='undefined'){
+    log('ReadableStream not available','warn');
+    bn('F-STREAMS','unavailable');
+    return Promise.resolve(0);
+  }
+
+  // F1: ReadableStream with rapid enqueue/close
+  function testRapidEnqueue(){
+    return new Promise(function(resolve){
+      var count=0;
+      var stream=new ReadableStream({
+        start:function(ctrl){
+          for(var i=0;i<1000;i++){
+            ctrl.enqueue(new Uint8Array([i&0xFF]));
+            count++;
+          }
+          ctrl.close();
+        }
+      });
+
+      var reader=stream.getReader();
+      var received=0;
+      function pump(){
+        return reader.read().then(function(r){
+          if(r.done){
+            tests++;
+            if(received!==1000){anomalies++;anomalyItems.push('F1-count:'+received);log('F1 ANOMALY: expected 1000, got '+received,'fail');}
+            details.push('rapid='+received);
+            resolve();
+            return;
+          }
+          received++;
+          return pump();
+        });
+      }
+      pump().catch(function(e){errors++;resolve();});
+    });
+  }
+
+  // F2: WritableStream backpressure test
+  function testBackpressure(){
+    return new Promise(function(resolve){
+      var written=0;
+      var ws=new WritableStream({
+        write:function(chunk){
+          written++;
+          // Simulate slow consumer
+          return new Promise(function(r){setTimeout(r,1);});
+        },
+        close:function(){
+          tests++;
+          details.push('backpressure='+written);
+          resolve();
+        }
+      });
+
+      var writer=ws.getWriter();
+      var chain=Promise.resolve();
+      for(var i=0;i<100;i++){
+        (function(idx){
+          chain=chain.then(function(){
+            return writer.write(new Uint8Array([idx]));
+          });
+        })(i);
+      }
+      chain.then(function(){return writer.close();}).catch(function(e){errors++;resolve();});
+    });
+  }
+
+  // F3: ReadableStream tee
+  function testTee(){
+    return new Promise(function(resolve){
+      var data=[];
+      for(var i=0;i<50;i++) data.push(i);
+      var idx=0;
+      var stream=new ReadableStream({
+        pull:function(ctrl){
+          if(idx>=data.length){ctrl.close();return;}
+          ctrl.enqueue(data[idx++]);
+        }
+      });
+
+      var branches=stream.tee();
+      var r1=branches[0].getReader();
+      var r2=branches[1].getReader();
+      var out1=[],out2=[];
+
+      function read1(){return r1.read().then(function(r){if(!r.done){out1.push(r.value);return read1();}});}
+      function read2(){return r2.read().then(function(r){if(!r.done){out2.push(r.value);return read2();}});}
+
+      Promise.all([read1(),read2()]).then(function(){
+        tests++;
+        if(out1.length!==50||out2.length!==50){
+          anomalies++;anomalyItems.push('F3-tee');
+          log('F3 ANOMALY: tee mismatch: '+out1.length+'/'+out2.length,'fail');
+        }
+        var dataMatch=true;
+        for(var i=0;i<50;i++){
+          if(out1[i]!==out2[i]||out1[i]!==i){dataMatch=false;break;}
+        }
+        if(!dataMatch){anomalies++;anomalyItems.push('F3-data');log('F3 ANOMALY: tee data mismatch','fail');}
+        details.push('tee='+out1.length+'/'+out2.length);
+        resolve();
+      }).catch(function(e){errors++;resolve();});
+    });
+  }
+
+  // F4: Cancel during read
+  function testCancel(){
+    return new Promise(function(resolve){
+      var cancelled=false;
+      var stream=new ReadableStream({
+        pull:function(ctrl){
+          ctrl.enqueue(new Uint8Array(1024));
+        },
+        cancel:function(reason){
+          cancelled=true;
+        }
+      });
+
+      var reader=stream.getReader();
+      var readCount=0;
+      function pump(){
+        return reader.read().then(function(r){
+          readCount++;
+          if(readCount>=10){
+            return reader.cancel('test').then(function(){
+              tests++;
+              if(!cancelled){anomalies++;anomalyItems.push('F4-noCancel');log('F4 ANOMALY: cancel not called','fail');}
+              details.push('cancel-after='+readCount);
+              resolve();
+            });
+          }
+          return pump();
+        });
+      }
+      pump().catch(function(e){errors++;resolve();});
+    });
+  }
+
+  // F5: pipeTo with transform
+  function testPipeTransform(){
+    return new Promise(function(resolve){
+      var source=new ReadableStream({
+        start:function(ctrl){
+          for(var i=0;i<20;i++) ctrl.enqueue(i);
+          ctrl.close();
+        }
+      });
+
+      var transform=new TransformStream({
+        transform:function(chunk,ctrl){
+          ctrl.enqueue(chunk*2);
+        }
+      });
+
+      var collected=[];
+      var sink=new WritableStream({
+        write:function(chunk){collected.push(chunk);},
+        close:function(){
+          tests++;
+          if(collected.length!==20){anomalies++;anomalyItems.push('F5-len');}
+          var ok=true;
+          for(var i=0;i<20;i++){if(collected[i]!==i*2){ok=false;break;}}
+          if(!ok){anomalies++;anomalyItems.push('F5-data');log('F5 ANOMALY: transform data wrong','fail');}
+          details.push('pipe='+collected.length);
+          resolve();
+        }
+      });
+
+      source.pipeThrough(transform).pipeTo(sink).catch(function(e){errors++;resolve();});
+    });
+  }
+
+  return testRapidEnqueue()
+    .then(testBackpressure)
+    .then(testTee)
+    .then(testCancel)
+    .then(testPipeTransform)
+    .then(function(){
+      log('Phase F: tests='+tests+' errors='+errors+' anomalies='+anomalies,'ok');
+      bn('F-STREAMS','tests='+tests+'|errors='+errors+'|anomalies='+anomalies+'|'+details.join('|'));
+      totalAnomalies+=anomalies;
+      return anomalies;
+    });
+}
+
+// ============================================================
+// PHASE G: BroadcastChannel + PerformanceObserver
+// ============================================================
+function phaseG(){
+  log('');log('--- Phase G: BroadcastChannel + PerfObserver ---','info');
+  var errors=0, anomalies=0, tests=0;
+  var details=[];
+
+  // G1: BroadcastChannel self-messaging
+  if(typeof BroadcastChannel!=='undefined'){
+    try{
+      var bc=new BroadcastChannel('p1050-test');
+      var received=[];
+      bc.onmessage=function(e){received.push(e.data);};
+
+      // Post messages rapidly
+      for(var i=0;i<50;i++){
+        bc.postMessage({idx:i,payload:'test-'+i});
+      }
+
+      // Check after microtask
+      setTimeout(function(){}, 0);
+      tests++;
+      details.push('bc-sent=50,recv='+received.length);
+      bc.close();
+    }catch(e){errors++;}
+
+    // G2: BroadcastChannel with transferable-like objects
+    try{
+      var bc2=new BroadcastChannel('p1050-big');
+      var bigMsg={data:new Array(10000).fill('x').join('')};
+      bc2.postMessage(bigMsg);
+      tests++;
+      bc2.close();
+    }catch(e){errors++;}
+
+    // G3: Rapid open/close
+    try{
+      for(var i=0;i<100;i++){
+        var bc3=new BroadcastChannel('p1050-rapid-'+i);
+        bc3.postMessage('ping');
+        bc3.close();
+      }
+      tests++;
+      details.push('rapid-bc=100');
+    }catch(e){errors++;}
+  }else{
+    details.push('bc=unavail');
+  }
+
+  // G4: PerformanceObserver
+  if(typeof PerformanceObserver!=='undefined'){
+    try{
+      var entries=[];
+      var obs=new PerformanceObserver(function(list){
+        var items=list.getEntries();
+        for(var i=0;i<items.length;i++){
+          entries.push({name:items[i].name,type:items[i].entryType,dur:items[i].duration,start:items[i].startTime});
+        }
+      });
+
+      // Try different entry types
+      var types=['mark','measure','resource','longtask','paint','largest-contentful-paint','first-input','layout-shift'];
+      var supported=[];
+      for(var t=0;t<types.length;t++){
+        try{
+          obs.observe({type:types[t],buffered:true});
+          supported.push(types[t]);
+        }catch(e){}
+      }
+
+      // Create some marks/measures
+      performance.mark('p1050-start');
+      performance.mark('p1050-end');
+      try{performance.measure('p1050-measure','p1050-start','p1050-end');}catch(e){}
+
+      tests++;
+      details.push('perf-types='+supported.join(','));
+      details.push('perf-entries='+entries.length);
+
+      obs.disconnect();
+
+      // Check resource timing for info leaks
+      var resources=performance.getEntriesByType('resource');
+      var hasKernelLeak=false;
+      for(var r=0;r<resources.length;r++){
+        // Check if any timing values are suspiciously precise (sub-ms despite 1ms timer)
+        if(resources[r].duration%1!==0){
+          hasKernelLeak=true;
+          details.push('precise-timing:'+resources[r].name+'='+resources[r].duration);
+        }
+      }
+      if(hasKernelLeak){
+        anomalies++;anomalyItems.push('G4-precise');
+        log('G4 ANOMALY: sub-ms precision in resource timing!','fail');
+      }
+    }catch(e){errors++;}
+  }else{
+    details.push('perfobs=unavail');
+  }
+
+  log('Phase G: tests='+tests+' errors='+errors+' anomalies='+anomalies,'ok');
+  bn('G-BCPERF','tests='+tests+'|errors='+errors+'|anomalies='+anomalies+'|'+details.join('|'));
+  totalAnomalies+=anomalies;
+  return anomalies;
+}
+
+// ============================================================
+// PHASE H: Fetch + AbortController races
+// ============================================================
+function phaseH(){
+  log('');log('--- Phase H: Fetch + Abort Races ---','info');
+  var errors=0, anomalies=0, tests=0;
+  var details=[];
+
+  if(typeof AbortController==='undefined'||typeof fetch==='undefined'){
+    log('Fetch/AbortController not available','warn');
+    bn('H-FETCH','unavailable');
+    return Promise.resolve(0);
+  }
+
+  // H1: Abort before fetch completes
+  function testAbortBefore(){
+    return new Promise(function(resolve){
+      var ac=new AbortController();
+      ac.abort(); // abort immediately
+      fetch('/beacon.php?tag=P1050-FETCHTEST&data=abort-test&t='+Date.now(),{signal:ac.signal}).then(function(){
+        anomalies++;anomalyItems.push('H1-noAbort');
+        log('H1 ANOMALY: fetch succeeded despite pre-abort','fail');
+        tests++;
+        resolve();
+      }).catch(function(e){
+        tests++;
+        if(e.name!=='AbortError'){
+          details.push('abort-err='+e.name);
+        }
+        resolve();
+      });
+    });
+  }
+
+  // H2: Abort during body read
+  function testAbortDuring(){
+    return new Promise(function(resolve){
+      var ac=new AbortController();
+      fetch('/reload.txt?t='+Date.now(),{signal:ac.signal}).then(function(resp){
+        // Abort while reading body
+        ac.abort();
+        return resp.text();
+      }).then(function(t){
+        tests++;
+        details.push('abort-during=got-text');
+        resolve();
+      }).catch(function(e){
+        tests++;
+        details.push('abort-during='+e.name);
+        resolve();
+      });
+    });
+  }
+
+  // H3: Multiple fetches with shared AbortController
+  function testSharedAbort(){
+    return new Promise(function(resolve){
+      var ac=new AbortController();
+      var promises=[];
+      for(var i=0;i<10;i++){
+        promises.push(
+          fetch('/beacon.php?tag=P1050-MULTI&data=req-'+i+'&t='+Date.now(),{signal:ac.signal})
+            .then(function(){return 'ok';})
+            .catch(function(e){return e.name;})
+        );
+      }
+      // Abort after a tick
+      setTimeout(function(){ac.abort();},0);
+
+      Promise.all(promises).then(function(results){
+        tests++;
+        var aborted=results.filter(function(r){return r==='AbortError';}).length;
+        details.push('shared-abort='+aborted+'/10');
+        resolve();
+      });
+    });
+  }
+
+  // H4: Fetch with ReadableStream body
+  function testStreamBody(){
+    return new Promise(function(resolve){
+      try{
+        var stream=new ReadableStream({
+          start:function(ctrl){
+            ctrl.enqueue(new TextEncoder().encode('hello'));
+            ctrl.close();
+          }
+        });
+
+        // Try POST with stream body (may not be supported)
+        fetch('/beacon.php?tag=P1050-STREAMBODY&t='+Date.now(),{
+          method:'POST',
+          body:stream,
+          duplex:'half'
+        }).then(function(resp){
+          tests++;
+          details.push('stream-body='+resp.status);
+          resolve();
+        }).catch(function(e){
+          tests++;
+          details.push('stream-body=err:'+e.message.slice(0,50));
+          resolve();
+        });
+      }catch(e){
+        errors++;
+        details.push('stream-body=exn');
+        resolve();
+      }
+    });
+  }
+
+  return testAbortBefore()
+    .then(testAbortDuring)
+    .then(testSharedAbort)
+    .then(testStreamBody)
+    .then(function(){
+      log('Phase H: tests='+tests+' errors='+errors+' anomalies='+anomalies,'ok');
+      bn('H-FETCH','tests='+tests+'|errors='+errors+'|anomalies='+anomalies+'|'+details.join('|'));
+      totalAnomalies+=anomalies;
+      return anomalies;
+    });
+}
+
+// ============================================================
+// Run all phases
+// ============================================================
+setTimeout(function(){
+  try{
+    // Sync phases first
+    phaseA();
+    phaseD();
+    phaseE();
+    phaseG();
+
+    // Async phases
+    phaseB().then(function(){
+      return phaseC();
+    }).then(function(){
+      return phaseF();
+    }).then(function(){
+      return phaseH();
+    }).then(function(){
+      log('');
+      log('=== P1050 COMPLETE: total anomalies = '+totalAnomalies+' ===',totalAnomalies>0?'fail':'ok');
+      if(anomalyItems.length>0) log('Items: '+anomalyItems.join(', '),'warn');
+      bn('DONE','anomalies='+totalAnomalies+'|items='+anomalyItems.join(';'));
+    }).catch(function(e){
+      log('FATAL: '+e.message,'fail');
+      bn('FATAL',e.message);
+    });
+  }catch(e){
+    log('TOP FATAL: '+e.message,'fail');
+    bn('FATAL','top:'+e.message);
+  }
+},200);
+</script></body></html>

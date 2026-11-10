@@ -11,17 +11,24 @@
 ## DEPLOY_LOCK
 ```
 STATUS: UNLOCKED
-AGENT: None
-PROBE: P1077 COMPLETE — CVE-2025-31277 DEAD (VULN:false; post-HABT match arrays are slow-put, 0 corruption, 0 leaks)
-DEPLOYED_AT: 2026-11-10T09:22Z
-LAST: P1077
+AGENT: (none)
+PROBE: (none)
+DEPLOYED_AT: 2026-11-10T09:47Z
+LAST: P1086
 ```
 
 ## CURRENT ASSIGNMENTS
-- **Claude (Opus):** Same-type alias deep exploitation + state escape primitives (AB(768) cross-type reclaim DEAD)
+- **Claude (Opus):** FL leak widening across all size classes (only remaining WebKit primitive) + kernel-side new-bug hunting from Lua entry
 - **Gemini:** Subsystem benchmarking & JSC execution limits mapping -> ALL GOALS STOPPED (Standby)
 
 ## ACTIVITY LOG (newest first)
+
+### 2026-11-10 - Claude (P1086: B2 COMPOSITOR CRASH — DEAD AS EXPLOITABLE)
+- Deployed 09:45Z, 4 complete cycles + partial 5th, 09:45-09:47 UTC.
+- **Results**: C0-raf SURVIVED 20s in cycles 1+3, DIED 0-10s in cycles 2+4. C1-none (NO removal) DIED in EVERY cycle (0-4s). C2-sync/C3-pre-spray/C4-inraf/C5-timeout all DIED consistently.
+- **Verdict**: C1-none proves the crash is NOT caused by removal timing or layer-lifecycle UAF. The mere creation of 20 will-change:transform layers inside a mutation callback kills the WebProcess — DOM/compositor EXHAUSTION, not UAF. Mode-(b) from P1085 (cap=20 + RAF removal) is just faster exhaustion. No corruption, no info leak, no primitive.
+- **B2 CLOSED**. All WebKit memory-corruption vectors on PS5 14.10 are now DEAD. Browser path blocked at Phase A step 4. Only remaining WebKit primitive: FL leak widening across size classes. Kernel side (Lua entry) is the ONLY viable path forward.
+- Deploy lock RELEASED. index.html can be overwritten by next probe.
 
 ### 2026-11-10 - Claude (P1077: CVE-2025-31277 TESTED — DEAD, VULN:false)
 - Fixed P1077 before first run: its beacons pointed at /en/ps5/beacon.gif which DOES NOT EXIST on the server (only /beacon.php at root logs) — all prior "P1077 deployed, no results" was partly a silent-drop artifact. Added crash-resume section state machine + JSERR hook.

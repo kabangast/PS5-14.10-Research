@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P839</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P839: Heap Snapshot + _PS IPC Protocol + Console Internals</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P839-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+
+bn('BOOT','start');
+log('P839: Probing heap snapshot, _PS IPC, console internals','hot');
+
+/* ===== PHASE A: console.takeHeapSnapshot ===== */
+log('','');
+log('--- Phase A: console.takeHeapSnapshot ---','hot');
+
+var hsResults=[];
+try{
+  /* First: capture any console output by hooking console methods */
+  var capturedLogs=[];
+  var origLog=console.log;
+  var origWarn=console.warn;
+  var origError=console.error;
+  var origInfo=console.info;
+  var origDebug=console.debug;
+
+  console.log=function(){capturedLogs.push({m:'log',a:Array.prototype.slice.call(arguments)});origLog.apply(console,arguments);};
+  console.warn=function(){capturedLogs.push({m:'warn',a:Array.prototype.slice.call(arguments)});origWarn.apply(console,arguments);};
+  console.error=function(){capturedLogs.push({m:'error',a:Array.prototype.slice.call(arguments)});origError.apply(console,arguments);};
+  console.info=function(){capturedLogs.push({m:'info',a:Array.prototype.slice.call(arguments)});origInfo.apply(console,arguments);};
+  console.debug=function(){capturedLogs.push({m:'debug',a:Array.prototype.slice.call(arguments)});origDebug.apply(console,arguments);};
+
+  /* Check takeHeapSnapshot type and properties */
+  var ths=console.takeHeapSnapshot;
+  hsResults.push('type='+typeof ths);
+  hsResults.push('name='+(ths&&ths.name||'?'));
+  hsResults.push('length='+(ths&&ths.length||'?'));
+
+  if(typeof ths==='function'){
+    var thsStr=Function.prototype.toString.call(ths);
+    hsResults.push('str='+thsStr.slice(0,80));
+    log('takeHeapSnapshot: fn, name='+ths.name+', arity='+ths.length,'info');
+    log('toString: '+thsStr.slice(0,120),'info');
+    bn('THS-META','type=fn|name='+ths.name+'|len='+ths.length+'|str='+thsStr.slice(0,100));
+
+    /* CALL IT — this is the big test */
+    capturedLogs=[];
+    try{
+      var hsRet=console.takeHeapSnapshot();
+      hsResults.push('ret='+typeof hsRet);
+      log('takeHeapSnapshot() returned: '+typeof hsRet,'hot');
+
+      if(hsRet!==undefined&&hsRet!==null){
+        if(typeof hsRet==='string'){
+          hsResults.push('retLen='+hsRet.length);
+          hsResults.push('retStart='+hsRet.slice(0,200));
+          log('STRING RESULT ('+hsRet.length+'B): '+hsRet.slice(0,300),'hot');
+          bn('THS-RET','string|len='+hsRet.length+'|start='+hsRet.slice(0,500));
+        }else if(typeof hsRet==='object'){
+          var retKeys=Object.getOwnPropertyNames(hsRet).slice(0,20);
+          hsResults.push('retKeys='+retKeys.join(','));
+          log('OBJECT RESULT: keys='+retKeys.join(', '),'hot');
+          bn('THS-RET','obj|keys='+retKeys.join(','));
+
+          /* Dump first values */
+          for(var i=0;i<Math.min(retKeys.length,10);i++){
+            try{
+              var v=hsRet[retKeys[i]];
+              var vs=typeof v==='string'?v.slice(0,100):String(v).slice(0,50);
+              log('  .'+retKeys[i]+' = '+vs,'info');
+            }catch(e2){}
+          }
+        }else{
+          hsResults.push('retVal='+String(hsRet).slice(0,100));
+          bn('THS-RET',typeof hsRet+'|val='+String(hsRet).slice(0,200));
+        }
+      }else{
+        hsResults.push('ret='+String(hsRet));
+        bn('THS-RET','void='+String(hsRet));
+      }
+    }catch(e){
+      hsResults.push('callERR='+e.message.slice(0,60));
+      log('takeHeapSnapshot() THREW: '+e.message,'fail');
+      bn('THS-ERR',e.message.slice(0,200));
+    }
+
+    /* Check if any console output was generated */
+    if(capturedLogs.length>0){
+      hsResults.push('consoleCaptured='+capturedLogs.length);
+      log('Console output captured: '+capturedLogs.length+' messages','hot');
+      for(var i=0;i<Math.min(capturedLogs.length,5);i++){
+        var cl=capturedLogs[i];
+        var argStr=cl.a.map(function(a){return typeof a==='string'?a.slice(0,80):typeof a;}).join(', ');
+        log('  ['+cl.m+'] '+argStr,'info');
+        bn('THS-CONSOLE-'+i,cl.m+'|'+argStr.slice(0,200));
+      }
+    }
+  }else{
+    log('takeHeapSnapshot is NOT a function: '+typeof ths,'fail');
+  }
+}catch(e){
+  hsResults.push('ERR='+e.message);
+  bn('THS-FATAL',e.message.slice(0,200));
+}
+
+/* Restore console */
+try{console.log=origLog;console.warn=origWarn;console.error=origError;console.info=origInfo;console.debug=origDebug;}catch(e){}
+bn('THS-RESULT',hsResults.join('|'));
+
+/* ===== PHASE B: console.record / recordEnd / screenshot ===== */
+log('','');
+log('--- Phase B: Other console internals ---','hot');
+
+var conResults=[];
+
+/* console.record */
+try{
+  var crType=typeof console.record;
+  conResults.push('record='+crType);
+  if(crType==='function'){
+    conResults.push('record.name='+console.record.name);
+    conResults.push('record.len='+console.record.length);
+    try{
+      var rr=console.record();
+      conResults.push('record()='+typeof rr);
+      log('console.record() = '+typeof rr+(rr?': '+String(rr).slice(0,50):''),'info');
+    }catch(e){conResults.push('record()=ERR:'+e.message.slice(0,30));}
+  }
+}catch(e){}
+
+/* console.recordEnd */
+try{
+  var reType=typeof console.recordEnd;
+  conResults.push('recordEnd='+reType);
+  if(reType==='function'){
+    try{
+      var rer=console.recordEnd();
+      conResults.push('recordEnd()='+typeof rer);
+      log('console.recordEnd() = '+typeof rer+(rer?': '+String(rer).slice(0,50):''),'info');
+    }catch(e){conResults.push('recordEnd()=ERR:'+e.message.slice(0,30));}
+  }
+}catch(e){}
+
+/* console.screenshot */
+try{
+  var ssType=typeof console.screenshot;
+  conResults.push('screenshot='+ssType);
+  if(ssType==='function'){
+    conResults.push('screenshot.name='+console.screenshot.name);
+    conResults.push('screenshot.len='+console.screenshot.length);
+    var ssStr=Function.prototype.toString.call(console.screenshot);
+    conResults.push('screenshot.str='+ssStr.slice(0,60));
+    log('console.screenshot: fn, name='+console.screenshot.name+', arity='+console.screenshot.length,'info');
+    /* Don't call it — might do something drastic */
+  }
+}catch(e){}
+
+/* console.timeStamp */
+try{
+  if(typeof console.timeStamp==='function'){
+    conResults.push('timeStamp=fn');
+    try{
+      var tsr=console.timeStamp('P839');
+      conResults.push('timeStamp()='+typeof tsr);
+    }catch(e){}
+  }
+}catch(e){}
+
+bn('CONSOLE',conResults.join('|'));
+
+/* ===== PHASE C: _PS.postMessage protocol probing ===== */
+log('','');
+log('--- Phase C: _PS.postMessage IPC protocol ---','hot');
+
+var ipcResults=[];
+
+/* We know _PS.postMessage takes a string. Try various message formats */
+var ipcTests=[
+  /* JSON commands */
+  ['json-empty','{}'],
+  ['json-info','{"type":"info"}'],
+  ['json-debug','{"type":"debug"}'],
+  ['json-version','{"type":"version"}'],
+  ['json-memory','{"type":"memory"}'],
+  ['json-getaddr','{"type":"getAddress"}'],
+  ['json-eval','{"type":"eval","code":"1+1"}'],
+  ['json-system','{"cmd":"system","action":"info"}'],
+  ['json-navigate','{"type":"navigate","url":"about:blank"}'],
+
+  /* Simple string commands */
+  ['str-info','info'],
+  ['str-version','version'],
+  ['str-debug','debug'],
+  ['str-ping','ping'],
+  ['str-help','help'],
+  ['str-status','status'],
+
+  /* URL schemes */
+  ['url-ps','playstation://info'],
+  ['url-sce','sce://debug'],
+
+  /* PlayStation-specific */
+  ['ps-init','SCE_INIT'],
+  ['ps-ready','READY'],
+  ['ps-loaded','LOADED'],
+  ['ps-error','ERROR'],
+
+  /* Numeric */
+  ['num-0','0'],
+  ['num-1','1'],
+];
+
+for(var i=0;i<ipcTests.length;i++){
+  var label=ipcTests[i][0];
+  var msg=ipcTests[i][1];
+  try{
+    var ret=_PS.postMessage(msg);
+    var retStr=(ret===undefined)?'void':typeof ret+':'+String(ret).slice(0,40);
+    ipcResults.push(label+'='+retStr);
+    log('  _PS.postMessage("'+msg.slice(0,40)+'") = '+retStr,'ok');
+  }catch(e){
+    ipcResults.push(label+'=ERR:'+e.message.slice(0,30));
+    log('  _PS.postMessage("'+msg.slice(0,40)+'") threw: '+e.message.slice(0,40),'fail');
+  }
+}
+
+bn('IPC',ipcResults.slice(0,15).join('|'));
+bn('IPC2',ipcResults.slice(15).join('|'));
+
+/* ===== PHASE D: _PS.postMessage with response listener ===== */
+log('','');
+log('--- Phase D: IPC response detection ---','hot');
+
+var respResults=[];
+
+/* Maybe the PS5 native side posts messages BACK via window.postMessage */
+var receivedMsgs=[];
+window.addEventListener('message',function(e){
+  receivedMsgs.push({data:e.data,origin:e.origin,source:e.source===window?'self':'other'});
+});
+
+/* Send a message and wait for response */
+_PS.postMessage('{"type":"ping","id":"P839"}');
+_PS.postMessage('ping');
+_PS.postMessage('READY');
+
+/* Also check if _PS has any event-like interface */
+try{
+  if(typeof _PS.addEventListener==='function'){
+    respResults.push('addEventListener=YES');
+    log('_PS.addEventListener: YES!','hot');
+  }
+  if(typeof _PS.onmessage!=='undefined'){
+    respResults.push('onmessage='+typeof _PS.onmessage);
+    log('_PS.onmessage: '+typeof _PS.onmessage,'info');
+  }
+  if(typeof _PS.on==='function'){
+    respResults.push('on=YES');
+  }
+}catch(e){}
+
+bn('IPC-RESP','sent=3|'+respResults.join('|'));
+
+/* ===== PHASE E: Worker + Atomics race primitive ===== */
+log('','');
+log('--- Phase E: Worker + Atomics race ---','hot');
+
+var workerResults=[];
+try{
+  /* Can we use Atomics.wait in a Worker on regular AB? */
+  var workerCode=[
+    'self.onmessage=function(e){',
+    '  if(e.data.cmd==="atomicWait"){',
+    '    try{',
+    '      var sab=new Int32Array(e.data.buf);',
+    '      var r=Atomics.wait(sab,0,0,100);',
+    '      self.postMessage({cmd:"waitResult",result:r});',
+    '    }catch(err){',
+    '      self.postMessage({cmd:"waitResult",error:err.message});',
+    '    }',
+    '  }',
+    '  if(e.data.cmd==="heapInfo"){',
+    '    try{',
+    '      var abs=[];',
+    '      for(var i=0;i<50;i++)abs.push(new ArrayBuffer(192));',
+    '      self.postMessage({cmd:"heapDone",count:abs.length});',
+    '    }catch(err){',
+    '      self.postMessage({cmd:"heapDone",error:err.message});',
+    '    }',
+    '  }',
+    '  if(e.data.cmd==="echo"){',
+    '    self.postMessage({cmd:"echo",data:e.data.data});',
+    '  }',
+    '};'
+  ].join('\n');
+
+  var blob=new Blob([workerCode],{type:'application/javascript'});
+  var wurl=URL.createObjectURL(blob);
+  var w=new Worker(wurl);
+
+  var workerDone=false;
+  w.onmessage=function(e){
+    if(e.data.cmd==='waitResult'){
+      workerResults.push('atomicWait='+(e.data.error||e.data.result));
+      log('Worker Atomics.wait: '+(e.data.error||e.data.result),'hot');
+      bn('WORKER-WAIT',e.data.error||e.data.result);
+    }
+    if(e.data.cmd==='heapDone'){
+      workerResults.push('heapAlloc='+(e.data.error||e.data.count));
+      log('Worker heap alloc: '+(e.data.error||e.data.count)+' ABs','info');
+    }
+    if(e.data.cmd==='echo'){
+      workerResults.push('echo='+e.data.data);
+    }
+    workerDone=true;
+  };
+  w.onerror=function(e){
+    workerResults.push('workerERR='+e.message);
+    workerDone=true;
+  };
+
+  /* Test 1: Can Worker use Atomics.wait on regular ArrayBuffer? */
+  var testBuf=new ArrayBuffer(16);
+  var testView=new Int32Array(testBuf);
+  testView[0]=0;
+
+  /* Atomics.wait needs SharedArrayBuffer — but does PS5 enforce this? */
+  w.postMessage({cmd:'atomicWait',buf:testBuf});
+
+  /* Test 2: Worker heap allocation */
+  w.postMessage({cmd:'heapInfo'});
+
+  /* Test 3: Worker _PS access */
+  var workerCode2=[
+    'self.onmessage=function(e){',
+    '  if(e.data.cmd==="checkPS"){',
+    '    try{',
+    '      var has=typeof _PS!=="undefined";',
+    '      var type=has?typeof _PS:"N/A";',
+    '      self.postMessage({cmd:"psResult",has:has,type:type});',
+    '    }catch(err){',
+    '      self.postMessage({cmd:"psResult",error:err.message});',
+    '    }',
+    '  }',
+    '  if(e.data.cmd==="checkConsole"){',
+    '    try{',
+    '      var has=typeof console.takeHeapSnapshot;',
+    '      self.postMessage({cmd:"consoleResult",takeHeapSnapshot:has});',
+    '    }catch(err){',
+    '      self.postMessage({cmd:"consoleResult",error:err.message});',
+    '    }',
+    '  }',
+    '};'
+  ].join('\n');
+
+  var blob2=new Blob([workerCode2],{type:'application/javascript'});
+  var wurl2=URL.createObjectURL(blob2);
+  var w2=new Worker(wurl2);
+
+  w2.onmessage=function(e){
+    if(e.data.cmd==='psResult'){
+      workerResults.push('worker_PS='+(e.data.error||'has='+e.data.has+',type='+e.data.type));
+      log('Worker _PS access: '+(e.data.error||'has='+e.data.has+',type='+e.data.type),'hot');
+      bn('WORKER-PS',e.data.error||'has='+e.data.has+',type='+e.data.type);
+    }
+    if(e.data.cmd==='consoleResult'){
+      workerResults.push('worker_THS='+(e.data.error||'takeHeapSnapshot='+e.data.takeHeapSnapshot));
+      log('Worker console.takeHeapSnapshot: '+(e.data.error||e.data.takeHeapSnapshot),'hot');
+      bn('WORKER-THS',e.data.error||e.data.takeHeapSnapshot);
+    }
+  };
+
+  w2.postMessage({cmd:'checkPS'});
+  w2.postMessage({cmd:'checkConsole'});
+
+  URL.revokeObjectURL(wurl);
+  URL.revokeObjectURL(wurl2);
+  workerResults.push('started=2');
+}catch(e){
+  workerResults.push('ERR='+e.message);
+  bn('WORKER-ERR',e.message.slice(0,100));
+}
+
+/* ===== PHASE F: Check for window.postMessage responses after delay ===== */
+setTimeout(function(){
+  log('','');
+  log('--- Phase F: Delayed results (500ms) ---','hot');
+
+  /* Check IPC responses */
+  if(receivedMsgs.length>0){
+    log('RECEIVED '+receivedMsgs.length+' postMessage responses!','hot');
+    for(var i=0;i<Math.min(receivedMsgs.length,10);i++){
+      var m=receivedMsgs[i];
+      var ds=typeof m.data==='string'?m.data.slice(0,100):JSON.stringify(m.data).slice(0,100);
+      log('  ['+m.source+'] origin='+m.origin+' data='+ds,'info');
+    }
+    bn('IPC-RESPONSES','count='+receivedMsgs.length+'|first='+JSON.stringify(receivedMsgs[0]).slice(0,200));
+  }else{
+    log('No postMessage responses received','fail');
+    bn('IPC-RESPONSES','count=0');
+  }
+
+  /* Worker results */
+  bn('WORKER-FINAL',workerResults.join('|'));
+
+  /* ===== SUMMARY ===== */
+  log('','');
+  log('====== P839 COMPLETE ======','hot');
+  var summary='ths='+hsResults.slice(0,3).join(',')+
+    '|ipc='+ipcResults.length+'tests,'+receivedMsgs.length+'responses'+
+    '|worker='+workerResults.slice(0,3).join(',');
+  bn('DONE',summary);
+  log('Summary: '+summary,'ok');
+},500);
+
+</script></body></html>

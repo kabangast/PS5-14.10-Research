@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P1056</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#22c55e}.fail{color:#ef4444}.warn{color:#f59e0b}.info{color:#38bdf8}
+</style></head><body>
+<div id="hud"><div id="log"></div></div>
+<div id="sandbox" style="position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden"></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1056-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+var L=document.getElementById('log');
+function log(m,c){var d=document.createElement('div');if(c)d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+var SB=document.getElementById('sandbox');
+
+bn('BOOT','ts='+Date.now().toString(36));
+log('=== P1056: CSS/SVG/Regex/Intl Deep Fuzz ===','info');
+
+var totalAnomalies=0;
+var anomalyItems=[];
+
+// ============================================================
+// PHASE A: Deep SVG filter chain + mutation
+// ============================================================
+function phaseA(){
+  log('--- Phase A: SVG Filter Chain ---','info');
+  var details=[];
+  var anomalies=0;
+
+  // A1: Deep filter chain (can cause OOB in filter result buffers)
+  try{
+    var svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+    svg.setAttribute('width','200');svg.setAttribute('height','200');
+    var defs=document.createElementNS('http://www.w3.org/2000/svg','defs');
+
+    // Chain 20 filters together
+    var filter=document.createElementNS('http://www.w3.org/2000/svg','filter');
+    filter.setAttribute('id','deep');
+    filter.setAttribute('filterUnits','userSpaceOnUse');
+    filter.setAttribute('x','0');filter.setAttribute('y','0');
+    filter.setAttribute('width','200');filter.setAttribute('height','200');
+
+    var prevResult='SourceGraphic';
+    for(var i=0;i<20;i++){
+      var fe;
+      switch(i%4){
+        case 0:
+          fe=document.createElementNS('http://www.w3.org/2000/svg','feGaussianBlur');
+          fe.setAttribute('stdDeviation','1');
+          break;
+        case 1:
+          fe=document.createElementNS('http://www.w3.org/2000/svg','feColorMatrix');
+          fe.setAttribute('type','saturate');
+          fe.setAttribute('values','2');
+          break;
+        case 2:
+          fe=document.createElementNS('http://www.w3.org/2000/svg','feOffset');
+          fe.setAttribute('dx','1');fe.setAttribute('dy','1');
+          break;
+        case 3:
+          fe=document.createElementNS('http://www.w3.org/2000/svg','feComposite');
+          fe.setAttribute('operator','over');
+          if(i>0) fe.setAttribute('in2',prevResult);
+          break;
+      }
+      fe.setAttribute('in',prevResult);
+      fe.setAttribute('result','r'+i);
+      prevResult='r'+i;
+      filter.appendChild(fe);
+    }
+    defs.appendChild(filter);
+    svg.appendChild(defs);
+
+    var rect=document.createElementNS('http://www.w3.org/2000/svg','rect');
+    rect.setAttribute('width','200');rect.setAttribute('height','200');
+    rect.setAttribute('fill','red');
+    rect.setAttribute('filter','url(#deep)');
+    svg.appendChild(rect);
+    SB.appendChild(svg);
+    details.push('A1-filter=OK:20-deep');
+
+    // A2: Mutate filter elements while rendering
+    setTimeout(function(){
+      try{
+        // Change filter params during rendering
+        for(var i=0;i<filter.childNodes.length;i++){
+          var child=filter.childNodes[i];
+          if(child.getAttribute){
+            if(child.getAttribute('stdDeviation')){
+              child.setAttribute('stdDeviation','100');
+            }
+          }
+        }
+        // Force layout
+        svg.getBoundingClientRect();
+        details.push('A2-mutate=OK');
+      }catch(e){
+        details.push('A2-mutate-err='+e.name);
+      }
+      SB.innerHTML='';
+    },50);
+  }catch(e){
+    details.push('A1-err='+e.name);
+  }
+
+  // A3: SVG use element with recursive references
+  try{
+    var svg2=document.createElementNS('http://www.w3.org/2000/svg','svg');
+    svg2.setAttribute('width','100');svg2.setAttribute('height','100');
+    // Create elements that reference each other
+    var g1=document.createElementNS('http://www.w3.org/2000/svg','g');
+    g1.setAttribute('id','g1');
+    var use1=document.createElementNS('http://www.w3.org/2000/svg','use');
+    use1.setAttribute('href','#g2');
+    g1.appendChild(use1);
+
+    var g2=document.createElementNS('http://www.w3.org/2000/svg','g');
+    g2.setAttribute('id','g2');
+    var use2=document.createElementNS('http://www.w3.org/2000/svg','use');
+    use2.setAttribute('href','#g1');
+    g2.appendChild(use2);
+
+    svg2.appendChild(g1);svg2.appendChild(g2);
+    SB.appendChild(svg2);
+    // Force render
+    svg2.getBoundingClientRect();
+    details.push('A3-recursive-use=survived');
+    SB.removeChild(svg2);
+  }catch(e){
+    details.push('A3-err='+e.name);
+  }
+
+  // A4: SVG with extreme viewBox
+  try{
+    var svg3=document.createElementNS('http://www.w3.org/2000/svg','svg');
+    svg3.setAttribute('viewBox','0 0 999999999 999999999');
+    svg3.setAttribute('width','1');svg3.setAttribute('height','1');
+    var c=document.createElementNS('http://www.w3.org/2000/svg','circle');
+    c.setAttribute('r','999999999');c.setAttribute('cx','0');c.setAttribute('cy','0');
+    c.setAttribute('fill','blue');
+    svg3.appendChild(c);
+    SB.appendChild(svg3);
+    svg3.getBoundingClientRect();
+    details.push('A4-extreme-viewBox=survived');
+    SB.removeChild(svg3);
+  }catch(e){
+    details.push('A4-err='+e.name);
+  }
+
+  return new Promise(function(resolve){
+    setTimeout(function(){
+      totalAnomalies+=anomalies;
+      log('Phase A: '+details.join(' | '),'info');
+      bn('A-SVG',details.join('|'));
+      resolve(anomalies);
+    },200);
+  });
+}
+
+// ============================================================
+// PHASE B: Regex engine stress (YARR in interpret mode)
+// ============================================================
+function phaseB(){
+  log('');log('--- Phase B: Regex Engine Stress ---','info');
+  var details=[];
+  var anomalies=0;
+
+  // B1: Lookbehind with variable-length patterns
+  try{
+    var re1=/(?<=a{1,100})b/;
+    var m1='aaaaab'.match(re1);
+    details.push('B1-lookbehind='+(m1?m1[0]:'null'));
+  }catch(e){details.push('B1-err='+e.name);}
+
+  // B2: Named capture groups with Unicode
+  try{
+    var re2=new RegExp('(?<unicodeGrp>[\\u{10000}-\\u{10FFFF}])','u');
+    var m2='\u{10000}'.match(re2);
+    details.push('B2-unicode='+(m2?'match:'+m2.groups.unicodeGrp.length:'null'));
+  }catch(e){details.push('B2='+e.name);}
+
+  // B3: Catastrophic backtracking (should NOT crash — just slow)
+  try{
+    var t0=performance.now();
+    var re3=/^(a+)+$/;
+    var result3=re3.test('aaaaaaaaaaaaaaaaaaa!');
+    var dt=performance.now()-t0;
+    details.push('B3-backtrack='+result3+'|dt='+dt.toFixed(1)+'ms');
+  }catch(e){details.push('B3-err='+e.name);}
+
+  // B4: Regex.lastIndex manipulation
+  try{
+    var re4=/a/g;
+    re4.lastIndex=Number.MAX_SAFE_INTEGER;
+    var m4=re4.exec('aaa');
+    details.push('B4-maxIndex='+(m4===null?'null':m4[0]));
+    re4.lastIndex=-1;
+    var m5=re4.exec('aaa');
+    details.push('B4-negIndex='+(m5?m5[0]+':'+m5.index:'null'));
+  }catch(e){details.push('B4-err='+e.name);}
+
+  // B5: Very long pattern
+  try{
+    var pat='(?:';
+    for(var i=0;i<200;i++) pat+='a|';
+    pat+='b)';
+    var re5=new RegExp(pat);
+    var m6=re5.test('b');
+    details.push('B5-longPat='+m6);
+  }catch(e){details.push('B5-err='+e.name);}
+
+  // B6: Replace with function that modifies the regex
+  try{
+    var re6=/a/g;
+    var count=0;
+    var result='aaa'.replace(re6,function(match,offset,str){
+      count++;
+      if(count===2) re6.lastIndex=0; // Reset during replace
+      return 'X';
+    });
+    details.push('B6-replace='+result+'|count='+count);
+  }catch(e){details.push('B6-err='+e.name);}
+
+  // B7: RegExp species + subclass (can confuse internal type checks)
+  try{
+    function MyRegExp(p,f){return RegExp.call(this,p,f);}
+    MyRegExp.prototype=Object.create(RegExp.prototype);
+    MyRegExp[Symbol.species]=function(){return /replaced/g;};
+    var re7=new RegExp('test','g');
+    re7.constructor=MyRegExp;
+    var result7='test-test'.split(re7);
+    details.push('B7-species='+JSON.stringify(result7));
+  }catch(e){details.push('B7-err='+e.name+':'+e.message.slice(0,30));}
+
+  // B8: matchAll with resizable string
+  try{
+    var longStr='a'.repeat(100000);
+    var re8=/a{10}/g;
+    var matchCount=0;
+    for(var m of longStr.matchAll(re8)){
+      matchCount++;
+      if(matchCount>1000) break;
+    }
+    details.push('B8-matchAll='+matchCount);
+  }catch(e){details.push('B8-err='+e.name);}
+
+  log('Phase B: '+details.slice(0,5).join(' | '),'info');
+  bn('B-REGEX',details.join('|'));
+  return Promise.resolve(anomalies);
+}
+
+// ============================================================
+// PHASE C: Intl API fuzzing (ICU integration)
+// ============================================================
+function phaseC(){
+  log('');log('--- Phase C: Intl API Fuzz ---','info');
+  var details=[];
+  var anomalies=0;
+
+  // C1: DateTimeFormat with extreme options
+  try{
+    var dtf=new Intl.DateTimeFormat('en',{
+      dateStyle:'full',timeStyle:'full',
+      calendar:'islamic-umalqura',
+      numberingSystem:'arab',
+      timeZone:'Pacific/Kiritimati' // UTC+14
+    });
+    details.push('C1-extreme-dtf='+dtf.format(new Date(0)).slice(0,30));
+  }catch(e){details.push('C1-err='+e.name);}
+
+  // C2: NumberFormat with extreme values
+  try{
+    var nf=new Intl.NumberFormat('ar-SA',{
+      style:'currency',currency:'BHD',
+      minimumFractionDigits:20,maximumFractionDigits:20
+    });
+    details.push('C2-nf='+nf.format(Number.MAX_SAFE_INTEGER).slice(0,30));
+  }catch(e){details.push('C2-err='+e.name);}
+
+  // C3: Collator with unusual options
+  try{
+    var col=new Intl.Collator('zh-u-co-stroke',{
+      sensitivity:'variant',
+      caseFirst:'upper',
+      numeric:true,
+      ignorePunctuation:true
+    });
+    var result=col.compare('\u{20000}','\u{2A6DF}');
+    details.push('C3-collator='+result);
+  }catch(e){details.push('C3-err='+e.name);}
+
+  // C4: PluralRules with edge cases
+  try{
+    var pr=new Intl.PluralRules('ar-SA');
+    var tests=[0,1,2,3,10,100,1000000,NaN,Infinity,-Infinity,-0];
+    var results=tests.map(function(v){return v+':'+pr.select(v);});
+    details.push('C4-plural='+results.join(','));
+  }catch(e){details.push('C4-err='+e.name);}
+
+  // C5: Segmenter (if available — Safari 15.4+)
+  try{
+    if(typeof Intl.Segmenter!=='undefined'){
+      var seg=new Intl.Segmenter('ja',{granularity:'grapheme'});
+      // Emoji ZWJ sequence
+      var text='\u{1F468}‍\u{1F469}‍\u{1F467}‍\u{1F466}';
+      var segments=[];
+      for(var s of seg.segment(text)){
+        segments.push(s.index+':'+s.segment.length);
+      }
+      details.push('C5-segmenter='+segments.join(','));
+    }else{
+      details.push('C5-no-Segmenter');
+    }
+  }catch(e){details.push('C5-err='+e.name);}
+
+  // C6: ListFormat
+  try{
+    if(typeof Intl.ListFormat!=='undefined'){
+      var lf=new Intl.ListFormat('en',{style:'long',type:'conjunction'});
+      // Very long list
+      var items=[];
+      for(var i=0;i<500;i++) items.push('item'+i);
+      var result=lf.format(items);
+      details.push('C6-listFormat=len:'+result.length);
+    }else{
+      details.push('C6-no-ListFormat');
+    }
+  }catch(e){details.push('C6-err='+e.name);}
+
+  // C7: RelativeTimeFormat
+  try{
+    var rtf=new Intl.RelativeTimeFormat('en',{numeric:'auto'});
+    details.push('C7-rtf='+rtf.format(-Number.MAX_SAFE_INTEGER,'second').slice(0,30));
+  }catch(e){details.push('C7-err='+e.name);}
+
+  // C8: DisplayNames (Safari 14.1+)
+  try{
+    if(typeof Intl.DisplayNames!=='undefined'){
+      var dn=new Intl.DisplayNames('en',{type:'region'});
+      details.push('C8-display='+dn.of('US')+','+dn.of('JP'));
+      // Try invalid codes
+      try{
+        var bad=dn.of('XX');
+        details.push('C8-invalid='+bad);
+      }catch(e2){
+        details.push('C8-invalid='+e2.name);
+      }
+    }else{
+      details.push('C8-no-DisplayNames');
+    }
+  }catch(e){details.push('C8-err='+e.name);}
+
+  log('Phase C: '+details.slice(0,4).join(' | '),'info');
+  bn('C-INTL',details.join('|'));
+  return Promise.resolve(anomalies);
+}
+
+// ============================================================
+// PHASE D: DOM mutation observer + tree walker stress
+// ============================================================
+function phaseD(){
+  log('');log('--- Phase D: DOM Mutation Stress ---','info');
+  return new Promise(function(resolve){
+    var details=[];
+    var anomalies=0;
+
+    // D1: MutationObserver with rapid mutations
+    var div=document.createElement('div');
+    SB.appendChild(div);
+
+    var mutations=[];
+    var observer=new MutationObserver(function(records){
+      records.forEach(function(r){
+        mutations.push(r.type+':'+r.target.nodeName);
+        // Mutate during observation callback (re-entrant)
+        if(mutations.length<10){
+          r.target.setAttribute('data-counter',mutations.length);
+        }
+      });
+    });
+
+    observer.observe(div,{
+      childList:true,attributes:true,characterData:true,
+      subtree:true,attributeOldValue:true
+    });
+
+    // Rapid mutations
+    for(var i=0;i<100;i++){
+      var child=document.createElement('span');
+      child.textContent='node'+i;
+      div.appendChild(child);
+      if(i%3===0) div.removeChild(child);
+      if(i%5===0) div.setAttribute('data-x',i);
+    }
+
+    // D2: TreeWalker with filter that modifies tree
+    var tw;
+    try{
+      tw=document.createTreeWalker(div,NodeFilter.SHOW_ALL,{
+        acceptNode:function(node){
+          // Modify tree during walk
+          if(node.textContent&&node.textContent.indexOf('node5')===0){
+            // Remove the next sibling while walking
+            if(node.nextSibling) node.parentNode.removeChild(node.nextSibling);
+          }
+          return NodeFilter.FILTER_ACCEPT;
+        }
+      });
+      var walkCount=0;
+      while(tw.nextNode()) walkCount++;
+      details.push('D2-walk='+walkCount);
+    }catch(e){
+      details.push('D2-walk-err='+e.name);
+    }
+
+    // D3: Range manipulation during mutation
+    try{
+      var range=document.createRange();
+      range.selectNodeContents(div);
+      // Extract contents (moves nodes)
+      var frag=range.extractContents();
+      details.push('D3-extracted='+frag.childNodes.length);
+      // Re-insert
+      div.appendChild(frag);
+      // Delete contents
+      range.selectNodeContents(div);
+      range.deleteContents();
+      details.push('D3-deleted='+div.childNodes.length);
+    }catch(e){
+      details.push('D3-err='+e.name);
+    }
+
+    setTimeout(function(){
+      observer.disconnect();
+      details.push('D1-mutations='+mutations.length);
+      SB.innerHTML='';
+      totalAnomalies+=anomalies;
+      log('Phase D: mutations='+mutations.length,'info');
+      bn('D-DOM','mutations='+mutations.length+'|'+details.join('|'));
+      resolve(anomalies);
+    },300);
+  });
+}
+
+// ============================================================
+// PHASE E: String operations edge cases
+// ============================================================
+function phaseE(){
+  log('');log('--- Phase E: String Edge Cases ---','info');
+  var details=[];
+  var anomalies=0;
+
+  // E1: String.prototype.normalize with extreme inputs
+  try{
+    // Combining diacritics stacking
+    var s1='a'+'̀'.repeat(1000); // 1000 combining grave accents
+    var n1=s1.normalize('NFC');
+    details.push('E1-normalize=in:'+s1.length+'|out:'+n1.length);
+  }catch(e){details.push('E1-err='+e.name);}
+
+  // E2: String repeat edge cases
+  try{
+    try{
+      var s2='a'.repeat(0x7FFFFFFF); // 2GB string attempt
+      details.push('E2-repeat='+s2.length);
+    }catch(e){
+      details.push('E2-repeat='+e.name);
+    }
+    // Moderate size
+    try{
+      var s3='a'.repeat(0xFFFF); // 64KB
+      details.push('E2-64K='+s3.length);
+    }catch(e){
+      details.push('E2-64K='+e.name);
+    }
+  }catch(e){details.push('E2-outer='+e.name);}
+
+  // E3: String replace with capture group overflow
+  try{
+    var s4='a'.repeat(100);
+    // 200 capture groups
+    var pat='';
+    for(var i=0;i<200;i++) pat+='(a)?';
+    var re=new RegExp(pat);
+    var result=s4.replace(re,function(){
+      return arguments[201]||'none'; // argument count = groups + 3
+    });
+    details.push('E3-manyGroups='+result.slice(0,20));
+  }catch(e){details.push('E3-err='+e.name);}
+
+  // E4: String.prototype.split with regex that matches empty
+  try{
+    var s5='abc';
+    var parts=s5.split(/(?=)/u); // Split at every position
+    details.push('E4-emptySplit='+parts.length+':'+parts.join(','));
+  }catch(e){details.push('E4-err='+e.name);}
+
+  // E5: Template literal tag function abuse
+  try{
+    function tag(strings){
+      // Modify the raw array
+      Object.defineProperty(strings,'raw',{
+        get:function(){return ['modified\\n'];}
+      });
+      return String.raw(strings);
+    }
+    var result5=tag(['test']);
+    details.push('E5-tag='+result5);
+  }catch(e){details.push('E5-err='+e.name);}
+
+  // E6: String.fromCodePoint edge cases
+  try{
+    details.push('E6-maxCP='+String.fromCodePoint(0x10FFFF).length);
+    try{
+      String.fromCodePoint(0x110000); // Above max
+      details.push('E6-above-max=OK');
+    }catch(e){
+      details.push('E6-above-max='+e.name);
+    }
+    try{
+      String.fromCodePoint(-1);
+      details.push('E6-neg=OK');
+    }catch(e){
+      details.push('E6-neg='+e.name);
+    }
+  }catch(e){details.push('E6-err='+e.name);}
+
+  log('Phase E: '+details.slice(0,4).join(' | '),'info');
+  bn('E-STRING',details.join('|'));
+  return Promise.resolve(anomalies);
+}
+
+// ============================================================
+// PHASE F: JSON.parse edge cases
+// ============================================================
+function phaseF(){
+  log('');log('--- Phase F: JSON Parse Edge Cases ---','info');
+  var details=[];
+  var anomalies=0;
+
+  // F1: Deeply nested JSON
+  try{
+    var deep='{';
+    for(var i=0;i<500;i++) deep+='"a":{'
+    deep+='"x":1';
+    for(var i=0;i<500;i++) deep+='}';
+    deep+='}';
+    try{
+      var obj=JSON.parse(deep);
+      details.push('F1-deep500=OK');
+    }catch(e){
+      details.push('F1-deep500='+e.name);
+    }
+  }catch(e){details.push('F1-err='+e.name);}
+
+  // F2: JSON with reviver that modifies structure
+  try{
+    var json2='{"a":1,"b":2,"c":3,"d":4}';
+    var deleted=0;
+    var obj2=JSON.parse(json2,function(key,value){
+      if(key==='b'){
+        // Delete a property that hasn't been visited yet
+        delete this.d;
+        deleted++;
+      }
+      return value;
+    });
+    details.push('F2-reviver-delete=d:'+(obj2.d===undefined?'gone':'present')+'|del:'+deleted);
+  }catch(e){details.push('F2-err='+e.name);}
+
+  // F3: JSON.stringify replacer abuse
+  try{
+    var count=0;
+    var obj3={a:1,b:2};
+    var str3=JSON.stringify(obj3,function(key,value){
+      count++;
+      if(count===2){
+        // Add properties during stringify
+        this.c=3;
+        this.d=4;
+      }
+      return value;
+    });
+    details.push('F3-stringify='+str3+'|count='+count);
+  }catch(e){details.push('F3-err='+e.name);}
+
+  // F4: JSON with __proto__
+  try{
+    var obj4=JSON.parse('{"__proto__":{"polluted":true}}');
+    details.push('F4-proto='+({}).__proto__.polluted);
+    details.push('F4-own='+obj4.__proto__.polluted);
+  }catch(e){details.push('F4-err='+e.name);}
+
+  // F5: Very large JSON array
+  try{
+    var arr='[';
+    for(var i=0;i<10000;i++) arr+=(i>0?',':'')+i;
+    arr+=']';
+    var parsed=JSON.parse(arr);
+    details.push('F5-array='+parsed.length);
+  }catch(e){details.push('F5-err='+e.name);}
+
+  // F6: JSON.parse + toJSON + valueOf interplay
+  try{
+    var obj6={
+      toJSON:function(){
+        return {value:this.x};
+      },
+      valueOf:function(){return 42;},
+      x:'original'
+    };
+    // Modify during stringify
+    var str6=JSON.stringify(obj6,function(key,value){
+      if(key==='value') obj6.x='modified';
+      return value;
+    });
+    details.push('F6-toJSON='+str6);
+  }catch(e){details.push('F6-err='+e.name);}
+
+  log('Phase F: '+details.slice(0,4).join(' | '),'info');
+  bn('F-JSON',details.join('|'));
+  return Promise.resolve(anomalies);
+}
+
+// ============================================================
+// Run
+// ============================================================
+setTimeout(function(){
+  phaseA().then(function(){
+    return phaseB();
+  }).then(function(){
+    return phaseC();
+  }).then(function(){
+    return phaseD();
+  }).then(function(){
+    return phaseE();
+  }).then(function(){
+    return phaseF();
+  }).then(function(){
+    log('');
+    log('=== P1056 COMPLETE: total anomalies = '+totalAnomalies+' ===',totalAnomalies>0?'fail':'ok');
+    if(anomalyItems.length>0) log('Items: '+anomalyItems.join(', '),'warn');
+    bn('DONE','anomalies='+totalAnomalies+'|items='+anomalyItems.join(';'));
+  }).catch(function(e){
+    log('FATAL: '+e.message,'fail');
+    bn('FATAL',e.message);
+  });
+},200);
+</script></body></html>

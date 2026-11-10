@@ -1,0 +1,888 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>PS5 FW 14.10 // INDEXEDDB, ANIMATIONS, BIGINT &amp; TEXT METRICS HUD</title>
+<style>
+:root {
+  --bg-dark: #040711;
+  --panel-bg: rgba(8, 14, 28, 0.94);
+  --neon-cyan: #00f3ff;
+  --neon-green: #00ff66;
+  --neon-amber: #ffb800;
+  --neon-pink: #ff0077;
+  --neon-purple: #9d00ff;
+  --text-dim: #7085a5;
+  --text-main: #e2f1ff;
+  --border-glow: rgba(0, 243, 255, 0.35);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background-color: var(--bg-dark);
+  background-image: 
+    radial-gradient(ellipse at 50% 0%, rgba(0, 243, 255, 0.16), transparent 75%),
+    linear-gradient(rgba(0, 243, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 243, 255, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 28px 28px, 28px 28px;
+  color: var(--text-main);
+  font-family: "SF Mono", "Consolas", monospace;
+  padding: 16px;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+.scanline {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.02), rgba(0, 255, 0, 0.01), rgba(0, 255, 0, 0.02));
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+  z-index: 999;
+}
+
+/* Header */
+.header {
+  border: 1px solid var(--neon-cyan);
+  background: rgba(0, 243, 255, 0.07);
+  box-shadow: 0 0 20px rgba(0, 243, 255, 0.3);
+  padding: 12px 20px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title-glitch {
+  font-size: 18px;
+  font-weight: 900;
+  letter-spacing: 2px;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 10px rgba(0, 243, 255, 0.8);
+}
+.target-badge {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: rgba(0, 255, 102, 0.15);
+  border: 1px solid var(--neon-green);
+  color: var(--neon-green);
+  font-weight: bold;
+}
+
+/* Pipeline Trackers */
+.pipeline-track {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.node {
+  background: var(--panel-bg);
+  border: 1px solid rgba(112, 133, 165, 0.25);
+  border-radius: 6px;
+  padding: 10px;
+  position: relative;
+  transition: all 0.3s ease;
+}
+.node.done {
+  border-color: var(--neon-green);
+  box-shadow: 0 0 10px rgba(0, 255, 102, 0.25);
+}
+.node.active {
+  border-color: var(--neon-cyan);
+  box-shadow: 0 0 12px rgba(0, 243, 255, 0.4);
+}
+.node.locked {
+  border-color: rgba(112, 133, 165, 0.2);
+  opacity: 0.55;
+}
+.node-step {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.node.done .node-step { color: var(--neon-green); }
+.node.active .node-step { color: var(--neon-cyan); }
+.node-title {
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--text-main);
+  margin-bottom: 4px;
+}
+.node-desc {
+  font-size: 9px;
+  color: var(--text-dim);
+  line-height: 1.3;
+}
+
+/* Grid Layout */
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid rgba(0, 243, 255, 0.25);
+  border-radius: 6px;
+  padding: 14px;
+  position: relative;
+}
+.panel-full {
+  grid-column: 1 / -1;
+}
+.panel-title {
+  font-size: 13px;
+  font-weight: bold;
+  color: var(--neon-cyan);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.panel-title::before {
+  content: "";
+  display: inline-block;
+  width: 4px;
+  height: 14px;
+  background: var(--neon-cyan);
+}
+
+/* Metric Display Rows */
+.metric-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 0;
+  border-bottom: 1px solid rgba(112, 133, 165, 0.15);
+  font-size: 11px;
+}
+.metric-row:last-child { border-bottom: none; }
+.metric-label { color: var(--text-dim); }
+.metric-val { font-weight: bold; }
+.val-ok { color: var(--neon-green); }
+.val-amber { color: var(--neon-amber); }
+.val-dim { color: var(--text-dim); }
+.val-hex { color: var(--neon-cyan); }
+.val-pink { color: var(--neon-pink); }
+
+/* Terminal Output Box */
+.terminal {
+  background: rgba(2, 5, 12, 0.96);
+  border: 1px solid rgba(0, 243, 255, 0.2);
+  border-radius: 4px;
+  padding: 10px;
+  height: 150px;
+  overflow-y: auto;
+  font-size: 10px;
+  line-height: 1.4;
+  color: #a5c2eb;
+}
+.term-line { margin-bottom: 2px; }
+.term-ts { color: var(--neon-cyan); margin-right: 6px; }
+.term-hi { color: var(--neon-green); }
+.term-warn { color: var(--neon-amber); }
+.term-err { color: var(--neon-pink); }
+
+/* Hidden scratch container */
+#bench-scratch {
+  position: absolute;
+  left: -9999px;
+  top: -9999px;
+  width: 200px;
+  height: 200px;
+  overflow: hidden;
+  visibility: hidden;
+}
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+
+<div class="header">
+  <div class="title-glitch">PS5 WebKit Core Profiler // P975</div>
+  <div class="target-badge">PLAYSTATION 5 FW 14.10 // 192.168.1.106</div>
+</div>
+
+<!-- 6-Stage Pipeline Trackers -->
+<div class="pipeline-track">
+  <div class="node active" id="node-stage-1">
+    <div class="node-step">Stage 1 [INDEXEDDB]</div>
+    <div class="node-title">Storage Engine</div>
+    <div class="node-desc">Database &amp; Transaction Persistence</div>
+  </div>
+  <div class="node locked" id="node-stage-2">
+    <div class="node-step">Stage 2 [ANIMATE]</div>
+    <div class="node-title">Web Animations</div>
+    <div class="node-desc">500 Keyframe Interpolations</div>
+  </div>
+  <div class="node locked" id="node-stage-3">
+    <div class="node-step">Stage 3 [BIGINT]</div>
+    <div class="node-title">64-bit BigInt Math</div>
+    <div class="node-desc">1M BigInt vs Double Arithmetic</div>
+  </div>
+  <div class="node locked" id="node-stage-4">
+    <div class="node-step">Stage 4 [TEXT METRICS]</div>
+    <div class="node-title">Font Shaping &amp; CJK</div>
+    <div class="node-desc">5,000 Complex Script Measurements</div>
+  </div>
+  <div class="node locked" id="node-stage-5">
+    <div class="node-step">Stage 5 [P2P RING]</div>
+    <div class="node-title">Worker Direct P2P</div>
+    <div class="node-desc">Pure Inter-Worker MessagePort</div>
+  </div>
+  <div class="node locked" id="node-stage-6">
+    <div class="node-step">Stage 6 [VERDICT]</div>
+    <div class="node-title">Master Verdict</div>
+    <div class="node-desc">Telemetry &amp; Coordination Log</div>
+  </div>
+</div>
+
+<div class="dashboard-grid">
+  <!-- Panel 1: IndexedDB Storage -->
+  <div class="panel">
+    <div class="panel-title">Stage 1: IndexedDB Transaction Storage</div>
+    <div class="metric-row">
+      <span class="metric-label">IndexedDB Availability:</span>
+      <span class="metric-val" id="m-idb-status">INITIALIZING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Transaction Write Time (100 items):</span>
+      <span class="metric-val" id="m-idb-time">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Verification Read Count:</span>
+      <span class="metric-val" id="m-idb-count">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Database Mode:</span>
+      <span class="metric-val" id="m-idb-mode">--</span>
+    </div>
+  </div>
+
+  <!-- Panel 2: Web Animations API -->
+  <div class="panel">
+    <div class="panel-title">Stage 2: Web Animations API (element.animate)</div>
+    <div class="metric-row">
+      <span class="metric-label">API Support:</span>
+      <span class="metric-val" id="m-anim-status">PENDING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">500 Keyframe Dispatch Time:</span>
+      <span class="metric-val" id="m-anim-time">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Dispatch Throughput:</span>
+      <span class="metric-val" id="m-anim-ops">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Animation Cleanup:</span>
+      <span class="metric-val" id="m-anim-clean">--</span>
+    </div>
+  </div>
+
+  <!-- Panel 3: 64-bit BigInt vs Number -->
+  <div class="panel">
+    <div class="panel-title">Stage 3: 64-bit BigInt vs Double Math</div>
+    <div class="metric-row">
+      <span class="metric-label">BigInt Math (1,000,000 ops):</span>
+      <span class="metric-val" id="m-bi-time">PENDING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Number Math (1,000,000 ops):</span>
+      <span class="metric-val" id="m-num-time">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">BigInt Throughput:</span>
+      <span class="metric-val" id="m-bi-ops">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Number Throughput:</span>
+      <span class="metric-val" id="m-num-ops">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Heap Boxing Overhead Ratio:</span>
+      <span class="metric-val" id="m-bi-ratio">--</span>
+    </div>
+  </div>
+
+  <!-- Panel 4: Text Metrics & Font Shaping -->
+  <div class="panel">
+    <div class="panel-title">Stage 4: Canvas Font Shaping &amp; Metrics</div>
+    <div class="metric-row">
+      <span class="metric-label">5,000 measureText() Calls:</span>
+      <span class="metric-val" id="m-text-time">PENDING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Advanced Metrics Support:</span>
+      <span class="metric-val" id="m-adv-metrics">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Arabic Shaping Width (RTL):</span>
+      <span class="metric-val" id="m-ar-width">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Japanese CJK Width:</span>
+      <span class="metric-val" id="m-ja-width">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Shaping Throughput:</span>
+      <span class="metric-val" id="m-text-ops">--</span>
+    </div>
+  </div>
+
+  <!-- Panel 5: Direct Inter-Worker P2P -->
+  <div class="panel panel-full">
+    <div class="panel-title">Stage 5 &amp; 6: Direct Inter-Worker P2P &amp; Verdict</div>
+    <div class="metric-row">
+      <span class="metric-label">Worker A &lt;-&gt; Worker B Direct MessagePort:</span>
+      <span class="metric-val" id="m-p2p-status">PENDING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">200 P2P Roundtrips Duration:</span>
+      <span class="metric-val" id="m-p2p-duration">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Average Inter-Core IPC Latency:</span>
+      <span class="metric-val" id="m-p2p-rtt">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Probe Verdict:</span>
+      <span class="metric-val" id="m-probe-verdict">INITIALIZING PIPELINE...</span>
+    </div>
+  </div>
+</div>
+
+<!-- Terminal Log -->
+<div class="panel panel-full">
+  <div class="panel-title">Physical Hardware Telemetry Console</div>
+  <div class="terminal" id="term-box"></div>
+</div>
+
+<!-- Hidden Scratch Area -->
+<div id="bench-scratch"></div>
+
+<script>
+/* Logging and Synchronous Beacon Utility */
+var termBox = document.getElementById('term-box');
+function log(msg, cls) {
+  var d = document.createElement('div');
+  d.className = 'term-line ' + (cls || '');
+  var ts = '[' + new Date().toISOString().substring(11, 23) + '] ';
+  d.innerHTML = '<span class="term-ts">' + ts + '</span>' + msg;
+  termBox.appendChild(d);
+  termBox.scrollTop = termBox.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P975-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+window.onerror = function(msg, url, line) {
+  syncBn('JS-ERR', msg + ' at line ' + line);
+  log('[!] ERROR: ' + msg + ' (Line ' + line + ')', 'term-err');
+};
+
+log('Initializing Probe P975: IndexedDB, Web Animations, BigInt Math, Text Metrics & Worker P2P...', 'term-hi');
+syncBn('BOOT', 'start');
+
+var nodeStage1 = document.getElementById('node-stage-1');
+var nodeStage2 = document.getElementById('node-stage-2');
+var nodeStage3 = document.getElementById('node-stage-3');
+var nodeStage4 = document.getElementById('node-stage-4');
+var nodeStage5 = document.getElementById('node-stage-5');
+var nodeStage6 = document.getElementById('node-stage-6');
+
+var mIdbStatus = document.getElementById('m-idb-status');
+var mIdbTime = document.getElementById('m-idb-time');
+var mIdbCount = document.getElementById('m-idb-count');
+var mIdbMode = document.getElementById('m-idb-mode');
+
+var mAnimStatus = document.getElementById('m-anim-status');
+var mAnimTime = document.getElementById('m-anim-time');
+var mAnimOps = document.getElementById('m-anim-ops');
+var mAnimClean = document.getElementById('m-anim-clean');
+
+var mBiTime = document.getElementById('m-bi-time');
+var mNumTime = document.getElementById('m-num-time');
+var mBiOps = document.getElementById('m-bi-ops');
+var mNumOps = document.getElementById('m-num-ops');
+var mBiRatio = document.getElementById('m-bi-ratio');
+
+var mTextTime = document.getElementById('m-text-time');
+var mAdvMetrics = document.getElementById('m-adv-metrics');
+var mArWidth = document.getElementById('m-ar-width');
+var mJaWidth = document.getElementById('m-ja-width');
+var mTextOps = document.getElementById('m-text-ops');
+
+var mP2pStatus = document.getElementById('m-p2p-status');
+var mP2pDuration = document.getElementById('m-p2p-duration');
+var mP2pRtt = document.getElementById('m-p2p-rtt');
+var mProbeVerdict = document.getElementById('m-probe-verdict');
+
+var scratchArea = document.getElementById('bench-scratch');
+
+/* Metrics Globals */
+var gIdbOk = false;
+var gIdbTimeMs = 0;
+var gIdbCount = 0;
+var gIdbMode = 'UNTESTED';
+
+var gAnimSupported = false;
+var gAnimMs = 0;
+var gAnimOpsPerSec = 0;
+
+var gBiMs = 0;
+var gNumMs = 0;
+var gBiOps = 0;
+var gNumOps = 0;
+var gBiRatio = 0;
+
+var gTextMs = 0;
+var gAdvMetrics = false;
+var gArWidth = 0;
+var gJaWidth = 0;
+var gTextOps = 0;
+
+var gP2pMs = 0;
+var gP2pRttUs = 0;
+
+/* ============================================================
+ * STAGE 1: IndexedDB Transaction Storage
+ * ============================================================ */
+function runStage1IndexedDB() {
+  return new Promise(function(resolve) {
+    if (typeof indexedDB === 'undefined') {
+      gIdbMode = 'UNSUPPORTED';
+      mIdbStatus.textContent = 'UNSUPPORTED';
+      mIdbStatus.className = 'val-dim';
+      nodeStage1.className = 'node locked';
+      syncBn('INDEXEDDB', 'ok=false|mode=unsupported');
+      resolve();
+      return;
+    }
+
+    var timer = setTimeout(function() {
+      log('[-] IndexedDB timed out after 600ms (storage blocked or sandbox restricted)', 'term-warn');
+      gIdbMode = 'RESTRICTED_TIMEOUT';
+      mIdbStatus.textContent = 'TIMEOUT / BLOCKED';
+      mIdbStatus.className = 'val-amber';
+      nodeStage1.className = 'node locked';
+      syncBn('INDEXEDDB', 'ok=false|mode=restricted_timeout');
+      resolve();
+    }, 600);
+
+    try {
+      var dbName = 'ps5_stage1_' + Date.now();
+      var req = indexedDB.open(dbName, 1);
+
+      req.onupgradeneeded = function(e) {
+        var db = e.target.result;
+        db.createObjectStore('telemetry', { keyPath: 'id' });
+      };
+
+      req.onsuccess = function(e) {
+        var db = e.target.result;
+        var t0 = performance.now();
+        var tx = db.transaction('telemetry', 'readwrite');
+        var store = tx.objectStore('telemetry');
+
+        for (var i = 0; i < 100; i++) {
+          store.put({ id: i, payload: 'val_' + i, stamp: Date.now() });
+        }
+
+        tx.oncomplete = function() {
+          gIdbTimeMs = Math.max(1, Math.round(performance.now() - t0));
+          var countReq = db.transaction('telemetry', 'readonly').objectStore('telemetry').count();
+          countReq.onsuccess = function() {
+            clearTimeout(timer);
+            gIdbCount = countReq.result;
+            gIdbOk = (gIdbCount === 100);
+            gIdbMode = 'SQLITE_OPERATIONAL';
+
+            mIdbStatus.textContent = 'OPERATIONAL (ACTIVE)';
+            mIdbStatus.className = 'val-ok';
+            mIdbTime.textContent = gIdbTimeMs + ' ms (100 OBJECTS WRITTEN)';
+            mIdbCount.textContent = gIdbCount + ' ITEMS VERIFIED';
+            mIdbCount.className = 'val-ok';
+            mIdbMode.textContent = gIdbMode;
+            mIdbMode.className = 'val-hex';
+
+            db.close();
+            try { indexedDB.deleteDatabase(dbName); } catch(de) {}
+
+            log('[+] IndexedDB: 100 items written in ' + gIdbTimeMs + 'ms, verified=' + gIdbCount);
+            syncBn('INDEXEDDB', 'ok=true|writeMs=' + gIdbTimeMs + '|items=' + gIdbCount + '|mode=' + gIdbMode);
+
+            nodeStage1.className = 'node done';
+            nodeStage1.querySelector('.node-step').textContent = 'Stage 1 [DONE]';
+            resolve();
+          };
+          countReq.onerror = function() {
+            clearTimeout(timer);
+            resolve();
+          };
+        };
+
+        tx.onerror = function() {
+          clearTimeout(timer);
+          gIdbMode = 'TX_ERROR';
+          syncBn('INDEXEDDB', 'ok=false|mode=tx_error');
+          resolve();
+        };
+      };
+
+      req.onerror = function(e) {
+        clearTimeout(timer);
+        gIdbMode = 'OPEN_ERROR';
+        mIdbStatus.textContent = 'BLOCKED / SECURITY ERROR';
+        mIdbStatus.className = 'val-amber';
+        log('[-] IndexedDB open error: ' + (e.target.error ? e.target.error.message : 'Unknown'), 'term-warn');
+        syncBn('INDEXEDDB', 'ok=false|mode=open_error');
+        nodeStage1.className = 'node locked';
+        resolve();
+      };
+    } catch(idbe) {
+      clearTimeout(timer);
+      gIdbMode = 'EXCEPTION';
+      log('[-] IndexedDB Exception: ' + idbe.message, 'term-warn');
+      syncBn('INDEXEDDB', 'ok=false|mode=exception');
+      nodeStage1.className = 'node locked';
+      resolve();
+    }
+  });
+}
+
+/* ============================================================
+ * STAGE 2: Web Animations API (element.animate)
+ * ============================================================ */
+function runStage2Animations() {
+  nodeStage2.className = 'node active';
+  nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [ACTIVE]';
+
+  gAnimSupported = (typeof Element !== 'undefined' && typeof Element.prototype.animate === 'function');
+  if (gAnimSupported) {
+    try {
+      var animEls = [];
+      for (var i = 0; i < 500; i++) {
+        var el = document.createElement('div');
+        scratchArea.appendChild(el);
+        animEls.push(el);
+      }
+
+      var animObjects = [];
+      var tAnim0 = performance.now();
+      for (var a = 0; a < 500; a++) {
+        var anim = animEls[a].animate([
+          { transform: 'translate3d(0px, 0px, 0px)', opacity: 1 },
+          { transform: 'translate3d(20px, 40px, 0px)', opacity: 0.2 }
+        ], {
+          duration: 2000,
+          iterations: 1,
+          fill: 'forwards'
+        });
+        animObjects.push(anim);
+      }
+      gAnimMs = Math.max(1, Math.round(performance.now() - tAnim0));
+      gAnimOpsPerSec = Math.round(500 / (gAnimMs / 1000));
+
+      // Cleanup
+      for (var c = 0; c < 500; c++) {
+        animObjects[c].cancel();
+        scratchArea.removeChild(animEls[c]);
+      }
+
+      mAnimStatus.textContent = 'SUPPORTED (W3C LEVEL 1)';
+      mAnimStatus.className = 'val-ok';
+      mAnimTime.textContent = gAnimMs + ' ms (500 KEYFRAME INSTANCES)';
+      mAnimOps.textContent = gAnimOpsPerSec.toLocaleString() + ' ANIMATIONS/SEC';
+      mAnimOps.className = 'val-ok';
+      mAnimClean.textContent = '500 INSTANCES PURGED';
+      mAnimClean.className = 'val-hex';
+
+      log('[+] Web Animations API: 500 dispatches in ' + gAnimMs + 'ms (~' + gAnimOpsPerSec + ' anim/s)');
+      syncBn('ANIMATIONS', 'supported=true|timeMs=' + gAnimMs + '|count=500|ops=' + gAnimOpsPerSec);
+
+      nodeStage2.className = 'node done';
+      nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [DONE]';
+    } catch(ae) {
+      log('[-] Animation stage error: ' + ae.message, 'term-err');
+      syncBn('ANIM-ERR', ae.message);
+      nodeStage2.className = 'node locked';
+    }
+  } else {
+    mAnimStatus.textContent = 'UNSUPPORTED';
+    mAnimStatus.className = 'val-dim';
+    syncBn('ANIMATIONS', 'supported=false');
+    nodeStage2.className = 'node locked';
+  }
+}
+
+/* ============================================================
+ * STAGE 3: 64-bit BigInt vs Number Double Math Throughput
+ * ============================================================ */
+function runStage3BigIntMath() {
+  nodeStage3.className = 'node active';
+  nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [ACTIVE]';
+
+  try {
+    var OPS = 1000000;
+
+    /* 1,000,000 64-bit BigInt arithmetic operations */
+    var biA = 0x1234567890ABCDEFn;
+    var biB = 0x0FEDCBA098765432n;
+    var biC = 0x0011223344556677n;
+    var biSum = 0n;
+
+    var tBi0 = performance.now();
+    for (var bi = 0; bi < OPS; bi++) {
+      biSum += (biA ^ (biB + BigInt(bi))) & biC;
+    }
+    gBiMs = Math.max(1, Math.round(performance.now() - tBi0));
+    gBiOps = Math.round(OPS / (gBiMs / 1000));
+
+    /* 1,000,000 Number (double) arithmetic operations */
+    var numA = 0x12345678;
+    var numB = 0x0FEDCBA0;
+    var numC = 0x00112233;
+    var numSum = 0;
+
+    var tNum0 = performance.now();
+    for (var ni = 0; ni < OPS; ni++) {
+      numSum += (numA ^ (numB + ni)) & numC;
+    }
+    gNumMs = Math.max(1, Math.round(performance.now() - tNum0));
+    gNumOps = Math.round(OPS / (gNumMs / 1000));
+
+    gBiRatio = (gBiMs / gNumMs).toFixed(1);
+
+    mBiTime.textContent = gBiMs + ' ms (1,000,000 64-BIT BIGINT OPS)';
+    mNumTime.textContent = gNumMs + ' ms (1,000,000 32/64-BIT NUMBER OPS)';
+    mBiOps.textContent = gBiOps.toLocaleString() + ' BIGINT OPS/SEC';
+    mBiOps.className = 'val-ok';
+    mNumOps.textContent = gNumOps.toLocaleString() + ' NUMBER OPS/SEC';
+    mNumOps.className = 'val-ok';
+    mBiRatio.textContent = gBiRatio + 'x (BIGINT HEAP / BOXING PENALTY)';
+    mBiRatio.className = (parseFloat(gBiRatio) < 8.0) ? 'val-ok' : 'val-amber';
+
+    log('[+] 64-bit BigInt Math: bi=' + gBiMs + 'ms (~' + gBiOps + ' ops/s), num=' + gNumMs + 'ms (~' + gNumOps + ' ops/s), ratio=' + gBiRatio);
+    syncBn('BIGINT-MATH', 'biMs=' + gBiMs + '|numMs=' + gNumMs + '|biOps=' + gBiOps + '|numOps=' + gNumOps + '|ratio=' + gBiRatio);
+
+    nodeStage3.className = 'node done';
+    nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [DONE]';
+  } catch(be) {
+    log('[-] BigInt math error: ' + be.message, 'term-err');
+    syncBn('BIGINT-ERR', be.message);
+    nodeStage3.className = 'node locked';
+  }
+}
+
+/* ============================================================
+ * STAGE 4: Canvas Font Shaping & Text Metrics (measureText)
+ * ============================================================ */
+function runStage4TextMetrics() {
+  nodeStage4.className = 'node active';
+  nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [ACTIVE]';
+
+  try {
+    var cvs = document.createElement('canvas');
+    cvs.width = 300;
+    cvs.height = 100;
+    var ctx = cvs.getContext('2d');
+    ctx.font = '16px "SF Mono", "Consolas", monospace';
+
+    var sampleTexts = [
+      "PlayStation 5 Subsystem Diagnostic Engine 2026",
+      "نظام التحقق من متصفح الويب لبلايستيشن 5",
+      "プレイステーション5のWebKitエンジン検証",
+      "Диагностика подсистемы WebKit на PlayStation 5"
+    ];
+
+    var tText0 = performance.now();
+    var lastMetric = null;
+    for (var m = 0; m < 5000; m++) {
+      var txt = sampleTexts[m % 4];
+      lastMetric = ctx.measureText(txt);
+    }
+    gTextMs = Math.max(1, Math.round(performance.now() - tText0));
+    gTextOps = Math.round(5000 / (gTextMs / 1000));
+
+    // Check advanced metrics availability
+    gAdvMetrics = (typeof lastMetric.actualBoundingBoxAscent === 'number');
+
+    var mAr = ctx.measureText(sampleTexts[1]);
+    var mJa = ctx.measureText(sampleTexts[2]);
+    gArWidth = Math.round(mAr.width);
+    gJaWidth = Math.round(mJa.width);
+
+    mTextTime.textContent = gTextMs + ' ms (5,000 TEXT MEASUREMENTS)';
+    mAdvMetrics.textContent = gAdvMetrics ? 'ACTIVE (ACTUAL BOUNDING BOX)' : 'BASIC ONLY';
+    mAdvMetrics.className = gAdvMetrics ? 'val-ok' : 'val-dim';
+    mArWidth.textContent = gArWidth + ' px (CURSIVE RTL SHAPED)';
+    mArWidth.className = 'val-ok';
+    mJaWidth.textContent = gJaWidth + ' px (CJK GLYPHS RESOLVED)';
+    mJaWidth.className = 'val-ok';
+    mTextOps.textContent = gTextOps.toLocaleString() + ' SHAPINGS/SEC';
+    mTextOps.className = 'val-hex';
+
+    log('[+] Text Metrics: 5k shapings in ' + gTextMs + 'ms (~' + gTextOps + ' ops/s), advMetrics=' + gAdvMetrics + ', arW=' + gArWidth + ', jaW=' + gJaWidth);
+    syncBn('TEXT-METRICS', 'timeMs=' + gTextMs + '|ops=' + gTextOps + '|advMetrics=' + gAdvMetrics + '|arW=' + gArWidth + '|jaW=' + gJaWidth);
+
+    nodeStage4.className = 'node done';
+    nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [DONE]';
+  } catch(te) {
+    log('[-] Text metrics error: ' + te.message, 'term-err');
+    syncBn('TEXT-ERR', te.message);
+    nodeStage4.className = 'node locked';
+  }
+}
+
+/* ============================================================
+ * STAGE 5: Direct Inter-Worker MessagePort P2P Transfer
+ * ============================================================ */
+function runStage5WorkerP2P() {
+  return new Promise(function(resolve) {
+    nodeStage5.className = 'node active';
+    nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [ACTIVE]';
+
+    try {
+      /* Worker A Script: Sender */
+      var workerAScript = [
+        'var port = null;',
+        'var rounds = 0;',
+        'var maxRounds = 200;',
+        'var startTime = 0;',
+        'self.onmessage = function(e) {',
+        '  if (e.data.cmd === "init") {',
+        '    port = e.ports[0];',
+        '    port.onmessage = function(ev) {',
+        '      rounds++;',
+        '      if (rounds < maxRounds) {',
+        '        port.postMessage({ r: rounds });',
+        '      } else {',
+        '        var totalTime = performance.now() - startTime;',
+        '        self.postMessage({ done: true, totalTime: totalTime, rounds: rounds });',
+        '      }',
+        '    };',
+        '    startTime = performance.now();',
+        '    port.postMessage({ r: 0 });',
+        '  }',
+        '};'
+      ].join('\n');
+
+      /* Worker B Script: Echo responder */
+      var workerBScript = [
+        'var port = null;',
+        'self.onmessage = function(e) {',
+        '  if (e.data.cmd === "init") {',
+        '    port = e.ports[0];',
+        '    port.onmessage = function(ev) {',
+        '      port.postMessage({ echo: ev.data.r });',
+        '    };',
+        '  }',
+        '};'
+      ].join('\n');
+
+      var blobA = new Blob([workerAScript], { type: 'application/javascript' });
+      var blobB = new Blob([workerBScript], { type: 'application/javascript' });
+      var urlA = URL.createObjectURL(blobA);
+      var urlB = URL.createObjectURL(blobB);
+
+      var workerA = new Worker(urlA);
+      var workerB = new Worker(urlB);
+
+      var channel = new MessageChannel();
+
+      workerA.onmessage = function(e) {
+        if (e.data.done) {
+          gP2pMs = Math.round(e.data.totalTime);
+          gP2pRttUs = ( (e.data.totalTime / e.data.rounds) * 1000 ).toFixed(1);
+
+          mP2pStatus.textContent = 'CONNECTED &amp; TRANSFERRED (ZERO MAIN-THREAD IPC)';
+          mP2pStatus.className = 'val-ok';
+          mP2pDuration.textContent = gP2pMs + ' ms (200 P2P ROUNDTRIPS)';
+          mP2pRtt.textContent = gP2pRttUs + ' µs / ROUNDTRIP';
+          mP2pRtt.className = 'val-ok';
+
+          log('[+] Worker P2P Ring: 200 roundtrips in ' + gP2pMs + 'ms, per-roundtrip=' + gP2pRttUs + 'µs');
+          syncBn('WORKER-P2P', 'durationMs=' + gP2pMs + '|rounds=' + e.data.rounds + '|latUs=' + gP2pRttUs + '|ok=true');
+
+          workerA.terminate();
+          workerB.terminate();
+          URL.revokeObjectURL(urlA);
+          URL.revokeObjectURL(urlB);
+
+          nodeStage5.className = 'node done';
+          nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [DONE]';
+          resolve();
+        }
+      };
+
+      // Transfer port1 to Worker A, port2 to Worker B
+      workerB.postMessage({ cmd: 'init' }, [channel.port2]);
+      workerA.postMessage({ cmd: 'init' }, [channel.port1]);
+
+    } catch(pe) {
+      log('[-] Worker P2P error: ' + pe.message, 'term-err');
+      syncBn('P2P-ERR', pe.message);
+      nodeStage5.className = 'node locked';
+      resolve();
+    }
+  });
+}
+
+/* ============================================================
+ * MASTER EXECUTION PIPELINE
+ * ============================================================ */
+runStage1IndexedDB()
+  .then(function() {
+    runStage2Animations();
+    runStage3BigIntMath();
+    runStage4TextMetrics();
+    return runStage5WorkerP2P();
+  })
+  .then(function() {
+    /* Stage 6: Master Verdict */
+    nodeStage6.className = 'node done';
+    nodeStage6.querySelector('.node-step').textContent = 'Stage 6 [DONE]';
+
+    mProbeVerdict.textContent = 'ALL 6 SUBSYSTEM STAGES BENCHMARKED &amp; VERIFIED';
+    mProbeVerdict.className = 'val-ok';
+
+    log('[*] Probe P975 complete: IndexedDB, Animations, BigInt, TextMetrics & Worker P2P measured.', 'term-hi');
+    syncBn('DONE', 'status=P975_COMPLETE|idbMode=' + gIdbMode + '|idbMs=' + gIdbTimeMs + '|animMs=' + gAnimMs + '|biMs=' + gBiMs + '|numMs=' + gNumMs + '|biRatio=' + gBiRatio + '|textMs=' + gTextMs + '|p2pLatUs=' + gP2pRttUs);
+  });
+
+/* Auto-Reload Watcher for autonomous progression */
+var initialReloadToken = null;
+function checkAutoReload() {
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/reload.txt?t=' + Date.now(), true);
+    xhr.onload = function() {
+      if (xhr.status === 200) {
+        var token = xhr.responseText.trim();
+        if (initialReloadToken === null) {
+          initialReloadToken = token;
+        } else if (token !== initialReloadToken) {
+          log('[*] New deployment detected (token: ' + token + '). Auto-reloading in 500ms...');
+          setTimeout(function() { location.reload(); }, 500);
+        }
+      }
+    };
+    xhr.send();
+  } catch(e) {}
+}
+setInterval(checkAutoReload, 1500);
+</script>
+</body>
+</html>

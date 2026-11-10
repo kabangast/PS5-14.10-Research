@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>PS5 FW 14.10 // MEDIA CODECS, MSE &amp; WEBRTC HUD</title>
+<style>
+:root {
+  --bg-dark: #040711;
+  --panel-bg: rgba(8, 14, 28, 0.94);
+  --neon-cyan: #00f3ff;
+  --neon-green: #00ff66;
+  --neon-amber: #ffb800;
+  --neon-pink: #ff0077;
+  --neon-purple: #9d00ff;
+  --text-dim: #7085a5;
+  --text-main: #e2f1ff;
+  --border-glow: rgba(0, 243, 255, 0.35);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background-color: var(--bg-dark);
+  background-image: 
+    radial-gradient(ellipse at 50% 0%, rgba(0, 243, 255, 0.16), transparent 75%),
+    linear-gradient(rgba(0, 243, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 243, 255, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 28px 28px, 28px 28px;
+  color: var(--text-main);
+  font-family: "SF Mono", "Consolas", monospace;
+  padding: 16px;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+.scanline {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.02), rgba(0, 255, 0, 0.01), rgba(0, 255, 0, 0.02));
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+  z-index: 999;
+}
+
+/* Header */
+.header {
+  border: 1px solid var(--neon-cyan);
+  background: rgba(0, 243, 255, 0.07);
+  box-shadow: 0 0 20px rgba(0, 243, 255, 0.3);
+  padding: 12px 20px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title-glitch {
+  font-size: 18px;
+  font-weight: 900;
+  letter-spacing: 2px;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 10px rgba(0, 243, 255, 0.8);
+}
+.target-badge {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: rgba(0, 255, 102, 0.15);
+  border: 1px solid var(--neon-green);
+  color: var(--neon-green);
+  font-weight: bold;
+}
+
+/* Pipeline Trackers */
+.pipeline-track {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.node {
+  background: var(--panel-bg);
+  border: 1px solid rgba(112, 133, 165, 0.25);
+  border-radius: 6px;
+  padding: 10px;
+  position: relative;
+  transition: all 0.3s ease;
+}
+.node.done {
+  border-color: var(--neon-green);
+  box-shadow: 0 0 10px rgba(0, 255, 102, 0.25);
+}
+.node.active {
+  border-color: var(--neon-cyan);
+  box-shadow: 0 0 12px rgba(0, 243, 255, 0.4);
+}
+.node.locked {
+  border-color: rgba(112, 133, 165, 0.2);
+  opacity: 0.55;
+}
+.node-step {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.node.done .node-step { color: var(--neon-green); }
+.node.active .node-step { color: var(--neon-cyan); }
+.node-title {
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--text-main);
+  margin-bottom: 4px;
+}
+.node-desc {
+  font-size: 9px;
+  color: var(--text-dim);
+  line-height: 1.3;
+}
+
+/* Grid Layout */
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-glow);
+  border-radius: 6px;
+  padding: 14px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
+  position: relative;
+  overflow: hidden;
+}
+.panel-title {
+  font-size: 13px;
+  font-weight: bold;
+  color: var(--neon-cyan);
+  border-bottom: 1px solid rgba(0, 243, 255, 0.2);
+  padding-bottom: 8px;
+  margin-bottom: 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.live-meter {
+  display: flex;
+  justify-content: space-between;
+  margin: 6px 0;
+  font-size: 11px;
+}
+.val-hex { color: var(--neon-purple); font-weight: bold; }
+.val-ok { color: var(--neon-green); font-weight: bold; }
+.val-dim { color: var(--text-dim); }
+.val-cyan { color: var(--neon-cyan); font-weight: bold; }
+.val-warn { color: var(--neon-amber); font-weight: bold; }
+.val-fail { color: var(--neon-pink); font-weight: bold; }
+
+/* Radar & Glitch Accents */
+.radar-box {
+  width: 100%;
+  height: 2px;
+  background: rgba(0, 243, 255, 0.1);
+  position: relative;
+  overflow: hidden;
+  margin-top: 10px;
+}
+.radar-sweep {
+  position: absolute;
+  top: 0; left: -30%;
+  width: 30%; height: 100%;
+  background: linear-gradient(90deg, transparent, var(--neon-cyan), transparent);
+  animation: sweep 2.2s infinite linear;
+}
+@keyframes sweep {
+  0% { left: -30%; }
+  100% { left: 100%; }
+}
+
+/* Terminal Log */
+#terminal {
+  background: rgba(2, 4, 10, 0.9);
+  border: 1px solid rgba(0, 243, 255, 0.18);
+  border-radius: 4px;
+  padding: 10px;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: #a0c4e8;
+  height: 150px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+
+<div class="header">
+  <div>
+    <div class="title-glitch">&#x25C8; PS5 FW 14.10 // MEDIA CODECS, MSE &amp; WEBRTC HUD</div>
+    <div style="font-size: 10px; color: var(--text-dim); margin-top: 3px;">
+      WebKit Audio/Video Pipeline, Hardware Codecs &amp; Realtime Network Stack
+    </div>
+  </div>
+  <div class="target-badge" id="statusBadge">PROBING MEDIA STACK</div>
+</div>
+
+<!-- 6-Stage Visual Pipeline Tracker -->
+<div class="pipeline-track">
+  <div class="node active" id="nodeStage1">
+    <div class="node-step">Stage 1 [ACTIVE]</div>
+    <div class="node-title">Video Codec Suite</div>
+    <div class="node-desc">canPlayType() on H.264, HEVC, VP9, AV1 &amp; Theora.</div>
+  </div>
+  <div class="node locked" id="nodeStage2">
+    <div class="node-step">Stage 2 [QUEUED]</div>
+    <div class="node-title">Audio Codec Suite</div>
+    <div class="node-desc">canPlayType() on AAC, MP3, Opus, FLAC &amp; PCM WAV.</div>
+  </div>
+  <div class="node locked" id="nodeStage3">
+    <div class="node-step">Stage 3 [QUEUED]</div>
+    <div class="node-title">MSE Extensions</div>
+    <div class="node-desc">MediaSource API and buffer mimeType validation.</div>
+  </div>
+  <div class="node locked" id="nodeStage4">
+    <div class="node-step">Stage 4 [QUEUED]</div>
+    <div class="node-title">WebRTC &amp; RTCData</div>
+    <div class="node-desc">RTCPeerConnection, mediaDevices &amp; ICE candidates.</div>
+  </div>
+  <div class="node locked" id="nodeStage5">
+    <div class="node-step">Stage 5 [QUEUED]</div>
+    <div class="node-title">EME / DRM Modules</div>
+    <div class="node-desc">requestMediaKeySystemAccess() Widevine &amp; PlayReady.</div>
+  </div>
+  <div class="node locked" id="nodeStage6">
+    <div class="node-step">Stage 6 [QUEUED]</div>
+    <div class="node-title">Audio Routing / Sink</div>
+    <div class="node-desc">HTMLMediaElement sinkId &amp; media session controls.</div>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Panel 1: Video & MediaSource Telemetry -->
+  <div class="panel">
+    <div class="panel-title">
+      <span>VIDEO &amp; MEDIASOURCE PIPELINE</span>
+      <span style="color:var(--neon-green);" id="mVideoBadge">EVALUATING</span>
+    </div>
+    <div class="live-meter"><span>H.264 (AVC) Playback:</span><span class="val-cyan" id="mVH264">Testing...</span></div>
+    <div class="live-meter"><span>HEVC / H.265 (Main 10):</span><span class="val-cyan" id="mVHevc">Testing...</span></div>
+    <div class="live-meter"><span>VP9 (WebM / Profile 2):</span><span class="val-cyan" id="mVVp9">Testing...</span></div>
+    <div class="live-meter"><span>AV1 (AOMedia Video 1):</span><span class="val-cyan" id="mVAval1">Testing...</span></div>
+    <div class="live-meter"><span>MediaSource API:</span><span class="val-ok" id="mMseApi">Testing...</span></div>
+    <div class="live-meter"><span>MSE H.264 Buffer Support:</span><span class="val-ok" id="mMseH264">Testing...</span></div>
+    <div class="live-meter"><span>MSE VP9 Buffer Support:</span><span class="val-ok" id="mMseVp9">Testing...</span></div>
+    <div class="radar-box"><div class="radar-sweep"></div></div>
+  </div>
+
+  <!-- Panel 2: Audio, WebRTC & DRM -->
+  <div class="panel">
+    <div class="panel-title">
+      <span>AUDIO CODECS, WEBRTC &amp; DRM</span>
+      <span style="color:var(--neon-cyan);">ACTIVE TELEMETRY</span>
+    </div>
+    <div class="live-meter"><span>AAC Audio (MP4):</span><span class="val-ok" id="mAAac">Testing...</span></div>
+    <div class="live-meter"><span>MP3 Audio (MPEG):</span><span class="val-ok" id="mAMp3">Testing...</span></div>
+    <div class="live-meter"><span>Opus Audio:</span><span class="val-cyan" id="mAOpus">Testing...</span></div>
+    <div class="live-meter"><span>FLAC Lossless:</span><span class="val-cyan" id="mAFlac">Testing...</span></div>
+    <div class="live-meter"><span>RTCPeerConnection:</span><span class="val-hex" id="mRtcPeer">Testing...</span></div>
+    <div class="live-meter"><span>MediaDevices Capture:</span><span class="val-hex" id="mMediaDevices">Testing...</span></div>
+    <div class="live-meter"><span>Encrypted Media (EME):</span><span class="val-warn" id="mEme">Testing...</span></div>
+    <div class="radar-box"><div class="radar-sweep"></div></div>
+  </div>
+</div>
+
+<!-- Tactical Log Terminal -->
+<div class="panel">
+  <div class="panel-title">
+    <span>TACTICAL MEDIA &amp; CODEC LOG</span>
+    <span style="color:var(--neon-green);">LIVE STREAM TELEMETRY</span>
+  </div>
+  <pre id="terminal">[*] Initializing Probe P954 Media Engine &amp; Codec Suite...</pre>
+  <div class="radar-box"><div class="radar-sweep"></div></div>
+</div>
+
+<script>
+'use strict';
+var term = document.getElementById('terminal');
+var statusBadge = document.getElementById('statusBadge');
+var mVideoBadge = document.getElementById('mVideoBadge');
+
+var nodeStage1 = document.getElementById('nodeStage1');
+var nodeStage2 = document.getElementById('nodeStage2');
+var nodeStage3 = document.getElementById('nodeStage3');
+var nodeStage4 = document.getElementById('nodeStage4');
+var nodeStage5 = document.getElementById('nodeStage5');
+var nodeStage6 = document.getElementById('nodeStage6');
+
+var mVH264 = document.getElementById('mVH264');
+var mVHevc = document.getElementById('mVHevc');
+var mVVp9 = document.getElementById('mVVp9');
+var mVAval1 = document.getElementById('mVAval1');
+var mMseApi = document.getElementById('mMseApi');
+var mMseH264 = document.getElementById('mMseH264');
+var mMseVp9 = document.getElementById('mMseVp9');
+
+var mAAac = document.getElementById('mAAac');
+var mAMp3 = document.getElementById('mAMp3');
+var mAOpus = document.getElementById('mAOpus');
+var mAFlac = document.getElementById('mAFlac');
+var mRtcPeer = document.getElementById('mRtcPeer');
+var mMediaDevices = document.getElementById('mMediaDevices');
+var mEme = document.getElementById('mEme');
+
+function log(msg) {
+  var d = document.createElement('div');
+  d.textContent = '[' + new Date().toISOString().slice(11, 23) + '] ' + msg;
+  term.appendChild(d);
+  term.scrollTop = term.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P954-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+window.onerror = function(msg, url, line) {
+  syncBn('JS-ERR', msg + ' at line ' + line);
+  log('[!] ERROR: ' + msg + ' (Line ' + line + ')');
+};
+
+log('[*] Probe P954 online: Media Codecs, MediaSource Extensions & WebRTC Stack.');
+syncBn('BOOT', 'start');
+
+var vid = document.createElement('video');
+var aud = document.createElement('audio');
+
+function formatCanPlay(cp) {
+  if (cp === 'probably') return 'PROBABLY (YES)';
+  if (cp === 'maybe') return 'MAYBE (YES)';
+  return 'NO (UNSUPPORTED)';
+}
+
+/* ============================================================
+ * STAGE 1: Video Codec Probing
+ * ============================================================ */
+var cpH264 = vid.canPlayType('video/mp4; codecs="avc1.42E01E, mp4a.40.2"');
+var cpHevc = vid.canPlayType('video/mp4; codecs="hev1.1.6.L93.B0"');
+var cpVp9 = vid.canPlayType('video/webm; codecs="vp9"');
+var cpAv1 = vid.canPlayType('video/mp4; codecs="av01.0.08M.08"');
+var cpTheora = vid.canPlayType('video/ogg; codecs="theora"');
+
+mVH264.textContent = formatCanPlay(cpH264);
+mVH264.className = (cpH264 !== '') ? 'val-ok' : 'val-dim';
+mVHevc.textContent = formatCanPlay(cpHevc);
+mVHevc.className = (cpHevc !== '') ? 'val-ok' : 'val-dim';
+mVVp9.textContent = formatCanPlay(cpVp9);
+mVVp9.className = (cpVp9 !== '') ? 'val-ok' : 'val-dim';
+mVAval1.textContent = formatCanPlay(cpAv1);
+mVAval1.className = (cpAv1 !== '') ? 'val-ok' : 'val-dim';
+
+log('[+] Video Codecs: H264=' + (cpH264 || 'no') + ', HEVC=' + (cpHevc || 'no') + ', VP9=' + (cpVp9 || 'no') + ', AV1=' + (cpAv1 || 'no'));
+syncBn('CODEC-VIDEO', 'h264=' + (cpH264 || 'no') + '|hevc=' + (cpHevc || 'no') + '|vp9=' + (cpVp9 || 'no') + '|av1=' + (cpAv1 || 'no') + '|theora=' + (cpTheora || 'no'));
+
+nodeStage1.className = 'node done';
+nodeStage1.querySelector('.node-step').textContent = 'Stage 1 [DONE]';
+
+/* ============================================================
+ * STAGE 2: Audio Codec Probing
+ * ============================================================ */
+nodeStage2.className = 'node active';
+nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [ACTIVE]';
+
+var cpAac = aud.canPlayType('audio/mp4; codecs="mp4a.40.2"');
+var cpMp3 = aud.canPlayType('audio/mpeg');
+var cpOpus = aud.canPlayType('audio/ogg; codecs="opus"');
+var cpFlac = aud.canPlayType('audio/flac');
+var cpWav = aud.canPlayType('audio/wav; codecs="1"');
+var cpVorbis = aud.canPlayType('audio/ogg; codecs="vorbis"');
+
+mAAac.textContent = formatCanPlay(cpAac);
+mAAac.className = (cpAac !== '') ? 'val-ok' : 'val-dim';
+mAMp3.textContent = formatCanPlay(cpMp3);
+mAMp3.className = (cpMp3 !== '') ? 'val-ok' : 'val-dim';
+mAOpus.textContent = formatCanPlay(cpOpus);
+mAOpus.className = (cpOpus !== '') ? 'val-ok' : 'val-dim';
+mAFlac.textContent = formatCanPlay(cpFlac);
+mAFlac.className = (cpFlac !== '') ? 'val-ok' : 'val-dim';
+
+log('[+] Audio Codecs: AAC=' + (cpAac || 'no') + ', MP3=' + (cpMp3 || 'no') + ', Opus=' + (cpOpus || 'no') + ', FLAC=' + (cpFlac || 'no') + ', WAV=' + (cpWav || 'no'));
+syncBn('CODEC-AUDIO', 'aac=' + (cpAac || 'no') + '|mp3=' + (cpMp3 || 'no') + '|opus=' + (cpOpus || 'no') + '|flac=' + (cpFlac || 'no') + '|wav=' + (cpWav || 'no'));
+
+nodeStage2.className = 'node done';
+nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [DONE]';
+
+/* ============================================================
+ * STAGE 3: MediaSource Extensions (MSE)
+ * ============================================================ */
+nodeStage3.className = 'node active';
+nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [ACTIVE]';
+
+var hasMse = (typeof window.MediaSource !== 'undefined');
+var mseH264 = false, mseVp9 = false, mseHevc = false;
+
+if (hasMse) {
+  mMseApi.textContent = 'AVAILABLE (W3C MSE)';
+  mMseApi.className = 'val-ok';
+  try {
+    mseH264 = MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"');
+    mseVp9 = MediaSource.isTypeSupported('video/webm; codecs="vp9"');
+    mseHevc = MediaSource.isTypeSupported('video/mp4; codecs="hev1.1.6.L93.B0"');
+  } catch(e) {}
+} else {
+  mMseApi.textContent = 'DISABLED';
+  mMseApi.className = 'val-dim';
+}
+
+mMseH264.textContent = mseH264 ? 'BUFFER ACTIVE' : 'UNSUPPORTED';
+mMseH264.className = mseH264 ? 'val-ok' : 'val-dim';
+mMseVp9.textContent = mseVp9 ? 'BUFFER ACTIVE' : 'UNSUPPORTED';
+mMseVp9.className = mseVp9 ? 'val-ok' : 'val-dim';
+
+log('[+] MediaSource: supported=' + hasMse + ', mseH264=' + mseH264 + ', mseVp9=' + mseVp9 + ', mseHevc=' + mseHevc);
+syncBn('MSE', 'hasMse=' + hasMse + '|h264=' + mseH264 + '|vp9=' + mseVp9 + '|hevc=' + mseHevc);
+
+nodeStage3.className = 'node done';
+nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [DONE]';
+
+/* ============================================================
+ * STAGE 4: WebRTC & Real-Time Communications
+ * ============================================================ */
+nodeStage4.className = 'node active';
+nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [ACTIVE]';
+
+var hasRtc = (typeof window.RTCPeerConnection !== 'undefined' || typeof window.webkitRTCPeerConnection !== 'undefined');
+var hasMediaDevices = (typeof navigator.mediaDevices !== 'undefined' && typeof navigator.mediaDevices.getUserMedia !== 'undefined');
+var hasDataChannel = false;
+
+if (hasRtc) {
+  mRtcPeer.textContent = 'EXPOSED (RTCPeerConnection)';
+  mRtcPeer.className = 'val-ok';
+  try {
+    var PC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+    var pc = new PC();
+    if (typeof pc.createDataChannel === 'function') hasDataChannel = true;
+    pc.close();
+  } catch(e) {}
+} else {
+  mRtcPeer.textContent = 'DISABLED / BLOCKED';
+  mRtcPeer.className = 'val-dim';
+}
+
+mMediaDevices.textContent = hasMediaDevices ? 'EXPOSED' : 'BLOCKED / NO MIC';
+mMediaDevices.className = hasMediaDevices ? 'val-ok' : 'val-dim';
+
+log('[+] WebRTC Stack: RTCPeerConnection=' + hasRtc + ', mediaDevices=' + hasMediaDevices + ', dataChannel=' + hasDataChannel);
+syncBn('WEBRTC', 'hasRtc=' + hasRtc + '|devices=' + hasMediaDevices + '|dc=' + hasDataChannel);
+
+nodeStage4.className = 'node done';
+nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [DONE]';
+
+/* ============================================================
+ * STAGE 5: Encrypted Media Extensions (EME / DRM)
+ * ============================================================ */
+nodeStage5.className = 'node active';
+nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [ACTIVE]';
+
+var hasEme = (typeof navigator.requestMediaKeySystemAccess === 'function');
+mEme.textContent = hasEme ? 'API EXPOSED' : 'DISABLED';
+mEme.className = hasEme ? 'val-cyan' : 'val-dim';
+
+log('[+] EME Subsystem: requestMediaKeySystemAccess=' + hasEme);
+syncBn('EME-API', 'hasEme=' + hasEme);
+
+nodeStage5.className = 'node done';
+nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [DONE]';
+
+/* ============================================================
+ * STAGE 6: Audio Output & Sink Routing
+ * ============================================================ */
+nodeStage6.className = 'node active';
+nodeStage6.querySelector('.node-step').textContent = 'Stage 6 [ACTIVE]';
+
+var hasSinkId = ('sinkId' in aud || 'setSinkId' in HTMLMediaElement.prototype);
+var hasMediaSession = ('mediaSession' in navigator);
+
+log('[+] Media Routing: sinkId=' + hasSinkId + ', mediaSession=' + hasMediaSession);
+syncBn('MEDIA-ROUTING', 'sinkId=' + hasSinkId + '|mediaSession=' + hasMediaSession);
+
+nodeStage6.className = 'node done';
+nodeStage6.querySelector('.node-step').textContent = 'Stage 6 [DONE]';
+
+statusBadge.textContent = 'MEDIA AUDIT COMPLETE';
+statusBadge.style.background = '#00ff66';
+
+syncBn('DONE', 'status=P954_COMPLETE|hasMse=' + hasMse + '|h264=' + (cpH264 !== '') + '|hasRtc=' + hasRtc);
+
+/* Auto-Reload Watcher for autonomous progression */
+var initialReloadToken = null;
+function checkAutoReload() {
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/reload.txt?t=' + Date.now(), true);
+    xhr.onload = function() {
+      if (xhr.status === 200) {
+        var token = xhr.responseText.trim();
+        if (initialReloadToken === null) {
+          initialReloadToken = token;
+        } else if (token !== initialReloadToken) {
+          log('[*] New deployment detected (token: ' + token + '). Auto-reloading in 500ms...');
+          setTimeout(function() { location.reload(); }, 500);
+        }
+      }
+    };
+    xhr.send();
+  } catch(e) {}
+}
+setInterval(checkAutoReload, 1500);
+</script>
+</body>
+</html>

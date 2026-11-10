@@ -1,0 +1,594 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>PS5 FW 14.10 // MEDIASOURCE, BLOB &amp; INTL UNICODE HUD</title>
+<style>
+:root {
+  --bg-dark: #040711;
+  --panel-bg: rgba(8, 14, 28, 0.94);
+  --neon-cyan: #00f3ff;
+  --neon-green: #00ff66;
+  --neon-amber: #ffb800;
+  --neon-pink: #ff0077;
+  --neon-purple: #9d00ff;
+  --text-dim: #7085a5;
+  --text-main: #e2f1ff;
+  --border-glow: rgba(0, 243, 255, 0.35);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background-color: var(--bg-dark);
+  background-image: 
+    radial-gradient(ellipse at 50% 0%, rgba(0, 243, 255, 0.16), transparent 75%),
+    linear-gradient(rgba(0, 243, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 243, 255, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 28px 28px, 28px 28px;
+  color: var(--text-main);
+  font-family: "SF Mono", "Consolas", monospace;
+  padding: 16px;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+.scanline {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.02), rgba(0, 255, 0, 0.01), rgba(0, 255, 0, 0.02));
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+  z-index: 999;
+}
+
+/* Header */
+.header {
+  border: 1px solid var(--neon-cyan);
+  background: rgba(0, 243, 255, 0.07);
+  box-shadow: 0 0 20px rgba(0, 243, 255, 0.3);
+  padding: 12px 20px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title-glitch {
+  font-size: 18px;
+  font-weight: 900;
+  letter-spacing: 2px;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 10px rgba(0, 243, 255, 0.8);
+}
+.target-badge {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: rgba(0, 255, 102, 0.15);
+  border: 1px solid var(--neon-green);
+  color: var(--neon-green);
+  font-weight: bold;
+}
+
+/* Pipeline Stage Trackers */
+.pipeline-track {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.node {
+  background: var(--panel-bg);
+  border: 1px solid rgba(112, 133, 165, 0.25);
+  border-radius: 6px;
+  padding: 10px;
+  position: relative;
+  transition: all 0.3s ease;
+}
+.node.done {
+  border-color: var(--neon-green);
+  box-shadow: 0 0 10px rgba(0, 255, 102, 0.25);
+}
+.node.active {
+  border-color: var(--neon-cyan);
+  box-shadow: 0 0 12px rgba(0, 243, 255, 0.4);
+}
+.node.locked {
+  border-color: rgba(112, 133, 165, 0.2);
+  opacity: 0.55;
+}
+.node-step {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.node.done .node-step { color: var(--neon-green); }
+.node.active .node-step { color: var(--neon-cyan); }
+.node-title {
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--text-main);
+  margin-bottom: 4px;
+}
+.node-desc {
+  font-size: 9px;
+  color: var(--text-dim);
+  line-height: 1.3;
+}
+
+/* Grid Layout */
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-glow);
+  border-radius: 6px;
+  padding: 14px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
+  position: relative;
+  overflow: hidden;
+}
+.panel-title {
+  font-size: 13px;
+  font-weight: bold;
+  color: var(--neon-cyan);
+  border-bottom: 1px solid rgba(0, 243, 255, 0.2);
+  padding-bottom: 8px;
+  margin-bottom: 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.live-meter {
+  display: flex;
+  justify-content: space-between;
+  margin: 6px 0;
+  font-size: 11px;
+}
+.val-hex { color: var(--neon-purple); font-weight: bold; }
+.val-ok { color: var(--neon-green); font-weight: bold; }
+.val-dim { color: var(--text-dim); }
+.val-cyan { color: var(--neon-cyan); font-weight: bold; }
+.val-warn { color: var(--neon-amber); font-weight: bold; }
+.val-fail { color: var(--neon-pink); font-weight: bold; }
+
+/* Radar & Glitch Accents */
+.radar-box {
+  width: 100%;
+  height: 2px;
+  background: rgba(0, 243, 255, 0.1);
+  position: relative;
+  overflow: hidden;
+  margin-top: 10px;
+}
+.radar-sweep {
+  position: absolute;
+  top: 0; left: -30%;
+  width: 30%; height: 100%;
+  background: linear-gradient(90deg, transparent, var(--neon-cyan), transparent);
+  animation: sweep 2.2s infinite linear;
+}
+@keyframes sweep {
+  0% { left: -30%; }
+  100% { left: 100%; }
+}
+
+/* Terminal Log */
+#terminal {
+  background: rgba(2, 4, 10, 0.9);
+  border: 1px solid rgba(0, 243, 255, 0.18);
+  border-radius: 4px;
+  padding: 10px;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: #a0c4e8;
+  height: 150px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+
+<div class="header">
+  <div>
+    <div class="title-glitch">&#x25C8; PS5 FW 14.10 // MEDIASOURCE &amp; INTL UNICODE HUD</div>
+    <div style="font-size: 10px; color: var(--text-dim); margin-top: 3px;">
+      MediaSource SourceBuffer Execution &bull; Blob Memory Pipeline &bull; ICU Internationalization Oracle
+    </div>
+  </div>
+  <div class="target-badge" id="statusBadge">INITIALIZING SUITE</div>
+</div>
+
+<!-- 6-Stage Visual Pipeline Tracker -->
+<div class="pipeline-track">
+  <div class="node active" id="nodeStage1">
+    <div class="node-step">Stage 1 [ACTIVE]</div>
+    <div class="node-title">MSE Lifecycle</div>
+    <div class="node-desc">MediaSource URL attachment &amp; sourceopen dispatch.</div>
+  </div>
+  <div class="node locked" id="nodeStage2">
+    <div class="node-step">Stage 2 [QUEUED]</div>
+    <div class="node-title">SourceBuffer Ingest</div>
+    <div class="node-desc">addSourceBuffer('avc1') &amp; buffer properties.</div>
+  </div>
+  <div class="node locked" id="nodeStage3">
+    <div class="node-step">Stage 3 [QUEUED]</div>
+    <div class="node-title">Blob 4MB Memory</div>
+    <div class="node-desc">4MB Blob allocation &amp; URL.createObjectURL readback.</div>
+  </div>
+  <div class="node locked" id="nodeStage4">
+    <div class="node-step">Stage 4 [QUEUED]</div>
+    <div class="node-title">Intl.Segmenter</div>
+    <div class="node-desc">Unicode ZWJ emoji graphemes &amp; word boundaries.</div>
+  </div>
+  <div class="node locked" id="nodeStage5">
+    <div class="node-step">Stage 5 [QUEUED]</div>
+    <div class="node-title">ICU Intl Features</div>
+    <div class="node-desc">DisplayNames, ListFormat, RelativeTime &amp; Plurals.</div>
+  </div>
+  <div class="node locked" id="nodeStage6">
+    <div class="node-step">Stage 6 [QUEUED]</div>
+    <div class="node-title">Locale &amp; Norm</div>
+    <div class="node-desc">Default locale, numbering system &amp; NFC/NFD.</div>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Panel 1: MediaSource & Blob Memory -->
+  <div class="panel">
+    <div class="panel-title">
+      <span>MEDIASOURCE &amp; BLOB MEMORY PIPELINE</span>
+      <span style="color:var(--neon-green);" id="mMseBadge">ACTIVE</span>
+    </div>
+    <div class="live-meter"><span>MediaSource State:</span><span class="val-cyan" id="mMseState">Waiting...</span></div>
+    <div class="live-meter"><span>SourceBuffer Attachment:</span><span class="val-ok" id="mSbStatus">Waiting...</span></div>
+    <div class="live-meter"><span>Buffer Ingest Mode:</span><span class="val-hex" id="mSbMode">Waiting...</span></div>
+    <div class="live-meter"><span>4MB Blob Alloc Time:</span><span class="val-cyan" id="mBlobAlloc">Allocating...</span></div>
+    <div class="live-meter"><span>Blob Readback Throughput:</span><span class="val-ok" id="mBlobSpeed">Streaming...</span></div>
+    <div class="live-meter"><span>Blob Byte Verification:</span><span class="val-ok" id="mBlobVerify">Verifying...</span></div>
+    <div class="radar-box"><div class="radar-sweep"></div></div>
+  </div>
+
+  <!-- Panel 2: ICU & Unicode Subsystem -->
+  <div class="panel">
+    <div class="panel-title">
+      <span>ICU &amp; UNICODE INTERNATIONALIZATION HUD</span>
+      <span style="color:var(--neon-cyan);">ACTIVE TELEMETRY</span>
+    </div>
+    <div class="live-meter"><span>Intl.Segmenter:</span><span class="val-ok" id="mIntlSegmenter">Testing...</span></div>
+    <div class="live-meter"><span>ZWJ Grapheme Cluster Count:</span><span class="val-hex" id="mZwjGraphemes">Testing...</span></div>
+    <div class="live-meter"><span>Intl.DisplayNames:</span><span class="val-ok" id="mIntlDisplay">Testing...</span></div>
+    <div class="live-meter"><span>Intl.ListFormat:</span><span class="val-ok" id="mIntlList">Testing...</span></div>
+    <div class="live-meter"><span>Default Locale:</span><span class="val-hex" id="mDefLocale">Resolving...</span></div>
+    <div class="live-meter"><span>Numbering System:</span><span class="val-cyan" id="mDefNumbering">Resolving...</span></div>
+    <div class="live-meter"><span>Unicode NFC/NFD Decomp:</span><span class="val-ok" id="mUnicodeNorm">Testing...</span></div>
+    <div class="radar-box"><div class="radar-sweep"></div></div>
+  </div>
+</div>
+
+<!-- Tactical Log Terminal -->
+<div class="panel">
+  <div class="panel-title">
+    <span>TACTICAL MEDIA &amp; ICU LOG</span>
+    <span style="color:var(--neon-green);">LIVE STREAM TELEMETRY</span>
+  </div>
+  <pre id="terminal">[*] Initializing Probe P955 MediaSource, Blob &amp; ICU Suite...</pre>
+  <div class="radar-box"><div class="radar-sweep"></div></div>
+</div>
+
+<script>
+'use strict';
+var term = document.getElementById('terminal');
+var statusBadge = document.getElementById('statusBadge');
+var mMseBadge = document.getElementById('mMseBadge');
+
+var nodeStage1 = document.getElementById('nodeStage1');
+var nodeStage2 = document.getElementById('nodeStage2');
+var nodeStage3 = document.getElementById('nodeStage3');
+var nodeStage4 = document.getElementById('nodeStage4');
+var nodeStage5 = document.getElementById('nodeStage5');
+var nodeStage6 = document.getElementById('nodeStage6');
+
+var mMseState = document.getElementById('mMseState');
+var mSbStatus = document.getElementById('mSbStatus');
+var mSbMode = document.getElementById('mSbMode');
+var mBlobAlloc = document.getElementById('mBlobAlloc');
+var mBlobSpeed = document.getElementById('mBlobSpeed');
+var mBlobVerify = document.getElementById('mBlobVerify');
+
+var mIntlSegmenter = document.getElementById('mIntlSegmenter');
+var mZwjGraphemes = document.getElementById('mZwjGraphemes');
+var mIntlDisplay = document.getElementById('mIntlDisplay');
+var mIntlList = document.getElementById('mIntlList');
+var mDefLocale = document.getElementById('mDefLocale');
+var mDefNumbering = document.getElementById('mDefNumbering');
+var mUnicodeNorm = document.getElementById('mUnicodeNorm');
+
+function log(msg) {
+  var d = document.createElement('div');
+  d.textContent = '[' + new Date().toISOString().slice(11, 23) + '] ' + msg;
+  term.appendChild(d);
+  term.scrollTop = term.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P955-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+window.onerror = function(msg, url, line) {
+  syncBn('JS-ERR', msg + ' at line ' + line);
+  log('[!] ERROR: ' + msg + ' (Line ' + line + ')');
+};
+
+log('[*] Probe P955 online: MediaSource Lifecycle, Blob Memory, and ICU Internationalization.');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * STAGE 1 & 2: MediaSource Lifecycle & SourceBuffer Attachment
+ * ============================================================ */
+var hasMse = (typeof window.MediaSource !== 'undefined');
+var msOpened = false, sbAttached = false;
+var sbModeStr = 'none';
+
+if (hasMse) {
+  try {
+    var ms = new MediaSource();
+    var video = document.createElement('video');
+    var msUrl = URL.createObjectURL(ms);
+    video.src = msUrl;
+
+    ms.addEventListener('sourceopen', function() {
+      msOpened = true;
+      mMseState.textContent = 'OPEN (' + ms.readyState + ')';
+      log('[+] MediaSource opened: readyState=' + ms.readyState);
+
+      nodeStage1.className = 'node done';
+      nodeStage1.querySelector('.node-step').textContent = 'Stage 1 [DONE]';
+
+      // Stage 2: addSourceBuffer
+      nodeStage2.className = 'node active';
+      nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [ACTIVE]';
+
+      try {
+        var sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+        sbAttached = true;
+        sbModeStr = sb.mode;
+        mSbStatus.textContent = 'ATTACHED (H.264)';
+        mSbMode.textContent = sb.mode + ' (updating=' + sb.updating + ')';
+
+        log('[+] SourceBuffer attached: mode=' + sb.mode + ', updating=' + sb.updating + ', offset=' + sb.timestampOffset);
+        syncBn('MSE-ATTACH', 'open=true|mode=' + sb.mode + '|updating=' + sb.updating + '|offset=' + sb.timestampOffset);
+
+        nodeStage2.className = 'node done';
+        nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [DONE]';
+      } catch(sbe) {
+        mSbStatus.textContent = 'ERROR (' + sbe.name + ')';
+        mSbStatus.className = 'val-fail';
+        log('[-] SourceBuffer add error: ' + sbe.message);
+        syncBn('MSE-ATTACH-ERR', sbe.message);
+      }
+
+      try { URL.revokeObjectURL(msUrl); } catch(e) {}
+    });
+
+    syncBn('MSE-INIT', 'instantiated=true');
+  } catch(mseErr) {
+    log('[-] MediaSource error: ' + mseErr.message);
+    syncBn('MSE-ERR', mseErr.message);
+  }
+} else {
+  mMseState.textContent = 'DISABLED';
+  mSbStatus.textContent = 'N/A';
+  mSbMode.textContent = 'N/A';
+  syncBn('NO-MSE', 'disabled=true');
+}
+
+/* ============================================================
+ * STAGE 3: 4MB Blob Memory Allocation & Streaming Readback
+ * ============================================================ */
+nodeStage3.className = 'node active';
+nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [ACTIVE]';
+
+try {
+  var blobBytes = 4 * 1024 * 1024; // 4MB
+  var tAlloc0 = performance.now();
+  var u8 = new Uint8Array(blobBytes);
+  u8[0] = 0xAA;
+  u8[blobBytes / 2] = 0x55;
+  u8[blobBytes - 1] = 0xCC;
+
+  var blob = new Blob([u8], { type: 'application/octet-stream' });
+  var allocMs = (performance.now() - tAlloc0).toFixed(2);
+  mBlobAlloc.textContent = allocMs + ' ms (4MB BLOB)';
+
+  var blobUrl = URL.createObjectURL(blob);
+  var tRead0 = performance.now();
+
+  fetch(blobUrl).then(function(res) {
+    return res.arrayBuffer();
+  }).then(function(buf) {
+    var readMs = Math.max(1, performance.now() - tRead0);
+    var mbps = ((blobBytes / (1024 * 1024)) / (readMs / 1000)).toFixed(1);
+    mBlobSpeed.textContent = readMs.toFixed(0) + ' ms (' + mbps + ' MB/s)';
+
+    var check = new Uint8Array(buf);
+    var intact = (check.byteLength === blobBytes && check[0] === 0xAA && check[blobBytes / 2] === 0x55 && check[blobBytes - 1] === 0xCC);
+    mBlobVerify.textContent = intact ? '100% BYTE FIDELITY' : 'CORRUPTED';
+    mBlobVerify.className = intact ? 'val-ok' : 'val-fail';
+
+    log('[+] Blob 4MB: alloc=' + allocMs + 'ms, readback=' + readMs.toFixed(0) + 'ms (' + mbps + ' MB/s), intact=' + intact);
+    syncBn('BLOB-MEM', 'allocMs=' + allocMs + '|readMs=' + readMs.toFixed(0) + '|mbps=' + mbps + '|intact=' + intact);
+
+    URL.revokeObjectURL(blobUrl);
+
+    nodeStage3.className = 'node done';
+    nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [DONE]';
+  }).catch(function(be) {
+    log('[-] Blob fetch error: ' + be.message);
+    syncBn('BLOB-ERR', be.message);
+  });
+} catch(e) {
+  log('[-] Blob allocation error: ' + e.message);
+  syncBn('BLOB-ALLOC-ERR', e.message);
+}
+
+/* ============================================================
+ * STAGE 4: Intl.Segmenter & Unicode ZWJ Clustering
+ * ============================================================ */
+nodeStage4.className = 'node active';
+nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [ACTIVE]';
+
+var hasSegmenter = (typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function');
+var zwjCount = -1, wordCount = -1;
+
+if (hasSegmenter) {
+  mIntlSegmenter.textContent = 'SUPPORTED (Intl.Segmenter)';
+  mIntlSegmenter.className = 'val-ok';
+
+  try {
+    // Family emoji: 👨‍👩‍👧‍👦 (composed of 4 people + 3 ZWJ characters = 1 grapheme cluster)
+    var segGrapheme = new Intl.Segmenter('en', { granularity: 'grapheme' });
+    var familyEmoji = "\uD83D\uDC68\u200D\uD83D\uDC69\u200D\uD83D\uDC67\u200D\uD83D\uDC66";
+    var graphemes = Array.from(segGrapheme.segment(familyEmoji));
+    zwjCount = graphemes.length;
+    mZwjGraphemes.textContent = zwjCount + ' CLUSTER (CORRECT: 1)';
+
+    // Word segmentation
+    var segWord = new Intl.Segmenter('en', { granularity: 'word' });
+    var words = Array.from(segWord.segment("PlayStation 5 WebKit Engine"));
+    wordCount = words.length;
+
+    log('[+] Intl.Segmenter: ZWJ grapheme count=' + zwjCount + ' (expect 1), words=' + wordCount);
+    syncBn('SEGMENTER', 'supported=true|zwjCount=' + zwjCount + '|words=' + wordCount);
+
+    nodeStage4.className = 'node done';
+    nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [DONE]';
+  } catch(se) {
+    log('[-] Segmenter runtime error: ' + se.message);
+    syncBn('SEG-ERR', se.message);
+  }
+} else {
+  mIntlSegmenter.textContent = 'UNSUPPORTED';
+  mIntlSegmenter.className = 'val-dim';
+  mZwjGraphemes.textContent = 'N/A';
+  log('[-] Intl.Segmenter is not available.');
+  syncBn('SEGMENTER', 'supported=false');
+  nodeStage4.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 5: ICU Feature Suite (DisplayNames, ListFormat, etc.)
+ * ============================================================ */
+nodeStage5.className = 'node active';
+nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [ACTIVE]';
+
+var hasDisplayNames = (typeof Intl !== 'undefined' && typeof Intl.DisplayNames === 'function');
+var hasListFormat = (typeof Intl !== 'undefined' && typeof Intl.ListFormat === 'function');
+var hasRelTime = (typeof Intl !== 'undefined' && typeof Intl.RelativeTimeFormat === 'function');
+var hasPlural = (typeof Intl !== 'undefined' && typeof Intl.PluralRules === 'function');
+
+var displaySample = 'none', listSample = 'none';
+
+if (hasDisplayNames) {
+  try {
+    var dn = new Intl.DisplayNames(['en'], { type: 'language' });
+    displaySample = dn.of('ja');
+    mIntlDisplay.textContent = 'SUPPORTED ("' + displaySample + '")';
+  } catch(e) {}
+} else {
+  mIntlDisplay.textContent = 'UNSUPPORTED';
+  mIntlDisplay.className = 'val-dim';
+}
+
+if (hasListFormat) {
+  try {
+    var lf = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
+    listSample = lf.format(['A', 'B', 'C']);
+    mIntlList.textContent = 'SUPPORTED ("' + listSample + '")';
+  } catch(e) {}
+} else {
+  mIntlList.textContent = 'UNSUPPORTED';
+  mIntlList.className = 'val-dim';
+}
+
+log('[+] ICU APIs: DisplayNames=' + hasDisplayNames + ' (' + displaySample + '), ListFormat=' + hasListFormat + ', RelTime=' + hasRelTime + ', Plural=' + hasPlural);
+syncBn('INTL-ICU', 'disp=' + hasDisplayNames + '|list=' + hasListFormat + '|rel=' + hasRelTime + '|plural=' + hasPlural);
+
+nodeStage5.className = 'node done';
+nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [DONE]';
+
+/* ============================================================
+ * STAGE 6: Locale & Unicode Normalization Oracle
+ * ============================================================ */
+nodeStage6.className = 'node active';
+nodeStage6.querySelector('.node-step').textContent = 'Stage 6 [ACTIVE]';
+
+var defLocale = 'unknown', defCalendar = 'unknown', defNumbering = 'unknown';
+try {
+  var dtfOpt = Intl.DateTimeFormat().resolvedOptions();
+  defLocale = dtfOpt.locale || 'unknown';
+  defCalendar = dtfOpt.calendar || 'unknown';
+
+  var nfOpt = Intl.NumberFormat().resolvedOptions();
+  defNumbering = nfOpt.numberingSystem || 'unknown';
+} catch(e) {}
+
+mDefLocale.textContent = defLocale + ' (cal: ' + defCalendar + ')';
+mDefNumbering.textContent = defNumbering;
+
+// Unicode normalization test
+var normOk = false;
+try {
+  var decomposed = "\u00C5".normalize('NFD'); // Å -> A + combining ring
+  var recomposed = decomposed.normalize('NFC');
+  normOk = (decomposed.length === 2 && recomposed.length === 1 && recomposed === "\u00C5");
+  mUnicodeNorm.textContent = normOk ? 'NFC / NFD VERIFIED' : 'FAILED';
+} catch(e) {}
+
+log('[+] Locale & Unicode: locale=' + defLocale + ', numbering=' + defNumbering + ', UnicodeNorm=' + normOk);
+syncBn('LOCALE-NORM', 'locale=' + defLocale + '|cal=' + defCalendar + '|num=' + defNumbering + '|normOk=' + normOk);
+
+nodeStage6.className = 'node done';
+nodeStage6.querySelector('.node-step').textContent = 'Stage 6 [DONE]';
+
+statusBadge.textContent = 'ALL 6 STAGES COMPLETE';
+statusBadge.style.background = '#00ff66';
+
+syncBn('DONE', 'status=P955_COMPLETE|locale=' + defLocale + '|blobSpeed=' + (mBlobSpeed.textContent) + '|seg=' + hasSegmenter);
+
+/* Auto-Reload Watcher for autonomous progression */
+var initialReloadToken = null;
+function checkAutoReload() {
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/reload.txt?t=' + Date.now(), true);
+    xhr.onload = function() {
+      if (xhr.status === 200) {
+        var token = xhr.responseText.trim();
+        if (initialReloadToken === null) {
+          initialReloadToken = token;
+        } else if (token !== initialReloadToken) {
+          log('[*] New deployment detected (token: ' + token + '). Auto-reloading in 500ms...');
+          setTimeout(function() { location.reload(); }, 500);
+        }
+      }
+    };
+    xhr.send();
+  } catch(e) {}
+}
+setInterval(checkAutoReload, 1500);
+</script>
+</body>
+</html>

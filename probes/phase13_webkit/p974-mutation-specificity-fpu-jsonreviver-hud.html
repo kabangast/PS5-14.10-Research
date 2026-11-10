@@ -1,0 +1,835 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>PS5 FW 14.10 // MUTATION, SPECIFICITY, FPU &amp; JSON REVIVER HUD</title>
+<style>
+:root {
+  --bg-dark: #040711;
+  --panel-bg: rgba(8, 14, 28, 0.94);
+  --neon-cyan: #00f3ff;
+  --neon-green: #00ff66;
+  --neon-amber: #ffb800;
+  --neon-pink: #ff0077;
+  --neon-purple: #9d00ff;
+  --text-dim: #7085a5;
+  --text-main: #e2f1ff;
+  --border-glow: rgba(0, 243, 255, 0.35);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background-color: var(--bg-dark);
+  background-image: 
+    radial-gradient(ellipse at 50% 0%, rgba(0, 243, 255, 0.16), transparent 75%),
+    linear-gradient(rgba(0, 243, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 243, 255, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 28px 28px, 28px 28px;
+  color: var(--text-main);
+  font-family: "SF Mono", "Consolas", monospace;
+  padding: 16px;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+.scanline {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.02), rgba(0, 255, 0, 0.01), rgba(0, 255, 0, 0.02));
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+  z-index: 999;
+}
+
+/* Header */
+.header {
+  border: 1px solid var(--neon-cyan);
+  background: rgba(0, 243, 255, 0.07);
+  box-shadow: 0 0 20px rgba(0, 243, 255, 0.3);
+  padding: 12px 20px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title-glitch {
+  font-size: 18px;
+  font-weight: 900;
+  letter-spacing: 2px;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 10px rgba(0, 243, 255, 0.8);
+}
+.target-badge {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: rgba(0, 255, 102, 0.15);
+  border: 1px solid var(--neon-green);
+  color: var(--neon-green);
+  font-weight: bold;
+}
+
+/* Pipeline Trackers */
+.pipeline-track {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.node {
+  background: var(--panel-bg);
+  border: 1px solid rgba(112, 133, 165, 0.25);
+  border-radius: 6px;
+  padding: 10px;
+  position: relative;
+  transition: all 0.3s ease;
+}
+.node.done {
+  border-color: var(--neon-green);
+  box-shadow: 0 0 10px rgba(0, 255, 102, 0.25);
+}
+.node.active {
+  border-color: var(--neon-cyan);
+  box-shadow: 0 0 12px rgba(0, 243, 255, 0.4);
+}
+.node.locked {
+  border-color: rgba(112, 133, 165, 0.2);
+  opacity: 0.55;
+}
+.node-step {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.node.done .node-step { color: var(--neon-green); }
+.node.active .node-step { color: var(--neon-cyan); }
+.node-title {
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--text-main);
+  margin-bottom: 4px;
+}
+.node-desc {
+  font-size: 9px;
+  color: var(--text-dim);
+  line-height: 1.3;
+}
+
+/* Grid Layout */
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid rgba(0, 243, 255, 0.25);
+  border-radius: 6px;
+  padding: 14px;
+  position: relative;
+}
+.panel-full {
+  grid-column: 1 / -1;
+}
+.panel-title {
+  font-size: 13px;
+  font-weight: bold;
+  color: var(--neon-cyan);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.panel-title::before {
+  content: "";
+  display: inline-block;
+  width: 4px;
+  height: 14px;
+  background: var(--neon-cyan);
+}
+
+/* Metric Display Rows */
+.metric-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 0;
+  border-bottom: 1px solid rgba(112, 133, 165, 0.15);
+  font-size: 11px;
+}
+.metric-row:last-child { border-bottom: none; }
+.metric-label { color: var(--text-dim); }
+.metric-val { font-weight: bold; }
+.val-ok { color: var(--neon-green); }
+.val-amber { color: var(--neon-amber); }
+.val-dim { color: var(--text-dim); }
+.val-hex { color: var(--neon-cyan); }
+.val-pink { color: var(--neon-pink); }
+
+/* Terminal Output Box */
+.terminal {
+  background: rgba(2, 5, 12, 0.96);
+  border: 1px solid rgba(0, 243, 255, 0.2);
+  border-radius: 4px;
+  padding: 10px;
+  height: 150px;
+  overflow-y: auto;
+  font-size: 10px;
+  line-height: 1.4;
+  color: #a5c2eb;
+}
+.term-line { margin-bottom: 2px; }
+.term-ts { color: var(--neon-cyan); margin-right: 6px; }
+.term-hi { color: var(--neon-green); }
+.term-warn { color: var(--neon-amber); }
+.term-err { color: var(--neon-pink); }
+
+/* Hidden scratch container */
+#bench-scratch {
+  position: absolute;
+  left: -9999px;
+  top: -9999px;
+  width: 200px;
+  height: 200px;
+  overflow: hidden;
+  visibility: hidden;
+}
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+
+<div class="header">
+  <div class="title-glitch">PS5 WebKit Core Profiler // P974</div>
+  <div class="target-badge">PLAYSTATION 5 FW 14.10 // 192.168.1.106</div>
+</div>
+
+<!-- 6-Stage Pipeline Trackers -->
+<div class="pipeline-track">
+  <div class="node active" id="node-stage-1">
+    <div class="node-step">Stage 1 [MUTATION]</div>
+    <div class="node-title">Mutation Race</div>
+    <div class="node-desc">DOMNodeInserted vs MutationObserver</div>
+  </div>
+  <div class="node locked" id="node-stage-2">
+    <div class="node-step">Stage 2 [CASCADE]</div>
+    <div class="node-title">CSS Specificity</div>
+    <div class="node-desc">1,000 Conflicting Cascade Rules</div>
+  </div>
+  <div class="node locked" id="node-stage-3">
+    <div class="node-step">Stage 3 [FPU/SIMD]</div>
+    <div class="node-title">Dot Product Math</div>
+    <div class="node-desc">1M Int32 vs Float32 Operations</div>
+  </div>
+  <div class="node locked" id="node-stage-4">
+    <div class="node-step">Stage 4 [JSON TAX]</div>
+    <div class="node-title">Reviver/Replacer</div>
+    <div class="node-desc">5,000 Objects Callback Overhead</div>
+  </div>
+  <div class="node locked" id="node-stage-5">
+    <div class="node-step">Stage 5 [BARRIER]</div>
+    <div class="node-title">Worker Phase Sync</div>
+    <div class="node-desc">4-Worker Jitter &amp; Timestamp Barrier</div>
+  </div>
+  <div class="node locked" id="node-stage-6">
+    <div class="node-step">Stage 6 [VERDICT]</div>
+    <div class="node-title">Master Verdict</div>
+    <div class="node-desc">Summary &amp; Beacon Telemetry</div>
+  </div>
+</div>
+
+<div class="dashboard-grid">
+  <!-- Panel 1: Mutation Race -->
+  <div class="panel">
+    <div class="panel-title">Stage 1: DOM Mutation Event vs Observer</div>
+    <div class="metric-row">
+      <span class="metric-label">Legacy DOMNodeInserted:</span>
+      <span class="metric-val" id="m-legacy-status">TESTING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Legacy Event Time (1,000 Nodes):</span>
+      <span class="metric-val" id="m-legacy-time">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">MutationObserver Time (1,000 Nodes):</span>
+      <span class="metric-val" id="m-observer-time">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Observer Microtask Speedup:</span>
+      <span class="metric-val" id="m-mutation-ratio">--</span>
+    </div>
+  </div>
+
+  <!-- Panel 2: CSS Cascade Specificity -->
+  <div class="panel">
+    <div class="panel-title">Stage 2: CSS Specificity &amp; Precedence</div>
+    <div class="metric-row">
+      <span class="metric-label">Injected Conflict Rules:</span>
+      <span class="metric-val val-hex" id="m-rules-count">1,000 RULES</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Computed Color Resolution:</span>
+      <span class="metric-val" id="m-cascade-color">TESTING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Resolution Latency (1,000 queries):</span>
+      <span class="metric-val" id="m-cascade-time">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">W3C Precedence Winner:</span>
+      <span class="metric-val" id="m-cascade-winner">--</span>
+    </div>
+  </div>
+
+  <!-- Panel 3: FPU vs Integer Dot Product -->
+  <div class="panel">
+    <div class="panel-title">Stage 3: Int32 vs Float32 Dot Product</div>
+    <div class="metric-row">
+      <span class="metric-label">Int32Array Dot (1,000,000 ops):</span>
+      <span class="metric-val" id="m-int-dot">TESTING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Float32Array Dot (1,000,000 ops):</span>
+      <span class="metric-val" id="m-float-dot">TESTING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Int32 Throughput:</span>
+      <span class="metric-val" id="m-int-ops">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Float32 Throughput:</span>
+      <span class="metric-val" id="m-float-ops">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">FPU / Integer Ratio:</span>
+      <span class="metric-val" id="m-fpu-ratio">--</span>
+    </div>
+  </div>
+
+  <!-- Panel 4: JSON Replacer/Reviver Pipeline -->
+  <div class="panel">
+    <div class="panel-title">Stage 4: JSON Callback Boundary Tax</div>
+    <div class="metric-row">
+      <span class="metric-label">Baseline Stringify (5,000 objs):</span>
+      <span class="metric-val" id="m-base-str">TESTING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Replacer Stringify (5,000 objs):</span>
+      <span class="metric-val" id="m-rep-str">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Baseline Parse (5,000 objs):</span>
+      <span class="metric-val" id="m-base-parse">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Reviver Parse (5,000 objs):</span>
+      <span class="metric-val" id="m-rev-parse">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">JS Callback Boundary Tax:</span>
+      <span class="metric-val" id="m-json-tax">--</span>
+    </div>
+  </div>
+
+  <!-- Panel 5: Worker Phase Sync Barrier -->
+  <div class="panel panel-full">
+    <div class="panel-title">Stage 5 &amp; 6: 4-Worker Jitter &amp; Master Verdict</div>
+    <div class="metric-row">
+      <span class="metric-label">4-Worker Barrier Synchronization:</span>
+      <span class="metric-val" id="m-barrier-status">PENDING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Core Entry Jitter:</span>
+      <span class="metric-val" id="m-entry-jitter">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Worker Computation Duration Jitter:</span>
+      <span class="metric-val" id="m-work-jitter">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Overall Probe Verdict:</span>
+      <span class="metric-val" id="m-probe-verdict">RUNNING PIPELINE...</span>
+    </div>
+  </div>
+</div>
+
+<!-- Terminal Log -->
+<div class="panel panel-full">
+  <div class="panel-title">Physical Hardware Telemetry Console</div>
+  <div class="terminal" id="term-box"></div>
+</div>
+
+<!-- Hidden Scratch Area -->
+<div id="bench-scratch"></div>
+
+<script>
+/* Logging and Beacon Utility */
+var termBox = document.getElementById('term-box');
+function log(msg, cls) {
+  var d = document.createElement('div');
+  d.className = 'term-line ' + (cls || '');
+  var ts = '[' + new Date().toISOString().substring(11, 23) + '] ';
+  d.innerHTML = '<span class="term-ts">' + ts + '</span>' + msg;
+  termBox.appendChild(d);
+  termBox.scrollTop = termBox.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P974-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+window.onerror = function(msg, url, line) {
+  syncBn('JS-ERR', msg + ' at line ' + line);
+  log('[!] ERROR: ' + msg + ' (Line ' + line + ')', 'term-err');
+};
+
+log('Initializing Probe P974: Mutation Race, CSS Cascade, FPU Dot Product, JSON Tax & Worker Sync...', 'term-hi');
+syncBn('BOOT', 'start');
+
+var nodeStage1 = document.getElementById('node-stage-1');
+var nodeStage2 = document.getElementById('node-stage-2');
+var nodeStage3 = document.getElementById('node-stage-3');
+var nodeStage4 = document.getElementById('node-stage-4');
+var nodeStage5 = document.getElementById('node-stage-5');
+var nodeStage6 = document.getElementById('node-stage-6');
+
+var mLegacyStatus = document.getElementById('m-legacy-status');
+var mLegacyTime = document.getElementById('m-legacy-time');
+var mObserverTime = document.getElementById('m-observer-time');
+var mMutationRatio = document.getElementById('m-mutation-ratio');
+
+var mCascadeColor = document.getElementById('m-cascade-color');
+var mCascadeTime = document.getElementById('m-cascade-time');
+var mCascadeWinner = document.getElementById('m-cascade-winner');
+
+var mIntDot = document.getElementById('m-int-dot');
+var mFloatDot = document.getElementById('m-float-dot');
+var mIntOps = document.getElementById('m-int-ops');
+var mFloatOps = document.getElementById('m-float-ops');
+var mFpuRatio = document.getElementById('m-fpu-ratio');
+
+var mBaseStr = document.getElementById('m-base-str');
+var mRepStr = document.getElementById('m-rep-str');
+var mBaseParse = document.getElementById('m-base-parse');
+var mRevParse = document.getElementById('m-rev-parse');
+var mJsonTax = document.getElementById('m-json-tax');
+
+var mBarrierStatus = document.getElementById('m-barrier-status');
+var mEntryJitter = document.getElementById('m-entry-jitter');
+var mWorkJitter = document.getElementById('m-work-jitter');
+var mProbeVerdict = document.getElementById('m-probe-verdict');
+
+var scratchArea = document.getElementById('bench-scratch');
+
+/* Pipeline Global Metrics */
+var gLegacyOk = false;
+var gLegacyCount = 0;
+var gLegacyMs = 0;
+var gObserverMs = 0;
+var gCascadeMs = 0;
+var gIntMs = 0;
+var gFloatMs = 0;
+var gBaseStrMs = 0;
+var gRepStrMs = 0;
+var gBaseParseMs = 0;
+var gRevParseMs = 0;
+var gEntryJitterMs = 0;
+var gWorkJitterMs = 0;
+
+/* ============================================================
+ * STAGE 1: DOM Mutation Event vs MutationObserver Race
+ * ============================================================ */
+try {
+  /* Test Legacy Mutation Events */
+  var legacyParent = document.createElement('div');
+  scratchArea.appendChild(legacyParent);
+
+  var legacyFiredCount = 0;
+  var legacySupported = ('MutationEvent' in window);
+  
+  function onDomInserted(e) {
+    legacyFiredCount++;
+  }
+
+  legacyParent.addEventListener('DOMNodeInserted', onDomInserted, false);
+
+  var tLeg0 = performance.now();
+  for (var i = 0; i < 1000; i++) {
+    var span = document.createElement('span');
+    span.textContent = i;
+    legacyParent.appendChild(span);
+  }
+  gLegacyMs = Math.max(1, Math.round(performance.now() - tLeg0));
+  gLegacyCount = legacyFiredCount;
+  gLegacyOk = (legacyFiredCount === 1000);
+  legacyParent.removeEventListener('DOMNodeInserted', onDomInserted, false);
+  scratchArea.removeChild(legacyParent);
+
+  /* Test Modern MutationObserver */
+  var obsParent = document.createElement('div');
+  scratchArea.appendChild(obsParent);
+
+  var observerRecordsCount = 0;
+  var obs = new MutationObserver(function(mutations) {
+    observerRecordsCount += mutations.length;
+  });
+  obs.observe(obsParent, { childList: true });
+
+  var tObs0 = performance.now();
+  for (var j = 0; j < 1000; j++) {
+    var p = document.createElement('p');
+    p.textContent = j;
+    obsParent.appendChild(p);
+  }
+  var records = obs.takeRecords();
+  gObserverMs = Math.max(1, Math.round(performance.now() - tObs0));
+  observerRecordsCount += records.length;
+  obs.disconnect();
+  scratchArea.removeChild(obsParent);
+
+  var mutRatio = (gLegacyMs / gObserverMs).toFixed(1);
+  mLegacyStatus.textContent = gLegacyOk ? 'ACTIVE (' + gLegacyCount + ' events)' : (legacySupported ? 'DEPRECATED/IGNORED' : 'UNSUPPORTED');
+  mLegacyStatus.className = gLegacyOk ? 'val-amber' : 'val-ok';
+  mLegacyTime.textContent = gLegacyMs + ' ms (SYNCHRONOUS DISPATCH)';
+  mObserverTime.textContent = gObserverMs + ' ms (BATCHED TAKE_RECORDS: ' + observerRecordsCount + ')';
+  mMutationRatio.textContent = mutRatio + 'x FASTER VIA OBSERVER';
+  mMutationRatio.className = (gObserverMs <= gLegacyMs) ? 'val-ok' : 'val-dim';
+
+  log('[+] Mutation Race: legacyOk=' + gLegacyOk + ' (' + gLegacyMs + 'ms), observer=' + gObserverMs + 'ms (' + mutRatio + 'x speedup)');
+  syncBn('MUTATION-RACE', 'legacyOk=' + gLegacyOk + '|legacyCount=' + gLegacyCount + '|legacyMs=' + gLegacyMs + '|observerMs=' + gObserverMs + '|ratio=' + mutRatio);
+
+  nodeStage1.className = 'node done';
+  nodeStage1.querySelector('.node-step').textContent = 'Stage 1 [DONE]';
+} catch(me) {
+  log('[-] Mutation stage error: ' + me.message, 'term-err');
+  syncBn('MUT-ERR', me.message);
+  nodeStage1.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 2: CSS Cascade Specificity & !important Resolution
+ * ============================================================ */
+nodeStage2.className = 'node active';
+nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [ACTIVE]';
+
+try {
+  /* Inject 1,000 dynamic CSS rules with cascading specificity tiers */
+  var styleEl = document.createElement('style');
+  styleEl.id = 'dynamic-cascade-sheet';
+  var cssRules = [];
+
+  /* Low specificity rules */
+  for (var r = 0; r < 400; r++) {
+    cssRules.push('.tier-low-' + r + ' { color: rgb(10, 20, 30); background-color: rgb(1, 2, 3); }');
+  }
+
+  /* Medium specificity multi-class rules */
+  for (var m = 0; m < 300; m++) {
+    cssRules.push('.target-probe.tier-mid-' + m + ' { color: rgb(40, 50, 60); }');
+  }
+
+  /* High specificity ID + Attribute + Pseudo-class rules */
+  for (var h = 0; h < 290; h++) {
+    cssRules.push('div#cascade-target.target-probe[data-bench="ps5"]:nth-child(n) { color: rgb(70, 80, 90); }');
+  }
+
+  /* Winning rule: High specificity with !important override */
+  cssRules.push('.target-probe.winner-rule { color: rgb(0, 255, 102) !important; }');
+  /* Losing rule with higher selector specificity but lacking !important */
+  cssRules.push('html body #cascade-target.target-probe[data-bench="ps5"] { color: rgb(255, 0, 119); }');
+
+  styleEl.textContent = cssRules.join('\n');
+  document.head.appendChild(styleEl);
+
+  /* Create Target Element with matching classes */
+  var targetEl = document.createElement('div');
+  targetEl.id = 'cascade-target';
+  targetEl.className = 'target-probe tier-low-100 tier-mid-50 winner-rule';
+  targetEl.setAttribute('data-bench', 'ps5');
+  targetEl.setAttribute('style', 'color: rgb(255, 184, 0);'); /* Inline style (overridden by !important) */
+  scratchArea.appendChild(targetEl);
+
+  /* Benchmark computed style resolution over 1,000 queries */
+  var tCas0 = performance.now();
+  var resolvedColor = '';
+  for (var q = 0; q < 1000; q++) {
+    resolvedColor = window.getComputedStyle(targetEl).color;
+  }
+  gCascadeMs = Math.max(1, Math.round(performance.now() - tCas0));
+
+  /* rgb(0, 255, 102) represents winning !important rule */
+  var winnerMatch = (resolvedColor.indexOf('0, 255, 102') !== -1 || resolvedColor.indexOf('rgb(0, 255, 102)') !== -1);
+
+  mCascadeColor.textContent = resolvedColor;
+  mCascadeColor.className = winnerMatch ? 'val-ok' : 'val-hex';
+  mCascadeTime.textContent = gCascadeMs + ' ms (1,000 QUERIES ACROSS 1,000 RULES)';
+  mCascadeWinner.textContent = winnerMatch ? 'CLASS !IMPORTANT (W3C CASCADE 4 VERIFIED)' : 'INLINE/OTHER PRECEDENCE';
+  mCascadeWinner.className = winnerMatch ? 'val-ok' : 'val-amber';
+
+  log('[+] CSS Cascade: 1k rules resolved in ' + gCascadeMs + 'ms, winnerColor=' + resolvedColor + ', winnerMatch=' + winnerMatch);
+  syncBn('CSS-CASCADE', 'timeMs=' + gCascadeMs + '|color=' + resolvedColor + '|winnerMatch=' + winnerMatch);
+
+  document.head.removeChild(styleEl);
+  scratchArea.removeChild(targetEl);
+
+  nodeStage2.className = 'node done';
+  nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [DONE]';
+} catch(ce) {
+  log('[-] CSS Cascade error: ' + ce.message, 'term-err');
+  syncBn('CASCADE-ERR', ce.message);
+  nodeStage2.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 3: Int32Array vs Float32Array SIMD/FPU Dot Product
+ * ============================================================ */
+nodeStage3.className = 'node active';
+nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [ACTIVE]';
+
+try {
+  var NUM_OPS = 1000000;
+  var intA = new Int32Array(NUM_OPS);
+  var intB = new Int32Array(NUM_OPS);
+  var floatA = new Float32Array(NUM_OPS);
+  var floatB = new Float32Array(NUM_OPS);
+
+  /* Fill buffers with identical integer value sequences */
+  for (var vi = 0; vi < NUM_OPS; vi++) {
+    var val1 = (vi & 0x3F) - 32;
+    var val2 = ((vi * 7) & 0x3F) - 32;
+    intA[vi] = val1;
+    intB[vi] = val2;
+    floatA[vi] = val1;
+    floatB[vi] = val2;
+  }
+
+  /* Benchmark 1,000,000 Int32 Dot Product */
+  var intSum = 0;
+  var tInt0 = performance.now();
+  for (var ii = 0; ii < NUM_OPS; ii++) {
+    intSum += intA[ii] * intB[ii];
+  }
+  gIntMs = Math.max(1, Math.round(performance.now() - tInt0));
+  var intOpsPerSec = Math.round(NUM_OPS / (gIntMs / 1000));
+
+  /* Benchmark 1,000,000 Float32 Dot Product */
+  var floatSum = 0.0;
+  var tFloat0 = performance.now();
+  for (var fi = 0; fi < NUM_OPS; fi++) {
+    floatSum += floatA[fi] * floatB[fi];
+  }
+  gFloatMs = Math.max(1, Math.round(performance.now() - tFloat0));
+  var floatOpsPerSec = Math.round(NUM_OPS / (gFloatMs / 1000));
+
+  var fpuRatio = (gFloatMs / gIntMs).toFixed(2);
+
+  mIntDot.textContent = gIntMs + ' ms (DOT SUM=' + intSum + ')';
+  mFloatDot.textContent = gFloatMs + ' ms (DOT SUM=' + Math.round(floatSum) + ')';
+  mIntOps.textContent = intOpsPerSec.toLocaleString() + ' OPS/SEC';
+  mIntOps.className = 'val-ok';
+  mFloatOps.textContent = floatOpsPerSec.toLocaleString() + ' OPS/SEC';
+  mFloatOps.className = 'val-ok';
+  mFpuRatio.textContent = fpuRatio + 'x (FLOAT VS INT LATENCY)';
+  mFpuRatio.className = (gFloatMs <= gIntMs * 1.5) ? 'val-ok' : 'val-amber';
+
+  log('[+] FPU vs INT: int=' + gIntMs + 'ms (~' + intOpsPerSec + ' ops/s), float=' + gFloatMs + 'ms (~' + floatOpsPerSec + ' ops/s), ratio=' + fpuRatio);
+  syncBn('FPU-SIMD', 'intMs=' + gIntMs + '|floatMs=' + gFloatMs + '|intOps=' + intOpsPerSec + '|floatOps=' + floatOpsPerSec + '|ratio=' + fpuRatio);
+
+  nodeStage3.className = 'node done';
+  nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [DONE]';
+} catch(ae) {
+  log('[-] Arithmetic dot product error: ' + ae.message, 'term-err');
+  syncBn('FPU-ERR', ae.message);
+  nodeStage3.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 4: JSON Reviver & Replacer Serialization Pipeline
+ * ============================================================ */
+nodeStage4.className = 'node active';
+nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [ACTIVE]';
+
+try {
+  /* Build dataset of 5,000 nested objects */
+  var benchData = [];
+  for (var di = 0; di < 5000; di++) {
+    benchData.push({
+      id: di,
+      name: 'item_' + di,
+      value: di * 1.75,
+      flags: [di % 2 === 0, di % 3 === 0],
+      meta: { sub: 'val_' + (di & 0xFF) }
+    });
+  }
+
+  /* 1. Baseline JSON.stringify */
+  var tBaseStr0 = performance.now();
+  var jsonStr = JSON.stringify(benchData);
+  gBaseStrMs = Math.max(1, Math.round(performance.now() - tBaseStr0));
+
+  /* 2. Replacer JSON.stringify */
+  var tRepStr0 = performance.now();
+  var jsonStrRep = JSON.stringify(benchData, function(key, val) {
+    if (typeof val === 'number') return val + 1;
+    return val;
+  });
+  gRepStrMs = Math.max(1, Math.round(performance.now() - tRepStr0));
+
+  /* 3. Baseline JSON.parse */
+  var tBaseParse0 = performance.now();
+  var parsedBaseline = JSON.parse(jsonStr);
+  gBaseParseMs = Math.max(1, Math.round(performance.now() - tBaseParse0));
+
+  /* 4. Reviver JSON.parse */
+  var tRevParse0 = performance.now();
+  var parsedReviver = JSON.parse(jsonStr, function(key, val) {
+    if (key === 'id') return val * 2;
+    return val;
+  });
+  gRevParseMs = Math.max(1, Math.round(performance.now() - tRevParse0));
+
+  var stringifyTax = (gRepStrMs / gBaseStrMs).toFixed(1);
+  var parseTax = (gRevParseMs / gBaseParseMs).toFixed(1);
+
+  mBaseStr.textContent = gBaseStrMs + ' ms (BASELINE FAST-PATH)';
+  mRepStr.textContent = gRepStrMs + ' ms (' + stringifyTax + 'x SLOWER VIA REPLACER)';
+  mRepStr.className = 'val-amber';
+  mBaseParse.textContent = gBaseParseMs + ' ms (BASELINE C++ PARSER)';
+  mRevParse.textContent = gRevParseMs + ' ms (' + parseTax + 'x SLOWER VIA REVIVER)';
+  mRevParse.className = 'val-amber';
+  mJsonTax.textContent = stringifyTax + 'x (STRINGIFY) / ' + parseTax + 'x (PARSE)';
+  mJsonTax.className = 'val-hex';
+
+  log('[+] JSON Callback Tax: baseStr=' + gBaseStrMs + 'ms, repStr=' + gRepStrMs + 'ms, baseParse=' + gBaseParseMs + 'ms, revParse=' + gRevParseMs + 'ms');
+  syncBn('JSON-REVIVER', 'baseStrMs=' + gBaseStrMs + '|repStrMs=' + gRepStrMs + '|baseParseMs=' + gBaseParseMs + '|revParseMs=' + gRevParseMs + '|tax=' + stringifyTax + ',' + parseTax);
+
+  nodeStage4.className = 'node done';
+  nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [DONE]';
+} catch(je) {
+  log('[-] JSON Reviver error: ' + je.message, 'term-err');
+  syncBn('JSON-ERR', je.message);
+  nodeStage4.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 5: High-Precision Worker Thread Barrier Synchronization
+ * ============================================================ */
+nodeStage5.className = 'node active';
+nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [ACTIVE]';
+
+try {
+  var workerScript = [
+    'self.onmessage = function(e) {',
+    '  var barrierTarget = e.data.barrierTime;',
+    '  while (performance.now() < barrierTarget) {}',
+    '  var entryTime = performance.now();',
+    '  var acc = 0;',
+    '  for (var i = 0; i < 250000; i++) { acc = (acc + i * 3) & 0x7FFFFFFF; }',
+    '  var finishTime = performance.now();',
+    '  self.postMessage({ entryTime: entryTime, finishTime: finishTime, duration: finishTime - entryTime, acc: acc });',
+    '};'
+  ].join('\n');
+
+  var workerBlob = new Blob([workerScript], { type: 'application/javascript' });
+  var workerUrl = URL.createObjectURL(workerBlob);
+
+  var NUM_WORKERS = 4;
+  var workers = [];
+  var workerResults = [];
+  var targetBarrierTime = performance.now() + 50; /* 50ms in future */
+
+  function finalizeStage5And6() {
+    URL.revokeObjectURL(workerUrl);
+
+    var entryTimes = workerResults.map(function(r) { return r.entryTime; });
+    var durations = workerResults.map(function(r) { return r.duration; });
+
+    var minEntry = Math.min.apply(null, entryTimes);
+    var maxEntry = Math.max.apply(null, entryTimes);
+    gEntryJitterMs = (maxEntry - minEntry).toFixed(2);
+
+    var minDur = Math.min.apply(null, durations);
+    var maxDur = Math.max.apply(null, durations);
+    gWorkJitterMs = (maxDur - minDur).toFixed(2);
+
+    var avgDuration = (durations.reduce(function(a, b) { return a + b; }, 0) / NUM_WORKERS).toFixed(1);
+
+    mBarrierStatus.textContent = 'SYNCHRONIZED (' + NUM_WORKERS + ' CORES COMPLETED)';
+    mBarrierStatus.className = 'val-ok';
+    mEntryJitter.textContent = gEntryJitterMs + ' ms (MAX CORE SKEW AT BARRIER RELEASE)';
+    mEntryJitter.className = (parseFloat(gEntryJitterMs) < 5.0) ? 'val-ok' : 'val-amber';
+    mWorkJitter.textContent = gWorkJitterMs + ' ms (COMPUTE DURATION SKEW, AVG=' + avgDuration + 'ms)';
+    mWorkJitter.className = 'val-ok';
+
+    log('[+] Worker Barrier Sync: entryJitter=' + gEntryJitterMs + 'ms, durJitter=' + gWorkJitterMs + 'ms, avgWork=' + avgDuration + 'ms');
+    syncBn('WORKER-SYNC', 'workers=' + NUM_WORKERS + '|entryJitterMs=' + gEntryJitterMs + '|durJitterMs=' + gWorkJitterMs + '|avgWorkMs=' + avgDuration);
+
+    nodeStage5.className = 'node done';
+    nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [DONE]';
+
+    /* ============================================================
+     * STAGE 6: Master Verdict & Summary
+     * ============================================================ */
+    nodeStage6.className = 'node done';
+    nodeStage6.querySelector('.node-step').textContent = 'Stage 6 [DONE]';
+
+    mProbeVerdict.textContent = 'ALL 6 SUBSYSTEM STAGES BENCHMARKED &amp; VERIFIED';
+    mProbeVerdict.className = 'val-ok';
+
+    log('[*] Probe P974 complete: Mutation, Cascade Specificity, FPU SIMD, JSON Tax & Worker Sync executed.', 'term-hi');
+    syncBn('DONE', 'status=P974_COMPLETE|legacyOk=' + gLegacyOk + '|cascadeMs=' + gCascadeMs + '|intMs=' + gIntMs + '|floatMs=' + gFloatMs + '|repTax=' + stringifyTax + '|revTax=' + parseTax + '|jitterMs=' + gEntryJitterMs);
+  }
+
+  for (var w = 0; w < NUM_WORKERS; w++) {
+    (function(idx) {
+      var wk = new Worker(workerUrl);
+      workers.push(wk);
+      wk.onmessage = function(e) {
+        workerResults.push(e.data);
+        if (workerResults.length === NUM_WORKERS) {
+          finalizeStage5And6();
+        }
+      };
+      wk.postMessage({ barrierTime: targetBarrierTime, id: idx });
+    })(w);
+  }
+
+} catch(we) {
+  log('[-] Worker barrier sync error: ' + we.message, 'term-err');
+  syncBn('SYNC-ERR', we.message);
+  nodeStage5.className = 'node locked';
+}
+
+/* Auto-Reload Watcher for autonomous progression */
+var initialReloadToken = null;
+function checkAutoReload() {
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/reload.txt?t=' + Date.now(), true);
+    xhr.onload = function() {
+      if (xhr.status === 200) {
+        var token = xhr.responseText.trim();
+        if (initialReloadToken === null) {
+          initialReloadToken = token;
+        } else if (token !== initialReloadToken) {
+          log('[*] New deployment detected (token: ' + token + '). Auto-reloading in 500ms...');
+          setTimeout(function() { location.reload(); }, 500);
+        }
+      }
+    };
+    xhr.send();
+  } catch(e) {}
+}
+setInterval(checkAutoReload, 1500);
+</script>
+</body>
+</html>

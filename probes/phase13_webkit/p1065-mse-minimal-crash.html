@@ -1,0 +1,236 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1065</title>
+<style>
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px;margin:0}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#4ec9b0}.err{color:#f44747}.warn{color:#dcdcaa}.hot{color:#ff6b6b;font-weight:bold}
+</style></head><body><div id="hud"><div id="log"></div></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+var L=document.getElementById('log');
+function log(s,c){var d=document.createElement('div');d.className=c||'';d.textContent=s;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1065-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+
+bn('BOOT','mse-minimal-crash-isolator');
+log('P1065: MSE Minimal Crash Isolator','warn');
+
+// Run tests one at a time with delay between each
+var tests=[];
+var idx=0;
+var results=[];
+
+function addTest(id,fn){tests.push({id:id,fn:fn});}
+
+// Helpers
+function u32be(n){return new Uint8Array([(n>>>24)&0xFF,(n>>>16)&0xFF,(n>>>8)&0xFF,n&0xFF]);}
+function u16be(n){return new Uint8Array([(n>>>8)&0xFF,n&0xFF]);}
+function concat(){var a=arguments,t=0,i,j;for(i=0;i<a.length;i++)if(a[i])t+=a[i].length;var r=new Uint8Array(t);var o=0;for(i=0;i<a.length;i++)if(a[i])for(j=0;j<a[i].length;j++)r[o++]=a[i][j];return r;}
+function ascii(s){var a=new Uint8Array(s.length);for(var i=0;i<s.length;i++)a[i]=s.charCodeAt(i);return a;}
+function mkBox(t,p){var a=ascii(t);var s=8+(p?p.length:0);return concat(u32be(s),a,p||new Uint8Array(0));}
+
+// ===== TEST 1: Just MediaSource creation (no append) =====
+addTest('T1-MS-CREATE',function(cb){
+  var ms=new MediaSource();
+  var vid=document.createElement('video');
+  vid.src=URL.createObjectURL(ms);
+  ms.addEventListener('sourceopen',function(){
+    cb('OK-sourceopen|readyState:'+ms.readyState);
+  });
+  setTimeout(function(){cb('TIMEOUT-noSourceOpen');},3000);
+});
+
+// ===== TEST 2: addSourceBuffer only (no append) =====
+addTest('T2-ADD-SB',function(cb){
+  var ms=new MediaSource();
+  var vid=document.createElement('video');
+  vid.src=URL.createObjectURL(ms);
+  ms.addEventListener('sourceopen',function(){
+    try{
+      var sb=ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+      cb('OK-sb-created|updating:'+sb.updating+'|mode:'+sb.mode);
+    }catch(e){cb('ERR:'+e.name+':'+e.message);}
+  });
+  setTimeout(function(){cb('TIMEOUT');},3000);
+});
+
+// ===== TEST 3: Append empty ArrayBuffer =====
+addTest('T3-EMPTY-APPEND',function(cb){
+  var ms=new MediaSource();
+  var vid=document.createElement('video');
+  vid.src=URL.createObjectURL(ms);
+  ms.addEventListener('sourceopen',function(){
+    try{
+      var sb=ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+      sb.addEventListener('updateend',function(){cb('OK-empty-updateend');});
+      sb.addEventListener('error',function(){cb('OK-empty-error');});
+      sb.appendBuffer(new ArrayBuffer(0));
+    }catch(e){cb('CATCH:'+e.name+':'+e.message);}
+  });
+  setTimeout(function(){cb('TIMEOUT');},3000);
+});
+
+// ===== TEST 4: Append 8 bytes of garbage =====
+addTest('T4-GARBAGE-8B',function(cb){
+  var ms=new MediaSource();
+  var vid=document.createElement('video');
+  vid.src=URL.createObjectURL(ms);
+  ms.addEventListener('sourceopen',function(){
+    try{
+      var sb=ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+      sb.addEventListener('updateend',function(){cb('OK-updateend');});
+      sb.addEventListener('error',function(){cb('OK-error-event');});
+      sb.appendBuffer(new Uint8Array([0xDE,0xAD,0xBE,0xEF,0xCA,0xFE,0xBA,0xBE]));
+    }catch(e){cb('CATCH:'+e.name+':'+e.message);}
+  });
+  setTimeout(function(){cb('TIMEOUT');},3000);
+});
+
+// ===== TEST 5: Append just ftyp box =====
+addTest('T5-FTYP-ONLY',function(cb){
+  var ms=new MediaSource();
+  var vid=document.createElement('video');
+  vid.src=URL.createObjectURL(ms);
+  ms.addEventListener('sourceopen',function(){
+    try{
+      var sb=ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+      sb.addEventListener('updateend',function(){cb('OK-updateend');});
+      sb.addEventListener('error',function(){cb('OK-error-event');});
+      var ftyp=mkBox('ftyp',concat(ascii('isom'),u32be(0x200),ascii('isom'),ascii('mp41')));
+      sb.appendBuffer(ftyp);
+    }catch(e){cb('CATCH:'+e.name+':'+e.message);}
+  });
+  setTimeout(function(){cb('TIMEOUT');},3000);
+});
+
+// ===== TEST 6: Append ftyp + minimal moov (no tracks) =====
+addTest('T6-FTYP-MOOV-EMPTY',function(cb){
+  var ms=new MediaSource();
+  var vid=document.createElement('video');
+  vid.src=URL.createObjectURL(ms);
+  ms.addEventListener('sourceopen',function(){
+    try{
+      var sb=ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+      sb.addEventListener('updateend',function(){cb('OK-updateend');});
+      sb.addEventListener('error',function(){cb('OK-error-event');});
+      var ftyp=mkBox('ftyp',concat(ascii('isom'),u32be(0x200)));
+      var mvhd=mkBox('mvhd',new Uint8Array(96)); // minimal mvhd
+      var moov=mkBox('moov',mvhd);
+      sb.appendBuffer(concat(ftyp,moov));
+    }catch(e){cb('CATCH:'+e.name+':'+e.message);}
+  });
+  setTimeout(function(){cb('TIMEOUT');},3000);
+});
+
+// ===== TEST 7: ftyp + moov with empty trak =====
+addTest('T7-EMPTY-TRAK',function(cb){
+  var ms=new MediaSource();
+  var vid=document.createElement('video');
+  vid.src=URL.createObjectURL(ms);
+  ms.addEventListener('sourceopen',function(){
+    try{
+      var sb=ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+      sb.addEventListener('updateend',function(){cb('OK-updateend');});
+      sb.addEventListener('error',function(){cb('OK-error-event');});
+      var ftyp=mkBox('ftyp',concat(ascii('isom'),u32be(0x200)));
+      var mvhd=mkBox('mvhd',new Uint8Array(96));
+      var trak=mkBox('trak',new Uint8Array(0));
+      var moov=mkBox('moov',concat(mvhd,trak));
+      sb.appendBuffer(concat(ftyp,moov));
+    }catch(e){cb('CATCH:'+e.name+':'+e.message);}
+  });
+  setTimeout(function(){cb('TIMEOUT');},3000);
+});
+
+// ===== TEST 8: ftyp + moov with trak + mdia + minf + stbl (no codec) =====
+addTest('T8-TRAK-NO-CODEC',function(cb){
+  var ms=new MediaSource();
+  var vid=document.createElement('video');
+  vid.src=URL.createObjectURL(ms);
+  ms.addEventListener('sourceopen',function(){
+    try{
+      var sb=ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+      sb.addEventListener('updateend',function(){cb('OK-updateend');});
+      sb.addEventListener('error',function(){cb('OK-error-event');});
+      var ftyp=mkBox('ftyp',concat(ascii('isom'),u32be(0x200)));
+      var mvhd=mkBox('mvhd',new Uint8Array(96));
+      var tkhd=mkBox('tkhd',new Uint8Array(80));
+      var mdhd=mkBox('mdhd',new Uint8Array(20));
+      var hdlr=mkBox('hdlr',concat(new Uint8Array(8),ascii('vide'),new Uint8Array(12),new Uint8Array([0])));
+      var stsd=mkBox('stsd',concat(new Uint8Array([0,0,0,0]),u32be(0))); // 0 entries
+      var stbl=mkBox('stbl',stsd);
+      var minf=mkBox('minf',stbl);
+      var mdia=mkBox('mdia',concat(mdhd,hdlr,minf));
+      var trak=mkBox('trak',concat(tkhd,mdia));
+      var moov=mkBox('moov',concat(mvhd,trak));
+      sb.appendBuffer(concat(ftyp,moov));
+    }catch(e){cb('CATCH:'+e.name+':'+e.message);}
+  });
+  setTimeout(function(){cb('TIMEOUT');},3000);
+});
+
+// ===== TEST 9: WebM EBML header only =====
+addTest('T9-WEBM-EBML',function(cb){
+  var ms=new MediaSource();
+  var vid=document.createElement('video');
+  vid.src=URL.createObjectURL(ms);
+  ms.addEventListener('sourceopen',function(){
+    try{
+      var sb=ms.addSourceBuffer('video/webm; codecs="vp9"');
+      sb.addEventListener('updateend',function(){cb('OK-updateend');});
+      sb.addEventListener('error',function(){cb('OK-error-event');});
+      var ebml=new Uint8Array([0x1A,0x45,0xDF,0xA3,0x93,
+        0x42,0x86,0x81,0x01,0x42,0xF7,0x81,0x01,
+        0x42,0x82,0x84,0x77,0x65,0x62,0x6D,
+        0x42,0x87,0x81,0x04,0x42,0x85,0x81,0x02]);
+      sb.appendBuffer(ebml);
+    }catch(e){cb('CATCH:'+e.name+':'+e.message);}
+  });
+  setTimeout(function(){cb('TIMEOUT');},3000);
+});
+
+// ===== TEST 10: Append data to audio SourceBuffer =====
+addTest('T10-AUDIO-SB',function(cb){
+  var ms=new MediaSource();
+  var vid=document.createElement('video');
+  vid.src=URL.createObjectURL(ms);
+  ms.addEventListener('sourceopen',function(){
+    try{
+      var sb=ms.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+      sb.addEventListener('updateend',function(){cb('OK-updateend');});
+      sb.addEventListener('error',function(){cb('OK-error-event');});
+      var ftyp=mkBox('ftyp',concat(ascii('isom'),u32be(0x200)));
+      sb.appendBuffer(ftyp);
+    }catch(e){cb('CATCH:'+e.name+':'+e.message);}
+  });
+  setTimeout(function(){cb('TIMEOUT');},3000);
+});
+
+// Run sequentially
+function runNext(){
+  if(idx>=tests.length){
+    var s=results.map(function(r){return r.id+':'+r.result;}).join('|');
+    bn('DONE','total='+tests.length+'|'+s);
+    log('DONE: '+tests.length+' tests complete','ok');
+    return;
+  }
+  var t=tests[idx];
+  log('['+idx+'] '+t.id,'warn');
+  bn('PRE-'+t.id,'starting');
+  setTimeout(function(){
+    t.fn(function(result){
+      results.push({id:t.id,result:result});
+      bn('POST-'+t.id,result);
+      log('  -> '+result,result.indexOf('OK')>=0?'ok':'err');
+      idx++;
+      setTimeout(runNext,500);
+    });
+  },300);
+}
+
+setTimeout(runNext,500);
+</script></body></html>

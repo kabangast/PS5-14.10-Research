@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1070</title>
+<style>
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px;margin:0}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#22c55e}.fail{color:#ef4444}.warn{color:#f59e0b}.info{color:#38bdf8}
+</style>
+</head>
+<body>
+<div id="hud"></div>
+<div id="sandbox" style="position:absolute;left:-9999px;top:-9999px;width:800px;height:600px;overflow:hidden"></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1070-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+
+var hud=document.getElementById('hud');
+var sandbox=document.getElementById('sandbox');
+function log(cls,msg){
+  var d=document.createElement('div');d.className=cls;d.textContent=msg;hud.appendChild(d);
+  hud.scrollTop=hud.scrollHeight;
+}
+
+bn('BOOT','webp-uaf-race');
+log('info','=== P1070: WebP + DOM UAF + Race Condition Battery ===');
+
+var tests=[];var testIdx=0;
+function addTest(name,fn){tests.push({name:name,fn:fn});}
+function runNext(){
+  if(testIdx>=tests.length){
+    bn('DONE','all-'+tests.length+'-complete');
+    log('ok','=== ALL TESTS COMPLETE ===');
+    return;
+  }
+  var t=tests[testIdx];testIdx++;
+  bn('PRE-'+t.name,'starting');
+  log('info','['+testIdx+'/'+tests.length+'] '+t.name);
+  try{
+    t.fn(function(result){
+      bn('POST-'+t.name,String(result).slice(0,800));
+      var cls=(String(result).indexOf('CRASH')>=0||String(result).indexOf('ANOMALY')>=0)?'warn':'ok';
+      log(cls,'  -> '+result);
+      setTimeout(runNext,50);
+    });
+  }catch(e){
+    bn('ERR-'+t.name,e.message);
+    log('fail','  ERR: '+e.message);
+    setTimeout(runNext,50);
+  }
+}
+
+function clearSandbox(){sandbox.innerHTML='';}
+
+// ================================================================
+// SECTION A: WebP Support & CVE-2023-4863 Test
+// libwebp heap overflow in lossless Huffman table construction
+// ================================================================
+
+// A1: Basic WebP support test
+addTest('A1-WEBP-SUPPORT',function(cb){
+  clearSandbox();
+  var img=new Image();
+  img.onload=function(){cb('OK-webp-supported|w:'+img.naturalWidth+'|h:'+img.naturalHeight);};
+  img.onerror=function(){cb('NO-webp-not-supported');};
+  // Minimal 1x1 white WebP (lossy)
+  img.src='data:image/webp;base64,UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEADsD+JaQAA3AAAAAA';
+  sandbox.appendChild(img);
+});
+
+// A2: WebP lossless support test
+addTest('A2-WEBP-LOSSLESS',function(cb){
+  clearSandbox();
+  var img=new Image();
+  img.onload=function(){cb('OK-lossless-supported|w:'+img.naturalWidth+'|h:'+img.naturalHeight);};
+  img.onerror=function(){cb('NO-lossless-not-supported');};
+  // Minimal 1x1 WebP lossless
+  img.src='data:image/webp;base64,UklGRhYAAABXRUJQVlA4TAoAAAAvAAAAAAfQ//73fw==';
+  sandbox.appendChild(img);
+});
+
+// A3: WebP animated support
+addTest('A3-WEBP-ANIMATED',function(cb){
+  clearSandbox();
+  var canvas=document.createElement('canvas');
+  canvas.width=1;canvas.height=1;
+  var ctx=canvas.getContext('2d');
+  if(!ctx){cb('NO-canvas');return;}
+  var img=new Image();
+  img.onload=function(){
+    ctx.drawImage(img,0,0);
+    try{
+      var data=ctx.getImageData(0,0,1,1);
+      cb('OK-animated|pixel:'+data.data[0]+','+data.data[1]+','+data.data[2]+','+data.data[3]);
+    }catch(e){cb('OK-loaded-canvas-err:'+e.message);}
+  };
+  img.onerror=function(){cb('NO-animated-not-supported');};
+  img.src='data:image/webp;base64,UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEADsD+JaQAA3AAAAAA';
+  sandbox.appendChild(img);
+});
+
+// A4: WebP with oversized dimensions (integer overflow test)
+addTest('A4-WEBP-HUGE-DIM',function(cb){
+  clearSandbox();
+  // Try loading WebP with large claimed dimensions via canvas
+  var tests_done=0;
+  var results=[];
+  var dims=[[10000,10000],[32767,32767],[65535,1],[1,65535]];
+  dims.forEach(function(d,i){
+    var canvas=document.createElement('canvas');
+    try{
+      canvas.width=d[0];canvas.height=d[1];
+      var ctx=canvas.getContext('2d');
+      results.push(d[0]+'x'+d[1]+':'+(ctx?'ok':'no-ctx'));
+    }catch(e){
+      results.push(d[0]+'x'+d[1]+':err-'+e.message.slice(0,30));
+    }
+    tests_done++;
+    if(tests_done===dims.length)cb('dims:'+results.join('|'));
+  });
+});
+
+// ================================================================
+// SECTION B: DOM Layer-Tree UAF Pattern
+// Adapted from known WebKit heap UAF in layer tree updates
+// ================================================================
+
+// B1: Remove element during layer computation
+addTest('B1-LAYER-REMOVE-RECOMPUTE',function(cb){
+  clearSandbox();
+  // Create a deep DOM tree with transforms (forces layer creation)
+  var container=document.createElement('div');
+  container.style.cssText='position:relative;width:200px;height:200px';
+  var layers=[];
+  for(var i=0;i<20;i++){
+    var el=document.createElement('div');
+    el.style.cssText='position:absolute;width:50px;height:50px;transform:translate('+i+'px,'+i+'px);background:rgb('+(i*10)+',0,0);opacity:0.9;will-change:transform';
+    container.appendChild(el);
+    layers.push(el);
+  }
+  sandbox.appendChild(container);
+  void sandbox.offsetHeight; // Force initial layout
+  // Now rapidly remove layers while forcing recomputation
+  var removed=0;
+  for(var j=layers.length-1;j>=0;j-=2){
+    layers[j].parentNode.removeChild(layers[j]);
+    void sandbox.offsetHeight; // Force recompute between each removal
+    removed++;
+  }
+  cb('OK-removed:'+removed);
+});
+
+// B2: MutationObserver + requestAnimationFrame layer race
+addTest('B2-MUTOBS-RAF-LAYER',function(cb){
+  clearSandbox();
+  var container=document.createElement('div');
+  container.style.cssText='position:relative;width:100px;height:100px';
+  sandbox.appendChild(container);
+  var cycles=0;var maxCycles=50;
+  var obs=new MutationObserver(function(){
+    // During mutation callback, modify layers
+    if(cycles<maxCycles){
+      var el=document.createElement('div');
+      el.style.cssText='position:absolute;transform:translateZ(0);will-change:transform;width:10px;height:10px';
+      container.appendChild(el);
+      // Immediately remove in same microtask
+      requestAnimationFrame(function(){
+        if(el.parentNode)el.parentNode.removeChild(el);
+      });
+    }
+  });
+  obs.observe(container,{childList:true,subtree:true});
+  // Trigger mutations
+  var trigger=function(){
+    if(cycles>=maxCycles){
+      obs.disconnect();
+      cb('OK-cycles:'+cycles);
+      return;
+    }
+    var d=document.createElement('div');
+    d.textContent='trigger'+cycles;
+    container.appendChild(d);
+    cycles++;
+    setTimeout(trigger,5);
+  };
+  trigger();
+});
+
+// B3: Composited layer removal during animation
+addTest('B3-ANIM-LAYER-REMOVE',function(cb){
+  clearSandbox();
+  var el=document.createElement('div');
+  el.style.cssText='position:absolute;width:50px;height:50px;background:red;will-change:transform';
+  sandbox.appendChild(el);
+  void sandbox.offsetHeight;
+  // Start CSS animation
+  el.style.transition='transform 0.1s';
+  el.style.transform='translateX(100px)';
+  // Remove mid-animation
+  setTimeout(function(){
+    if(el.parentNode)el.parentNode.removeChild(el);
+    // Re-add immediately
+    sandbox.appendChild(el);
+    el.style.transform='translateX(0)';
+    void sandbox.offsetHeight;
+    setTimeout(function(){
+      if(el.parentNode)el.parentNode.removeChild(el);
+      cb('OK-anim-remove:done');
+    },50);
+  },20);
+});
+
+// B4: insertBefore during layout reflow
+addTest('B4-INSERT-DURING-REFLOW',function(cb){
+  clearSandbox();
+  var container=document.createElement('div');
+  container.style.cssText='display:flex;flex-wrap:wrap;width:200px';
+  for(var i=0;i<30;i++){
+    var el=document.createElement('div');
+    el.style.cssText='width:50px;height:50px;will-change:transform;flex-shrink:0';
+    el.textContent='item'+i;
+    container.appendChild(el);
+  }
+  sandbox.appendChild(container);
+  void sandbox.offsetHeight;
+  // insertBefore during reflow
+  var newEl=document.createElement('div');
+  newEl.style.cssText='width:100%;height:50px;will-change:transform';
+  newEl.textContent='inserted';
+  container.insertBefore(newEl,container.children[15]);
+  void sandbox.offsetHeight;
+  container.removeChild(newEl);
+  void sandbox.offsetHeight;
+  cb('OK-insert-reflow:done');
+});
+
+// ================================================================
+// SECTION C: Worker Race Conditions (CVE-2023-42917 pattern)
+// Race main thread vs Worker on shared resources
+// ================================================================
+
+// C1: postMessage ArrayBuffer transfer race
+addTest('C1-TRANSFER-RACE',function(cb){
+  if(typeof Worker==='undefined'){cb('SKIP-no-workers');return;}
+  try{
+    var workerCode='onmessage=function(e){var d=e.data;if(d.buf){try{var v=new Uint8Array(d.buf);postMessage({ok:true,len:v.length,first:v[0]});}catch(err){postMessage({ok:false,err:err.message});}}};';
+    var blob=new Blob([workerCode],{type:'application/javascript'});
+    var url=URL.createObjectURL(blob);
+    var w=new Worker(url);
+    var results=[];
+    var done=0;var target=50;
+    w.onmessage=function(e){
+      results.push(e.data.ok?'ok-'+e.data.len:'err-'+e.data.err);
+      done++;
+      if(done>=target){
+        w.terminate();
+        URL.revokeObjectURL(url);
+        var errs=results.filter(function(r){return r.indexOf('err')===0;});
+        cb('transfers:'+done+'|errors:'+errs.length+'|sample:'+results.slice(0,5).join(','));
+      }
+    };
+    w.onerror=function(e){
+      results.push('worker-err');done++;
+      if(done>=target){w.terminate();URL.revokeObjectURL(url);cb('transfers:'+done+'|errors:'+results.length);}
+    };
+    // Race: create buffer, start filling it, transfer before fill completes
+    for(var i=0;i<target;i++){
+      var buf=new ArrayBuffer(1024);
+      var view=new Uint8Array(buf);
+      // Fill partially
+      for(var j=0;j<512;j++)view[j]=0xAA;
+      // Transfer - this should detach the buffer
+      try{
+        w.postMessage({buf:buf},[buf]);
+        // After transfer, try to access (should throw)
+        try{
+          view[0]=0xBB; // should throw if detached
+          results.push('ANOMALY-write-after-transfer');
+        }catch(e){
+          // Expected: TypeError on detached buffer
+        }
+      }catch(e){
+        results.push('transfer-fail');
+      }
+    }
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// C2: Concurrent fetch from main thread and Worker
+addTest('C2-CONCURRENT-FETCH',function(cb){
+  if(typeof Worker==='undefined'){cb('SKIP-no-workers');return;}
+  try{
+    var workerCode='onmessage=function(e){var url=e.data.url;try{var x=new XMLHttpRequest();x.open("GET",url,false);x.send();postMessage({ok:true,len:x.responseText.length});}catch(err){postMessage({ok:false,err:err.message});}};';
+    var blob=new Blob([workerCode],{type:'application/javascript'});
+    var url=URL.createObjectURL(blob);
+    var w=new Worker(url);
+    var workerDone=false;
+    var mainResult='';var workerResult='';
+    w.onmessage=function(e){
+      workerResult=e.data.ok?'ok-'+e.data.len:'err-'+e.data.err;
+      workerDone=true;
+      check();
+    };
+    // Both fetch the same URL simultaneously
+    var target='/beacon.php?tag=P1070-C2-main&data=ping&t='+Date.now();
+    w.postMessage({url:target});
+    try{
+      var x=new XMLHttpRequest();x.open('GET',target,false);x.send();
+      mainResult='ok-'+x.responseText.length;
+    }catch(e){mainResult='err-'+e.message;}
+    function check(){
+      if(workerDone){
+        w.terminate();URL.revokeObjectURL(url);
+        cb('main:'+mainResult+'|worker:'+workerResult);
+      }
+    }
+    setTimeout(function(){if(!workerDone){w.terminate();URL.revokeObjectURL(url);cb('main:'+mainResult+'|worker:timeout');}},3000);
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// C3: BroadcastChannel message storm
+addTest('C3-BCAST-STORM',function(cb){
+  if(typeof BroadcastChannel==='undefined'){cb('SKIP-no-bcast');return;}
+  try{
+    var ch1=new BroadcastChannel('race-test');
+    var ch2=new BroadcastChannel('race-test');
+    var received=0;var sent=0;
+    ch2.onmessage=function(e){received++;};
+    // Send many messages rapidly
+    for(var i=0;i<1000;i++){
+      ch1.postMessage({idx:i,data:'x'.repeat(100)});
+      sent++;
+    }
+    setTimeout(function(){
+      ch1.close();ch2.close();
+      cb('sent:'+sent+'|received:'+received+'|loss:'+(sent-received));
+    },500);
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// C4: Worker creating multiple workers (nesting test)
+addTest('C4-NESTED-WORKERS',function(cb){
+  if(typeof Worker==='undefined'){cb('SKIP-no-workers');return;}
+  try{
+    var innerCode='onmessage=function(e){postMessage("inner-"+e.data);};';
+    var outerCode='onmessage=function(e){'
+      +'try{'
+      +'var blob=new Blob(['+JSON.stringify(innerCode)+'],{type:"application/javascript"});'
+      +'var url=URL.createObjectURL(blob);'
+      +'var w2=new Worker(url);'
+      +'w2.onmessage=function(e2){postMessage("nested-"+e2.data);w2.terminate();URL.revokeObjectURL(url);};'
+      +'w2.onerror=function(){postMessage("nested-err");};'
+      +'w2.postMessage(e.data);'
+      +'}catch(err){postMessage("nest-fail:"+err.message);}'
+      +'};';
+    var blob=new Blob([outerCode],{type:'application/javascript'});
+    var url=URL.createObjectURL(blob);
+    var w=new Worker(url);
+    w.onmessage=function(e){
+      w.terminate();URL.revokeObjectURL(url);
+      cb('result:'+e.data);
+    };
+    w.onerror=function(e){
+      w.terminate();URL.revokeObjectURL(url);
+      cb('worker-err:'+e.message);
+    };
+    w.postMessage('test-nest');
+    setTimeout(function(){w.terminate();URL.revokeObjectURL(url);cb('timeout');},3000);
+  }catch(e){cb('ERR:'+e.message);}
+});
+
+// C5: Rapid worker create/destroy
+addTest('C5-WORKER-CHURN',function(cb){
+  if(typeof Worker==='undefined'){cb('SKIP-no-workers');return;}
+  var code='onmessage=function(e){postMessage(e.data);};';
+  var created=0;var responses=0;
+  var blob=new Blob([code],{type:'application/javascript'});
+  var url=URL.createObjectURL(blob);
+  for(var i=0;i<20;i++){
+    try{
+      var w=new Worker(url);
+      created++;
+      (function(worker,idx){
+        worker.onmessage=function(e){
+          responses++;
+          worker.terminate();
+        };
+        worker.postMessage('ping-'+idx);
+      })(w,i);
+    }catch(e){break;}
+  }
+  setTimeout(function(){
+    URL.revokeObjectURL(url);
+    cb('created:'+created+'|responses:'+responses);
+  },2000);
+});
+
+// ================================================================
+// SECTION D: DOM Lifecycle Race Patterns
+// ================================================================
+
+// D1: Remove iframe during script execution
+addTest('D1-IFRAME-SCRIPT-REMOVE',function(cb){
+  clearSandbox();
+  var iframe=document.createElement('iframe');
+  iframe.srcdoc='<html><body><script>parent.postMessage("loaded","*");<\/script></body></html>';
+  var msgReceived=false;
+  window.addEventListener('message',function handler(e){
+    if(e.data==='loaded'){
+      msgReceived=true;
+      window.removeEventListener('message',handler);
+    }
+  });
+  sandbox.appendChild(iframe);
+  // Remove before script can execute
+  setTimeout(function(){
+    if(iframe.parentNode)iframe.parentNode.removeChild(iframe);
+    setTimeout(function(){
+      cb('OK-removed|msgReceived:'+msgReceived);
+    },200);
+  },10);
+});
+
+// D2: Concurrent image loading + DOM removal
+addTest('D2-IMG-LOAD-REMOVE-RACE',function(cb){
+  clearSandbox();
+  var loaded=0;var errors=0;var removed=0;
+  for(var i=0;i<20;i++){
+    var img=new Image();
+    img.onload=function(){loaded++;};
+    img.onerror=function(){errors++;};
+    // Use data URI that takes a moment to decode
+    img.src='data:image/svg+xml,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><rect width="100" height="100" fill="red"/></svg>');
+    sandbox.appendChild(img);
+    // Immediately remove half
+    if(i%2===0){
+      sandbox.removeChild(img);
+      removed++;
+    }
+  }
+  setTimeout(function(){
+    cb('loaded:'+loaded+'|errors:'+errors+'|removed:'+removed);
+  },500);
+});
+
+// D3: Style recalc during element adoption
+addTest('D3-STYLE-RECALC-ADOPT',function(cb){
+  clearSandbox();
+  var doc2=document.implementation.createHTMLDocument('');
+  var adopted=0;
+  for(var i=0;i<30;i++){
+    var el=document.createElement('div');
+    el.style.cssText='position:absolute;transform:translateZ(0);will-change:transform;opacity:0.5';
+    el.className='adopt-test-'+i;
+    el.textContent='content-'+i;
+    sandbox.appendChild(el);
+    void sandbox.offsetHeight; // Force layout with element in document
+    // Adopt to different document (removes from DOM, invalidates styles)
+    document.adoptNode(el);
+    doc2.body.appendChild(el);
+    void sandbox.offsetHeight; // Force layout without element
+    adopted++;
+  }
+  cb('OK-adopted:'+adopted);
+});
+
+// D4: WeakRef + FinalizationRegistry GC timing
+addTest('D4-WEAKREF-GC-TIMING',function(cb){
+  if(typeof WeakRef==='undefined'){cb('SKIP-no-WeakRef');return;}
+  var collected=0;
+  var refs=[];
+  var fr=new FinalizationRegistry(function(val){collected++;});
+  // Create objects, register them, then lose references
+  for(var i=0;i<100;i++){
+    var obj={idx:i,data:new Array(1000).fill(i)};
+    refs.push(new WeakRef(obj));
+    fr.register(obj,'ref-'+i);
+  }
+  // Lose all strong references
+  // (the loop variable 'obj' holds the last one, overwrite it)
+  var obj=null;
+  // Try to force GC
+  for(var j=0;j<10;j++){
+    var waste=[];
+    for(var k=0;k<10000;k++)waste.push(new ArrayBuffer(256));
+    waste=null;
+  }
+  setTimeout(function(){
+    var alive=0;
+    for(var r=0;r<refs.length;r++){
+      if(refs[r].deref()!==undefined)alive++;
+    }
+    cb('created:100|alive:'+alive+'|collected:'+collected);
+  },500);
+});
+
+log('info','Starting '+tests.length+' tests...');
+setTimeout(runNext,100);
+</script>
+</body>
+</html>

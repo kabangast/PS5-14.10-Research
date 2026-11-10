@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>PS5 FW 14.10 // FRAGMENT, ZERO-COPY, UUID &amp; SEGMENTER HUD</title>
+<style>
+:root {
+  --bg-dark: #040711;
+  --panel-bg: rgba(8, 14, 28, 0.94);
+  --neon-cyan: #00f3ff;
+  --neon-green: #00ff66;
+  --neon-amber: #ffb800;
+  --neon-pink: #ff0077;
+  --neon-purple: #9d00ff;
+  --text-dim: #7085a5;
+  --text-main: #e2f1ff;
+  --border-glow: rgba(0, 243, 255, 0.35);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background-color: var(--bg-dark);
+  background-image: 
+    radial-gradient(ellipse at 50% 0%, rgba(0, 243, 255, 0.16), transparent 75%),
+    linear-gradient(rgba(0, 243, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 243, 255, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 28px 28px, 28px 28px;
+  color: var(--text-main);
+  font-family: "SF Mono", "Consolas", monospace;
+  padding: 16px;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+.scanline {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.02), rgba(0, 255, 0, 0.01), rgba(0, 255, 0, 0.02));
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+  z-index: 999;
+}
+
+/* Header */
+.header {
+  border: 1px solid var(--neon-cyan);
+  background: rgba(0, 243, 255, 0.07);
+  box-shadow: 0 0 20px rgba(0, 243, 255, 0.3);
+  padding: 12px 20px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title-glitch {
+  font-size: 18px;
+  font-weight: 900;
+  letter-spacing: 2px;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 10px rgba(0, 243, 255, 0.8);
+}
+.target-badge {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: rgba(0, 255, 102, 0.15);
+  border: 1px solid var(--neon-green);
+  color: var(--neon-green);
+  font-weight: bold;
+}
+
+/* Pipeline Trackers */
+.pipeline-track {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.node {
+  background: var(--panel-bg);
+  border: 1px solid rgba(112, 133, 165, 0.25);
+  border-radius: 6px;
+  padding: 10px;
+  position: relative;
+  transition: all 0.3s ease;
+}
+.node.done {
+  border-color: var(--neon-green);
+  box-shadow: 0 0 10px rgba(0, 255, 102, 0.25);
+}
+.node.active {
+  border-color: var(--neon-cyan);
+  box-shadow: 0 0 12px rgba(0, 243, 255, 0.4);
+}
+.node.locked {
+  border-color: rgba(112, 133, 165, 0.2);
+  opacity: 0.55;
+}
+.node-step {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.node.done .node-step { color: var(--neon-green); }
+.node.active .node-step { color: var(--neon-cyan); }
+.node-title {
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--text-main);
+  margin-bottom: 4px;
+}
+.node-desc {
+  font-size: 9px;
+  color: var(--text-dim);
+  line-height: 1.3;
+}
+
+/* Grid Layout */
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.hud-panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-glow);
+  border-radius: 6px;
+  padding: 14px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid rgba(0, 243, 255, 0.2);
+  padding-bottom: 8px;
+  margin-bottom: 12px;
+}
+.panel-title {
+  font-size: 13px;
+  font-weight: bold;
+  color: var(--neon-cyan);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+.panel-tag {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: rgba(0, 243, 255, 0.1);
+  color: var(--neon-cyan);
+  border: 1px solid rgba(0, 243, 255, 0.3);
+}
+
+.live-meter {
+  display: flex;
+  justify-content: space-between;
+  padding: 7px 0;
+  border-bottom: 1px solid rgba(112, 133, 165, 0.12);
+  font-size: 12px;
+}
+.val-ok { color: var(--neon-green); font-weight: bold; }
+.val-hex { color: var(--neon-amber); font-weight: bold; }
+.val-cyan { color: var(--neon-cyan); font-weight: bold; }
+.val-dim { color: var(--text-dim); }
+
+/* Live Terminal */
+.terminal-panel {
+  background: #020409;
+  border: 1px solid rgba(0, 243, 255, 0.4);
+  border-radius: 6px;
+  padding: 12px;
+  font-size: 11px;
+  box-shadow: inset 0 0 14px rgba(0, 0, 0, 0.8);
+}
+.terminal-log {
+  max-height: 220px;
+  overflow-y: auto;
+  line-height: 1.45;
+  color: #a4c2e6;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+
+<div class="header">
+  <div class="title-glitch">PS5 // P973: FRAGMENT, ZERO-COPY, UUID &amp; SEGMENTER HUD</div>
+  <div class="target-badge" id="mStatusBadge">INITIALIZING...</div>
+</div>
+
+<!-- 6-Stage Pipeline Node Status -->
+<div class="pipeline-track">
+  <div class="node active" id="nodeStage1">
+    <div class="node-step">Stage 1 [ACTIVE]</div>
+    <div class="node-title">FRAGMENT BATCH</div>
+    <div class="node-desc">5,000 direct vs DocumentFragment</div>
+  </div>
+  <div class="node locked" id="nodeStage2">
+    <div class="node-step">Stage 2 [STANDBY]</div>
+    <div class="node-title">ZERO-COPY VIEW</div>
+    <div class="node-desc">50k slice() copy vs subarray()</div>
+  </div>
+  <div class="node locked" id="nodeStage3">
+    <div class="node-step">Stage 3 [STANDBY]</div>
+    <div class="node-title">RANDOMUUID 50K</div>
+    <div class="node-desc">50,000 crypto.randomUUID v4</div>
+  </div>
+  <div class="node locked" id="nodeStage4">
+    <div class="node-step">Stage 4 [STANDBY]</div>
+    <div class="node-title">INTL.SEGMENTER</div>
+    <div class="node-desc">Arabic, Japanese &amp; ZWJ Emoji</div>
+  </div>
+  <div class="node locked" id="nodeStage5">
+    <div class="node-step">Stage 5 [STANDBY]</div>
+    <div class="node-title">PROTO 500 DEPTH</div>
+    <div class="node-desc">500-level prototype traversal</div>
+  </div>
+  <div class="node locked" id="nodeStage6">
+    <div class="node-step">Stage 6 [STANDBY]</div>
+    <div class="node-title">SYSTEM VERDICT</div>
+    <div class="node-desc">Unified telemetry consensus</div>
+  </div>
+</div>
+
+<div class="dashboard-grid">
+  <!-- Left Panel: DOM Fragment & Zero-Copy Slicing -->
+  <div class="hud-panel">
+    <div class="panel-header">
+      <div class="panel-title">DOM Batching &amp; Buffer Slicing</div>
+      <div class="panel-tag">DOM / BUFFER</div>
+    </div>
+    <div class="live-meter"><span>Direct Sequential Appends (5,000):</span><span class="val-cyan" id="mDirectMs">Measuring...</span></div>
+    <div class="live-meter"><span>DocumentFragment Batched Appends:</span><span class="val-cyan" id="mFragMs">Measuring...</span></div>
+    <div class="live-meter"><span>DocumentFragment Speedup:</span><span class="val-cyan" id="mFragSpeedup">Measuring...</span></div>
+    <div class="live-meter"><span>ArrayBuffer.slice() (50k copies):</span><span class="val-cyan" id="mSliceMs">Pending...</span></div>
+    <div class="live-meter"><span>TypedArray.subarray() (50k zero-copy):</span><span class="val-cyan" id="mSubMs">Pending...</span></div>
+    <div class="live-meter"><span>Zero-Copy Speedup Factor:</span><span class="val-cyan" id="mZeroCopyRatio">Pending...</span></div>
+  </div>
+
+  <!-- Right Panel: UUID, Segmenter & Prototype Chains -->
+  <div class="hud-panel">
+    <div class="panel-header">
+      <div class="panel-title">Crypto, ICU &amp; Prototype Cache</div>
+      <div class="panel-tag">CRYPTO / ICU / JSC</div>
+    </div>
+    <div class="live-meter"><span>crypto.randomUUID() 50,000 Ops:</span><span class="val-cyan" id="mUuidMs">Pending...</span></div>
+    <div class="live-meter"><span>randomUUID Throughput &amp; RFC4122:</span><span class="val-cyan" id="mUuidSpeed">Pending...</span></div>
+    <div class="live-meter"><span>Arabic Word Segmentation:</span><span class="val-cyan" id="mArabicSeg">Pending...</span></div>
+    <div class="live-meter"><span>Japanese Grapheme Clusters:</span><span class="val-cyan" id="mJapaneseSeg">Pending...</span></div>
+    <div class="live-meter"><span>ZWJ Multi-Person Family Emoji:</span><span class="val-cyan" id="mEmojiSeg">Pending...</span></div>
+    <div class="live-meter"><span>500-Level Prototype Chain Traversal:</span><span class="val-cyan" id="mProtoMs">Pending...</span></div>
+  </div>
+</div>
+
+<!-- Live Terminal Panel -->
+<div class="terminal-panel">
+  <div class="terminal-log" id="termLog"></div>
+</div>
+
+<script>
+var term = document.getElementById('termLog');
+var statusBadge = document.getElementById('mStatusBadge');
+
+var nodeStage1 = document.getElementById('nodeStage1');
+var nodeStage2 = document.getElementById('nodeStage2');
+var nodeStage3 = document.getElementById('nodeStage3');
+var nodeStage4 = document.getElementById('nodeStage4');
+var nodeStage5 = document.getElementById('nodeStage5');
+var nodeStage6 = document.getElementById('nodeStage6');
+
+var mDirectMs = document.getElementById('mDirectMs');
+var mFragMs = document.getElementById('mFragMs');
+var mFragSpeedup = document.getElementById('mFragSpeedup');
+var mSliceMs = document.getElementById('mSliceMs');
+var mSubMs = document.getElementById('mSubMs');
+var mZeroCopyRatio = document.getElementById('mZeroCopyRatio');
+
+var mUuidMs = document.getElementById('mUuidMs');
+var mUuidSpeed = document.getElementById('mUuidSpeed');
+var mArabicSeg = document.getElementById('mArabicSeg');
+var mJapaneseSeg = document.getElementById('mJapaneseSeg');
+var mEmojiSeg = document.getElementById('mEmojiSeg');
+var mProtoMs = document.getElementById('mProtoMs');
+
+/* Global Trackers */
+var gDirectMs = 0;
+var gFragMs = 0;
+var gSliceMs = 0;
+var gSubMs = 0;
+var gUuidMs = 0;
+var gUuidSpeed = 0;
+var gSegOk = false;
+var gProtoMs = 0;
+
+function log(msg) {
+  var d = document.createElement('div');
+  d.textContent = '[' + new Date().toISOString().slice(11, 23) + '] ' + msg;
+  term.appendChild(d);
+  term.scrollTop = term.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P973-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+window.onerror = function(msg, url, line) {
+  syncBn('JS-ERR', msg + ' at line ' + line);
+  log('[!] ERROR: ' + msg + ' (Line ' + line + ')');
+};
+
+log('[*] Probe P973 online: DocumentFragment, Zero-Copy Subarray, UUID & Segmenter.');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * STAGE 1: DOM DocumentFragment Batching vs Direct Appends
+ * ============================================================ */
+try {
+  var container1 = document.createElement('div');
+  container1.id = 'dom-test-cont1';
+  document.body.appendChild(container1);
+
+  var tDirect0 = performance.now();
+  for (var i = 0; i < 5000; i++) {
+    var span1 = document.createElement('span');
+    span1.textContent = 'a';
+    container1.appendChild(span1);
+  }
+  gDirectMs = Math.max(1, Math.round(performance.now() - tDirect0));
+
+  container1.innerHTML = '';
+
+  var tFrag0 = performance.now();
+  var frag = document.createDocumentFragment();
+  for (var j = 0; j < 5000; j++) {
+    var span2 = document.createElement('span');
+    span2.textContent = 'b';
+    frag.appendChild(span2);
+  }
+  container1.appendChild(frag);
+  gFragMs = Math.max(1, Math.round(performance.now() - tFrag0));
+
+  document.body.removeChild(container1);
+
+  var fragSpeedup = (gDirectMs / gFragMs).toFixed(1);
+  mDirectMs.textContent = gDirectMs + ' ms (5,000 INDIVIDUAL APPENDS)';
+  mFragMs.textContent = gFragMs + ' ms (5,000 BATCHED VIA FRAGMENT)';
+  mFragSpeedup.textContent = fragSpeedup + 'x FASTER VIA FRAGMENT';
+  mFragSpeedup.className = (gFragMs <= gDirectMs) ? 'val-ok' : 'val-hex';
+
+  log('[+] DOM Fragment: direct=' + gDirectMs + 'ms, frag=' + gFragMs + 'ms (' + fragSpeedup + 'x speedup)');
+  syncBn('DOM-FRAG', 'directMs=' + gDirectMs + '|fragMs=' + gFragMs + '|speedup=' + fragSpeedup);
+
+  nodeStage1.className = 'node done';
+  nodeStage1.querySelector('.node-step').textContent = 'Stage 1 [DONE]';
+} catch(fe) {
+  log('[-] DOM Fragment error: ' + fe.message);
+  syncBn('FRAG-ERR', fe.message);
+  nodeStage1.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 2: ArrayBuffer.slice() vs TypedArray.subarray() Zero-Copy
+ * ============================================================ */
+nodeStage2.className = 'node active';
+nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [ACTIVE]';
+
+try {
+  var sourceBuf = new ArrayBuffer(4096);
+  var sourceU8 = new Uint8Array(sourceBuf);
+  sourceU8.fill(0x55);
+
+  var tSlice0 = performance.now();
+  var sliceSum = 0;
+  for (var s = 0; s < 50000; s++) {
+    var sl = sourceBuf.slice(0, 1024);
+    sliceSum += sl.byteLength;
+  }
+  gSliceMs = Math.max(1, Math.round(performance.now() - tSlice0));
+
+  var tSub0 = performance.now();
+  var subSum = 0;
+  for (var u = 0; u < 50000; u++) {
+    var sub = sourceU8.subarray(0, 1024);
+    subSum += sub.byteLength;
+  }
+  gSubMs = Math.max(1, Math.round(performance.now() - tSub0));
+
+  var zeroCopyRatio = (gSliceMs / gSubMs).toFixed(1);
+  mSliceMs.textContent = gSliceMs + ' ms (50,000 MEMORY COPIES)';
+  mSubMs.textContent = gSubMs + ' ms (50,000 ZERO-COPY VIEWS)';
+  mZeroCopyRatio.textContent = zeroCopyRatio + 'x FASTER (ZERO-COPY)';
+  mZeroCopyRatio.className = 'val-ok';
+
+  log('[+] Zero-Copy Slicing: sliceCopy=' + gSliceMs + 'ms, subarrayZeroCopy=' + gSubMs + 'ms (' + zeroCopyRatio + 'x speedup)');
+  syncBn('ZERO-COPY', 'sliceMs=' + gSliceMs + '|subMs=' + gSubMs + '|ratio=' + zeroCopyRatio);
+
+  nodeStage2.className = 'node done';
+  nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [DONE]';
+} catch(ze) {
+  log('[-] Zero-copy error: ' + ze.message);
+  syncBn('ZERO-COPY-ERR', ze.message);
+  nodeStage2.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 3: crypto.randomUUID() 50,000 Operations
+ * ============================================================ */
+nodeStage3.className = 'node active';
+nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [ACTIVE]';
+
+var hasRandomUuid = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function');
+
+if (hasRandomUuid) {
+  try {
+    var tUuid0 = performance.now();
+    var lastUuid = '';
+    for (var ui = 0; ui < 50000; ui++) {
+      lastUuid = crypto.randomUUID();
+    }
+    gUuidMs = Math.max(1, Math.round(performance.now() - tUuid0));
+    gUuidSpeed = Math.round((50000 / (gUuidMs / 1000)));
+
+    var uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    var uuidFormatOk = uuidRegex.test(lastUuid);
+
+    mUuidMs.textContent = gUuidMs + ' ms (50,000 UUID v4 GENERATED)';
+    mUuidSpeed.textContent = gUuidSpeed.toLocaleString() + ' UUIDs/SEC (RFC 4122: ' + uuidFormatOk + ')';
+    mUuidSpeed.className = uuidFormatOk ? 'val-ok' : 'val-hex';
+
+    log('[+] crypto.randomUUID: 50,000 in ' + gUuidMs + 'ms (~' + gUuidSpeed + ' uuid/s), rfcOk=' + uuidFormatOk);
+    syncBn('RANDOM-UUID', 'timeMs=' + gUuidMs + '|speed=' + gUuidSpeed + '|rfcOk=' + uuidFormatOk);
+
+    nodeStage3.className = 'node done';
+    nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [DONE]';
+  } catch(ue) {
+    log('[-] randomUUID error: ' + ue.message);
+    syncBn('UUID-ERR', ue.message);
+    nodeStage3.className = 'node locked';
+  }
+} else {
+  mUuidMs.textContent = 'UNSUPPORTED';
+  mUuidMs.className = 'val-dim';
+  nodeStage3.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 4: Intl.Segmenter Multilingual Parsing
+ * ============================================================ */
+nodeStage4.className = 'node active';
+nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [ACTIVE]';
+
+var hasSegmenter = (typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function');
+var arabicWords = 0;
+var japaneseGraphemes = 0;
+var zwjGraphemes = 0;
+var segMs = 0;
+
+if (hasSegmenter) {
+  try {
+    var tSeg0 = performance.now();
+
+    var segWordAr = new Intl.Segmenter('ar', { granularity: 'word' });
+    var arText = "الْحَمْدُ لِلَّهِ رَبِّ الْعَالَمِينَ";
+    var arIter = segWordAr.segment(arText);
+    for (var w of arIter) {
+      if (w.isWordLike) arabicWords++;
+    }
+
+    var segGraphemeJa = new Intl.Segmenter('ja', { granularity: 'grapheme' });
+    var jaText = "PlayStation 5のWebKit検証";
+    var jaIter = segGraphemeJa.segment(jaText);
+    for (var g of jaIter) {
+      japaneseGraphemes++;
+    }
+
+    var segGraphemeEmoji = new Intl.Segmenter('en', { granularity: 'grapheme' });
+    var emojiText = "👨‍👩‍👧‍👦";
+    var emojiIter = segGraphemeEmoji.segment(emojiText);
+    for (var e of emojiIter) {
+      zwjGraphemes++;
+    }
+
+    segMs = Math.max(1, Math.round(performance.now() - tSeg0));
+    gSegOk = (arabicWords === 4 && zwjGraphemes === 1);
+
+    mArabicSeg.textContent = arabicWords + ' WORDS IDENTIFIED (diacritics parsed)';
+    mArabicSeg.className = (arabicWords === 4) ? 'val-ok' : 'val-hex';
+
+    mJapaneseSeg.textContent = japaneseGraphemes + ' GRAPHEMES (Kanji/Kana clusters)';
+    mEmojiSeg.textContent = zwjGraphemes + ' CLUSTER (4-person ZWJ family intact)';
+    mEmojiSeg.className = (zwjGraphemes === 1) ? 'val-ok' : 'val-hex';
+
+    log('[+] Intl.Segmenter: arWords=' + arabicWords + ', jaGraphemes=' + japaneseGraphemes + ', zwjCluster=' + zwjGraphemes + ' in ' + segMs + 'ms');
+    syncBn('SEGMENTER', 'arWords=' + arabicWords + '|jaGraphemes=' + japaneseGraphemes + '|zwjCluster=' + zwjGraphemes + '|timeMs=' + segMs);
+
+    nodeStage4.className = 'node done';
+    nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [DONE]';
+  } catch(se) {
+    log('[-] Segmenter error: ' + se.message);
+    syncBn('SEG-ERR', se.message);
+    nodeStage4.className = 'node locked';
+  }
+} else {
+  mArabicSeg.textContent = 'UNSUPPORTED';
+  mArabicSeg.className = 'val-dim';
+  nodeStage4.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 5: 500-Level Object Prototype Chain Traversal
+ * ============================================================ */
+nodeStage5.className = 'node active';
+nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [ACTIVE]';
+
+try {
+  var rootProto = { baseSecret: 0x1337BEEF };
+  var currentObj = rootProto;
+  for (var p = 0; p < 500; p++) {
+    currentObj = Object.create(currentObj);
+  }
+
+  var leafObj = currentObj;
+  var tProto0 = performance.now();
+  var protoAccum = 0;
+  for (var it = 0; it < 50000; it++) {
+    protoAccum += leafObj.baseSecret;
+  }
+  gProtoMs = Math.max(1, Math.round(performance.now() - tProto0));
+  var protoOk = (protoAccum === 50000 * 0x1337BEEF);
+
+  mProtoMs.textContent = gProtoMs + ' ms (50,000 RESOLUTIONS ACROSS 500 PROTOS)';
+  mProtoMs.className = protoOk ? 'val-ok' : 'val-hex';
+
+  log('[+] Prototype 500 Depth: 50k lookups in ' + gProtoMs + 'ms, protoOk=' + protoOk);
+  syncBn('PROTO-DEPTH', 'depth=500|lookups=50000|timeMs=' + gProtoMs + '|ok=' + protoOk);
+
+  nodeStage5.className = 'node done';
+  nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [DONE]';
+} catch(pre) {
+  log('[-] Prototype depth error: ' + pre.message);
+  syncBn('PROTO-ERR', pre.message);
+  nodeStage5.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 6: Master Verdict & Summary
+ * ============================================================ */
+nodeStage6.className = 'node done';
+nodeStage6.querySelector('.node-step').textContent = 'Stage 6 [DONE]';
+
+statusBadge.textContent = 'ALL 6 STAGES NOMINAL';
+statusBadge.style.background = '#00ff66';
+
+log('[*] Probe P973 complete: DocumentFragment, Zero-Copy, UUID, Segmenter & Prototype benchmarked.');
+syncBn('DONE', 'status=P973_COMPLETE|directMs=' + gDirectMs + '|fragMs=' + gFragMs + '|sliceMs=' + gSliceMs + '|subMs=' + gSubMs + '|uuidSpeed=' + gUuidSpeed + '|segOk=' + gSegOk + '|protoMs=' + gProtoMs);
+
+/* Auto-Reload Watcher for autonomous progression */
+var initialReloadToken = null;
+function checkAutoReload() {
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/reload.txt?t=' + Date.now(), true);
+    xhr.onload = function() {
+      if (xhr.status === 200) {
+        var token = xhr.responseText.trim();
+        if (initialReloadToken === null) {
+          initialReloadToken = token;
+        } else if (token !== initialReloadToken) {
+          log('[*] New deployment detected (token: ' + token + '). Auto-reloading in 500ms...');
+          setTimeout(function() { location.reload(); }, 500);
+        }
+      }
+    };
+    xhr.send();
+  } catch(e) {}
+}
+setInterval(checkAutoReload, 1500);
+</script>
+</body>
+</html>

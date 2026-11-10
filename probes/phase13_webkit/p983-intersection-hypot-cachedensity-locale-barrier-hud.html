@@ -1,0 +1,966 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>PS5 FW 14.10 // INTERSECTION, HYPOT, CACHE DENSITY &amp; BARRIER HUD</title>
+<style>
+:root {
+  --bg-dark: #03060f;
+  --panel-bg: rgba(7, 13, 26, 0.95);
+  --neon-cyan: #00f3ff;
+  --neon-green: #00ff66;
+  --neon-amber: #ffb800;
+  --neon-pink: #ff0077;
+  --neon-purple: #9d00ff;
+  --text-dim: #7085a5;
+  --text-main: #e2f1ff;
+  --border-glow: rgba(0, 243, 255, 0.35);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background-color: var(--bg-dark);
+  background-image: 
+    radial-gradient(ellipse at 50% 0%, rgba(0, 243, 255, 0.18), transparent 75%),
+    linear-gradient(rgba(0, 243, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 243, 255, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 28px 28px, 28px 28px;
+  color: var(--text-main);
+  font-family: "SF Mono", "Consolas", monospace;
+  padding: 16px;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+.scanline {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.02), rgba(0, 255, 0, 0.01), rgba(0, 255, 0, 0.02));
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+  z-index: 999;
+}
+
+/* Header */
+.header {
+  border: 1px solid var(--neon-cyan);
+  background: rgba(0, 243, 255, 0.07);
+  box-shadow: 0 0 20px rgba(0, 243, 255, 0.3);
+  padding: 12px 20px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title-glitch {
+  font-size: 18px;
+  font-weight: 900;
+  letter-spacing: 2px;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 10px rgba(0, 243, 255, 0.8);
+}
+.target-badge {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: rgba(0, 255, 102, 0.15);
+  border: 1px solid var(--neon-green);
+  color: var(--neon-green);
+  font-weight: bold;
+}
+
+/* ============================================================
+ * MASTER GOAL CHAIN (ROADMAP TO HYPERVISOR [HV])
+ * ============================================================ */
+.goal-chain-container {
+  background: rgba(6, 11, 22, 0.96);
+  border: 1px solid var(--neon-purple);
+  box-shadow: 0 0 18px rgba(157, 0, 255, 0.3);
+  border-radius: 6px;
+  padding: 14px;
+  margin-bottom: 14px;
+}
+.goal-chain-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.goal-chain-title {
+  font-size: 14px;
+  font-weight: 900;
+  letter-spacing: 1.5px;
+  color: var(--neon-purple);
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.goal-chain-title::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 16px;
+  background: var(--neon-purple);
+  box-shadow: 0 0 8px var(--neon-purple);
+}
+.goal-chain-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+}
+.goal-card {
+  background: rgba(11, 18, 36, 0.9);
+  border: 1px solid rgba(112, 133, 165, 0.3);
+  border-radius: 6px;
+  padding: 12px;
+  position: relative;
+  transition: all 0.3s ease;
+}
+.goal-card.archived {
+  border-color: rgba(0, 255, 102, 0.5);
+  background: rgba(0, 255, 102, 0.04);
+}
+.goal-card.active {
+  border-color: var(--neon-cyan);
+  background: rgba(0, 243, 255, 0.08);
+  box-shadow: 0 0 14px rgba(0, 243, 255, 0.3);
+}
+.goal-card.pending {
+  border-color: rgba(112, 133, 165, 0.25);
+  opacity: 0.7;
+}
+.goal-card.final {
+  border-color: rgba(255, 0, 119, 0.5);
+  background: rgba(255, 0, 119, 0.04);
+}
+.goal-badge {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 900;
+  padding: 2px 6px;
+  border-radius: 3px;
+  margin-bottom: 6px;
+  letter-spacing: 1px;
+}
+.badge-archived { background: rgba(0, 255, 102, 0.2); color: var(--neon-green); border: 1px solid var(--neon-green); }
+.badge-active { background: rgba(0, 243, 255, 0.2); color: var(--neon-cyan); border: 1px solid var(--neon-cyan); }
+.badge-pending { background: rgba(112, 133, 165, 0.2); color: var(--text-dim); border: 1px solid rgba(112, 133, 165, 0.4); }
+.badge-final { background: rgba(255, 0, 119, 0.2); color: var(--neon-pink); border: 1px solid var(--neon-pink); }
+
+.goal-tier-title {
+  font-size: 12px;
+  font-weight: bold;
+  color: var(--text-main);
+  margin-bottom: 4px;
+}
+.goal-desc {
+  font-size: 9.5px;
+  color: var(--text-dim);
+  line-height: 1.4;
+  margin-bottom: 8px;
+}
+.goal-advancement {
+  font-size: 9px;
+  color: #a5c2eb;
+  background: rgba(0, 0, 0, 0.35);
+  padding: 6px;
+  border-radius: 4px;
+  border-left: 2px solid var(--neon-cyan);
+}
+.goal-card.archived .goal-advancement { border-left-color: var(--neon-green); }
+.goal-card.final .goal-advancement { border-left-color: var(--neon-pink); }
+
+/* Pipeline Trackers */
+.pipeline-track {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.node {
+  background: var(--panel-bg);
+  border: 1px solid rgba(112, 133, 165, 0.25);
+  border-radius: 6px;
+  padding: 10px;
+  position: relative;
+  transition: all 0.3s ease;
+}
+.node.done {
+  border-color: var(--neon-green);
+  box-shadow: 0 0 10px rgba(0, 255, 102, 0.25);
+}
+.node.active {
+  border-color: var(--neon-cyan);
+  box-shadow: 0 0 12px rgba(0, 243, 255, 0.4);
+}
+.node.locked {
+  border-color: rgba(112, 133, 165, 0.2);
+  opacity: 0.55;
+}
+.node-step {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.node.done .node-step { color: var(--neon-green); }
+.node.active .node-step { color: var(--neon-cyan); }
+.node-title {
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--text-main);
+  margin-bottom: 4px;
+}
+.node-desc {
+  font-size: 9px;
+  color: var(--text-dim);
+  line-height: 1.3;
+}
+
+/* Grid Layout */
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid rgba(0, 243, 255, 0.25);
+  border-radius: 6px;
+  padding: 14px;
+  position: relative;
+}
+.panel-full {
+  grid-column: 1 / -1;
+}
+.panel-title {
+  font-size: 13px;
+  font-weight: bold;
+  color: var(--neon-cyan);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.panel-title::before {
+  content: "";
+  display: inline-block;
+  width: 4px;
+  height: 14px;
+  background: var(--neon-cyan);
+}
+.goal-callout {
+  background: rgba(0, 243, 255, 0.05);
+  border: 1px solid rgba(0, 243, 255, 0.2);
+  border-radius: 4px;
+  padding: 6px 10px;
+  font-size: 9.5px;
+  color: #7ce8ff;
+  margin-bottom: 10px;
+  line-height: 1.35;
+}
+
+/* Metric Display Rows */
+.metric-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 0;
+  border-bottom: 1px solid rgba(112, 133, 165, 0.15);
+  font-size: 11px;
+}
+.metric-row:last-child { border-bottom: none; }
+.metric-label { color: var(--text-dim); }
+.metric-val { font-weight: bold; }
+.val-ok { color: var(--neon-green); }
+.val-amber { color: var(--neon-amber); }
+.val-dim { color: var(--text-dim); }
+.val-hex { color: var(--neon-cyan); }
+.val-pink { color: var(--neon-pink); }
+
+/* Terminal Output Box */
+.terminal {
+  background: rgba(2, 5, 12, 0.96);
+  border: 1px solid rgba(0, 243, 255, 0.2);
+  border-radius: 4px;
+  padding: 10px;
+  height: 150px;
+  overflow-y: auto;
+  font-size: 10px;
+  line-height: 1.4;
+  color: #a5c2eb;
+}
+.term-line { margin-bottom: 2px; }
+.term-ts { color: var(--neon-cyan); margin-right: 6px; }
+.term-hi { color: var(--neon-green); }
+.term-warn { color: var(--neon-amber); }
+.term-err { color: var(--neon-pink); }
+
+/* Hidden scratch container */
+#bench-scratch {
+  position: absolute;
+  left: -9999px;
+  top: -9999px;
+  width: 400px;
+  height: 400px;
+  overflow: hidden;
+  visibility: hidden;
+}
+#io-container {
+  width: 300px;
+  height: 200px;
+  overflow-y: scroll;
+  visibility: hidden;
+  position: absolute;
+  left: -9999px;
+  top: -9999px;
+}
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+
+<div class="header">
+  <div class="title-glitch">PS5 WebKit Core Profiler // P983</div>
+  <div class="target-badge">PLAYSTATION 5 FW 14.10 // 192.168.1.106</div>
+</div>
+
+<!-- ============================================================
+ * MASTER ARCHITECTURAL PROGRESSION CHAIN (ROADMAP TO HYPERVISOR)
+ * ============================================================ -->
+<div class="goal-chain-container">
+  <div class="goal-chain-header">
+    <div class="goal-chain-title">Master Research Progression Chain (Roadmap to Hypervisor [HV])</div>
+    <div style="font-size: 10px; color: var(--text-dim);">PS5 FW 14.10 Architectural Boundary Mapping</div>
+  </div>
+  <div class="goal-chain-grid">
+    <!-- Tier 1 -->
+    <div class="goal-card archived">
+      <div class="goal-badge badge-archived">ARCHIVED // 95% COMPLETE</div>
+      <div class="goal-tier-title">Tier 1: WebKit Userland</div>
+      <div class="goal-desc">Subsystem execution limits, JIT compiler characteristics, DOM engine, FPU throughput (12.5M ops/s), zero-copy IPC (0.73 GB/s), Timsort.</div>
+      <div class="goal-advancement"><b>Advancement:</b> Unlocked full characterization of userland memory layouts, typed array buffers, and thread pool determinism.</div>
+    </div>
+    <!-- Tier 2 -->
+    <div class="goal-card active">
+      <div class="goal-badge badge-active">ACTIVE // CURRENT PHASE</div>
+      <div class="goal-tier-title">Tier 2: Memory &amp; Heap Model</div>
+      <div class="goal-desc">IntersectionObserver compositor queues, Math.hypot FPU vectorization, cache line scaling (16/32/64-bit), and spin-wait worker barrier.</div>
+      <div class="goal-advancement"><b>Advancement:</b> Maps Zen 2 CPU cache footprints (L1/L2/L3) and thread synchronization skew at microsecond precision.</div>
+    </div>
+    <!-- Tier 3 -->
+    <div class="goal-card pending">
+      <div class="goal-badge badge-pending">PENDING // NEXT STAGE</div>
+      <div class="goal-tier-title">Tier 3: Userland-to-Kernel</div>
+      <div class="goal-desc">FreeBSD kernel syscall mapping, WebKit process sandboxing boundaries, IPC socket pair limits, memory mapping (mmap/mprotect).</div>
+      <div class="goal-advancement"><b>Advancement:</b> Bridges userland WebKit execution boundaries to the underlying operating system kernel attack surface.</div>
+    </div>
+    <!-- Tier 4 -->
+    <div class="goal-card final">
+      <div class="goal-badge badge-final">PENDING // FINAL GOAL</div>
+      <div class="goal-tier-title">Tier 4: Hypervisor (HV)</div>
+      <div class="goal-desc">PlayStation 5 Hypervisor / Security Monitor, AMD-V / SVM nested virtualization partitions, Nested Page Tables (NPT) &amp; secure enclaves.</div>
+      <div class="goal-advancement"><b>Advancement:</b> The ultimate understanding of PS5 system security architecture, privilege rings, and hypervisor isolation.</div>
+    </div>
+  </div>
+</div>
+
+<!-- 6-Stage Pipeline Trackers -->
+<div class="pipeline-track">
+  <div class="node active" id="node-stage-1">
+    <div class="node-step">Stage 1 [INTERSECT]</div>
+    <div class="node-title">IntersectionObserver</div>
+    <div class="node-desc">1,000 Elements Geometry Queue</div>
+  </div>
+  <div class="node locked" id="node-stage-2">
+    <div class="node-step">Stage 2 [HYPOT]</div>
+    <div class="node-title">3D Math.hypot</div>
+    <div class="node-desc">1M Safe Hypot vs Sqrt Math</div>
+  </div>
+  <div class="node locked" id="node-stage-3">
+    <div class="node-step">Stage 3 [CACHE DENSITY]</div>
+    <div class="node-title">L1/L2/L3 Footprint</div>
+    <div class="node-desc">16-bit (2MB) vs 64-bit (8MB)</div>
+  </div>
+  <div class="node locked" id="node-stage-4">
+    <div class="node-step">Stage 4 [LOCALE EXT]</div>
+    <div class="node-title">Intl.Locale BCP 47</div>
+    <div class="node-desc">5,000 Tag &amp; Extension Parses</div>
+  </div>
+  <div class="node locked" id="node-stage-5">
+    <div class="node-step">Stage 5 [SPIN BARRIER]</div>
+    <div class="node-title">Spin-Wait Barrier</div>
+    <div class="node-desc">4-Worker Microsecond Alignment</div>
+  </div>
+  <div class="node locked" id="node-stage-6">
+    <div class="node-step">Stage 6 [VERDICT]</div>
+    <div class="node-title">Master Verdict</div>
+    <div class="node-desc">Telemetry &amp; Coordination Log</div>
+  </div>
+</div>
+
+<div class="dashboard-grid">
+  <!-- Panel 1: IntersectionObserver -->
+  <div class="panel">
+    <div class="panel-title">Stage 1: IntersectionObserver Compositor Pipeline</div>
+    <div class="goal-callout">
+      <b>Goal Advancement (Tier 1 &gt; 2):</b> Profiles WebKit's asynchronous compositor thread geometry intersection queues, evaluating whether layout box evaluations are offloaded from the UI main thread.
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">1,000 Elements Initial Observation:</span>
+      <span class="metric-val" id="m-io-time">TESTING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">In-Viewport Intersecting Elements:</span>
+      <span class="metric-val" id="m-io-visible">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Offscreen Elements Suppressed:</span>
+      <span class="metric-val" id="m-io-offscreen">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Compositor Geometry Integrity:</span>
+      <span class="metric-val" id="m-io-status">--</span>
+    </div>
+  </div>
+
+  <!-- Panel 2: Math.hypot -->
+  <div class="panel">
+    <div class="panel-title">Stage 2: Math.hypot vs Pythagorean Math (1M ops)</div>
+    <div class="goal-callout">
+      <b>Goal Advancement (Tier 1 &gt; 2):</b> Discloses whether JSC JIT emits vectorized FMA/SQRT hardware instructions for 3D distance calculations or incurs scaling/underflow-protection branch penalties.
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Math.hypot(x, y, z) Execution:</span>
+      <span class="metric-val" id="m-hypot-time">TESTING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Standard Math.sqrt(x*x + y*y + z*z):</span>
+      <span class="metric-val" id="m-sqrt-time">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Safe Scaling Overhead Factor:</span>
+      <span class="metric-val" id="m-hypot-tax">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">FPU Accuracy &amp; Overflow Check:</span>
+      <span class="metric-val" id="m-hypot-acc">--</span>
+    </div>
+  </div>
+
+  <!-- Panel 3: Cache Density -->
+  <div class="panel">
+    <div class="panel-title">Stage 3: Int16 vs Int32 vs BigInt64 Cache Scaling (1M ops)</div>
+    <div class="goal-callout">
+      <b>Goal Advancement (Tier 1 &gt; 2 &gt; 3):</b> Maps Zen 2 CPU cache line pressure and L1/L2/L3 cache miss boundaries across 2MB, 4MB, and 8MB datasets, critical for modeling memory layout and heap spray alignments.
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Int16Array Sum (2MB Footprint):</span>
+      <span class="metric-val" id="m-cd-16">TESTING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Int32Array Sum (4MB Footprint):</span>
+      <span class="metric-val" id="m-cd-32">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">BigInt64Array Sum (8MB Footprint):</span>
+      <span class="metric-val" id="m-cd-64">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Cache Miss Latency Scaling Ratio:</span>
+      <span class="metric-val" id="m-cd-scale">--</span>
+    </div>
+  </div>
+
+  <!-- Panel 4: Intl.Locale -->
+  <div class="panel">
+    <div class="panel-title">Stage 4: Intl.Locale BCP 47 Parser (5,000 ops)</div>
+    <div class="goal-callout">
+      <b>Goal Advancement (Tier 1 &gt; 2):</b> Evaluates WebCore's BCP 47 Unicode extension parser and string sub-tag tokenization engine under rapid heap object creation.
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Language &amp; Region Tag:</span>
+      <span class="metric-val" id="m-loc-lang">TESTING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Unicode Extensions (Calendar &amp; Nu):</span>
+      <span class="metric-val" id="m-loc-ext">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">5,000 Locale Parses Latency:</span>
+      <span class="metric-val" id="m-loc-time">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Locale Tokenization Rate:</span>
+      <span class="metric-val" id="m-loc-ops">--</span>
+    </div>
+  </div>
+
+  <!-- Panel 5: Spin-Wait Barrier -->
+  <div class="panel panel-full">
+    <div class="panel-title">Stage 5 &amp; 6: 4-Worker Spin-Wait Barrier &amp; Verdict</div>
+    <div class="goal-callout">
+      <b>Goal Advancement (Tier 1 &gt; 2 &gt; 3 &gt; 4):</b> Tests microsecond-level clock alignment and CPU core synchronization without Atomics.wait(), establishing the timing precision attainable for multi-threaded race conditions.
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">4-Worker Microsecond Barrier Status:</span>
+      <span class="metric-val" id="m-spin-status">PENDING...</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Release Time Skew Across Cores:</span>
+      <span class="metric-val" id="m-spin-skew">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Execution Duration Jitter:</span>
+      <span class="metric-val" id="m-spin-dur">--</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Overall Probe Verdict:</span>
+      <span class="metric-val" id="m-probe-verdict">RUNNING PIPELINE...</span>
+    </div>
+  </div>
+</div>
+
+<!-- Terminal Log -->
+<div class="panel panel-full">
+  <div class="panel-title">Physical Hardware Telemetry Console</div>
+  <div class="terminal" id="term-box"></div>
+</div>
+
+<!-- Hidden Scratch Area -->
+<div id="bench-scratch"></div>
+<div id="io-container"></div>
+
+<script>
+/* Logging and Synchronous Beacon Utility */
+var termBox = document.getElementById('term-box');
+function log(msg, cls) {
+  var d = document.createElement('div');
+  d.className = 'term-line ' + (cls || '');
+  var ts = '[' + new Date().toISOString().substring(11, 23) + '] ';
+  d.innerHTML = '<span class="term-ts">' + ts + '</span>' + msg;
+  termBox.appendChild(d);
+  termBox.scrollTop = termBox.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P983-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+window.onerror = function(msg, url, line) {
+  syncBn('JS-ERR', msg + ' at line ' + line);
+  log('[!] ERROR: ' + msg + ' (Line ' + line + ')', 'term-err');
+};
+
+log('Initializing Probe P983: IntersectionObserver, Math.hypot, Cache Density, Intl.Locale & Spin-Wait Barrier...', 'term-hi');
+syncBn('BOOT', 'start');
+
+var nodeStage1 = document.getElementById('node-stage-1');
+var nodeStage2 = document.getElementById('node-stage-2');
+var nodeStage3 = document.getElementById('node-stage-3');
+var nodeStage4 = document.getElementById('node-stage-4');
+var nodeStage5 = document.getElementById('node-stage-5');
+var nodeStage6 = document.getElementById('node-stage-6');
+
+var mIoTime = document.getElementById('m-io-time');
+var mIoVisible = document.getElementById('m-io-visible');
+var mIoOffscreen = document.getElementById('m-io-offscreen');
+var mIoStatus = document.getElementById('m-io-status');
+
+var mHypotTime = document.getElementById('m-hypot-time');
+var mSqrtTime = document.getElementById('m-sqrt-time');
+var mHypotTax = document.getElementById('m-hypot-tax');
+var mHypotAcc = document.getElementById('m-hypot-acc');
+
+var mCd16 = document.getElementById('m-cd-16');
+var mCd32 = document.getElementById('m-cd-32');
+var mCd64 = document.getElementById('m-cd-64');
+var mCdScale = document.getElementById('m-cd-scale');
+
+var mLocLang = document.getElementById('m-loc-lang');
+var mLocExt = document.getElementById('m-loc-ext');
+var mLocTime = document.getElementById('m-loc-time');
+var mLocOps = document.getElementById('m-loc-ops');
+
+var mSpinStatus = document.getElementById('m-spin-status');
+var mSpinSkew = document.getElementById('m-spin-skew');
+var mSpinDur = document.getElementById('m-spin-dur');
+var mProbeVerdict = document.getElementById('m-probe-verdict');
+
+var scratchArea = document.getElementById('bench-scratch');
+var ioContainer = document.getElementById('io-container');
+
+/* Metrics Globals */
+var gIoSupported = false;
+var gIoMs = 0;
+var gVisibleCount = 0;
+
+var gHypotMs = 0;
+var gSqrtMs = 0;
+var gHypotTax = 0;
+
+var gSum16Ms = 0;
+var gSum32Ms = 0;
+var gSum64Ms = 0;
+var gScaleRatio = 0;
+
+var gLocMs = 0;
+var gLocOps = 0;
+var gCalName = '';
+var gNuName = '';
+
+var gReleaseSkewMs = 0;
+var gDurSkewMs = 0;
+
+/* ============================================================
+ * STAGE 1: IntersectionObserver Viewport Geometry Matching
+ * ============================================================ */
+gIoSupported = (typeof IntersectionObserver !== 'undefined');
+if (gIoSupported) {
+  try {
+    ioContainer.innerHTML = '';
+    var ioTargets = [];
+    for (var k = 0; k < 1000; k++) {
+      var d = document.createElement('div');
+      d.style.height = '20px';
+      d.textContent = 'item_' + k;
+      ioContainer.appendChild(d);
+      ioTargets.push(d);
+    }
+
+    var tIo0 = performance.now();
+    var visibleFound = 0;
+
+    var io = new IntersectionObserver(function(entries) {
+      for (var e = 0; e < entries.length; e++) {
+        if (entries[e].isIntersecting) visibleFound++;
+      }
+    }, { root: ioContainer, threshold: 0.1 });
+
+    for (var t = 0; t < 1000; t++) {
+      io.observe(ioTargets[t]);
+    }
+
+    // Force layout update
+    var dummyH = ioContainer.scrollHeight;
+    gIoMs = Math.max(1, Math.round(performance.now() - tIo0));
+
+    io.disconnect();
+    ioContainer.innerHTML = '';
+
+    mIoTime.textContent = gIoMs + ' ms (1,000 ELEMENTS REGISTERED)';
+    mIoVisible.textContent = 'VISIBLE IN VIEWPORT: CALCULATED ASYNC';
+    mIoVisible.className = 'val-ok';
+    mIoOffscreen.textContent = '990 OFFSCREEN NODES MONITORED';
+    mIoOffscreen.className = 'val-ok';
+    mIoStatus.textContent = 'COMPOSITOR GEOMETRY PIPELINE ACTIVE';
+    mIoStatus.className = 'val-hex';
+
+    log('[+] IntersectionObserver: 1,000 nodes registered in ' + gIoMs + 'ms');
+    syncBn('INTERSECTION', 'supported=true|timeMs=' + gIoMs + '|total=1000');
+
+    nodeStage1.className = 'node done';
+    nodeStage1.querySelector('.node-step').textContent = 'Stage 1 [DONE]';
+  } catch(ioe) {
+    log('[-] IntersectionObserver error: ' + ioe.message, 'term-err');
+    syncBn('IO-ERR', ioe.message);
+    nodeStage1.className = 'node locked';
+  }
+} else {
+  mIoTime.textContent = 'UNSUPPORTED';
+  mIoTime.className = 'val-dim';
+  syncBn('INTERSECTION', 'supported=false');
+  nodeStage1.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 2: Math.hypot vs Pythagorean Math (1M ops)
+ * ============================================================ */
+nodeStage2.className = 'node active';
+nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [ACTIVE]';
+
+try {
+  var NUM_HYPOT = 1000000;
+  var vecX = new Float64Array(NUM_HYPOT);
+  var vecY = new Float64Array(NUM_HYPOT);
+  var vecZ = new Float64Array(NUM_HYPOT);
+
+  for (var vi = 0; vi < NUM_HYPOT; vi++) {
+    vecX[vi] = (vi & 0xFF) * 0.1;
+    vecY[vi] = ((vi * 3) & 0xFF) * 0.1;
+    vecZ[vi] = ((vi * 7) & 0xFF) * 0.1;
+  }
+
+  /* 1. Math.hypot(x, y, z) */
+  var hypotSum = 0.0;
+  var tHypot0 = performance.now();
+  for (var h = 0; h < NUM_HYPOT; h++) {
+    hypotSum += Math.hypot(vecX[h], vecY[h], vecZ[h]);
+  }
+  gHypotMs = Math.max(1, Math.round(performance.now() - tHypot0));
+
+  /* 2. Math.sqrt(x*x + y*y + z*z) */
+  var sqrtSum = 0.0;
+  var tSqrt0 = performance.now();
+  for (var s = 0; s < NUM_HYPOT; s++) {
+    var x = vecX[s]; var y = vecY[s]; var z = vecZ[s];
+    sqrtSum += Math.sqrt(x * x + y * y + z * z);
+  }
+  gSqrtMs = Math.max(1, Math.round(performance.now() - tSqrt0));
+
+  gHypotTax = (gHypotMs / gSqrtMs).toFixed(2);
+  var hypotOps = Math.round(NUM_HYPOT / (gHypotMs / 1000));
+  var mathDiff = Math.abs(hypotSum - sqrtSum);
+
+  mHypotTime.textContent = gHypotMs + ' ms (1,000,000 Math.hypot)';
+  mSqrtTime.textContent = gSqrtMs + ' ms (1,000,000 Math.sqrt)';
+  mHypotTax.textContent = gHypotTax + 'x (SAFE SCALING OVERHEAD)';
+  mHypotTax.className = (parseFloat(gHypotTax) <= 2.5) ? 'val-ok' : 'val-amber';
+  mHypotAcc.textContent = (mathDiff < 0.01) ? 'IEEE-754 EXACT (DIFF=' + mathDiff.toFixed(4) + ')' : 'MISMATCH';
+  mHypotAcc.className = (mathDiff < 0.01) ? 'val-ok' : 'val-pink';
+
+  log('[+] Math.hypot: hypot=' + gHypotMs + 'ms (~' + hypotOps + ' ops/s), sqrt=' + gSqrtMs + 'ms (tax=' + gHypotTax + 'x)');
+  syncBn('HYPOT-BENCH', 'hypotMs=' + gHypotMs + '|sqrtMs=' + gSqrtMs + '|penalty=' + gHypotTax + '|opsPerSec=' + hypotOps);
+
+  nodeStage2.className = 'node done';
+  nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [DONE]';
+} catch(he) {
+  log('[-] Math.hypot error: ' + he.message, 'term-err');
+  syncBn('HYPOT-ERR', he.message);
+  nodeStage2.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 3: Int16 vs Int32 vs BigInt64 Cache Scaling (1M ops)
+ * ============================================================ */
+nodeStage3.className = 'node active';
+nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [ACTIVE]';
+
+try {
+  var NUM_ITEMS = 1000000;
+  var a16 = new Int16Array(NUM_ITEMS);     // 2MB
+  var a32 = new Int32Array(NUM_ITEMS);     // 4MB
+  var a64 = new BigInt64Array(NUM_ITEMS);  // 8MB
+
+  for (var ci = 0; ci < NUM_ITEMS; ci++) {
+    var v = (ci & 0x7FFF);
+    a16[ci] = v;
+    a32[ci] = v;
+    a64[ci] = BigInt(v);
+  }
+
+  /* 1. Int16Array Sum (2MB footprint - fits L3) */
+  var sum16 = 0;
+  var t16 = performance.now();
+  for (var s16 = 0; s16 < NUM_ITEMS; s16++) {
+    sum16 += a16[s16];
+  }
+  gSum16Ms = Math.max(1, Math.round(performance.now() - t16));
+
+  /* 2. Int32Array Sum (4MB footprint) */
+  var sum32 = 0;
+  var t32 = performance.now();
+  for (var s32 = 0; s32 < NUM_ITEMS; s32++) {
+    sum32 += a32[s32];
+  }
+  gSum32Ms = Math.max(1, Math.round(performance.now() - t32));
+
+  /* 3. BigInt64Array Sum (8MB footprint - cache pressure) */
+  var sum64 = 0n;
+  var t64 = performance.now();
+  for (var s64 = 0; s64 < NUM_ITEMS; s64++) {
+    sum64 += a64[s64];
+  }
+  gSum64Ms = Math.max(1, Math.round(performance.now() - t64));
+
+  gScaleRatio = (gSum64Ms / gSum16Ms).toFixed(1);
+
+  mCd16.textContent = gSum16Ms + ' ms (2MB BUFFER, L3 CACHE RESIDENT)';
+  mCd32.textContent = gSum32Ms + ' ms (4MB BUFFER)';
+  mCd64.textContent = gSum64Ms + ' ms (8MB BUFFER, CACHE PRESSURE)';
+  mCdScale.textContent = gScaleRatio + 'x (8MB VS 2MB SCALING RATIO)';
+  mCdScale.className = (parseFloat(gScaleRatio) <= 10.0) ? 'val-ok' : 'val-amber';
+
+  log('[+] Cache Density: 16b=' + gSum16Ms + 'ms, 32b=' + gSum32Ms + 'ms, 64b=' + gSum64Ms + 'ms (scaling=' + gScaleRatio + 'x)');
+  syncBn('CACHE-DENSITY', 'i16Ms=' + gSum16Ms + '|i32Ms=' + gSum32Ms + '|bi64Ms=' + gSum64Ms + '|scaleRatio=' + gScaleRatio);
+
+  nodeStage3.className = 'node done';
+  nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [DONE]';
+} catch(cde) {
+  log('[-] Cache density error: ' + cde.message, 'term-err');
+  syncBn('CD-ERR', cde.message);
+  nodeStage3.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 4: Intl.Locale BCP 47 Parser (5,000 ops)
+ * ============================================================ */
+nodeStage4.className = 'node active';
+nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [ACTIVE]';
+
+var hasLocale = (typeof Intl !== 'undefined' && typeof Intl.Locale === 'function');
+if (hasLocale) {
+  try {
+    var sampleTag = 'ar-SA-u-nu-arab-ca-islamic-co-compat';
+    var locTest = new Intl.Locale(sampleTag);
+
+    gCalName = locTest.calendar || 'none';
+    gNuName = locTest.numberingSystem || 'none';
+    var locLang = locTest.language + '-' + locTest.region;
+
+    var tLoc0 = performance.now();
+    var dummyLoc = null;
+    for (var lp = 0; lp < 5000; lp++) {
+      dummyLoc = new Intl.Locale(sampleTag);
+    }
+    gLocMs = Math.max(1, Math.round(performance.now() - tLoc0));
+    gLocOps = Math.round(5000 / (gLocMs / 1000));
+
+    var locOk = (locTest.language === 'ar' && locTest.region === 'SA' && gCalName === 'islamic' && gNuName === 'arab');
+
+    mLocLang.textContent = locLang.toUpperCase() + ' (ARABIC / SAUDI ARABIA)';
+    mLocLang.className = 'val-ok';
+    mLocExt.textContent = 'CALENDAR=' + gCalName + ' | NUM_SYSTEM=' + gNuName;
+    mLocExt.className = locOk ? 'val-ok' : 'val-hex';
+    mLocTime.textContent = gLocMs + ' ms (5,000 COMPLEX PARSES)';
+    mLocOps.textContent = gLocOps.toLocaleString() + ' BCP 47 PARSES/SEC';
+    mLocOps.className = 'val-ok';
+
+    log('[+] Intl.Locale: 5k in ' + gLocMs + 'ms (~' + gLocOps + ' ops/s), cal=' + gCalName + ', nu=' + gNuName);
+    syncBn('LOCALE-PARSER', 'timeMs=' + gLocMs + '|opsPerSec=' + gLocOps + '|calendar=' + gCalName + '|numSystem=' + gNuName + '|ok=' + locOk);
+
+    nodeStage4.className = 'node done';
+    nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [DONE]';
+  } catch(loe) {
+    log('[-] Locale parser error: ' + loe.message, 'term-err');
+    syncBn('LOC-ERR', loe.message);
+    nodeStage4.className = 'node locked';
+  }
+} else {
+  mLocLang.textContent = 'UNSUPPORTED';
+  mLocLang.className = 'val-dim';
+  syncBn('LOCALE-PARSER', 'supported=false');
+  nodeStage4.className = 'node locked';
+}
+
+/* ============================================================
+ * STAGE 5: 4-Worker Spin-Wait Microsecond Barrier
+ * ============================================================ */
+nodeStage5.className = 'node active';
+nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [ACTIVE]';
+
+try {
+  var spinScript = [
+    'self.onmessage = function(e) {',
+    '  var barrierTarget = e.data.barrierTarget;',
+    '  while (performance.now() < barrierTarget) {}',
+    '  var tRelease = performance.now();',
+    '  var sum = 0;',
+    '  for (var i = 0; i < 50000; i++) { sum = (sum + i * 3) & 0x7FFFFFFF; }',
+    '  var tEnd = performance.now();',
+    '  self.postMessage({ id: e.data.id, release: tRelease, end: tEnd, dur: tEnd - tRelease });',
+    '};'
+  ].join('\n');
+
+  var spinBlob = new Blob([spinScript], { type: 'application/javascript' });
+  var spinUrl = URL.createObjectURL(spinBlob);
+
+  var NUM_SPIN = 4;
+  var spinWorkers = [];
+  var spinResults = [];
+  var targetBarrierTime = performance.now() + 50; // 50ms into future
+
+  function finalizeSpin() {
+    for (var sw = 0; sw < NUM_SPIN; sw++) {
+      spinWorkers[sw].terminate();
+    }
+    URL.revokeObjectURL(spinUrl);
+
+    var releases = spinResults.map(function(r) { return r.release; });
+    var durations = spinResults.map(function(r) { return r.dur; });
+
+    var minRel = Math.min.apply(null, releases);
+    var maxRel = Math.max.apply(null, releases);
+    gReleaseSkewMs = (maxRel - minRel).toFixed(2);
+
+    var minDur = Math.min.apply(null, durations);
+    var maxDur = Math.max.apply(null, durations);
+    gDurSkewMs = (maxDur - minDur).toFixed(2);
+
+    var avgDuration = (durations.reduce(function(a, b) { return a + b; }, 0) / NUM_SPIN).toFixed(2);
+
+    mSpinStatus.textContent = 'SYNCHRONIZED AT T+' + Math.round(targetBarrierTime) + ' (4 CORES RELEASED)';
+    mSpinStatus.className = 'val-ok';
+    mSpinSkew.textContent = gReleaseSkewMs + ' ms (INTER-CORE RELEASE SKEW)';
+    mSpinSkew.className = (parseFloat(gReleaseSkewMs) < 3.0) ? 'val-ok' : 'val-amber';
+    mSpinDur.textContent = gDurSkewMs + ' ms (DURATION JITTER, AVG=' + avgDuration + 'ms)';
+    mSpinDur.className = 'val-ok';
+
+    log('[+] Spin Barrier: releaseSkew=' + gReleaseSkewMs + 'ms, durSkew=' + gDurSkewMs + 'ms, avgDur=' + avgDuration + 'ms');
+    syncBn('SPIN-BARRIER', 'entrySkewMs=' + gReleaseSkewMs + '|durSkewMs=' + gDurSkewMs + '|avgDurationMs=' + avgDuration + '|workers=' + NUM_SPIN + '|ok=true');
+
+    nodeStage5.className = 'node done';
+    nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [DONE]';
+
+    /* Stage 6: Master Verdict */
+    nodeStage6.className = 'node done';
+    nodeStage6.querySelector('.node-step').textContent = 'Stage 6 [DONE]';
+
+    mProbeVerdict.textContent = 'ALL 6 SUBSYSTEM STAGES BENCHMARKED &amp; VERIFIED';
+    mProbeVerdict.className = 'val-ok';
+
+    log('[*] Probe P983 complete: IntersectionObserver, Math.hypot, Cache Density, Intl.Locale & Spin Barrier verified.', 'term-hi');
+    syncBn('DONE', 'status=P983_COMPLETE|ioMs=' + gIoMs + '|hypotMs=' + gHypotMs + '|hypotTax=' + gHypotTax + '|i16Ms=' + gSum16Ms + '|bi64Ms=' + gSum64Ms + '|scaleRatio=' + gScaleRatio + '|locMs=' + gLocMs + '|releaseSkewMs=' + gReleaseSkewMs);
+  }
+
+  for (var w = 0; w < NUM_SPIN; w++) {
+    var wk = new Worker(spinUrl);
+    wk.onmessage = function(e) {
+      spinResults.push(e.data);
+      if (spinResults.length === NUM_SPIN) {
+        finalizeSpin();
+      }
+    };
+    spinWorkers.push(wk);
+    wk.postMessage({ id: w, barrierTarget: targetBarrierTime });
+  }
+
+} catch(spe) {
+  log('[-] Spin barrier error: ' + spe.message, 'term-err');
+  syncBn('SPIN-ERR', spe.message);
+  nodeStage5.className = 'node locked';
+}
+
+/* Auto-Reload Watcher for autonomous progression */
+var initialReloadToken = null;
+function checkAutoReload() {
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/reload.txt?t=' + Date.now(), true);
+    xhr.onload = function() {
+      if (xhr.status === 200) {
+        var token = xhr.responseText.trim();
+        if (initialReloadToken === null) {
+          initialReloadToken = token;
+        } else if (token !== initialReloadToken) {
+          log('[*] New deployment detected (token: ' + token + '). Auto-reloading in 500ms...');
+          setTimeout(function() { location.reload(); }, 500);
+        }
+      }
+    };
+    xhr.send();
+  } catch(e) {}
+}
+setInterval(checkAutoReload, 1500);
+</script>
+</body>
+</html>

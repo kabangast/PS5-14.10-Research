@@ -1,0 +1,556 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1063</title>
+<style>
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px;margin:0}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#4ec9b0}.err{color:#f44747}.warn{color:#dcdcaa}.hot{color:#ff6b6b;font-weight:bold}
+h2{color:#569cd6;margin:8px 0 4px;font-size:13px}
+</style></head><body><div id="hud"><h2>P1063 YARR JIT DEEP STRESS</h2><div id="log"></div></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+var L=document.getElementById('log');
+function log(s,c){var d=document.createElement('div');d.className=c||'';d.textContent=s;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1063-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+
+var anomalies=[];
+function anom(id,desc){anomalies.push(id);log('!! ANOMALY '+id+': '+desc,'hot');}
+
+bn('BOOT','yarr-jit-stress');
+log('Booted. YARR JIT deep stress testing...','ok');
+
+// ======== PHASE A: YARR JIT CONFIRMATION + TIMING ========
+(function phaseA(){
+  log('--- Phase A: YARR JIT confirmation ---','warn');
+  var r=[];
+
+  // A1: Confirm YARR JIT with more precise timing
+  // Simple regex (interpreted) vs complex regex (JIT compiled)
+  var simple=/^abc$/;
+  var complex=/(?:(?:[a-zA-Z0-9_-]+\.)*[a-zA-Z0-9_-]+@(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,})/;
+  var input='test@example.com.really.long.domain.name.here.foo.bar.baz';
+
+  var N=50000;
+  var t0=Date.now();
+  for(var i=0;i<N;i++) simple.test('abc');
+  var simpleTime=Date.now()-t0;
+
+  t0=Date.now();
+  for(var i=0;i<N;i++) complex.test(input);
+  var complexTime=Date.now()-t0;
+
+  var ratio=complexTime/Math.max(simpleTime,1);
+  r.push('A1-timing=simple:'+simpleTime+'ms|complex:'+complexTime+'ms|ratio:'+ratio.toFixed(2));
+
+  // A2: Backreference stress - deep backrefs can trigger different JIT paths
+  var backrefRe=/^(.)(.)(.)(.)(.)(.)(.)(.)(.)(.)(.)(.)(.)(.)(.)(.)(.)(.)(.)(.)(.)(.)(.)(.)(.)\1\2\3\4\5\6\7\8\9/;
+  var backrefInput='abcdefghijklmnopqrstuvwxyabcdefghi';
+  var m=backrefRe.exec(backrefInput);
+  r.push('A2-backref25=match:'+(m?'YES':'NO')+'|g1:'+(m?m[1]:'')+'|g25:'+(m?m[25]:''));
+
+  // A3: Quantifier stress - nested quantifiers can cause exponential backtracking
+  // YARR JIT may handle this differently than interpreter
+  var quantRe=/^(a+)+$/; // classic catastrophic backtracking
+  var shortInput='aaaaaaaaaaaaaaab'; // 15 a's + b (should fail slowly)
+  t0=Date.now();
+  var qResult=quantRe.test(shortInput);
+  var qTime=Date.now()-t0;
+  r.push('A3-catastrophic=match:'+qResult+'|time:'+qTime+'ms');
+  if(qTime>2000) r.push('A3-NOTE:exponential-backtrack-detected');
+
+  // A4: Character class range stress
+  var rangeRe=/[\x00-\xFFĀ-￿]+/g;
+  var uniInput='Hello éñА中\u{1F600}';
+  var rm=uniInput.match(rangeRe);
+  r.push('A4-range=matches:'+(rm?rm.length:'null')+'|first:'+(rm?rm[0].length:''));
+
+  // A5: Lookahead/lookbehind stress
+  var laRe=/(?<=\d{3})(?=\d{3})/g; // insert comma positions
+  var numStr='1234567890';
+  var positions=[];
+  var lm;
+  while((lm=laRe.exec(numStr))!==null){
+    positions.push(lm.index);
+    if(positions.length>20) break;
+  }
+  r.push('A5-lookbehind=positions:['+positions.join(',')+']');
+
+  bn('A-JIT',r.join('|'));
+  log(r.join('\n'),'ok');
+})();
+
+// ======== PHASE B: REGEX COMPILATION EDGE CASES ========
+(function phaseB(){
+  log('--- Phase B: Regex compilation edges ---','warn');
+  var r=[];
+
+  // B1: Very long regex (may exceed JIT buffer)
+  var longPattern='';
+  for(var i=0;i<200;i++) longPattern+='(?:a'+i+'|b'+i+')';
+  try{
+    var longRe=new RegExp(longPattern);
+    var lm=longRe.test('a0');
+    r.push('B1-longRegex=compiled:YES|length:'+longPattern.length+'|match:'+lm);
+  }catch(e){
+    r.push('B1-longRegex=ERROR:'+e.name+':'+e.message);
+    if(e.name!=='SyntaxError') anom('B1',e.name+' on long regex');
+  }
+
+  // B2: Many capture groups (>99)
+  var manyGroups='';
+  for(var i=0;i<120;i++) manyGroups+='(.)';
+  try{
+    var mgRe=new RegExp('^'+manyGroups+'$');
+    var mgInput='';
+    for(var i=0;i<120;i++) mgInput+=String.fromCharCode(65+i%26);
+    var mgm=mgRe.exec(mgInput);
+    r.push('B2-120groups=match:'+(mgm?'YES':'NO')+'|g1:'+(mgm?mgm[1]:'')+'|g120:'+(mgm?mgm[120]:'')+'|len:'+(mgm?mgm.length:''));
+  }catch(e){
+    r.push('B2-120groups=ERROR:'+e.name);
+  }
+
+  // B3: Named group collision / override
+  try{
+    var ngRe=new RegExp('(?<x>a)|(?<x>b)');
+    r.push('B3-namedDup=compiled:YES');
+    var nm1=ngRe.exec('a');
+    var nm2=ngRe.exec('b');
+    r.push('B3-a=x:'+(nm1?nm1.groups.x:'')+'|B3-b=x:'+(nm2?nm2.groups.x:''));
+  }catch(e){
+    r.push('B3-namedDup='+e.name+':'+e.message);
+  }
+
+  // B4: Unicode property escapes (if supported)
+  try{
+    var upRe=new RegExp('\\p{Script=Greek}+','u');
+    var upm=upRe.exec('Ααω');
+    r.push('B4-unicodeProp=supported:YES|match:'+(upm?upm[0].length:''));
+  }catch(e){
+    r.push('B4-unicodeProp='+e.name);
+  }
+
+  // B5: Regex with embedded null bytes
+  try{
+    var nullRe=new RegExp('a\x00b');
+    var nullm=nullRe.test('a\x00b');
+    r.push('B5-nullByte=match:'+nullm);
+    // Does null in the middle truncate?
+    var nullm2=nullRe.test('a');
+    r.push('B5-truncated:'+nullm2);
+  }catch(e){
+    r.push('B5-nullByte='+e.name);
+  }
+
+  // B6: Regex with all flags simultaneously
+  try{
+    var allFlags=new RegExp('test','gimsuy');
+    r.push('B6-allFlags=flags:'+allFlags.flags+'|compiled:YES');
+  }catch(e){
+    r.push('B6-allFlags='+e.name);
+  }
+
+  // B7: Dynamic regex from user-controlled string (ReDoS vector)
+  try{
+    var userInput='(?:a{1,100}){1,100}(?:b{1,100}){1,100}c';
+    var dynRe=new RegExp(userInput);
+    t0=Date.now();
+    var dynResult=dynRe.test('a'.repeat(50)+'b'.repeat(50)+'c');
+    var dynTime=Date.now()-t0;
+    r.push('B7-dynamic=match:'+dynResult+'|time:'+dynTime+'ms');
+  }catch(e){
+    r.push('B7-dynamic='+e.name);
+  }
+
+  bn('B-COMPILE',r.join('|'));
+  log(r.join('\n'),'ok');
+})();
+
+// ======== PHASE C: JIT-SPECIFIC ATTACK PATTERNS ========
+(function phaseC(){
+  log('--- Phase C: JIT attack patterns ---','warn');
+  var r=[];
+
+  // C1: Regex JIT with prototype pollution
+  // If RegExp.prototype is poisoned, does JIT code check?
+  var origExec=RegExp.prototype.exec;
+  var origTest=RegExp.prototype.test;
+  var hijackCount=0;
+
+  try{
+    RegExp.prototype.exec=function(s){
+      hijackCount++;
+      return origExec.call(this,s);
+    };
+    var re1=/^hello$/;
+    var result1=re1.exec('hello');
+    r.push('C1-execHijack=called:'+hijackCount+'|result:'+(result1?result1[0]:'null'));
+
+    // Does String.prototype.match use the hijacked exec?
+    hijackCount=0;
+    var smResult='hello world'.match(/hello/);
+    r.push('C1-stringMatch=hijacked:'+hijackCount+'|result:'+(smResult?smResult[0]:'null'));
+  }finally{
+    RegExp.prototype.exec=origExec;
+    RegExp.prototype.test=origTest;
+  }
+
+  // C2: Symbol.match/search/replace/split override
+  var customMatcher={
+    [Symbol.match]:function(s){return ['CUSTOM_MATCH',s.length];},
+    [Symbol.search]:function(s){return 42;},
+    [Symbol.replace]:function(s,r){return 'REPLACED';},
+    [Symbol.split]:function(s){return ['A','B','C'];}
+  };
+  try{
+    var cm='test'.match(customMatcher);
+    var cs='test'.search(customMatcher);
+    var cr='test'.replace(customMatcher,'x');
+    var csp='test'.split(customMatcher);
+    r.push('C2-symbolMatch='+JSON.stringify(cm)+'|search:'+cs+'|replace:'+cr+'|split:'+JSON.stringify(csp));
+  }catch(e){
+    r.push('C2-symbolMatch='+e.name);
+  }
+
+  // C3: RegExp constructor with toString coercion
+  var coercionCount=0;
+  var evilObj={
+    toString:function(){
+      coercionCount++;
+      if(coercionCount===1) return 'abc';
+      return '.*'; // different on second call!
+    }
+  };
+  try{
+    var re2=new RegExp(evilObj);
+    r.push('C3-coerce=source:'+re2.source+'|calls:'+coercionCount);
+    coercionCount=0;
+    var re3=new RegExp(evilObj);
+    r.push('C3-coerce2=source:'+re3.source+'|calls:'+coercionCount);
+  }catch(e){
+    r.push('C3-coerce='+e.name);
+  }
+
+  // C4: lastIndex manipulation during global exec
+  var re4=/a/g;
+  re4.lastIndex=1e15; // huge lastIndex
+  var r4=re4.exec('aaaa');
+  r.push('C4-hugeLastIndex=result:'+(r4?r4.index:'null')+'|lastIndex:'+re4.lastIndex);
+
+  re4.lastIndex=-1;
+  var r5=re4.exec('aaaa');
+  r.push('C4-negLastIndex=result:'+(r5?r5.index:'null')+'|lastIndex:'+re4.lastIndex);
+
+  re4.lastIndex={valueOf:function(){return 2;}};
+  var r6=re4.exec('aaaa');
+  r.push('C4-objLastIndex=result:'+(r6?r6.index:'null'));
+
+  // C5: RegExp.prototype[Symbol.replace] with function replacer + group manipulation
+  try{
+    var re5=/(?<first>\w+)\s(?<second>\w+)/;
+    var replaceResult='hello world'.replace(re5,function(match,p1,p2,offset,string,groups){
+      // Can we see the groups object? Can we modify it?
+      var gKeys=groups?Object.keys(groups):[];
+      if(groups) groups.injected='EVIL';
+      return 'R:'+gKeys.join(',')+':'+p1+':'+p2;
+    });
+    r.push('C5-replaceGroups=result:'+replaceResult);
+  }catch(e){
+    r.push('C5-replaceGroups='+e.name);
+  }
+
+  // C6: matchAll with modified Symbol.matchAll
+  try{
+    var re6=/\d+/g;
+    var origMatchAll=RegExp.prototype[Symbol.matchAll];
+    var maCount=0;
+    RegExp.prototype[Symbol.matchAll]=function(s){
+      maCount++;
+      // Return a custom iterator
+      var orig=origMatchAll.call(this,s);
+      return {
+        next:function(){
+          var n=orig.next();
+          if(!n.done&&n.value) n.value.push('INJECTED');
+          return n;
+        },
+        [Symbol.iterator]:function(){return this;}
+      };
+    };
+    var maResult=[...'abc123def456'.matchAll(re6)];
+    RegExp.prototype[Symbol.matchAll]=origMatchAll;
+    r.push('C6-matchAll=count:'+maResult.length+'|hijacked:'+maCount+'|first:'+JSON.stringify(maResult[0]));
+  }catch(e){
+    r.push('C6-matchAll='+e.name);
+    try{RegExp.prototype[Symbol.matchAll]=origMatchAll;}catch(e2){}
+  }
+
+  bn('C-JIT',r.join('|'));
+  log(r.join('\n'),'ok');
+})();
+
+// ======== PHASE D: YARR INTERNAL STRESS ========
+(function phaseD(){
+  log('--- Phase D: YARR internal stress ---','warn');
+  var r=[];
+
+  // D1: Atomic groups / possessive quantifiers (if supported)
+  try{
+    // JSC doesn't have (?>...) but let's check
+    var atomRe=new RegExp('(?>a+)b');
+    r.push('D1-atomic=supported:YES');
+  }catch(e){
+    r.push('D1-atomic=not-supported:'+e.name);
+  }
+
+  // D2: Regex on very long strings (>1MB) - test JIT buffer bounds
+  var bigStr='';
+  for(var i=0;i<20;i++) bigStr+='abcdefghij'.repeat(5000); // 1MB
+  bigStr+='NEEDLE';
+  var t0=Date.now();
+  var bigMatch=/NEEDLE/.exec(bigStr);
+  var bigTime=Date.now()-t0;
+  r.push('D2-bigString=len:'+bigStr.length+'|found:'+(bigMatch?bigMatch.index:'-1')+'|time:'+bigTime+'ms');
+
+  // D3: Alternation explosion
+  var altParts=[];
+  for(var i=0;i<500;i++) altParts.push('word'+i);
+  try{
+    var altRe=new RegExp(altParts.join('|'));
+    var altMatch=altRe.test('word499');
+    r.push('D3-alt500=compiled:YES|match:'+altMatch);
+  }catch(e){
+    r.push('D3-alt500='+e.name);
+  }
+
+  // D4: Character class with surrogate pairs
+  try{
+    var surRe=new RegExp('[\\uD800-\\uDBFF][\\uDC00-\\uDFFF]','g');
+    var surInput='Hello 😀 World 😍';
+    var surMatches=surInput.match(surRe);
+    r.push('D4-surrogate=matches:'+(surMatches?surMatches.length:'0'));
+
+    var surReU=new RegExp('[\\u{1F600}-\\u{1F64F}]','gu');
+    var surMatchesU=surInput.match(surReU);
+    r.push('D4-surrogateU=matches:'+(surMatchesU?surMatchesU.length:'0'));
+  }catch(e){
+    r.push('D4-surrogate='+e.name);
+  }
+
+  // D5: Regex compilation + GC pressure
+  var gcRegexes=[];
+  for(var i=0;i<10000;i++){
+    gcRegexes.push(new RegExp('pattern_'+i+'_[a-z]+'));
+  }
+  // Force some to be collected
+  gcRegexes.splice(0,5000);
+  // Now use remaining - are they still valid?
+  var gcOk=0;
+  for(var i=0;i<gcRegexes.length;i++){
+    if(gcRegexes[i].test('pattern_'+String(5000+i)+'_abc')) gcOk++;
+  }
+  r.push('D5-gcStress=created:10000|remaining:'+gcRegexes.length+'|working:'+gcOk);
+
+  // D6: Regex in a hot loop (trigger JIT OSR)
+  var hotRe=/^(\d{1,3}\.){3}\d{1,3}$/;
+  var hotOk=0;
+  t0=Date.now();
+  for(var i=0;i<100000;i++){
+    if(hotRe.test('192.168.1.'+String(i%256))) hotOk++;
+  }
+  var hotTime=Date.now()-t0;
+  r.push('D6-hotLoop=iters:100000|matches:'+hotOk+'|time:'+hotTime+'ms');
+
+  // D7: String.prototype.replace with regex + exec interleaving
+  var re7=/(\w+)/g;
+  var replCount=0;
+  var interleaveResult='one two three four five'.replace(re7,function(m){
+    replCount++;
+    // During replacement, exec the SAME regex on different string
+    var sideEffect=re7.exec('side effect test');
+    return m.toUpperCase()+(sideEffect?'!':'');
+  });
+  r.push('D7-interleave=calls:'+replCount+'|result:'+interleaveResult);
+
+  bn('D-INTERNAL',r.join('|'));
+  log(r.join('\n'),'ok');
+})();
+
+// ======== PHASE E: YARR BUFFER OVERFLOW PATTERNS ========
+(function phaseE(){
+  log('--- Phase E: Overflow patterns ---','warn');
+  var r=[];
+
+  // E1: Regex with very deep nesting
+  var nested='';
+  for(var i=0;i<100;i++) nested+='(?:';
+  nested+='a';
+  for(var i=0;i<100;i++) nested+=')';
+  try{
+    var nestRe=new RegExp(nested);
+    r.push('E1-nest100=compiled:YES|match:'+nestRe.test('a'));
+  }catch(e){
+    r.push('E1-nest100='+e.name+':'+e.message);
+    if(e.name!=='SyntaxError') anom('E1',e.name+' on 100-deep nesting');
+  }
+
+  // E2: Even deeper nesting (may hit stack limit)
+  var nested2='';
+  for(var i=0;i<500;i++) nested2+='(?:';
+  nested2+='x';
+  for(var i=0;i<500;i++) nested2+=')';
+  try{
+    var nestRe2=new RegExp(nested2);
+    r.push('E2-nest500=compiled:YES|match:'+nestRe2.test('x'));
+  }catch(e){
+    r.push('E2-nest500='+e.name);
+    if(e.name==='InternalError'||e.name==='RangeError') r.push('E2-NOTE:hit-stack-limit');
+  }
+
+  // E3: Huge character class
+  var charClass='[';
+  for(var i=0;i<1000;i++) charClass+=String.fromCharCode(32+i%95);
+  charClass+=']';
+  try{
+    var ccRe=new RegExp(charClass+'+');
+    r.push('E3-hugeCharClass=compiled:YES|match:'+ccRe.test('hello'));
+  }catch(e){
+    r.push('E3-hugeCharClass='+e.name);
+  }
+
+  // E4: Regex source that changes via getter
+  try{
+    var fakeRegex={};
+    Object.defineProperty(fakeRegex,'source',{get:function(){return 'abc';}});
+    Object.defineProperty(fakeRegex,'flags',{get:function(){return 'g';}});
+    fakeRegex[Symbol.match]=RegExp.prototype[Symbol.match];
+    var fr='test abc test'.match(fakeRegex);
+    r.push('E4-fakeRegex=result:'+JSON.stringify(fr));
+  }catch(e){
+    r.push('E4-fakeRegex='+e.name);
+  }
+
+  // E5: Subclass RegExp with overridden exec
+  try{
+    function EvilRegExp(p,f){
+      var re=new RegExp(p,f);
+      re.exec=function(s){
+        // Override exec to return wrong shape
+        return {0:'HIJACKED',index:999,input:s,length:1,groups:{x:'EVIL'}};
+      };
+      return re;
+    }
+    var ere=EvilRegExp('test','g');
+    var eResult='hello test world'.replace(ere,function(m,off,s,g){
+      return 'GOT:'+m+':off='+off;
+    });
+    r.push('E5-evilExec=result:'+eResult);
+  }catch(e){
+    r.push('E5-evilExec='+e.name);
+  }
+
+  // E6: Species constructor for RegExp
+  try{
+    var SpeciesRe=class extends RegExp{
+      static get[Symbol.species](){return RegExp;}
+    };
+    var sre=new SpeciesRe('\\d+','g');
+    var split='a1b2c3'.split(sre);
+    r.push('E6-species=split:'+JSON.stringify(split));
+  }catch(e){
+    r.push('E6-species='+e.name);
+  }
+
+  bn('E-OVERFLOW',r.join('|'));
+  log(r.join('\n'),'ok');
+})();
+
+// ======== PHASE F: CROSS-REALM REGEX + TIMING ORACLE ========
+(function phaseF(){
+  log('--- Phase F: Cross-realm + timing ---','warn');
+  var r=[];
+
+  // F1: Worker regex timing comparison (if workers available)
+  // Skip for now - test in main thread
+
+  // F1: Timing oracle - can regex timing distinguish allocated vs unallocated memory?
+  // Use string length to probe internal string representation
+  var shortStr='a';
+  var ropeStr='';
+  for(var i=0;i<16;i++) ropeStr+=String.fromCharCode(65+i); // force rope
+  var flatStr=ropeStr.slice(0); // may flatten
+
+  var N=100000;
+  var re=/^.{16}$/;
+  var t0=Date.now();
+  for(var i=0;i<N;i++) re.test(ropeStr);
+  var ropeTime=Date.now()-t0;
+
+  t0=Date.now();
+  for(var i=0;i<N;i++) re.test(flatStr);
+  var flatTime=Date.now()-t0;
+
+  r.push('F1-stringRepr=rope:'+ropeTime+'ms|flat:'+flatTime+'ms|ratio:'+(ropeTime/Math.max(flatTime,1)).toFixed(2));
+
+  // F2: Cross-iframe regex behavior
+  try{
+    var iframe=document.createElement('iframe');
+    iframe.style.display='none';
+    document.body.appendChild(iframe);
+    var otherRegExp=iframe.contentWindow.RegExp;
+    var crossRe=new otherRegExp('test','g');
+    var crossResult='test1 test2'.match(crossRe);
+    r.push('F2-crossRealm=type:'+typeof crossRe+'|instanceof:'+(crossRe instanceof RegExp)+'|crossInstance:'+(crossRe instanceof otherRegExp)+'|match:'+JSON.stringify(crossResult));
+    document.body.removeChild(iframe);
+  }catch(e){
+    r.push('F2-crossRealm='+e.name);
+  }
+
+  // F3: RegExp.prototype.toString override
+  var origToStr=RegExp.prototype.toString;
+  try{
+    RegExp.prototype.toString=function(){return '/evil/g';};
+    var re8=/abc/;
+    var str8=String(re8);
+    var str8b=''+re8;
+    r.push('F3-toStr=String:'+str8+'|concat:'+str8b+'|source:'+re8.source+'|flags:'+re8.flags);
+  }finally{
+    RegExp.prototype.toString=origToStr;
+  }
+
+  // F4: exec on detached ArrayBuffer string view (if possible)
+  try{
+    var ab=new ArrayBuffer(32);
+    var u8=new Uint8Array(ab);
+    for(var i=0;i<26;i++) u8[i]=65+i;
+    var strFromBuf=String.fromCharCode.apply(null,u8);
+    // Now detach via postMessage
+    try{
+      var mc=new MessageChannel();
+      mc.port1.postMessage('',[ ab]);
+      // ab is now detached
+      var detachedView;
+      try{detachedView=new Uint8Array(ab);}catch(e){detachedView='DETACHED';}
+      // Can we still use strFromBuf with regex?
+      var detRe=/[A-Z]+/;
+      var detMatch=detRe.exec(strFromBuf);
+      r.push('F4-detachedAB=strStillValid:'+(strFromBuf.length>0)+'|match:'+(detMatch?detMatch[0].length:'null')+'|view:'+detachedView);
+    }catch(e){
+      r.push('F4-detach='+e.name);
+    }
+  }catch(e){
+    r.push('F4-detachedAB='+e.name);
+  }
+
+  bn('F-CROSS',r.join('|'));
+  log(r.join('\n'),'ok');
+})();
+
+// === DONE ===
+var summary=anomalies.length>0?anomalies.join(','):'none';
+bn('DONE','anomalies='+anomalies.length+'|items='+summary);
+log('ALL DONE. Anomalies: '+anomalies.length,'ok');
+</script></body></html>

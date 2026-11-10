@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>P1047</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.pass{color:#22c55e}.fail{color:#ef4444}.warn{color:#f59e0b}.info{color:#38bdf8}
+h2{color:#7dd3fc;margin:8px 0 4px;font-size:13px}
+</style></head><body><div id="hud"><b class="info">P1047: Image Crash Isolator</b><br>
+<span class="warn">Testing each malformed image INDIVIDUALLY with pre/post beacons...</span><div id="log"></div></div>
+<div id="arena" style="position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;overflow:hidden"></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1047-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+function lg(s,c){var d=document.getElementById('log');if(d){d.innerHTML+='<div class="'+(c||'info')+'">'+s+'</div>';d.scrollTop=d.scrollHeight;}}
+
+bn('BOOT','ts='+Date.now().toString(36));
+lg('P1047 booted - isolating which image crashes the browser');
+
+// Each test: send PRE beacon, create image, wait, send POST beacon
+// If POST never arrives, that image crashed the browser
+
+var tests = [];
+
+// Test 0: Blob URL creation baseline (no image, just blob)
+tests.push({
+  name: 'T0-baseline-blob',
+  fn: function(cb){
+    var blob = new Blob([new Uint8Array([0x89,0x50,0x4E,0x47])], {type:'image/png'});
+    var url = URL.createObjectURL(blob);
+    URL.revokeObjectURL(url);
+    cb('blobOK');
+  }
+});
+
+// Test 1: Huge PNG dimensions (0xFFFFFFFF x 0xFFFFFFFF)
+tests.push({
+  name: 'T1-png-huge-dims',
+  fn: function(cb){
+    var bytes = [0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,
+      0x00,0x00,0x00,0x0D,
+      0x49,0x48,0x44,0x52,
+      0xFF,0xFF,0xFF,0xFF,  // width
+      0xFF,0xFF,0xFF,0xFF,  // height
+      0x08,0x06,0x00,0x00,0x00,
+      0x00,0x00,0x00,0x00];
+    var blob = new Blob([new Uint8Array(bytes)], {type:'image/png'});
+    var url = URL.createObjectURL(blob);
+    var img = new Image();
+    img.onload = function(){ URL.revokeObjectURL(url); cb('loaded:'+img.naturalWidth+'x'+img.naturalHeight); };
+    img.onerror = function(){ URL.revokeObjectURL(url); cb('error'); };
+    img.src = url;
+    setTimeout(function(){ URL.revokeObjectURL(url); cb('timeout'); }, 3000);
+  }
+});
+
+// Test 2: Truncated PNG (IHDR only, no IDAT)
+tests.push({
+  name: 'T2-png-truncated',
+  fn: function(cb){
+    var bytes = [0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,
+      0x00,0x00,0x00,0x0D,
+      0x49,0x48,0x44,0x52,
+      0x00,0x00,0x00,0x04,
+      0x00,0x00,0x00,0x04,
+      0x08,0x06,0x00,0x00,0x00,
+      0xA9,0xF1,0x9E,0x7E];
+    var blob = new Blob([new Uint8Array(bytes)], {type:'image/png'});
+    var url = URL.createObjectURL(blob);
+    var img = new Image();
+    img.onload = function(){ URL.revokeObjectURL(url); cb('loaded:'+img.naturalWidth+'x'+img.naturalHeight); };
+    img.onerror = function(){ URL.revokeObjectURL(url); cb('error'); };
+    img.src = url;
+    setTimeout(function(){ URL.revokeObjectURL(url); cb('timeout'); }, 3000);
+  }
+});
+
+// Test 3: PNG near INT32_MAX width
+tests.push({
+  name: 'T3-png-intmax-w',
+  fn: function(cb){
+    var bytes = [0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,
+      0x00,0x00,0x00,0x0D,
+      0x49,0x48,0x44,0x52,
+      0x7F,0xFF,0xFF,0xFF,  // width near INT32_MAX
+      0x00,0x00,0x00,0x01,
+      0x08,0x02,0x00,0x00,0x00,
+      0x00,0x00,0x00,0x00];
+    var blob = new Blob([new Uint8Array(bytes)], {type:'image/png'});
+    var url = URL.createObjectURL(blob);
+    var img = new Image();
+    img.onload = function(){ URL.revokeObjectURL(url); cb('loaded:'+img.naturalWidth+'x'+img.naturalHeight); };
+    img.onerror = function(){ URL.revokeObjectURL(url); cb('error'); };
+    img.src = url;
+    setTimeout(function(){ URL.revokeObjectURL(url); cb('timeout'); }, 3000);
+  }
+});
+
+// Test 4: Bad JPEG (premature EOI)
+tests.push({
+  name: 'T4-jpeg-premature-eoi',
+  fn: function(cb){
+    var bytes = [0xFF,0xD8,0xFF,0xE0,
+      0x00,0x10,
+      0x4A,0x46,0x49,0x46,0x00,
+      0x01,0x01,0x00,0x00,0x01,0x00,0x01,0x00,0x00,
+      0xFF,0xC0,
+      0x00,0x0B,
+      0x08,
+      0xFF,0xFF,  // height 65535
+      0xFF,0xFF,  // width 65535
+      0x03,
+      0x01,0x11,0x00,
+      0xFF,0xD9];
+    var blob = new Blob([new Uint8Array(bytes)], {type:'image/jpeg'});
+    var url = URL.createObjectURL(blob);
+    var img = new Image();
+    img.onload = function(){ URL.revokeObjectURL(url); cb('loaded:'+img.naturalWidth+'x'+img.naturalHeight); };
+    img.onerror = function(){ URL.revokeObjectURL(url); cb('error'); };
+    img.src = url;
+    setTimeout(function(){ URL.revokeObjectURL(url); cb('timeout'); }, 3000);
+  }
+});
+
+// Test 5: GIF with LZW over-read
+tests.push({
+  name: 'T5-gif-lzw-overread',
+  fn: function(cb){
+    var bytes = [0x47,0x49,0x46,0x38,0x39,0x61,
+      0x01,0x00,0x01,0x00,
+      0x80,0x00,0x00,
+      0xFF,0xFF,0xFF,
+      0x00,0x00,0x00,
+      0x2C,
+      0x00,0x00,0x00,0x00,
+      0x01,0x00,0x01,0x00,
+      0x00,
+      0x02,
+      0xFF]; // 255-byte sub-block claimed but...
+    // Fill with garbage that overruns
+    for(var i=0; i<255; i++) bytes.push(i & 0xFF);
+    bytes.push(0x00);
+    bytes.push(0x3B);
+    var blob = new Blob([new Uint8Array(bytes)], {type:'image/gif'});
+    var url = URL.createObjectURL(blob);
+    var img = new Image();
+    img.onload = function(){ URL.revokeObjectURL(url); cb('loaded:'+img.naturalWidth+'x'+img.naturalHeight); };
+    img.onerror = function(){ URL.revokeObjectURL(url); cb('error'); };
+    img.src = url;
+    setTimeout(function(){ URL.revokeObjectURL(url); cb('timeout'); }, 3000);
+  }
+});
+
+// Test 6: WebP with huge dimensions
+tests.push({
+  name: 'T6-webp-huge',
+  fn: function(cb){
+    var bytes = [
+      0x52,0x49,0x46,0x46,
+      0x24,0x00,0x00,0x00,
+      0x57,0x45,0x42,0x50,
+      0x56,0x50,0x38,0x20,
+      0x18,0x00,0x00,0x00,
+      0x30,0x01,0x00,0x9D,0x01,0x2A,
+      0xFF,0x7F,0xFF,0x7F,
+      0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+      0x00,0x00,0x00,0x00,0x00,0x00];
+    var blob = new Blob([new Uint8Array(bytes)], {type:'image/webp'});
+    var url = URL.createObjectURL(blob);
+    var img = new Image();
+    img.onload = function(){ URL.revokeObjectURL(url); cb('loaded:'+img.naturalWidth+'x'+img.naturalHeight); };
+    img.onerror = function(){ URL.revokeObjectURL(url); cb('error'); };
+    img.src = url;
+    setTimeout(function(){ URL.revokeObjectURL(url); cb('timeout'); }, 3000);
+  }
+});
+
+// Test 7: PNG with negative chunk length (underflow)
+tests.push({
+  name: 'T7-png-neg-chunk',
+  fn: function(cb){
+    var bytes = [0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,
+      0x00,0x00,0x00,0x0D,
+      0x49,0x48,0x44,0x52,
+      0x00,0x00,0x00,0x08,
+      0x00,0x00,0x00,0x08,
+      0x08,0x06,0x00,0x00,0x00,
+      0x40,0x26,0xB7,0xA2,  // CRC for 8x8 RGBA
+      // Chunk with 0xFFFFFFFE length (underflow)
+      0xFF,0xFF,0xFF,0xFE,
+      0x74,0x45,0x58,0x74, // tEXt
+      0x41,0x42,0x43,0x00, // minimal data
+      0x00,0x00,0x00,0x00  // CRC
+    ];
+    var blob = new Blob([new Uint8Array(bytes)], {type:'image/png'});
+    var url = URL.createObjectURL(blob);
+    var img = new Image();
+    img.onload = function(){ URL.revokeObjectURL(url); cb('loaded:'+img.naturalWidth+'x'+img.naturalHeight); };
+    img.onerror = function(){ URL.revokeObjectURL(url); cb('error'); };
+    img.src = url;
+    setTimeout(function(){ URL.revokeObjectURL(url); cb('timeout'); }, 3000);
+  }
+});
+
+// Test 8: BMP with negative height (top-down bitmap)
+tests.push({
+  name: 'T8-bmp-negheight',
+  fn: function(cb){
+    var headerSize = 54;
+    var w = 4, h = -4; // negative height = top-down
+    var rowSize = ((w*3+3)&~3);
+    var dataSize = rowSize * 4; // abs(h)
+    var fileSize = headerSize + dataSize;
+    var bytes = new Uint8Array(fileSize);
+    var dv = new DataView(bytes.buffer);
+    // BM signature
+    bytes[0]=0x42; bytes[1]=0x4D;
+    dv.setUint32(2, fileSize, true);
+    dv.setUint32(10, headerSize, true);
+    dv.setUint32(14, 40, true); // BITMAPINFOHEADER
+    dv.setInt32(18, w, true);
+    dv.setInt32(22, h, true); // NEGATIVE!
+    dv.setUint16(26, 1, true); // planes
+    dv.setUint16(28, 24, true); // bpp
+    // Fill pixel data
+    for(var i=headerSize; i<fileSize; i++) bytes[i] = 0xCC;
+
+    var blob = new Blob([bytes], {type:'image/bmp'});
+    var url = URL.createObjectURL(blob);
+    var img = new Image();
+    img.onload = function(){ URL.revokeObjectURL(url); cb('loaded:'+img.naturalWidth+'x'+img.naturalHeight); };
+    img.onerror = function(){ URL.revokeObjectURL(url); cb('error'); };
+    img.src = url;
+    setTimeout(function(){ URL.revokeObjectURL(url); cb('timeout'); }, 3000);
+  }
+});
+
+// Test 9: BMP with huge dimensions
+tests.push({
+  name: 'T9-bmp-huge-dims',
+  fn: function(cb){
+    var bytes = new Uint8Array(70);
+    var dv = new DataView(bytes.buffer);
+    bytes[0]=0x42; bytes[1]=0x4D;
+    dv.setUint32(2, 70, true);
+    dv.setUint32(10, 54, true);
+    dv.setUint32(14, 40, true);
+    dv.setInt32(18, 0x7FFFFFFF, true); // width INT32_MAX
+    dv.setInt32(22, 1, true);
+    dv.setUint16(26, 1, true);
+    dv.setUint16(28, 32, true); // 32bpp
+
+    var blob = new Blob([bytes], {type:'image/bmp'});
+    var url = URL.createObjectURL(blob);
+    var img = new Image();
+    img.onload = function(){ URL.revokeObjectURL(url); cb('loaded:'+img.naturalWidth+'x'+img.naturalHeight); };
+    img.onerror = function(){ URL.revokeObjectURL(url); cb('error'); };
+    img.src = url;
+    setTimeout(function(){ URL.revokeObjectURL(url); cb('timeout'); }, 3000);
+  }
+});
+
+// Test 10: ICO with malformed entries
+tests.push({
+  name: 'T10-ico-malformed',
+  fn: function(cb){
+    var bytes = [
+      0x00,0x00, // reserved
+      0x01,0x00, // type: icon
+      0x01,0x00, // count: 1
+      // Entry
+      0x10,      // width 16
+      0x10,      // height 16
+      0x00,      // palette
+      0x00,      // reserved
+      0x01,0x00, // planes
+      0x20,0x00, // bpp 32
+      0xFF,0xFF,0xFF,0xFF, // size (huge!)
+      0x16,0x00,0x00,0x00  // offset
+    ];
+    // Minimal PNG at the offset
+    bytes = bytes.concat([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]);
+
+    var blob = new Blob([new Uint8Array(bytes)], {type:'image/x-icon'});
+    var url = URL.createObjectURL(blob);
+    var img = new Image();
+    img.onload = function(){ URL.revokeObjectURL(url); cb('loaded:'+img.naturalWidth+'x'+img.naturalHeight); };
+    img.onerror = function(){ URL.revokeObjectURL(url); cb('error'); };
+    img.src = url;
+    setTimeout(function(){ URL.revokeObjectURL(url); cb('timeout'); }, 3000);
+  }
+});
+
+// Test 11: SVG via image element (can trigger XML/SVG parser bugs)
+tests.push({
+  name: 'T11-svg-via-img',
+  fn: function(cb){
+    var svgStr = '<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">';
+    // Deep nesting
+    for(var i=0; i<200; i++) svgStr += '<g>';
+    svgStr += '<rect width="10" height="10" fill="red"/>';
+    for(var i=0; i<200; i++) svgStr += '</g>';
+    svgStr += '</svg>';
+
+    var blob = new Blob([svgStr], {type:'image/svg+xml'});
+    var url = URL.createObjectURL(blob);
+    var img = new Image();
+    img.onload = function(){ URL.revokeObjectURL(url); cb('loaded:'+img.naturalWidth+'x'+img.naturalHeight); };
+    img.onerror = function(){ URL.revokeObjectURL(url); cb('error'); };
+    img.src = url;
+    setTimeout(function(){ URL.revokeObjectURL(url); cb('timeout'); }, 3000);
+  }
+});
+
+// Test 12: createImageBitmap with extreme crop
+tests.push({
+  name: 'T12-createImgBmp-crop',
+  fn: function(cb){
+    if(typeof createImageBitmap === 'undefined'){
+      cb('unavailable');
+      return;
+    }
+    var canvas = document.createElement('canvas');
+    canvas.width = 4; canvas.height = 4;
+    var ctx = canvas.getContext('2d');
+    ctx.fillStyle = 'red';
+    ctx.fillRect(0,0,4,4);
+
+    // Extreme crop parameters
+    createImageBitmap(canvas, -1000, -1000, 0x7FFFFFFF, 0x7FFFFFFF).then(function(bmp){
+      cb('loaded:'+bmp.width+'x'+bmp.height);
+      bmp.close();
+    }).catch(function(e){
+      cb('err:'+e.message.slice(0,60));
+    });
+    setTimeout(function(){ cb('timeout'); }, 3000);
+  }
+});
+
+// Execute tests sequentially with pre/post beacons
+var testIdx = 0;
+var completed = {};
+
+function runNext(){
+  if(testIdx >= tests.length){
+    bn('DONE', 'all='+tests.length+'|completed='+Object.keys(completed).length);
+    lg('<h2>ALL TESTS COMPLETE</h2>', 'pass');
+    for(var k in completed){
+      lg(k + ': ' + completed[k], 'pass');
+    }
+    return;
+  }
+
+  var test = tests[testIdx];
+  var name = test.name;
+
+  bn('PRE-'+name, 'starting');
+  lg('Testing: '+name+'...', 'info');
+
+  var called = false;
+  test.fn(function(result){
+    if(called) return;
+    called = true;
+    completed[name] = result;
+    bn('POST-'+name, result);
+    lg(name + ': ' + result, result==='error'||result==='timeout'?'warn':'pass');
+    testIdx++;
+    setTimeout(runNext, 100);
+  });
+
+  // Safety: if callback never fires
+  setTimeout(function(){
+    if(!called){
+      called = true;
+      completed[name] = 'HUNG';
+      bn('POST-'+name, 'HUNG');
+      lg(name + ': HUNG (no callback)', 'fail');
+      testIdx++;
+      setTimeout(runNext, 100);
+    }
+  }, 5000);
+}
+
+setTimeout(runNext, 50);
+
+</script></body></html>

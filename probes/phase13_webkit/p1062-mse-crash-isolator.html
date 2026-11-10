@@ -1,0 +1,382 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1062</title>
+<style>
+body{background:#0a0e14;color:#c8d0da;font:11px/1.5 monospace;padding:10px;margin:0}
+#hud{background:#111820;border:1px solid #1e2a3a;border-radius:6px;padding:10px;max-height:95vh;overflow-y:auto}
+.ok{color:#4ec9b0}.err{color:#f44747}.warn{color:#dcdcaa}.hot{color:#ff6b6b;font-weight:bold}
+h2{color:#569cd6;margin:8px 0 4px;font-size:13px}
+</style></head><body><div id="hud"><h2>P1062 MSE CRASH ISOLATOR</h2><div id="log"></div></div>
+<script>
+var _rl='';
+setInterval(function(){
+  try{var x=new XMLHttpRequest();x.open('GET','/reload.txt?'+Date.now(),false);x.send();
+    if(x.status===200){var v=x.responseText.trim();if(_rl&&v!==_rl)location.reload(true);_rl=v;}
+  }catch(e){}
+},2500);
+
+var L=document.getElementById('log');
+function log(s,c){var d=document.createElement('div');d.className=c||'';d.textContent=s;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function bn(t,d){try{var x=new XMLHttpRequest();x.open('GET','/beacon.php?tag=P1062-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d||'').slice(0,1800))+'&t='+Date.now(),false);x.send();}catch(e){}}
+
+// MP4 box builders
+function u32be(n){return new Uint8Array([(n>>>24)&0xFF,(n>>>16)&0xFF,(n>>>8)&0xFF,n&0xFF]);}
+function u16be(n){return new Uint8Array([(n>>>8)&0xFF,n&0xFF]);}
+function concat(){var a=arguments,total=0,i,j;for(i=0;i<a.length;i++){if(a[i])total+=a[i].length;}var r=new Uint8Array(total);var o=0;for(i=0;i<a.length;i++){if(a[i]){for(j=0;j<a[i].length;j++)r[o++]=a[i][j];}}return r;}
+function ascii(s){var a=new Uint8Array(s.length);for(var i=0;i<s.length;i++)a[i]=s.charCodeAt(i);return a;}
+function mkBox(type,payload){
+  var t=ascii(type);
+  var size=8+(payload?payload.length:0);
+  return concat(u32be(size),t,payload||new Uint8Array(0));
+}
+
+// Minimal valid moov for avc1
+function mkValidInit(){
+  var sps=new Uint8Array([0x67,0x42,0xE0,0x1E,0xDA,0x02,0xD0,0x28,0x30]);
+  var pps=new Uint8Array([0x68,0xCE,0x06,0xE2]);
+  var avcC=concat(
+    new Uint8Array([1,0x42,0xE0,0x1E,0xFF,0xE1]),
+    u16be(sps.length),sps,
+    new Uint8Array([1]),
+    u16be(pps.length),pps
+  );
+  var avc1=concat(
+    new Uint8Array(6), // reserved
+    u16be(1), // data_ref_index
+    new Uint8Array(16), // predefined+reserved
+    u16be(320),u16be(240), // w,h
+    u32be(0x00480000),u32be(0x00480000), // horiz/vert res
+    new Uint8Array(4), // reserved
+    u16be(1), // frame count
+    new Uint8Array(32), // compressor
+    u16be(0x0018), // depth
+    new Uint8Array([0xFF,0xFF]), // pre_defined
+    mkBox('avcC',avcC)
+  );
+  var stsd=mkBox('stsd',concat(new Uint8Array([0,0,0,0]),u32be(1),mkBox('avc1',avc1)));
+  var stbl=concat(stsd,mkBox('stts',new Uint8Array([0,0,0,0,0,0,0,0])),mkBox('stsc',new Uint8Array([0,0,0,0,0,0,0,0])),mkBox('stsz',new Uint8Array([0,0,0,0,0,0,0,0,0,0,0,0])),mkBox('stco',new Uint8Array([0,0,0,0,0,0,0,0])));
+  var minf=concat(mkBox('vmhd',new Uint8Array([0,0,0,1,0,0,0,0,0,0,0,0])),mkBox('dinf',mkBox('dref',concat(new Uint8Array([0,0,0,0,0,0,0,1]),mkBox('url ',new Uint8Array([0,0,0,1]))))),mkBox('stbl',stbl));
+  var mdia=concat(mkBox('mdhd',new Uint8Array([0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x03,0xE8,0,0,0,0,0,0,0,0])),mkBox('hdlr',concat(new Uint8Array([0,0,0,0,0,0,0,0]),ascii('vide'),new Uint8Array(12),new Uint8Array([0]))),mkBox('minf',minf));
+  var trak=mkBox('trak',concat(mkBox('tkhd',concat(new Uint8Array([0,0,0,3]),new Uint8Array(8),u32be(1),new Uint8Array(4),u32be(0),new Uint8Array(8),new Uint8Array(8),new Uint8Array(4),new Uint8Array(4),new Uint8Array(4),u16be(320),u16be(240))),mkBox('mdia',mdia)));
+  var mvhd=mkBox('mvhd',concat(new Uint8Array([0,0,0,0]),new Uint8Array(8),u32be(1000),u32be(0),u32be(0x00010000),u16be(0x0100),new Uint8Array(10),new Uint8Array([0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x40,0,0,0]),new Uint8Array(24),u32be(2)));
+  var moov=mkBox('moov',concat(mvhd,trak));
+  var ftyp=mkBox('ftyp',concat(ascii('isom'),u32be(0x200),ascii('isom'),ascii('iso2'),ascii('avc1'),ascii('mp41')));
+  return concat(ftyp,moov);
+}
+
+// Sequential test runner - one test at a time with pre-beacon
+var tests=[];
+var results=[];
+var testIdx=0;
+
+function addTest(id,desc,dataFn){tests.push({id:id,desc:desc,dataFn:dataFn});}
+
+// ============ PHASE A: MALFORMED MP4 INIT SEGMENTS ============
+
+// A0: Baseline valid init (should work - P1060 confirmed)
+addTest('A0-VALID','Valid ftyp+moov init segment',function(){return mkValidInit();});
+
+// A1: Zero-length ftyp box (size=0 means "extends to end of file")
+addTest('A1-ZERO-FTYP','ftyp with size=0 (extends to EOF)',function(){
+  return concat(u32be(0),ascii('ftyp'),ascii('isom'),u32be(0x200));
+});
+
+// A2: ftyp with size=1 (64-bit extended size) but truncated
+addTest('A2-TRUNC-EXT','ftyp size=1 + truncated 64-bit ext',function(){
+  return concat(u32be(1),ascii('ftyp'),u32be(0),u32be(0x20));
+});
+
+// A3: ftyp with absurd size (0xFFFFFFFF)
+addTest('A3-HUGE-SIZE','ftyp size=0xFFFFFFFF',function(){
+  var d=new Uint8Array(16);
+  d[0]=0xFF;d[1]=0xFF;d[2]=0xFF;d[3]=0xFF;
+  d[4]=0x66;d[5]=0x74;d[6]=0x79;d[7]=0x70; // ftyp
+  d[8]=0x69;d[9]=0x73;d[10]=0x6F;d[11]=0x6D; // isom
+  return d;
+});
+
+// A4: moov with size overflow (declared size < actual content)
+addTest('A4-MOOV-UNDERSIZE','moov box size smaller than contents',function(){
+  var ftyp=mkBox('ftyp',concat(ascii('isom'),u32be(0x200)));
+  var moovContent=new Uint8Array(200); // fake moov content
+  // Set size to 12 but content is 200
+  return concat(ftyp,u32be(12),ascii('moov'),moovContent);
+});
+
+// A5: Nested boxes with integer overflow in total size
+addTest('A5-NESTED-OVERFLOW','Nested boxes where child sizes overflow parent',function(){
+  var ftyp=mkBox('ftyp',concat(ascii('isom'),u32be(0x200)));
+  // moov containing a trak where child box size exceeds parent
+  var bigChild=new Uint8Array(12);
+  bigChild[0]=0x7F;bigChild[1]=0xFF;bigChild[2]=0xFF;bigChild[3]=0xFF; // size=2GB
+  bigChild[4]=0x74;bigChild[5]=0x6B;bigChild[6]=0x68;bigChild[7]=0x64; // tkhd
+  var trak=mkBox('trak',bigChild);
+  var moov=mkBox('moov',concat(mkBox('mvhd',new Uint8Array(100)),trak));
+  return concat(ftyp,moov);
+});
+
+// ============ PHASE B: DEEP/DEGENERATE ATOMS ============
+
+// B1: 50-level deep nested boxes
+addTest('B1-DEEP-NEST','50-level deep nested unknown boxes',function(){
+  var inner=new Uint8Array([0,0,0,8,0x64,0x61,0x74,0x61]); // 'data' empty
+  for(var i=0;i<50;i++){
+    var t=ascii('n'+String(i%10)+String(Math.floor(i/10)%10)+'x');
+    inner=concat(u32be(8+inner.length),t,inner);
+  }
+  var ftyp=mkBox('ftyp',concat(ascii('isom'),u32be(0x200)));
+  var moov=mkBox('moov',inner);
+  return concat(ftyp,moov);
+});
+
+// B2: stsd with entry_count = 0xFFFFFFFF
+addTest('B2-STSD-HUGE','stsd entry_count=0xFFFFFFFF',function(){
+  var vi=mkValidInit();
+  // Find stsd in the valid init and corrupt entry_count
+  var d=new Uint8Array(vi);
+  for(var i=0;i<d.length-8;i++){
+    if(d[i]==0x73&&d[i+1]==0x74&&d[i+2]==0x73&&d[i+3]==0x64){ // 'stsd'
+      d[i+4]=0xFF;d[i+5]=0xFF;d[i+6]=0xFF;d[i+7]=0xFF; // corrupt entry_count
+      break;
+    }
+  }
+  return d;
+});
+
+// B3: mdat with size=1 + 64-bit extended size = 0xFFFFFFFFFFFFFFFF
+addTest('B3-MDAT-HUGE64','mdat with 64-bit ext size=max',function(){
+  var ftyp=mkBox('ftyp',concat(ascii('isom'),u32be(0x200)));
+  var moov=mkBox('moov',mkBox('mvhd',new Uint8Array(100)));
+  // mdat with 64-bit extended size
+  var mdat=concat(u32be(1),ascii('mdat'),
+    new Uint8Array([0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF]),
+    new Uint8Array(16) // some "data"
+  );
+  return concat(ftyp,moov,mdat);
+});
+
+// B4: Fragmented MP4 without init segment
+addTest('B4-FRAG-NO-INIT','moof+mdat without moov (fragmented)',function(){
+  var moof=mkBox('moof',concat(
+    mkBox('mfhd',concat(new Uint8Array([0,0,0,0]),u32be(1))),
+    mkBox('traf',concat(
+      mkBox('tfhd',concat(new Uint8Array([0,0,0,0]),u32be(1))),
+      mkBox('trun',concat(new Uint8Array([0,0,0,1]),u32be(1),u32be(0)))
+    ))
+  ));
+  var mdat=mkBox('mdat',new Uint8Array(100));
+  return concat(moof,mdat);
+});
+
+// B5: free box with negative-looking size
+addTest('B5-FREE-NEGSIZE','free box where size looks negative (0x80000008)',function(){
+  var d=new Uint8Array(16);
+  d[0]=0x80;d[1]=0x00;d[2]=0x00;d[3]=0x10; // 0x80000010 = 2GB+16
+  d[4]=0x66;d[5]=0x72;d[6]=0x65;d[7]=0x65; // free
+  return d;
+});
+
+// ============ PHASE C: SOURCEBUFFER ABUSE ============
+
+// C1: Double append while updating
+addTest('C1-DOUBLE-APPEND','appendBuffer while already updating',function(){return 'DOUBLE_APPEND';});
+
+// C2: appendBuffer with zero-length data
+addTest('C2-ZERO-APPEND','appendBuffer with 0-byte ArrayBuffer',function(){return 'ZERO_APPEND';});
+
+// C3: Rapid append/abort cycles
+addTest('C3-RAPID-ABORT','50x rapid append+abort',function(){return 'RAPID_ABORT';});
+
+// C4: changeType to invalid codec
+addTest('C4-CHANGETYPE','changeType to bogus codec string',function(){return 'CHANGETYPE';});
+
+// C5: remove(-1, Infinity)
+addTest('C5-REMOVE-RANGE','remove with extreme ranges',function(){return 'REMOVE_RANGE';});
+
+// ============ PHASE D: WEBM EDGE CASES ============
+
+// D1: EBML header only
+addTest('D1-EBML-ONLY','Minimal EBML header (no segment)',function(){
+  return new Uint8Array([0x1A,0x45,0xDF,0xA3,0x93,0x42,0x86,0x81,0x01,
+    0x42,0xF7,0x81,0x01,0x42,0x82,0x84,0x77,0x65,0x62,0x6D,
+    0x42,0x87,0x81,0x04,0x42,0x85,0x81,0x02]);
+});
+
+// D2: WebM with invalid version
+addTest('D2-EBML-BADVER','EBML with version=255',function(){
+  return new Uint8Array([0x1A,0x45,0xDF,0xA3,0x93,0x42,0x86,0x81,0xFF,
+    0x42,0xF7,0x81,0xFF,0x42,0x82,0x84,0x77,0x65,0x62,0x6D,
+    0x42,0x87,0x81,0x04,0x42,0x85,0x81,0x02]);
+});
+
+// D3: Cluster without segment/tracks
+addTest('D3-CLUSTER-BARE','Raw cluster without segment info',function(){
+  return new Uint8Array([0x1F,0x43,0xB6,0x75,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x20,
+    0xE7,0x81,0x00, // timecode=0
+    0xA3,0x85,0x81,0x00,0x00,0x80,0xDE,0xAD]); // SimpleBlock
+});
+
+// D4: Maximum VINT value element
+addTest('D4-VINT-MAX','Element with max VINT size field',function(){
+  return new Uint8Array([0x1A,0x45,0xDF,0xA3,
+    0x01,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF]); // EBML with size=max
+});
+
+// Run tests sequentially
+function runNextTest(){
+  if(testIdx>=tests.length){
+    var summary=results.map(function(r){return r.id+':'+r.result;}).join('|');
+    bn('DONE','total='+tests.length+'|'+summary);
+    log('ALL DONE: '+tests.length+' tests','ok');
+    return;
+  }
+  var t=tests[testIdx];
+  log('['+testIdx+'/'+tests.length+'] '+t.id+': '+t.desc,'warn');
+  bn('PRE-'+t.id,'about-to-run');
+
+  // Small delay to ensure beacon is sent before potential crash
+  setTimeout(function(){
+    runSingleTest(t,function(result){
+      results.push({id:t.id,result:result});
+      bn('POST-'+t.id,result);
+      log('  -> '+result, result.indexOf('OK')>=0?'ok':'err');
+      testIdx++;
+      setTimeout(runNextTest,200);
+    });
+  },300);
+}
+
+function runSingleTest(t,cb){
+  var data;
+  try{data=t.dataFn();}catch(e){cb('DATAFN-ERR:'+e.message);return;}
+
+  // Special handling for SourceBuffer abuse tests
+  if(typeof data==='string'){
+    runSpecialTest(t.id,data,cb);
+    return;
+  }
+
+  // Standard: create MediaSource, add SourceBuffer, append data
+  var timeout=setTimeout(function(){cb('TIMEOUT-5s');},5000);
+  try{
+    var ms=new MediaSource();
+    var vid=document.createElement('video');
+    vid.src=URL.createObjectURL(ms);
+    ms.addEventListener('sourceopen',function(){
+      try{
+        var sb=ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+        sb.addEventListener('updateend',function(){
+          clearTimeout(timeout);
+          cb('OK-updateend|dur='+ms.duration+'|buffered='+(sb.buffered.length>0?sb.buffered.end(0):'none'));
+        });
+        sb.addEventListener('error',function(e){
+          clearTimeout(timeout);
+          cb('SB-ERROR|dur='+ms.duration);
+        });
+        sb.appendBuffer(data);
+      }catch(e){
+        clearTimeout(timeout);
+        cb('SB-CATCH:'+e.name+':'+e.message);
+      }
+    });
+    ms.addEventListener('error',function(){
+      clearTimeout(timeout);
+      cb('MS-ERROR');
+    });
+  }catch(e){
+    clearTimeout(timeout);
+    cb('OUTER-CATCH:'+e.name+':'+e.message);
+  }
+}
+
+function runSpecialTest(id,type,cb){
+  var timeout=setTimeout(function(){cb('TIMEOUT-5s');},5000);
+  try{
+    var ms=new MediaSource();
+    var vid=document.createElement('video');
+    vid.src=URL.createObjectURL(ms);
+    ms.addEventListener('sourceopen',function(){
+      try{
+        var sb=ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+
+        if(type==='DOUBLE_APPEND'){
+          var validData=mkValidInit();
+          sb.appendBuffer(validData);
+          // Try second append while first is updating
+          try{
+            sb.appendBuffer(new Uint8Array([0,0,0,8,0x66,0x72,0x65,0x65]));
+            clearTimeout(timeout);
+            cb('DOUBLE-ACCEPTED-BUG!');
+          }catch(e2){
+            clearTimeout(timeout);
+            cb('OK-rejected:'+e2.name);
+          }
+        }
+        else if(type==='ZERO_APPEND'){
+          sb.addEventListener('updateend',function(){
+            clearTimeout(timeout);
+            cb('OK-zero-accepted');
+          });
+          sb.addEventListener('error',function(){
+            clearTimeout(timeout);
+            cb('OK-zero-error');
+          });
+          sb.appendBuffer(new ArrayBuffer(0));
+        }
+        else if(type==='RAPID_ABORT'){
+          var count=0;var errs=0;
+          function doOne(){
+            if(count>=50){clearTimeout(timeout);cb('OK-cycles='+count+'|errs='+errs);return;}
+            try{
+              sb.appendBuffer(new Uint8Array([0,0,0,8,0x66,0x72,0x65,0x65]));
+              sb.abort();
+              count++;
+            }catch(e){errs++;count++;}
+            setTimeout(doOne,10);
+          }
+          doOne();
+        }
+        else if(type==='CHANGETYPE'){
+          try{
+            sb.changeType('video/mp4; codecs="INVALID_CODEC_STRING"');
+            clearTimeout(timeout);
+            cb('CHANGETYPE-ACCEPTED-BUG!');
+          }catch(e){
+            clearTimeout(timeout);
+            cb('OK-rejected:'+e.name+':'+e.message);
+          }
+        }
+        else if(type==='REMOVE_RANGE'){
+          sb.addEventListener('updateend',function onue(){
+            sb.removeEventListener('updateend',onue);
+            try{
+              sb.remove(-1,Infinity);
+              clearTimeout(timeout);
+              cb('REMOVE-NEG-ACCEPTED');
+            }catch(e){
+              try{
+                sb.remove(0,1e15);
+                sb.addEventListener('updateend',function(){
+                  clearTimeout(timeout);
+                  cb('OK-bigRemove-done');
+                });
+              }catch(e2){
+                clearTimeout(timeout);
+                cb('OK-remove-rejected:'+e2.name);
+              }
+            }
+          });
+          sb.appendBuffer(mkValidInit());
+        }
+        else{
+          clearTimeout(timeout);
+          cb('UNKNOWN-TYPE');
+        }
+      }catch(e){clearTimeout(timeout);cb('INNER-CATCH:'+e.name+':'+e.message);}
+    });
+  }catch(e){clearTimeout(timeout);cb('OUTER-CATCH:'+e.name+':'+e.message);}
+}
+
+// === BOOT ===
+bn('BOOT','tests='+tests.length+'|sequential-crash-isolator');
+log('Booted. Running '+tests.length+' tests sequentially...','ok');
+setTimeout(runNextTest,500);
+</script></body></html>
