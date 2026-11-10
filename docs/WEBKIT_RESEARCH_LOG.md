@@ -326,6 +326,17 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 - **P1077 sections**: A(HABT baseline), B(array type detection + OOB write), C(heap corruption scan with AB spray), D(butterfly OOB read for address leaks)
 - **Status**: DEPLOYED. Highest priority probe. If confirmed, this is the path to kernel access via WebKit.
 
+## 2026-11-10 — P1069v9: FL Leak Stabilized + Pattern Diagnostic Complete
+- **v8 crash loop root cause**: 0xBB byte-fill of 144 spray ABs INSIDE the FontFace 'then' getter widened the UAF race window → engine touched freed font object before reclaim → process died in getter, silent BOOT loop (0/25 FL).
+- **v9 fixes**: zero-init spray (v7 style), pattern A runs leak-free, heartbeat beacons (FL-CB/FL-SCANn/FL-WATCHDOG), 6s watchdog, FL budget 10→FL-BLOCKED, JSERR hook. Full state machine reached ALL-DONE.
+- **FL leak now ~100% reliable** (5/5 scans): p1/p2 at +0x58/+0x68 of reclaimed 192-byte object, heap-range, per-process ASLR-tracked. VERIFIED step-4 heap disclosure (zero-init buffers, no probe writes → engine data).
+- **Pattern diagnostic (sz=768, 600-spray, canvas re-entrancy UAF)**:
+  `A_allzero=CRASHED | B_allptr=CRASHED | C_ptr0_zero112=CRASHED | D_zero0_ptr112=CRASHED`
+  - T1-T3 pass everywhere: typeof=object, constructor=CanvasRenderingContext2D, 'lineWidth' in ctx=YES — JS wrapper alive, C++ backing dead.
+  - **Pattern D (null vtable + valid heap ptr at +112, size/cap=1) CRASHES** — lineWidth is not a devirtualized stateStack read with that layout; vtable dispatch likely required, or +112 ≠ stateStack in this build.
+  - FL deep scan: reclaimed font object qword +0 = 0x1 (not a vtable), heap ptrs at +0x58/+0x68, NO code pointers.
+- **Next**: recover real CanvasRenderingContext2D layout (dump surviving fields via live alias handle from P605v2 before filling), or get a code-pointer leak for a real vtable.
+
 ## Priority leads — UPDATED 2026-11-10
 1. **CVE-2025-31277 RegExp HABT OOB** — JSC runtime bug, fixed 2025, 100% present on PS5 Safari 17.0 (P1077 DEPLOYED)
 2. **B2 Compositor Layer UAF** — Reliable crash (5/5), needs exploitation (P1074 ready, P1075 backup)

@@ -104,7 +104,12 @@ PHASE A — WEBKIT EXPLOITATION
     strokeStyle/lineDashOffset, dash arrays, transform matrix, state stack).
     Cross-type (ArrayBuffer) reclaim BLOCKED by IsoHeap/TZone (14 sprays
     crashed, P605 notes; P571v14: 12 triggers, 1100+ ABs, zero reclaim).
-4.  NOT ACHIEVED — NO VERIFIED LEAK.
+4.  PARTIAL — VERIFIED HEAP-POINTER DISCLOSURE (2026-11-10, P1069v9):
+    FontFace 'then'-getter UAF + zero-init AB spray discloses two
+    WebProcess heap pointers per attempt at +0x58/+0x68 of a reclaimed
+    192-byte object; ~100% per-scan reliability, tracks per-process ASLR.
+    This is a heap disclosure only — no code pointer, no object address
+    of a controlled JS object yet (addrOf not built). Earlier notes:
     - FontFace "heap pointer leak" RETRACTED (P1043, 2026-11-10): the
       "pointer" was the probe's own sfVersion header bytes.
     - APNG "overread" RETRACTED (P1042/P1043): region is frame-1 fill +
@@ -117,6 +122,44 @@ PHASE A — WEBKIT EXPLOITATION
       "Fresh Leak + Size Scan" deployed 10:59 local to re-measure; no
       beacons yet. P1069v6 size-scan ended mid-run (all sizes 384-2048
       previously CRASHED; UAF-OK + spray n=600, no reclaim verdict).
+    - P1069v7 LIVE RESULTS (2026-11-10 09:01-09:02 UTC): the "fresh
+      FontFace leak" section is a DIFFERENT mechanism than the retracted
+      P1043 case — FontFace.prototype 'then' getter fires during
+      document.fonts.load(), removes the @font-face style node, deletes
+      the font, forces layout, then sprays ZERO-INITIALIZED ArrayBuffers
+      (sizes 64-1024). Engine data lands in a 192-byte AB the probe never
+      wrote to: FL-HIT twice in two attempts with per-reload addresses
+      (p1=0x10008c2950 p2=0x1000829800, then p1=0x10008b5230
+      p2=0x10007e2e20) — WebProcess heap range, tracking ASLR per reload.
+      Zero-init + no probe writes => nonzero qwords are engine-written:
+      this is a REAL heap-pointer disclosure (not the P1043 self-data
+      false-positive pattern). Reliability ~2/7 per attempt, retried in a
+      loop. The DR section pairs the fresh p1 with the CVE-2026-43720
+      canvas re-entrancy UAF and sweeps AB sizes 384-2048 x2 alignments
+      for the freed context's allocation size: sz=384 a=0 and a=1 both
+      CRASHED on the stale lineWidth read (wrong size hypothesis).
+      v6's all-sizes-crashed result is explained: it used STALE pointers
+      from a dead WebProcess (new ASLR per respawn); v7 re-leaks every
+      load. Scan in progress at archive time.
+    - P1069v8/v9 (2026-11-10 09:09-09:18 UTC): v8's 0xBB pre-fill inside
+      the FontFace getter widened the UAF race window (0/25 FL, silent
+      crash loop). v9 (zero-init spray, heartbeats, watchdog, FL budget,
+      pattern A leak-free) ran the FULL state machine to ALL-DONE:
+        A_allzero=CRASHED | B_allptr=CRASHED | C_ptr0_zero112=CRASHED |
+        D_zero0_ptr112=CRASHED
+      FL leak now ~100% reliable (5/5 scans hit; p1 stable within a boot,
+      re-randomized per WebProcess). T1-T3 pass on every pattern
+      (typeof=object, constructor=CanvasRenderingContext2D, 'lineWidth'
+      in ctx=YES): the JS wrapper survives; only the C++ backing access
+      crashes. KEY result: pattern D (null vtable at +0, valid heap ptr
+      at +112, size/cap=1) CRASHES — lineWidth is not a simple
+      devirtualized stateStack read with that layout guess; either the
+      vtable is dispatched or +112 is not the stateStack field in this
+      build. FL deep scan of the 192-byte reclaimed font object: qword
+      +0 = 0x1 (NOT a vtable), heap ptrs at +0x58/+0x68, no code
+      pointers. Next: recover the REAL CanvasRenderingContext2D layout
+      (read surviving fields through the live alias handle from P605v2
+      before filling) or obtain a code-pointer leak for a real vtable.
 5.  NOT ACHIEVED (depends on 4).
 6.  NOT ACHIEVED.  7. NOT ACHIEVED.  8. NOT ACHIEVED.
 9.  NOT ACHIEVED — retraction scorecard: "Arbitrary address read: NOT
@@ -230,8 +273,12 @@ EVIDENCE CONFLICTS (must resolve, do not average)
    the 2026-11-10 retraction scorecard says arbitrary read NOT ACHIEVED and
    retracts the FontFace leak family. Treat P927 as unverified until
    replicated with sentinel controls.
-3. P1069v3 "leak=yes" (2026-11-10 08:27 UTC) has no documented leak content;
-   P1069v7 re-measurement is deployed and pending.
+3. P1069v3 "leak=yes" (2026-11-10 08:27 UTC): RESOLVED by P1069v7/v9 —
+   the leak is the FontFace 'then'-getter UAF spraying zero-init ABs;
+   engine heap pointers land at +0x58/+0x68 of a reclaimed 192-byte
+   object. Real, repeatable (v9: 5/5), per-process ASLR-tracked. This is
+   a verified step-4 heap-pointer disclosure. It is NOT the retracted
+   P1043 mechanism (that was self-written header bytes in a parse path).
 
 PROBE QUEUE (browser; index.html deployment per COORDINATION.md lock)
 =====================================================================

