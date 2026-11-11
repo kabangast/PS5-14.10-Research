@@ -519,9 +519,21 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
   on PS5. DEAD for our console. Fix is Jun-2026 (main-tracked — likely in
   the Sep-28 build anyway).
 
-## 2026-11-11 — CREATIVE ATTACK MODE (user directive: keep poking, go wild)
+## 2026-11-11 — VERSION PINNED + LOCAL SOURCE PENTESTING LINE (user strategy)
+- **PS5 browser version pinned from beacon logs**: UA = `Mozilla/5.0 (PlayStation; PlayStation 5/14.10) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15`; vendor = "Sony Interactive Entertainment Inc." (P833-PLAT). → **Safari 17.0 line = WebKit 7618.1.15.x**.
+- **Exact public branch identified**: `safari-7618.1.15-branch` (mirror has the full 7618 branch family incl. .1.15.10-.14). Shallow clone started in background (tools/webkit-7618).
+- **Local assets**: pastawithpesto submodule fully populated (their loader/payloads/tools incl. tools/cve-commit-map.py for CVE→commit mapping).
+- **Plan (user-approved)**: (1) diff the exact branch against our on-console measurements (TZone/ISO macros, feature gates, backport presence) to pin Sony's exact revision; (2) local parser fuzzing (Path2D/font/image) with fast host tooling; (3) systematic CVE→branch mapping via cve-commit-map.py; (4) craft payloads against the exact code instead of blind probing.
+- WSL not installed on host (option for user: local Linux JSC build for offline JS-level testing).
+
+## 2026-11-11 — CREATIVE ATTACK MODE results (user directive: keep poking, go wild)
 - **P1179 (sweep x state-stack code-pointer trap)**: 3-primitive chain — metadata sweep writes a code pointer every 112B; state-stack out-of-line buffer allocated during the sweep; alias reads every state double. Result: alias control verified (defaults clean), trap stages found NO pointer-shaped values — the 6400B state buffer is also outside the sweep's path (10+ sweep experiments now: the sweep traverses only JS-unreadable memory on our console; its writes are conclusively unreachable).
 - **P1180 (BMR dangle + transferFromImageBitmap)**: novel variant — free the 80B bitmaprenderer context by calling getContext('2d') after it exists. Result: ALL stages SURVIVED — per spec getContext returns null WITHOUT replacing an existing different-type context, so the BMR is never freed; no dangle forms. CLOSED by design.
 - **P1181 (poke battery)**: FontFace descriptor-getter re-entrancy 50/50 clean (no crash); beginLayer/endLayer ABSENT on PS5 (feature-stripped); drawImage rect-overflow all clamped; hostile measureText strings handled (10k families w=72, 2e9px w=85504, no crash).
 - **P1182 (font loca OOB pixel oracle — community open lead p180a/p182)**: 8 TTF variants crafted (minimal 7/8-table TTFs, then community f0.ttf fetched+parsed — single empty glyph). Result: malformed fonts LOAD but render ZERO pixels for ALL loca offsets (past-EOF, far, uint-wrap) with no crash; the control renders 0 too until the glyph was valid; serif control renders 301px (canvas pipeline fine). **The PS5 font parser accepts OOB loca at load but clamps/ignores invalid glyph data at render — the community's open p182 loca-OOB lead yields NO observable oracle on our console.** CLOSED.
 - Next poke-queue: (1) WebP/PNG/JPEG decoder fuzz with FL-leak adjacency (decoder buffer reclaim + engine writes); (2) canvas gradient/pattern addColorStop count overflow; (3) Path2D edge cases (addPath with huge coords); (4) SVG filter/pattern element lifetime churn + alias readback; (5) ResizableArrayBuffer grow/shrink race with the canvas alias.
+- **P1183 (decoder x FL adjacency)**: PNG/WebP decodes around/inside the leak window — leak channel unchanged (3-field heap ptrs only, codeShaped=0). Clean.
+- **P1184 (Path2D parser + filter churn + gradient)**: 25 crafted path strings all parsed safely; filter url() remove-mid-use clean; 100k addColorStop (17.6s) no overflow. Clean.
+- **P1185 (FontFaceSet iteration re-entrancy)**: delete-each/delete-all/add-during/keys-values-entries+clear/load-in-loop — ALL safe (iterator sees added faces; invalidation-safe implementation). Clean.
+- **P1186 (RAB sort / TransformStream+fonts / MessageChannel+fonts / RAB resize during fonts.load)**: deployed 2026-11-11; awaiting console run.
+- Poke-verdict so far: PS5 build hardens re-entrancy + parser surfaces unusually well; every classic class clean. Live bugs are deep C++-lifetime quirks only.

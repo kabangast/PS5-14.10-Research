@@ -1,0 +1,170 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1186 RAB x Stream x Channel Battery</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1186 — RAB x STREAM x CHANNEL BATTERY</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">stage: ?</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var d=document.createElement('div');d.textContent=t;FD.textContent='';FD.appendChild(d);}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1186-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1186: battery of remaining async-surface re-entrancy angles.
+   0: RAB grow/shrink mid-sort (sort on RAB view while resizing)
+   1: TransformStream transform() callback triggers FL-style font free
+   2: MessageChannel onmessage -> fonts.delete + iterator
+   3: RAB grow during fonts.load (async + resize interleave)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var STAGES=['rabsort','stream','channel','rabFonts'];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1186_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1186_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/3 — '+STAGES[stage]);
+
+if(stage>=STAGES.length){
+  setStatus('ALL DONE');
+  B('ALL-DONE',JSON.stringify(results).slice(0,800));
+  log('=== ALL DONE ===','ok');
+  try{localStorage.removeItem('p1186_stage');}catch(e){}
+}else{
+
+try{localStorage.setItem('p1186_stage',''+(stage+1));}catch(e){}
+var cur=STAGES[stage];
+
+function done(rep){
+  results.push({stage:stage,name:cur,result:rep});
+  try{localStorage.setItem('p1186_res',JSON.stringify(results));}catch(e){}
+  B('RESULT',rep.slice(0,700));
+  addFind(cur+': '+rep.slice(0,300));
+  setStatus(rep.slice(0,80));
+  log('=== '+cur+' -> '+rep+' ===','ok');
+  B('NEXT');
+  setTimeout(function(){location.reload(true);},700);
+}
+
+if(cur==='rabsort'){
+  setPhase('RAB grow/shrink mid-sort');
+  var rep='';
+  try{
+    var ab=new ArrayBuffer(256,{maxByteLength:4096});
+    var ta=new Uint8Array(ab);
+    for(var i=0;i<256;i++)ta[i]=(i*3)%251;
+    var n=0;
+    ta.sort(function(a,b){
+      n++;
+      if(n===1){ab.resize(1024);}
+      if(n===2){ab.resize(64);}
+      return a-b;
+    });
+    rep='sorted ok|cmps='+n+'|len='+ta.length;
+  }catch(e){rep='THROW:'+e.constructor.name+':'+String(e.message).slice(0,40);}
+  done(rep);
+}else if(cur==='stream'){
+  setPhase('TransformStream transform + font free');
+  var rep2='';
+  try{
+    var ts=new TransformStream({
+      transform:function(chunk,controller){
+        var ff=new FontFace('st'+Date.now()%100,'local(Courier)');
+        document.fonts.add(ff);
+        document.fonts.delete(ff);
+        controller.enqueue(chunk);
+      }
+    });
+    var writer=ts.writable.getWriter();
+    var reader=ts.readable.getReader();
+    writer.write('x').then(function(){
+      reader.read().then(function(r){
+        rep2='streamed='+(r.value||'?');
+        done(rep2);
+      });
+    });
+    return; /* done called in the async chain */
+  }catch(e){rep2='THROW:'+e.constructor.name+':'+String(e.message).slice(0,40);}
+  done(rep2);
+}else if(cur==='channel'){
+  setPhase('MessageChannel onmessage + fonts.delete');
+  var rep3='';
+  try{
+    var ch=new MessageChannel();
+    ch.port1.onmessage=function(ev){
+      var ff=new FontFace('mc'+Date.now()%100,'local(Courier)');
+      document.fonts.add(ff);
+      document.fonts.delete(ff);
+      document.fonts.check('1em mc0');
+      rep3='msg-handled|size='+document.fonts.size;
+      done(rep3);
+    };
+    ch.port2.postMessage('go');
+  }catch(e){rep3='THROW:'+e.constructor.name+':'+String(e.message).slice(0,40);done(rep3);}
+}else if(cur==='rabFonts'){
+  setPhase('RAB resize during fonts.load');
+  var rep4='';
+  try{
+    var ab2=new ArrayBuffer(256,{maxByteLength:1048576});
+    var iv=setInterval(function(){
+      try{ab2.resize((ab2.byteLength*2)%1048576+256);}catch(e){clearInterval(iv);}
+    },5);
+    document.fonts.load('1em s0','AB').then(function(){
+      clearInterval(iv);
+      rep4='loaded|len='+ab2.byteLength;
+      done(rep4);
+    },function(){clearInterval(iv);rep4='rejected';done(rep4);});
+  }catch(e){rep4='THROW:'+e.constructor.name+':'+String(e.message).slice(0,40);done(rep4);}
+}
+
+} /* stage machine */
+
+/* auto-reload checker */
+(function(){
+  var cur='P1186-rab-stream';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>
