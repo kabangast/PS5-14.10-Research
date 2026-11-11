@@ -1,0 +1,158 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1190 structuredClone Getter+Transfer Races</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1190 — STRUCTUREDCLONE GETTER+TRANSFER RACES</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">stage: ?</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var d=document.createElement('div');d.textContent=t;FD.textContent='';FD.appendChild(d);}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1190-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* P1190: structuredClone getter+transfer races — getters on the cloned
+   object that transfer/detach buffers mid-serialization; transfer lists
+   referencing objects also mutated by getters; RAB grow during clone. */
+var STAGES=['detachInGetter','transferSelfGetter','rabGrowClone','cloneTransferSame','nestedGetter'];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1190_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1190_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/4 — '+STAGES[stage]);
+
+if(stage>=STAGES.length){
+  setStatus('ALL DONE');
+  B('ALL-DONE',JSON.stringify(results).slice(0,800));
+  log('=== ALL DONE ===','ok');
+  try{localStorage.removeItem('p1190_stage');}catch(e){}
+}else{
+try{localStorage.setItem('p1190_stage',''+(stage+1));}catch(e){}
+var cur=STAGES[stage];
+
+function done(rep){
+  results.push({stage:stage,name:cur,result:rep});
+  try{localStorage.setItem('p1190_res',JSON.stringify(results));}catch(e){}
+  B('RESULT',rep.slice(0,700));
+  addFind(cur+': '+rep.slice(0,300));
+  setStatus(rep.slice(0,80));
+  log('=== '+cur+' -> '+rep+' ===','ok');
+  B('NEXT');setTimeout(function(){location.reload(true);},700);
+}
+
+if(cur==='detachInGetter'){
+  setPhase('getter detaches a buffer mid-clone');
+  var ab=new ArrayBuffer(1024);
+  var u8=new Uint8Array(ab);
+  for(var i=0;i<1024;i++)u8[i]=i%251;
+  var obj={};
+  Object.defineProperty(obj,'x',{configurable:true,get:function(){
+    B('GETTER','detach');
+    try{structuredClone(ab,{transfer:[ab]});}catch(e){}
+    return u8;
+  }});
+  var rep;
+  try{
+    var c=structuredClone(obj);
+    rep='cloned|len='+(c.x?c.x.byteLength:'?');
+  }catch(e){rep='THROW:'+e.constructor.name+':'+String(e.message).slice(0,40);}
+  done(rep);
+}else if(cur==='transferSelfGetter'){
+  setPhase('transfer list object with getter');
+  var ab2=new ArrayBuffer(2048);
+  var rep2;
+  try{
+    var c2=structuredClone({}, {transfer:[ab2]});
+    rep2='cloned|abLen='+ab2.byteLength;
+  }catch(e){rep2='THROW:'+e.constructor.name+':'+String(e.message).slice(0,40);}
+  done(rep2);
+}else if(cur==='rabGrowClone'){
+  setPhase('RAB grow during clone');
+  var rab=new ArrayBuffer(256,{maxByteLength:8192});
+  var src={a:new Uint8Array(rab)};
+  var iv=setInterval(function(){
+    try{rab.resize((rab.byteLength*2)%8192+256);}catch(e){clearInterval(iv);}
+  },2);
+  var rep3;
+  try{
+    var c3=structuredClone(src);
+    clearInterval(iv);
+    rep3='cloned|len='+c3.a.byteLength+'|rab='+rab.byteLength;
+  }catch(e){clearInterval(iv);rep3='THROW:'+e.constructor.name;}
+  done(rep3);
+}else if(cur==='cloneTransferSame'){
+  setPhase('clone+transfer same buffer');
+  var ab4=new ArrayBuffer(4096);
+  var rep4;
+  try{
+    var c4=structuredClone({b:ab4},{transfer:[ab4]});
+    rep4='cloned|b='+(c4.b&&c4.b.byteLength)+'|orig='+ab4.byteLength;
+  }catch(e){rep4='THROW:'+e.constructor.name+':'+String(e.message).slice(0,40);}
+  done(rep4);
+}else if(cur==='nestedGetter'){
+  setPhase('nested getters + GC');
+  var obj5={};
+  var get1=function(){
+    B('NEST-G1','fired');
+    for(var g=0;g<3000;g++){var t=new ArrayBuffer(1024);t=null;}
+    return {deep:{x:1}};
+  };
+  Object.defineProperty(obj5,'a',{configurable:true,get:get1});
+  Object.defineProperty(obj5,'b',{configurable:true,get:function(){
+    B('NEST-G2','fired');
+    return obj5.a;
+  }});
+  var rep5;
+  try{var c5=structuredClone(obj5);rep5='cloned';}
+  catch(e){rep5='THROW:'+e.constructor.name+':'+String(e.message).slice(0,40);}
+  done(rep5);
+}
+} /* stage machine */
+
+(function(){
+  var cur='P1190-sc-races';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>
