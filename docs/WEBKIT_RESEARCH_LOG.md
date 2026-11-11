@@ -388,9 +388,32 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 - All P595 logic bugs — clean
 - Custom element innerHTML re-entrancy — children detached before callbacks
 
-## Priority leads — UPDATED 2026-11-10 (post-P1086)
-**ALL WebKit memory-corruption vectors are DEAD on PS5 14.10.**
-1. **FL leak widening** — scan all spray size classes for recurring offset-0 qwords (vtable/code-pointer candidates). This is the ONLY remaining WebKit-side primitive.
-2. **CVE-2023-28205 structuredClone UAF** — Likely fixed but worth a quick test (P1076 ready); low probability.
-3. **CVE-2026-43720 same-type reclaim** — faithful alias but no pointer control (P702/P703); byte-write into the 768B object not reachable (P693-P705 matrix)
-4. **Kernel side (from Lua entry)** — only new-bug hunting remains: 13.60 static capture diffing, untested argument contracts. Browser path to kernel is blocked at Phase A step 4 (no addrOf/code-pointer leak).
+## 2026-11-10 — P1087: FL Leak Widening Results (11/15 sizes tested)
+- **Results**: sz=64,96,128,160,224,256,320,384,512,640,768 ALL returned zero non-zero qwords. Only **sz=192** returned engine data: 3 nz qwords, 2 heap pointers at +0x58/+0x68 (`0x10008bd140`, `0x10007e92d0`), off0=0x1, zero code/eboot pointers.
+- **Critical finding**: IsoHeap/TZone segregation is EXACT. Only the 192-byte size class reclaims the freed CSSFontFace slot. All other sizes produce clean zero-init buffers — zero leaks of ANY kind (heap, code, or otherwise).
+- **Implication**: The FontFace UAF leak is a singleton — it only discloses heap base via the 192B object's internal fields. There is no "adjacent size class" with code pointers. The leak widening approach is blocked.
+- **Off0 analysis**: The first qword of the reclaimed 192B object is always 0x1 (a refcount or flags field, NOT a vtable). +0x58 and +0x68 are heap pointers (likely m_family or m_fontData references). No code pointers anywhere in the 192-byte span.
+- **Status after sz=768**: probe stalled (no beacons 10:06-12:01), PS5 browser likely crashed on later size. But pattern is already decisive from 11/15 sizes.
+
+## 2026-11-11 — P1154v2/P1155/P1157 + pastawithpesto repo diff — NEW PRIMITIVE PATH
+- **P1157 WebAudio**: AudioContext=false — no WebAudio on PS5. DEAD.
+- **P1154/P1154v2 canvas stale-font UAF**: v2 got then-getter to fire (uafHit=true) and JS FontFace wrapper collected (wr=collected), but canvas `measureText` on the stale font returns UNCHANGED widths (w=111) — the C++ CSSFontFace stays alive via the canvas font state. No corruption, no leak. Stale-canvas-font path DEAD.
+- **P1155 dom-lifecycle survey**: deployed 2026-11-11 02:11 local, zero beacons (browser closed). No auto-reload checker in that page — manual reload needed.
+- **P1061/P1099/P1101 (verified from beacon log)**: sort-during-detach UAF confirmed (structuredClone transfer inside sort comparator: SORT_AFTER_DETACH, 6430 values from freed memory, P1061 06:09 UTC). P1099/P1101: read-then-patch on 192B reclaimed object — +0x0=0x1/0x100 flags, heap ptrs +0x58=0x10008cd820/+0x68=0x10007ee330 (per-boot ASLR-tracked), +0x0 write 0x100→0x1 survived 15s. Same FL-leak family (192B CSSFontFace).
+- **pastawithpesto repo diff (github.com/pastawithpesto/PS5-14.10-Jailbreak-Research, master)**: they are AHEAD on CVE-2026-43720:
+  - IsoHeap **OFF** on PlayStation per source audit (WTF_MAKE_ISO_ALLOCATED → standard FastMalloc, BPlatform.h:341 BPLATFORM(PLAYSTATION)); Gigacage OFF; JSC Config unfrozen (startOfStructureHeap writable); DAZ ON (must use BigUint64Array).
+  - v527: AB(768) reclaim of freed 768B context CONFIRMED (lineWidth=9999.99 readback) — CONTRADICTS our P693-P705/P571v14 "cross-type reclaim dead" matrix.
+  - V630: all 12 Canvas2D APIs R/W through alias CONFIRMED.
+  - V650-V655 CRASH ORACLE CONFIRMED: forge m_stateStack at AB offsets +112 (m_buffer, 8B LE) +120 (m_size) +124 (m_capacity); innerCtx.lineWidth = static read of float64 at m_buffer+48 (CanvasState.m_lineWidth); unmapped target → SIGSEGV. V655 binary-subdivision scanner over 0x310000000-0x311800000.
+  - V674: APNG overread leaks 1651 heap pointers — ASLR defeat CONFIRMED (different technique from our retracted P1042/P1043).
+  - Arb-R/W DESIGNED (not yet confirmed): forged lineDash Vector<double> in AB; getLineDash → arbitrary read, setLineDash copy-assign (capacity >= N) → arbitrary write.
+  - KEY MISSED TECHNIQUE: **600 × AB(16) deallocation-log flush BEFORE the AB(768) spray** — our reclaim matrix never did this.
+- **P1158 deployed 2026-11-11 05:48 local**: 16-stage crash-resume replication of V650 oracle, anchored on FL-leaked p1/p2 (guaranteed mapped). Stage sweep: AB sizes {768,736,752,784,800,816,832,896,1024} × offsets {112,104,120,128,136,96,88,80}. Survived lineWidth read = reclaim + oracle WORK on our console.
+- **Next**: collect P1158 beacons; if oracle works → V655-style scan around leaked p1 to map the WebProcess heap → forged lineDash Vector R/W (their Stage 6) → vtable hijack (Stage 7).
+
+## Priority leads — UPDATED 2026-11-11 (post-repo-diff)
+**NEW PRIMARY: Canvas CVE-2026-43720 forged-stateStack oracle → lineDash Vector arbitrary R/W** (pastawithpesto chain replication — they have oracle+leak, NOT yet R/W).
+1. **P1158 oracle discriminator** — running. Determines if AB(768) reclaim + +112 oracle works on our console.
+2. **If oracle works**: lineDash Vector forgery → arbitrary read (getLineDash) / write (setLineDash copy-assign) → startOfStructureHeap overwrite (unfrozen JSC config) → type confusion → code exec.
+3. **If oracle fails**: identify why cross-type reclaim differs from their console (allocator flush behavior, size class rounding) — their v527/v650 evidence is strong.
+4. Legacy leads (below) remain as fallback.

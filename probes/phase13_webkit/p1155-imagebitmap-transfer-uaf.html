@@ -1,0 +1,335 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1155</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+
+log('phase','=== P1155: DOM LIFECYCLE + TRANSFER UAF SURVEY ===');
+log('info','Testing multiple DOM UAF angles on PS5 Safari 17.0');
+B('P1155-START','t='+Date.now());
+
+var results=[];
+function addR(name,val){results.push(name+'='+val);}
+
+// === TEST A: ImageBitmap transfer detach ===
+log('phase','--- A: ImageBitmap transfer ---');
+(function(){
+  var cv=document.createElement('canvas');
+  cv.width=100;cv.height=100;
+  var ctx=cv.getContext('2d');
+  ctx.fillStyle='red';
+  ctx.fillRect(0,0,100,100);
+
+  var hasIB=(typeof createImageBitmap==='function');
+  addR('hasImageBitmap',hasIB);
+  B('P1155-A-HAS','createImageBitmap='+hasIB);
+
+  if(hasIB){
+    createImageBitmap(cv).then(function(bmp){
+      addR('bmpW',bmp.width);addR('bmpH',bmp.height);
+      B('P1155-A-BMP','w='+bmp.width+'|h='+bmp.height);
+
+      // Transfer via structuredClone
+      var hasTransfer=false;
+      try{
+        var clone=structuredClone(bmp,{transfer:[bmp]});
+        hasTransfer=true;
+        addR('transferred','true');
+        addR('origClosed',bmp.width===0&&bmp.height===0);
+        addR('cloneW',clone.width);
+        B('P1155-A-TRANSFER','origW='+bmp.width+'|cloneW='+clone.width);
+
+        // Now close the clone
+        if(typeof clone.close==='function'){
+          clone.close();
+          addR('cloneClosed','true');
+          B('P1155-A-CLOSE','closedW='+clone.width);
+          // Try to draw with closed bitmap
+          var cv2=document.createElement('canvas');
+          cv2.width=100;cv2.height=100;
+          var ctx2=cv2.getContext('2d');
+          try{
+            ctx2.drawImage(clone,0,0);
+            var pix=ctx2.getImageData(0,0,10,1);
+            var anyColor=false;
+            for(var i=0;i<pix.data.length;i+=4){
+              if(pix.data[i]>0)anyColor=true;
+            }
+            B('P1155-A-DRAW-CLOSED','drew=true|anyColor='+anyColor);
+          }catch(e){B('P1155-A-DRAW-CLOSED','err='+e.message.substring(0,40));}
+        }else{
+          addR('hasClose','false');
+          B('P1155-A-CLOSE','no close method');
+        }
+      }catch(e){
+        addR('transferErr',e.message.substring(0,40));
+        B('P1155-A-TRANSFER','err='+e.message.substring(0,40));
+      }
+    }).catch(function(e){B('P1155-A-BMP','err='+e.message.substring(0,40));});
+  }
+})();
+
+// === TEST B: Range/Selection stale node ===
+log('phase','--- B: Range stale node ---');
+(function(){
+  var container=document.createElement('div');
+  container.innerHTML='<span id="target">Hello</span><span>World</span>';
+  document.body.appendChild(container);
+  var target=container.querySelector('#target');
+
+  var range=document.createRange();
+  range.selectNodeContents(target);
+  addR('rangeStr',range.toString());
+  B('P1155-B-RANGE','str='+range.toString());
+
+  // Remove target node while Range holds it
+  target.remove();
+  // Force layout
+  document.body.offsetHeight;
+
+  // Access range after node removal
+  var postStr='',postStart='',postEnd='';
+  try{postStr=range.toString();}catch(e){postStr='ERR:'+e.message.substring(0,30);}
+  try{postStart=range.startContainer.nodeName;}catch(e){postStart='ERR';}
+  try{postEnd=range.endContainer.nodeName;}catch(e){postEnd='ERR';}
+  B('P1155-B-POST','str='+postStr+'|start='+postStart+'|end='+postEnd);
+
+  // GC pressure then access again
+  for(var g=0;g<1000;g++){var t={};t=null;}
+  target=null;
+
+  var gcStr='';
+  try{gcStr=range.toString();}catch(e){gcStr='ERR:'+e.message.substring(0,30);}
+  B('P1155-B-GC','str='+gcStr);
+  container.remove();
+})();
+
+// === TEST C: MutationObserver + node removal timing ===
+log('phase','--- C: MutationObserver lifecycle ---');
+(function(){
+  var container=document.createElement('div');
+  document.body.appendChild(container);
+  var child=document.createElement('div');
+  child.textContent='observed';
+  child.id='mut-target';
+  container.appendChild(child);
+
+  var records=[];
+  var obs=new MutationObserver(function(muts){
+    for(var i=0;i<muts.length;i++){
+      var m=muts[i];
+      var targetTag='?';
+      try{targetTag=m.target.nodeName+'#'+m.target.id;}catch(e){targetTag='ERR';}
+      records.push(m.type+':'+targetTag);
+    }
+  });
+  obs.observe(container,{childList:true,subtree:true,attributes:true});
+
+  // Modify child
+  child.setAttribute('data-x','1');
+  // Remove child
+  container.removeChild(child);
+  // Null out reference
+  var weakChild=new WeakRef(child);
+  child=null;
+
+  // Force microtask
+  Promise.resolve().then(function(){
+    // GC
+    for(var g=0;g<2000;g++){var t=new ArrayBuffer(1024);t=null;}
+
+    var wr='?';
+    try{var d=weakChild.deref();wr=d?'alive':'collected';}catch(e){wr='err';}
+    B('P1155-C-MUT','records='+records.join(';')+'|wr='+wr);
+
+    // Check if records still reference the removed node
+    obs.disconnect();
+    var pending=obs.takeRecords();
+    B('P1155-C-PENDING','count='+pending.length);
+  });
+
+  container.remove();
+})();
+
+// === TEST D: Event listener on removed node ===
+log('phase','--- D: Event dispatch on removed node ---');
+(function(){
+  var el=document.createElement('div');
+  el.id='evt-target';
+  document.body.appendChild(el);
+
+  var evtFired=false;
+  el.addEventListener('custom-test',function(e){
+    evtFired=true;
+    B('P1155-D-EVT','target='+e.target.id+'|type='+e.type);
+  });
+
+  // Remove from DOM
+  el.remove();
+  document.body.offsetHeight;
+
+  // Dispatch event on removed (but still referenced) element
+  try{
+    el.dispatchEvent(new CustomEvent('custom-test',{detail:{x:1}}));
+    B('P1155-D-DISPATCH','fired='+evtFired);
+  }catch(e){B('P1155-D-DISPATCH','err='+e.message.substring(0,40));}
+
+  // Now null the reference
+  var weakEl=new WeakRef(el);
+  el=null;
+  for(var g=0;g<2000;g++){var t={};t=null;}
+  var wr='?';
+  try{var d=weakEl.deref();wr=d?'alive':'collected';}catch(e){wr='err';}
+  B('P1155-D-GC','wr='+wr);
+})();
+
+// === TEST E: TreeWalker on modified tree ===
+log('phase','--- E: TreeWalker stale iterator ---');
+(function(){
+  var container=document.createElement('div');
+  for(var i=0;i<10;i++){
+    var c=document.createElement('span');
+    c.textContent='node'+i;
+    c.className='tw-node';
+    container.appendChild(c);
+  }
+  document.body.appendChild(container);
+
+  var tw=document.createTreeWalker(container,NodeFilter.SHOW_ELEMENT);
+  // Advance to node 3
+  for(var i=0;i<3;i++)tw.nextNode();
+  var current=tw.currentNode;
+  B('P1155-E-POS','current='+current.textContent);
+
+  // Remove nodes 4-7 while walker is at node 3
+  var toRemove=[];
+  var spans=container.querySelectorAll('.tw-node');
+  for(var i=4;i<8&&i<spans.length;i++)toRemove.push(spans[i]);
+  for(var i=0;i<toRemove.length;i++)toRemove[i].remove();
+
+  // Continue walking — does it skip, crash, or access freed nodes?
+  var walked=[];
+  var next;
+  try{
+    while(next=tw.nextNode()){
+      walked.push(next.textContent);
+      if(walked.length>20)break;
+    }
+  }catch(e){walked.push('ERR:'+e.message.substring(0,30));}
+  B('P1155-E-WALK','nodes='+walked.join(','));
+  container.remove();
+})();
+
+// === TEST F: CSSStyleDeclaration on removed element ===
+log('phase','--- F: Stale CSSStyleDeclaration ---');
+(function(){
+  var el=document.createElement('div');
+  el.style.width='100px';
+  el.style.color='red';
+  document.body.appendChild(el);
+
+  var computed=getComputedStyle(el);
+  var liveW=computed.width;
+  var liveC=computed.color;
+  B('P1155-F-LIVE','w='+liveW+'|c='+liveC);
+
+  // Remove element
+  el.remove();
+  el=null;
+  document.body.offsetHeight;
+
+  // Access computed style of removed element
+  var staleW='',staleC='';
+  try{staleW=computed.width;}catch(e){staleW='ERR:'+e.message.substring(0,30);}
+  try{staleC=computed.color;}catch(e){staleC='ERR:'+e.message.substring(0,30);}
+  B('P1155-F-STALE','w='+staleW+'|c='+staleC);
+
+  // GC and try again
+  for(var g=0;g<3000;g++){var t=new ArrayBuffer(512);t=null;}
+  var staleW2='',staleC2='';
+  try{staleW2=computed.width;}catch(e){staleW2='ERR:'+e.message.substring(0,30);}
+  try{staleC2=computed.color;}catch(e){staleC2='ERR:'+e.message.substring(0,30);}
+  B('P1155-F-GC','w='+staleW2+'|c='+staleC2);
+})();
+
+// === TEST G: OffscreenCanvas transfer (if available) ===
+log('phase','--- G: OffscreenCanvas ---');
+(function(){
+  var hasOC=(typeof OffscreenCanvas!=='undefined');
+  B('P1155-G-HAS','OffscreenCanvas='+hasOC);
+  if(hasOC){
+    try{
+      var oc=new OffscreenCanvas(100,100);
+      var octx=oc.getContext('2d');
+      octx.fillRect(0,0,50,50);
+      // Transfer via structuredClone
+      var clone=structuredClone(oc,{transfer:[oc]});
+      B('P1155-G-TRANSFER','origW='+oc.width+'|cloneW='+clone.width);
+    }catch(e){B('P1155-G-TRANSFER','err='+e.message.substring(0,40));}
+  }
+
+  // Test canvas.transferControlToOffscreen
+  var cv=document.createElement('canvas');
+  cv.width=100;cv.height=100;
+  var hasTCO=(typeof cv.transferControlToOffscreen==='function');
+  B('P1155-G-TCO','hasTransferControl='+hasTCO);
+})();
+
+// === TEST H: Blob URL after revoke ===
+log('phase','--- H: Blob URL revoke ---');
+(function(){
+  var blob=new Blob(['<h1>test</h1>'],{type:'text/html'});
+  var url=URL.createObjectURL(blob);
+  B('P1155-H-URL','url='+url.substring(0,60));
+
+  // Revoke
+  URL.revokeObjectURL(url);
+  blob=null;
+
+  // Try to fetch revoked URL
+  var img=new Image();
+  img.onload=function(){B('P1155-H-LOAD','loaded');};
+  img.onerror=function(){B('P1155-H-LOAD','error (expected)');};
+  img.src=url;
+})();
+
+// === TEST I: CSS animation on removed element ===
+log('phase','--- I: CSS animation lifecycle ---');
+(function(){
+  var style=document.createElement('style');
+  style.textContent='@keyframes testAnim{from{opacity:1}to{opacity:0}}.anim-test{animation:testAnim 2s linear}';
+  document.head.appendChild(style);
+
+  var el=document.createElement('div');
+  el.className='anim-test';
+  el.textContent='animated';
+  el.style.width='50px';
+  document.body.appendChild(el);
+
+  var animStarted=false;
+  el.addEventListener('animationstart',function(){
+    animStarted=true;
+    B('P1155-I-ASTART','started');
+  });
+
+  // Remove element mid-animation
+  setTimeout(function(){
+    var wasStarted=animStarted;
+    el.remove();
+    el=null;
+    // GC
+    for(var g=0;g<2000;g++){var t={};t=null;}
+    B('P1155-I-REMOVED','wasStarted='+wasStarted);
+    style.remove();
+  },100);
+})();
+
+// === DONE ===
+setTimeout(function(){
+  B('P1155-RESULTS',results.join('|'));
+  B('P1155-DONE','complete');
+},5000);
+</script></body></html>

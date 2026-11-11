@@ -1,0 +1,176 @@
+🎮 PS5 Full Jailbreak Chain
+=========================
+
+📋 TARGET INFO
+=========================
+Platform:        PlayStation 5
+Firmware:        14.10
+Exploit:         WebKit (browser)
+
+📊 PROGRESS: 4/35 steps done (11%)
+🚧 CURRENT BLOCKER: Step 5 — need to derive WebKit code base from heap pointers
+
+⛓️ JAILBREAK CHAIN
+=========================
+
+🌐 PHASE A: WEBKIT EXPLOITATION
+1.  ✅ Find a WebKit bug                    — P1061: sort-during-detach UAF
+2.  ✅ Trigger the bug                      — P1061: structuredClone/postMessage/worker detach during sort
+3.  ✅ Stabilize the corruption              — P1099: read-then-patch strategy, survived 15s no crash
+4.  ✅ Get an info leak                      — P1099/P1101: 2 heap ptrs at +0x58/+0x68, write confirmed
+5.  🟨 Defeat ASLR                           — have heap ptrs, need WebKit code base
+6.  ⬜ Build addrOf primitive                 — JS object to raw heap address
+7.  ⬜ Build fakeObj primitive                — raw address to fake JS object
+8.  ⬜ Create fake ArrayBuffer                — forge butterfly/backing store pointer
+9.  ⬜ Get arbitrary read                     — read any userland address
+10. ⬜ Get arbitrary write                    — write any userland address
+11. ⬜ Defeat WebKit mitigations              — Gigacage, StructureID, IsoHeap
+12. ⬜ Find RWX or code-signing bypass        — no JIT on PS5, W^X enforced
+13. ⬜ Write shellcode                        — place payload in executable memory
+14. ⬜ Hijack control flow                    — overwrite function ptr or vtable
+15. ⬜ Execute userland shellcode             — native code in WebProcess
+
+🔓 PHASE B: SANDBOX ESCAPE
+16. ⬜ Escape WebKit sandbox                  — syscall or IPC escape from WebProcess
+
+💀 PHASE C: KERNEL EXPLOITATION
+17. ⬜ Leak kernel ASLR slide                 — find kernel base from userland
+18. ⬜ Find a kernel bug                      — race, UAF, overflow in syscall
+19. ⬜ Trigger kernel bug                     — craft syscall sequence
+20. ⬜ Get kernel read primitive              — read arbitrary kernel memory
+21. ⬜ Get kernel write primitive             — write arbitrary kernel memory
+
+👑 PHASE D: PRIVILEGE ESCALATION
+22. ⬜ Find kernel credentials struct          — locate ucred in kernel memory
+23. ⬜ Escalate privileges                    — uid=0, capabilities, authid
+24. ⬜ Disable kernel security flags          — syscall filter, sandbox
+25. ⬜ Disable W^X in kernel                  — patch PTEs or security policy
+26. ⬜ Map kernel as RW from userland         — or keep kernel R/W primitive
+27. ⬜ Patch code signing                     — allow unsigned code
+
+🛡️ PHASE E: HYPERVISOR BYPASS
+28. ⬜ Defeat hypervisor checks               — HV monitors kernel integrity
+29. ⬜ Find hypervisor bug                    — separate HV vuln
+30. ⬜ Escape hypervisor                      — HV code exec or neutralize
+31. ⬜ Disable IOMMU                          — DMA to all physical memory
+
+🏁 PHASE F: PERSISTENCE + PAYLOAD
+32. ⬜ Patch secure boot chain                — prevent re-verification
+33. ⬜ Install payload loader                 — persistent entry point
+34. ⬜ Load homebrew enabler                  — GoldHEN equivalent
+35. 🏆 Profit                                 — unsigned code, dumps, packages
+
+
+
+
+
+
+
+
+
+
+================================================================================
+📖 MORE TECHNICAL INFO
+================================================================================
+
+🎯 TARGET INFO
+-----------
+Platform:        PlayStation 5
+Firmware:        14.10
+Exploit:         WebKit (browser)
+Kernel:          FreeBSD r230171 (Sep 28 2026)
+Device:          PlayStation 5 (Retail)
+Page Size:       16KB
+WebKit Version:  605.1.15 (Safari 17.0 era)
+JS Engine:       JavaScriptCore — LLInt ONLY (no DFG/FTL JIT)
+User Agent:      Mozilla/5.0 (PlayStation; PlayStation 5/14.10) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0
+CPU Cores:       4 (exposed to JS)
+Language:        en-US
+Touch Points:    0
+
+🛡️ SECURITY MITIGATIONS
+--------------------
+W^X:             🔴 ENFORCED (mprotect bit 0x4 always refused)
+IsoHeap/TZone:   🔴 ACTIVE (blocks cross-type UAF reclaim)
+Gigacage:        🟡 UNKNOWN (indirect test inconclusive)
+JIT:             🔴 DISABLED (LLInt only — no DFG, no FTL)
+YARR JIT:        🟢 LIKELY ACTIVE (regex JIT separate from JS JIT, ratio=1.28)
+ASLR:            🔴 Per-connection (fresh process each WebKit load)
+XOM:             🔴 System lib .text is execute-only (reading crashes)
+Eboot:           🟢 RX (readable + executable)
+WebAssembly:     ❌ NO
+SharedArrayBuffer: ❌ NO
+Workers:         ✅ YES (with transfer)
+ServiceWorker:   ❌ NO
+OffscreenCanvas: ❌ NO
+
+⚡ EXPLOIT PRIMITIVES AVAILABLE
+-----------------------------
+Sort-during-detach UAF:   🔥 P1061 (structuredClone/postMessage/worker)
+Heap ptr leak:            🔥 P1099/P1101 (+0x58, +0x68 stable across runs)
+Object write:             🔥 P1101 (overwrote +0x0, survived)
+BigUint64Array:           ✅ YES (reads raw 64-bit pointers, bypasses DAZ)
+ResizableArrayBuffer:     ✅ YES
+structuredClone transfer: ✅ YES (detaches properly)
+FontFace ptr disclosure:  ✅ YES (engine heap base, not self-address)
+MSE/SourceBuffer:         ✅ YES (avc1/hev1/vp9/mp4a/opus)
+BroadcastChannel:         ✅ YES
+CacheAPI:                 ✅ YES
+crypto.subtle:            ✅ YES (AES-GCM, HMAC, ECDH, PBKDF2)
+
+================================================================================
+💻 CODE SNIPPETS — How each done step was achieved
+================================================================================
+
+--- 🐛 STEP 1 & 2: Find + Trigger the bug (P1061) ---
+
+// Sort-during-detach UAF: sort comparator keeps running on freed memory
+let ab = new ArrayBuffer(1024);
+let ta = new Uint8Array(ab);
+ta.fill(0x41);
+
+ta.sort(function(a, b) {
+    // Detach the buffer mid-sort via structuredClone transfer
+    if (!detached) {
+        structuredClone(ab, { transfer: [ab] });
+        detached = true;
+    }
+    // Sort comparator CONTINUES reading freed memory here
+    leaked.push(a);  // these come from freed backing store
+    return a - b;
+});
+// Result: 163K comparisons, 6430 values extracted from freed memory
+
+
+--- 🧱 STEP 3: Stabilize the corruption (P1099) ---
+
+// "read-then-patch" strategy: trigger UAF, spray same-size ABs, patch object
+let victim = new ArrayBuffer(384);
+let view = new BigUint64Array(victim);
+
+// Trigger detach during sort
+view.sort((a, b) => {
+    if (!freed) { structuredClone(victim, { transfer: [victim] }); freed = true; }
+    return Number(a - b);
+});
+
+// Spray 600 same-size ArrayBuffers to reclaim the freed slot
+let spray = [];
+for (let i = 0; i < 600; i++) spray.push(new ArrayBuffer(384));
+
+// Read the reclaimed object — survived 15 seconds, no crash
+// Object sits stable in memory with readable/writable fields
+
+
+--- 🔍 STEP 4: Get an info leak (P1099/P1101) ---
+
+// After stabilization, read the corrupted object's fields via BigUint64Array
+// Two heap pointers consistently appear:
+//   +0x58 = 0x10008b5d20  (WebKit heap object)
+//   +0x68 = 0x100090a190  (WebKit heap object)
+//   +0x00 = 0x100          (size/flags field)
+
+// P1101 confirmed WRITE works too:
+// Overwrote +0x0 from 0x100 to 0x1 — process survived
+// These are stable, reproducible across runs (different ASLR slide each time)
+// Both pointers are in 0x100xxxxxxx range = WebKit heap region

