@@ -1,0 +1,184 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1185 FontFaceSet Iteration Re-entrancy</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1185 — FONTFACESET ITERATION RE-ENTRANCY</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">stage: ?</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var d=document.createElement('div');d.textContent=t;FD.textContent='';FD.appendChild(d);}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1185-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1185: FontFaceSet (document.fonts) iteration with mid-iteration
+   mutation — HashSet iterator invalidation is a classic UAF class never
+   tested on the fonts set. Stages:
+   0: 10 faces; for..of delete current face inside loop
+   1: delete ALL faces on first iteration
+   2: add NEW faces during iteration
+   3: keys()/values()/entries() iterators + delete
+   4: iteration + fonts.load re-entrancy inside loop
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var STAGES=['delEach','delAll','addDuring','iterators','loadInLoop'];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1185_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1185_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/4 — '+STAGES[stage]);
+
+if(stage>=STAGES.length){
+  setStatus('ALL DONE');
+  B('ALL-DONE',JSON.stringify(results).slice(0,800));
+  log('=== ALL DONE ===','ok');
+  try{localStorage.removeItem('p1185_stage');}catch(e){}
+}else{
+
+try{localStorage.setItem('p1185_stage',''+(stage+1));}catch(e){}
+var cur=STAGES[stage];
+
+function addFaces(n,prefix){
+  var out=[];
+  for(var i=0;i<n;i++){
+    var ff=new FontFace(prefix+i,'local(Courier)');
+    document.fonts.add(ff);
+    out.push(ff);
+  }
+  return out;
+}
+
+function done(rep){
+  results.push({stage:stage,name:cur,result:rep});
+  try{localStorage.setItem('p1185_res',JSON.stringify(results));}catch(e){}
+  B('RESULT',rep.slice(0,700));
+  addFind(cur+': '+rep.slice(0,300));
+  setStatus(rep.slice(0,80));
+  log('=== '+cur+' -> '+rep+' ===','ok');
+  B('NEXT');
+  setTimeout(function(){location.reload(true);},700);
+}
+
+if(cur==='delEach'){
+  setPhase('delete each during iteration');
+  var fs=addFaces(10,'it');
+  var seen=0,deleted=0,err='';
+  try{
+    for(var f of document.fonts){
+      seen++;
+      if(fs.indexOf(f)>=0){document.fonts.delete(f);deleted++;}
+    }
+  }catch(e){err=e.constructor.name+':'+String(e.message).slice(0,30);}
+  done('seen='+seen+'|deleted='+deleted+'|size='+document.fonts.size+'|err='+(err||'none'));
+}else if(cur==='delAll'){
+  setPhase('delete ALL on first iter');
+  addFaces(10,'all');
+  var seen2=0,err2='';
+  try{
+    for(var f2 of document.fonts){
+      if(seen2===0){
+        var arr=[];
+        for(var g of document.fonts)arr.push(g);
+        for(var h=0;h<arr.length;h++)document.fonts.delete(arr[h]);
+      }
+      seen2++;
+    }
+  }catch(e){err2=e.constructor.name+':'+String(e.message).slice(0,30);}
+  done('seen='+seen2+'|size='+document.fonts.size+'|err='+(err2||'none'));
+}else if(cur==='addDuring'){
+  setPhase('add during iteration');
+  addFaces(5,'ad');
+  var seen3=0,err3='';
+  try{
+    for(var f3 of document.fonts){
+      if(seen3<3)addFaces(2,'new'+seen3);
+      seen3++;
+    }
+  }catch(e){err3=e.constructor.name+':'+String(e.message).slice(0,30);}
+  done('seen='+seen3+'|size='+document.fonts.size+'|err='+(err3||'none'));
+}else if(cur==='iterators'){
+  setPhase('keys/values/entries + delete');
+  addFaces(6,'kv');
+  var rep='';
+  try{
+    var it1=document.fonts.keys();
+    var k1=it1.next();document.fonts.clear();
+    var k2=it1.next();
+    rep+='keys='+k1.value+'/'+(k2.done?'done':'more');
+  }catch(e){rep+='keysERR:'+String(e.message).slice(0,20);}
+  try{
+    addFaces(6,'kv2');
+    var it2=document.fonts.values();
+    var v1=it2.next();
+    document.fonts.clear();
+    var v2=it2.next();
+    rep+='|vals='+(v2.done?'done':'more');
+  }catch(e){rep+='|valsERR:'+String(e.message).slice(0,20);}
+  done(rep);
+}else if(cur==='loadInLoop'){
+  setPhase('fonts.load inside iteration');
+  addFaces(6,'ld');
+  var seen4=0,err4='';
+  try{
+    for(var f4 of document.fonts){
+      if(seen4===2){
+        document.fonts.load('1em ld0').then(function(){},function(){});
+        document.fonts.delete(f4);
+      }
+      seen4++;
+    }
+  }catch(e){err4=e.constructor.name+':'+String(e.message).slice(0,30);}
+  done('seen='+seen4+'|err='+(err4||'none'));
+}
+
+} /* stage machine */
+
+/* auto-reload checker */
+(function(){
+  var cur='P1185-ffset-iter';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>
