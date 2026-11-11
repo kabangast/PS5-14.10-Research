@@ -501,6 +501,12 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
   318348 = DFG OSR bug (dead); no other disclosures found.
 - Check log: 2026-11-11 r24: no WSA-2026-0007; 316918 (64780) =
   WASM OMG SIMD bug (dead — no WASM on PS5). Batch confirmed JIT/WASM-tier.
+- Check log: 2026-11-11 r25: no WSA-2026-0007. Source-verified the canvas
+  save/restore state-stack (local webkit_src CanvasRenderingContext2DBase.cpp):
+  realizeSavesLoop caps at MaxSaveCount (16385 entries max), restore()
+  guards empty-stack and unrealized cases — NO off-by-one, NO OOB.
+  The save-count-mismatch OOB idea is CLOSED (was UAF-dependent; TZone
+  killed the UAF).
 
 ## Priority leads — UPDATED 2026-11-11 (user directive: WebKit-only)
 1. WSA-2026-0007+ watch (standing re-check each round).
