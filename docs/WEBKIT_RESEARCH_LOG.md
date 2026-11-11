@@ -531,6 +531,16 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 - **Local audit queue (43720 bug class = dictionary-conversion-before-state-settle)**: KeyframeEffect.cpp:222/224 (WAAPI KeyframeEffectOptions — PS5 HAS Web Animations, UNTESTED re-entrancy), OffscreenCanvas.cpp (absent on PS5 — dead), SubtleCrypto.cpp:1216 (algorithm dicts). Next console probes target the KeyframeEffect construction re-entrancy (keyframe/option getters removing the target element mid-construction).
 - WSL not installed on host (option for user: local Linux JSC build for offline JS-level testing).
 
+## 2026-11-11 — Blackout period: font-machinery source audit complete (FL leak path fully documented)
+- **FL-leak trigger path source-confirmed (exact branch)**: FontFaceSet::load() (FontFaceSet.cpp) → matchingFacesExcludingPreinstalledFonts → face.get().load() → CSSFontFaceSet::fontStateChanged → faceFinished → pendingPromise->promise->resolve(faces) → JS thenable assimilation fires FontFace.prototype.then getter = OUR leak window. The dual-face requirement: the pending promise is appended to BOTH faces' lists (2 refs) — resolves only at the second finish (hasOneRef check).
+- **Allocator map (exact branch, complete)**: FontFaceSet = ISO (per-type zone); CSSFontFace = FAST_ALLOCATED_WITH_HEAP_IDENTIFIER (192B, reclaimable — the leak object); CSSFontFaceSource = DEFINE_ALLOCATOR_WITH_HEAP_IDENTIFIER (plain fastMalloc, vtable-bearing via FontLoadRequest::Client, ~128-160B, freed alongside the face but never written post-free — consistent with our 192B-only leak).
+- **fontLoaded() protects the face**: Ref<CSSFontFace> protectedFace(m_face) — explains face survival until the promise path.
+- **New audit findings**:
+  - FontFaceSet::Iterator::next() re-checks size() each step (in-bounds; P1185-safe).
+  - CSSFontFaceSource::fontLoaded "may be called twice if loading was cancelled" — double-finish path; faceFinished's second take() returns empty (guarded).
+  - CSSFontFaceSet::completedLoading iterates m_fontEventClients while 'loadingdone' JS fires — P1193 targets the add/remove-listener mutation of that set.
+- **P1193 committed** (FontEventClient set mutation, 6 stages). Queue: P1187v6 (deployed) → P1188-P1193.
+
 ## 2026-11-11 — CREATIVE ATTACK MODE results (user directive: keep poking, go wild)
 - **P1179 (sweep x state-stack code-pointer trap)**: 3-primitive chain — metadata sweep writes a code pointer every 112B; state-stack out-of-line buffer allocated during the sweep; alias reads every state double. Result: alias control verified (defaults clean), trap stages found NO pointer-shaped values — the 6400B state buffer is also outside the sweep's path (10+ sweep experiments now: the sweep traverses only JS-unreadable memory on our console; its writes are conclusively unreachable).
 - **P1180 (BMR dangle + transferFromImageBitmap)**: novel variant — free the 80B bitmaprenderer context by calling getContext('2d') after it exists. Result: ALL stages SURVIVED — per spec getContext returns null WITHOUT replacing an existing different-type context, so the BMR is never freed; no dangle forms. CLOSED by design.
