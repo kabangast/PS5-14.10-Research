@@ -457,12 +457,23 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 - **CVE-2026-64784 confirmed timeline**: WSA-2026-0006 (29 Sep 2026, one day after our FW build) lists it — consistent with our P1161 live result.
 - Remaining untriaged: CVE-2026-64715 (bug 316347 UAF, ZDI), CVE-2026-64719 (bug 319404 OOB), CVE-2026-64779/64782 (bugs 321485/321480 memory corruption), and the AI-found batch (bugs 317142/317349/317450/317603/317611/316791/316918/316996/318348/318405/321517 = CVE-2026-65331..65351).
 
-## Priority leads — UPDATED 2026-11-11 (CVE triage line)
-1. **P1174 (running next)**: CVE-2026-64783 datalist UAF — if any activation
-   variant crashes, we have a NEW live WebCore UAF on our console; then
-   probe InputType allocator + same/cross-type reclaim for the fake-vtable
-   escalation (the call is a VIRTUAL call through the freed owner!).
-2. **P1175+**: continue the commit-search triage of the remaining WSA-2026
-   bugs (64715/64719/64779/64782 + the 65331-65351 batch).
+## 2026-11-11 — CVE triage results (WSA-2026-0005/0006 round 1)
+- **CVE-2026-64783 (datalist UAF)**: **DEAD — feature absent**. P1174 stage 0 detect: `datalist=false|listAttr=false|inp.list=null` — PS5 build has NO `<datalist>`/`list` support (HTMLDataListElement undefined), so the DataListButtonElement shadow structure never exists. All 6 activation variants survived. Same class as the P604 date-input stripping: PS5 removes form-control features wholesale.
+- **CVE-2026-64715 (bug 316347, ZDI)**: **DEAD — JIT bug**. Fix commit = "[JSC] Fix B3 ReduceStrength Select specialization" — B3 is the DFG/FTL backend, absent on PS5 (LLInt+Baseline only).
+- **CVE-2026-64787 (bug 313703)**: trigger recovered (adoptNode + iframe.remove + innerHTML under require-trusted-types-for CSP) — needs Trusted Types; PS5 Safari 17-era build almost certainly lacks it. Feature-check queued (low priority).
+- **CVE-2026-64784**: WSA-2026-0006 (2026-09-29, one day after FW build) — consistent with our live P1161 sweep.
+- **CVE-2026-64719 (bug 319404)**: fix commit not yet in public mirror (embargoed) — queue for re-check.
+- **Remaining queue**: 64779 (321485), 64782 (321480) locking bugs; the AI-found batch 65331-65351 (bugs 317142/317349/317450/317603/317611/316791/316918/316996/318348/318405/321517).
+- **Method note**: GitHub commit search matches BOTH bug-id references and canonical-link numbers; the fix is the commit whose MESSAGE contains "bugs.webkit.org/show_bug.cgi?id=<n>".
+
+## Priority leads — UPDATED 2026-11-11 (triage round 1)
+1. **P1175+ triage continuation**: commit-search the remaining queue
+   (64779/64782 + 65331-65351 batch) — the batch is the most promising:
+   10+ state-management/memory fixes from a coordinated 2026 AI-assisted
+   effort, LLInt-relevant, unbackported to the PS5 fork unless Sony chose
+   specific ones.
+2. Feature-gate awareness: prioritize bugs whose code paths exist in the
+   PS5's stripped build (no datalist, no date inputs, no Trusted Types,
+   no JIT, no WASM) — check the trigger's feature before writing probes.
 3. Canvas same-type alias + FL leak remain supporting primitives.
 4. Kernel side (Lua entry): only new-bug hunting remains.
