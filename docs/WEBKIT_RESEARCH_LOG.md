@@ -483,14 +483,15 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 - **Pattern**: post-disclosure security fixes re-appear in the mirror with bug IDs (like 313521/313703/317142 did); currently-embargoed ones are invisible to commit-search. The public triage queue is drained — next usable feed is WSA-2026-0007+ (post-build-date fixes) plus periodic re-checks of the embargoed IDs.
 - Consolidated console surface (all measured): canvas same-type alias R/W (typed); CSSFontFace 3-field leak; metadata sweep DoS; sort-detach anomaly. No addrOf/code-pointer/arb-R/W on this build via the known bug set.
 
-## Priority leads — UPDATED 2026-11-11 (post-triage-drain)
-1. **WSA-2026-0007+ watch** (next advisory, post-build-date fixes) + re-check
-   embargoed IDs (317349/317450/317603/317611/316791/316918/316996/318348/
-   318405/321517/321480) periodically via commit search.
-2. Unexplored micro-escalation of verified primitives remains open: the
-   canvas state-buffer (Vector<State> out-of-line 6400B buffer = plain
-   fastMalloc) stale-data read via unzeroed allocations — requires an
-   allocator path that does not fill (StringImpl createUninitialized
-   candidates) — needs source-verification before console time.
-3. Canvas same-type alias + FL leak remain supporting primitives.
+## 2026-11-11 — Source verification: unzeroed-StringImpl stale-read idea UNLIKELY
+- Checked WTF StringImpl.h + JSC StringPrototype.cpp (upstream main): `createUninitialized`/`tryCreateUninitialized` exist but ALL identified JS-reachable callers fill the full span (repeatCharacter: "allocating a sequential buffer and fill"; replace/pad use StringBuilder with full fill). No partial-fill path found → the canvas state-buffer stale-data read via a reclaimed string has no source support on the current upstream design, and the PS5 fork (older) is even less likely to have one.
+- **Verdict: micro-escalation CLOSED at source level — no console time spent.** The known-bug surface on our console is now measured end-to-end; the remaining feeds are time-gated (WSA-2026-0007+ advisories, embargo lifts).
+
+## Priority leads — UPDATED 2026-11-11 (source verification done)
+1. **WSA-2026-0007+ watch** — the next advisory's fixes (post-build-date
+   2026-09-28) are the only class Sony provably hasn't backported.
+2. Periodic re-check of embargoed batch IDs (317349/317450/317603/317611/
+   316791/316918/316996/318348/318405/321517/321480) via commit search.
+3. Canvas same-type alias + FL leak remain supporting primitives (typed
+   R/W + heap-ptr leak) for any future chain step that needs them.
 4. Kernel side (Lua entry): only new-bug hunting remains.
