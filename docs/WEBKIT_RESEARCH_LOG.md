@@ -499,6 +499,8 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
      without a new trigger.
 - Check log: 2026-11-11 r23: no WSA-2026-0007 (latest still 0006, Sep 29);
   318348 = DFG OSR bug (dead); no other disclosures found.
+- Check log: 2026-11-11 r24: no WSA-2026-0007; 316918 (64780) =
+  WASM OMG SIMD bug (dead — no WASM on PS5). Batch confirmed JIT/WASM-tier.
 
 ## Priority leads — UPDATED 2026-11-11 (user directive: WebKit-only)
 1. WSA-2026-0007+ watch (standing re-check each round).
