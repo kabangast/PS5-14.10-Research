@@ -521,9 +521,14 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 
 ## 2026-11-11 — VERSION PINNED + LOCAL SOURCE PENTESTING LINE (user strategy)
 - **PS5 browser version pinned from beacon logs**: UA = `Mozilla/5.0 (PlayStation; PlayStation 5/14.10) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15`; vendor = "Sony Interactive Entertainment Inc." (P833-PLAT). → **Safari 17.0 line = WebKit 7618.1.15.x**.
-- **Exact public branch identified**: `safari-7618.1.15-branch` (mirror has the full 7618 branch family incl. .1.15.10-.14). Shallow clone started in background (tools/webkit-7618).
-- **Local assets**: pastawithpesto submodule fully populated (their loader/payloads/tools incl. tools/cve-commit-map.py for CVE→commit mapping).
-- **Plan (user-approved)**: (1) diff the exact branch against our on-console measurements (TZone/ISO macros, feature gates, backport presence) to pin Sony's exact revision; (2) local parser fuzzing (Path2D/font/image) with fast host tooling; (3) systematic CVE→branch mapping via cve-commit-map.py; (4) craft payloads against the exact code instead of blind probing.
+- **CLONE COMPLETE (2026-11-11)**: `safari-7618.1.15-branch` @ tools/webkit-7618 (52,493 Source files, 1.24GB). **Source confirmations against our live console results (macro-for-macro match):**
+  - CanvasRenderingContext2D.h:37 = `WTF_MAKE_ISO_ALLOCATED` → our cross-type-reclaim failure is source-proven for the exact version; community "IsoHeap OFF" claim doubly disproven.
+  - CSSFontFace.h:61 = `WTF_MAKE_FAST_ALLOCATED_WITH_HEAP_IDENTIFIER` → FL-leak reclaimability explained.
+  - UnlinkedMetadataTable.cpp:109 = `unsigned offset` accumulator → metadata wrap bug NATIVE to this branch (matches P1161 live).
+  - HTMLCanvasElement.cpp:228-269 = m_context check BEFORE dictionary conversion, NO post-conversion re-check → CVE-2026-43720 UAF NATIVE to this branch (matches P605 live).
+  - CSSFontFace members: m_families(RefPtr), m_ranges(Vector), m_sources(Vector<unique_ptr>), m_wrapper(WeakPtr), m_status, bools, m_timeoutTimer(last) → our leak's +0x0=0x1 = RefCounted refcount; +0x58/+0x68 = vector buffer pointers (sources/families).
+  - **CONCLUSION: PS5 14.10 WebKit ≈ this exact public branch + Sony feature-strips + selective backports.**
+- **Local audit queue (43720 bug class = dictionary-conversion-before-state-settle)**: KeyframeEffect.cpp:222/224 (WAAPI KeyframeEffectOptions — PS5 HAS Web Animations, UNTESTED re-entrancy), OffscreenCanvas.cpp (absent on PS5 — dead), SubtleCrypto.cpp:1216 (algorithm dicts). Next console probes target the KeyframeEffect construction re-entrancy (keyframe/option getters removing the target element mid-construction).
 - WSL not installed on host (option for user: local Linux JSC build for offline JS-level testing).
 
 ## 2026-11-11 — CREATIVE ATTACK MODE results (user directive: keep poking, go wild)
