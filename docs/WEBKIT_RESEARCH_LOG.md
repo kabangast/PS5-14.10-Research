@@ -507,6 +507,9 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
   guards empty-stack and unrealized cases — NO off-by-one, NO OOB.
   The save-count-mismatch OOB idea is CLOSED (was UAF-dependent; TZone
   killed the UAF).
+- Check log: 2026-11-11 r26: no WSA-2026-0007; 321517 (65351) security
+  fix still embargoed (only test-coverage collision in mirror). No new
+  actionable triggers.
 
 ## Priority leads — UPDATED 2026-11-11 (user directive: WebKit-only)
 1. WSA-2026-0007+ watch (standing re-check each round).
