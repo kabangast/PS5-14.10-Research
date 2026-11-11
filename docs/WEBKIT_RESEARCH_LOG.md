@@ -445,15 +445,16 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 - **Implication**: the canvas object is off-limits for cross-type; our only cross-type UAF channel is the fastMalloc CSSFontFace (192B) — the setStatus write (+130) + Timer deref (+144..+191, m_thread +176) surface (community p458) is the live exploitation lead. P1171 targets exactly that.
 - P1172 (extended size sweep 512-4096) is superseded: cross-type reclaim is impossible at any size; kept only for the same-type control record.
 
-## Priority leads — UPDATED 2026-11-11 (768B mystery resolved)
-1. **P1171 (run on next reload)**: CSSFontFace setStatus UAF — observe the
-   m_status=3 write into our reclaimed AB (+130) and test the Timer deref:
-   forge +176 (m_thread) with FL-leaked p1/p2/0 → setStatus → crash/survive
-   = deref oracle. The face is fastMalloc → reclaim verified → this is the
-   one cross-type object we can control on our console.
-2. **Font/timer field exploration**: map every deref'd field of the
-   reclaimed face via controlled patterns (the p458 Timer RELEASE_ASSERT
-   proves a real deref exists — turn it into an oracle or a controlled
-   call via the leaked heap pointers).
+## 2026-11-11 — P1171 results + P1173 field mapper deployed
+- **P1171 partial results (04:49-04:50 UTC, 2 runs)**: stage 0 READBACK `status@130=0` + timer all-zeros — the community's +130 m_status / +144..+191 timer offsets are THEIR build's (wk1200); they do not match our console's build. Stage 2 forge +176=0 SURVIVED setStatus (LOADED status=loaded) — no timer deref crash, so either the offset is wrong or the timer path isn't taken on the freed face here.
+- **Interpretation**: our leak's stable +0x0=0x1 field may BE m_status (Status::Loading=1) on our build — the engine writes it post-free into our reclaimed AB (P1069v9 deep scan). Our build's CSSFontFace layout must be mapped empirically; the engine's post-free writes into the reclaimed AB are the map's readout.
+- **P1173 deployed**: per-operation full-192B qword dumps (baseline/fontscheck/fontsload/canvasfont/stylerecalc/facecycle) to identify which offsets the engine touches per operation on OUR build.
+
+## Priority leads — UPDATED 2026-11-11 (post-P1171)
+1. **P1173 (running next)**: empirical CSSFontFace field map for our build;
+   then forge the mapped deref fields (timer/thread) with FL-leaked pointers
+   to build the deref oracle.
+2. If the timer/thread deref exists on our build: p1/p2/0 forge matrix ->
+   crash-vs-survive oracle -> extend to a controlled call target.
 3. Canvas same-type alias + FL leak remain supporting primitives.
 4. Kernel side (Lua entry): only new-bug hunting remains.
