@@ -471,12 +471,20 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 - **STRATEGIC FINDING — Sony backports recent WebKit fixes**: the 65337 fix is 2026-08-25, yet our 14.10 build (kernel 2026-09-28) does NOT crash — matching the HABT case (2025-10 fix backported). The PS5 WebKit is NOT a frozen 2023 fork; it receives SELECTIVE security backports through at least Aug-Sep 2026. Implications for triage: bugs fixed BEFORE ~Sep 2026 are likely patched on our console (64783 was dead by feature-absence, not backport — but the pattern still holds); **the triage must target fixes AFTER the Sep-28-2026 build date** (post-WSA-2026-0006, e.g. bugs fixed Oct-Nov 2026), plus bugs Sony's selection missed (canvas 43720, metadata 64784).
 - 65337/64715 were JIT-or-LLInt IC bugs; both dead. The canvas 43720 + metadata 64784 (both live) are both pre-2024-vintage code paths Sony never touched — the profitable target class is OLD bugs in code Sony didn't modify, not new fixes they did apply.
 
-## Priority leads — UPDATED 2026-11-11 (backport pattern)
-1. **Post-build-date triage**: watch WSA-2026-0007+ (next advisories) and
-   search commits with dates after 2026-09-28; probe only those.
-2. **Old-bug surface in untouched code**: bugs like 43720/64784 that live
-   in subsystems Sony never patched (canvas, UnlinkedMetadataTable) —
-   audit OTHER old subsystems the same way (the 65331-65351 batch remains
-   worth checking case-by-case — some may be in unpatched subsystems).
-3. Canvas same-type alias + FL leak remain supporting primitives.
-4. Kernel side (Lua entry): only new-bug hunting remains.
+## 2026-11-11 — P1176/P1177/P1178: P1061 sort-detach escalation CLOSED (not a primitive)
+- **P1176**: P1061 re-confirmed (5120 comparisons after detach) but mid-sort string reclaim showed NO corruption (rope flatten ambiguity).
+- **P1177**: ImageData(16,16)/8x32 reclaim during sort, flattened string, 0xA5 pattern, pre-alloc control — ALL zero corruption. **The detached sort's writes do NOT reach reclaimed memory.**
+- **P1178**: Float64Array(24)/AB(192) + CSSFontFaceSource reclaim in-comparator — comparator values are ONLY my own pattern (0x3ffc...=1.75) + NaN (0x7ff8... = the sort's detached-slot filler). The CONTROL (no reclaim) shows identical values — **the sort reads from its own captured data, not live freed memory**. P1061's "SECRET_LEAKED" values were self-data all along.
+- **VERDICT: the sort-during-detach UAF (P1061) is a behavior anomaly only — no read primitive, no write primitive on freed memory. CLOSED.**
+
+## Priority leads — UPDATED 2026-11-11 (post-P1178)
+All confirmed console bugs are now fully characterized:
+- Canvas UAF: same-type alias R/W (typed only); cross-type impossible (TZone).
+- CSSFontFace UAF: 3-field leak only; no deref surface.
+- MetadataTable sweep: live DoS; writes unreachable.
+- Sort-detach UAF: anomaly only; CLOSED as primitive.
+Remaining forward paths:
+1. **Fresh-CVE line**: fixes AFTER the 2026-09-28 build date (next WSA-2026-0007+)
+   + old bugs in subsystems Sony never patched (canvas/metadata class).
+2. Canvas same-type alias + FL leak remain supporting primitives.
+3. Kernel side (Lua entry): only new-bug hunting remains.
