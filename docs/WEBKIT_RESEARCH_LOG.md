@@ -487,11 +487,21 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 - Checked WTF StringImpl.h + JSC StringPrototype.cpp (upstream main): `createUninitialized`/`tryCreateUninitialized` exist but ALL identified JS-reachable callers fill the full span (repeatCharacter: "allocating a sequential buffer and fill"; replace/pad use StringBuilder with full fill). No partial-fill path found → the canvas state-buffer stale-data read via a reclaimed string has no source support on the current upstream design, and the PS5 fork (older) is even less likely to have one.
 - **Verdict: micro-escalation CLOSED at source level — no console time spent.** The known-bug surface on our console is now measured end-to-end; the remaining feeds are time-gated (WSA-2026-0007+ advisories, embargo lifts).
 
-## Priority leads — UPDATED 2026-11-11 (source verification done)
-1. **WSA-2026-0007+ watch** — the next advisory's fixes (post-build-date
-   2026-09-28) are the only class Sony provably hasn't backported.
-2. Periodic re-check of embargoed batch IDs (317349/317450/317603/317611/
-   316791/316918/316996/318348/318405/321517/321480) via commit search.
-3. Canvas same-type alias + FL leak remain supporting primitives (typed
-   R/W + heap-ptr leak) for any future chain step that needs them.
-4. Kernel side (Lua entry): only new-bug hunting remains.
+## 2026-11-11 — Direction decision (user): WebKit-only, waiting on next advisory
+- User confirmed: stay WebKit-only; do NOT reopen the Lua/kernel side.
+- Standing procedure for each round until WSA-2026-0007 lands:
+  1. Re-check webkitgtk.org/security.html for a new advisory (post-build-date
+     fixes = the only class Sony provably hasn't backported).
+  2. Re-check 2 embargoed batch IDs via GitHub commit search (they become
+     visible on disclosure): 319404, 321480, 321485, 321517, 317450,
+     317603, 317611, 316791, 316918, 316996, 318405.
+  3. Keep the archive + verdict table current; no new console probes
+     without a new trigger.
+- Check log: 2026-11-11 r23: no WSA-2026-0007 (latest still 0006, Sep 29);
+  318348 = DFG OSR bug (dead); no other disclosures found.
+
+## Priority leads — UPDATED 2026-11-11 (user directive: WebKit-only)
+1. WSA-2026-0007+ watch (standing re-check each round).
+2. Embargo re-checks (2 IDs per round via commit search).
+3. Supporting primitives maintained (canvas alias, FL leak); kernel side
+   explicitly off-table per user directive.
