@@ -421,9 +421,15 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
   - Browser crash-recovery stalled after this crash (no auto-reload) — manual reload needed; next load reports CALL-CRASHED via stage=1.
 - **Next (exploitation of the sweep)**: port p144 bait-and-switch + p146 worker-polling architecture: main thread grooms witness strings + polls .length concurrently while a Worker triggers the call; the sweep corrupts the groomed targets (community: 14 JSString headers, .length=81400) BEFORE the process dies. Then encode bytecode offsets to control the written metadata bytes → m_fiber overwrite → length oracle → addrOf.
 
-## Priority leads — UPDATED 2026-11-11 (post-P1161)
-**MetadataTable overflow (CVE-2026-64784) is now OUR primary** — confirmed live on our console; it is a forward 32-bit-controlled write sweep that ignores IsoHeap entirely (writes raw bytes through the heap).
-1. **P1162: p146-style worker-polling corruption observer** — prove sweep corrupts groomed targets on OUR console (strings .length change observed before crash).
-2. **P1163: bytecode-offset encoding** — make the sweep write chosen 32-bit values at chosen offsets → JSString m_fiber overwrite → .length oracle = addrOf.
-3. Canvas same-type alias + FL leak remain as secondary primitives; community chain replication blocked (no cross-type 768B reclaim here).
-4. Kernel side (Lua entry) unchanged: only new-bug hunting remains.
+## 2026-11-11 — P1162: sweep corruption observer (memory-pressure status)
+- v1 (attempts 0-2): worker compiled (~11s) and GO fired on attempts 0-1; process died 6.9-9.7s later (sweep crash as expected) but ZERO POLL/CORRUPT beacons — root cause: poll() was never invoked initially (bug: polling=true set, poll() not called). Attempt 2 died during blob build.
+- v2 (fixed poll() + attempts=2): attempt 0 built blob (1054ms) and created worker but died ~5.7s into worker compile (no GO); attempt 1 died during blob build. **WebProcess memory exhaustion from repeated 171MB builds** — matches community dead-end note (OOM at 3.7GB AST). Browser needs restart for clean runs.
+- **Status: P1162 awaiting clean console state** (browser restart). The corruption-observer architecture is ready; once a clean boot compiles + GO fires, main-thread witness strings are polled every 100ms during the worker's sweep.
+- Exploitation note (for P1163): the sweep writes 96B entries at stride 96 starting at buffer+112; op_call metadata = bytecode offsets = a LINEAR RAMP (offset_k ≈ c×k) — a "write ramp values at 96B stride" primitive. To write value V at target T: place T so it's hit by entry k where offset_k = V. Target must sit at buffer+112+96k → groom with 96B-multiple objects. JSString m_fiber overwrite → .length oracle.
+
+## Priority leads — UPDATED 2026-11-11 (post-P1162)
+**MetadataTable overflow (CVE-2026-64784) is our primary** — confirmed live on our console; forward ramp-write sweep ignoring IsoHeap.
+1. **P1162 (redeploy after browser restart)**: observe sweep corruption of groomed witness strings (worker sweeps, main polls).
+2. **P1163: ramp-value encoding** — arrange targets at 96B-stride slots; overwrite JSString m_fiber with chosen ramp values → length oracle → addrOf.
+3. Canvas same-type alias + FL leak remain secondary. Community chain blocked (no cross-type 768B reclaim here).
+4. Kernel side (Lua entry): only new-bug hunting remains.
