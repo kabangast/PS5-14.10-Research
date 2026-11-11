@@ -106,7 +106,7 @@ def build_ttf(loca_off1):
     locaOff = i
     u32(i, 0); i += 4
     u32(i, loca_off1); i += 4
-    u32(i, loca_off1 + 12); i += 4
+    u32(i, loca_off1 + 34); i += 4    # glyph1 is 34 bytes (10 empty + 34 box)
     assert i - locaOff == locaL
     glyfOff = i
     # glyph0 empty (10 bytes)
@@ -187,8 +187,8 @@ tmap = {name: (off, ln) for name, off, ln in tables}
 locaOff = tmap["loca"][0]; glyfOff = tmap["glyf"][0]
 l0, l1, l2 = struct.unpack_from(">III", buf, locaOff)
 print(f"loca = [{l0}, {l1}, {l2}]  glyfOff={glyfOff}")
-if not (l0 == 0 and l1 == 10 and l2 == 10+44):
-    print(f"  !! loca mismatch: glyph0 [0,10), glyph1 [{l1},{l2}) expected [10,54)")
+if not (l0 == 0 and l1 == 10 and l2 == 10+34):
+    print(f"  !! loca mismatch: glyph0 [0,10), glyph1 [{l1},{l2}) expected [10,44)")
     ok = False
 else:
     print("  loca consistent: glyph0 empty, glyph1 = the box")
