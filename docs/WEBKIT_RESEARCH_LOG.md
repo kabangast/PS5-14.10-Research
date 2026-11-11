@@ -542,7 +542,12 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 - **P1193 committed** (FontEventClient set mutation, 6 stages). Queue: P1187v6 (deployed) → P1188-P1193.
 - **FontFace.cpp audit (r43)**: getter window confirmed = fontStateChanged(Success) → LoadedPromise::resolve(*this) → JS thenable assimilation, firing synchronously inside f.load() (P598v2-C match). Mechanism for face survival: JS-wrapper faces hold m_backing Ref (never freed by fonts.delete alone); the FL leak works on the CSS-RULE face (s0 — no wrapper) freed by styleEl.remove() + delete. P1194's style-removal-in-getter design validated; a freed-rule-face re-touch in FontFaceSet::load's loop is the crash candidate. Also: ArrayBuffer-source FontFace constructor MOVES the AB (detaches caller's buffer) — no getter window (descriptors read before create).
 
-## 2026-11-11 — PAUSED for power restoration (user directive)
+## 2026-11-11 — SWEEP-HARVEST LINE CONCLUSIVELY CLOSED (fusion run verdict)
+- **P1187v9 fusion (buf=188, N=38,347,923) executed its sweep**: 83s survival (vs ~10s for marge-tier buffers) = the 188B buffer DID land in the segregated tier as designed. Yet ALL 640 witnesses (16 sizes, 192B-100KB) stayed clean — zero 0xFFFFFFFF signatures, zero code pointers.
+- **FINAL VERDICT (this console)**: the MetadataTable 4.29GB sweep's write path does not cross ANY JS-readable allocation in any tested geometry — main-thread sprays, during-sweep allocs, worker-transfer holes, canvas baits, multi-class baits, in-worker geometry, and the segregated-tier fusion. ~40 sweep runs across 9 geometries. The sweep remains a live process-killing primitive (P1161 parity) with writes unreachable to JS. The community's p144/p146 harvest does not reproduce here. **LINE CLOSED.**
+- Queue advances: P1188 (KeyframeEffect re-entrancy) → P1189-P1194.
+
+## 2026-11-11 — SerializedScriptValue audit note
 - **SerializedScriptValue audit (in-progress, paused)**: the branch's serializer explicitly handles getter-mutation mid-clone — `// Property was removed during serialisation` guard re-checks property liveness; transfer pools (m_transferredArrayBuffers etc.) are handled via ObjectPoolMap. P1190's race variants are expected spec-guarded — the probe still worth one run (cheap).
 - **Standing state at pause**: console dark since 07:40 UTC (blackout). PS5 queue (10 probes): P1187v6 (deployed) → v7 → v8 → P1188 → P1189 → P1190 → P1191 → P1192 → P1193 → P1194. PC-test suite complete (6 tests). Archive current on private repo.
 - On resume: reload browser → P1187v6 runs → advance queue on beacon arrival.
