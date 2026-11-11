@@ -519,8 +519,7 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
   on PS5. DEAD for our console. Fix is Jun-2026 (main-tracked — likely in
   the Sep-28 build anyway).
 
-## Priority leads — UPDATED 2026-11-11 (user directive: WebKit-only)
-1. WSA-2026-0007+ watch (standing re-check each round).
-2. Embargo re-checks (2 IDs per round via commit search).
-3. Supporting primitives maintained (canvas alias, FL leak); kernel side
-   explicitly off-table per user directive.
+## 2026-11-11 — CREATIVE ATTACK MODE (user directive: keep poking, go wild)
+- **P1179 (sweep x state-stack code-pointer trap)**: 3-primitive chain — metadata sweep writes a code pointer every 112B; state-stack out-of-line buffer allocated during the sweep; alias reads every state double. Result: alias control verified (defaults clean), trap stages found NO pointer-shaped values — the 6400B state buffer is also outside the sweep's path (10+ sweep experiments now: the sweep traverses only JS-unreadable memory on our console; its writes are conclusively unreachable).
+- **P1180 (BMR dangle + transferFromImageBitmap)**: novel variant — free the 80B bitmaprenderer context by calling getContext('2d') after it exists. Result: ALL stages SURVIVED — per spec getContext returns null WITHOUT replacing an existing different-type context, so the BMR is never freed; no dangle forms. CLOSED by design.
+- Next poke-queue (novel, untested): (1) dictionary-re-entrancy on OTHER IDL methods (FontFace family/source/descriptor getters during constructor — descriptors dictionary conversion before C++ object creation); (2) beginLayer/endLayer state-switcher lifecycle mismatch (targetSwitcher Ref in CanvasState); (3) drawImage source-rect integer-overflow fuzz (huge negative coords); (4) putImageData/getImageData OOM-rect shapes; (5) measureText with hostile font strings (huge family lists, unicode ranges).

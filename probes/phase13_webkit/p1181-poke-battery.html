@@ -1,0 +1,171 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1181 Re-entrancy Poke Battery</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1181 — RE-ENTRANCY POKE BATTERY</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">stage: ?</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var d=document.createElement('div');d.textContent=t;FD.textContent='';FD.appendChild(d);}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1181-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1181: poke battery of untested novel angles.
+   0: FontFace descriptor getter re-entrancy (weight getter deletes fonts
+      + GC during constructor dictionary conversion)
+   1: descriptor getter re-entrancy x50 loop
+   2: beginLayer/endLayer detect + mismatch (endLayer without begin;
+      double endLayer; save/beginLayer/restore interleave)
+   3: drawImage source-rect integer-overflow fuzz (huge coords)
+   4: measureText hostile font strings (10k-family list, huge sizes)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var STAGES=['ffdesc','ffdesc50','layers','drawrect','fontstr'];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1181_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1181_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/4 — '+STAGES[stage]);
+
+if(stage>=STAGES.length){
+  setStatus('ALL DONE');
+  B('ALL-DONE',JSON.stringify(results).slice(0,800));
+  log('=== ALL DONE ===','ok');
+  try{localStorage.removeItem('p1181_stage');}catch(e){}
+}else{
+
+try{localStorage.setItem('p1181_stage',''+(stage+1));}catch(e){}
+var cur=STAGES[stage];
+
+function done(rep){
+  results.push({stage:stage,name:cur,result:rep});
+  try{localStorage.setItem('p1181_res',JSON.stringify(results));}catch(e){}
+  B('RESULT',rep.slice(0,700));
+  addFind(cur+': '+rep.slice(0,300));
+  setStatus(rep.slice(0,80));
+  log('=== '+cur+' -> '+rep+' ===','ok');
+  B('NEXT');
+  setTimeout(function(){location.reload(true);},700);
+}
+function gcP(){for(var g=0;g<2000;g++){var t=new ArrayBuffer(64);t=null;}}
+
+if(cur==='ffdesc'||cur==='ffdesc50'){
+  setPhase('FontFace descriptor getter re-entrancy');
+  var n=cur==='ffdesc50'?50:1;
+  var fired=0,thrown='';
+  try{
+    for(var i=0;i<n;i++){
+      var styleEl=document.createElement('style');
+      styleEl.textContent='@font-face{font-family:rk'+i+';src:local(Arial);}';
+      document.head.appendChild(styleEl);
+      document.fonts.load('1em rk'+i).then(function(){},function(){});
+      var desc={};
+      Object.defineProperty(desc,'weight',{configurable:true,get:function(){
+        fired++;
+        styleEl.remove();
+        document.body.offsetHeight;
+        gcP();
+        return '400';
+      }});
+      var ff=new FontFace('rk'+i,'local(Arial)',desc);
+      document.fonts.add(ff);
+      void ff.loaded;
+    }
+  }catch(e){thrown=e.constructor.name+':'+String(e.message).slice(0,40);}
+  done('fired='+fired+'|thrown='+(thrown||'none'));
+}else if(cur==='layers'){
+  setPhase('beginLayer/endLayer lifecycle');
+  var cv=document.createElement('canvas');cv.width=100;cv.height=100;
+  var cx=cv.getContext('2d');
+  var hasBL=(typeof cx.beginLayer==='function');
+  var hasEL=(typeof cx.endLayer==='function');
+  var r1='',r2='',r3='';
+  if(hasEL){try{cx.endLayer();r1='no-throw';}catch(e){r1='THROW:'+e.constructor.name;}}
+  if(hasBL){
+    try{cx.beginLayer();cx.save();cx.beginLayer();cx.restore();
+      try{cx.endLayer();r2='ok1';}catch(e){r2='THROW1';}
+      try{cx.endLayer();r3='ok2';}catch(e){r3='THROW2';}
+    }catch(e){r2='OUTER:'+e.constructor.name;}
+  }
+  done('bl='+hasBL+'|el='+hasEL+'|endNoBegin='+r1+'|mismatch='+r2+'|'+(r3||''));
+}else if(cur==='drawrect'){
+  setPhase('drawImage rect overflow fuzz');
+  var src=document.createElement('canvas');src.width=100;src.height=100;
+  var sc=src.getContext('2d');sc.fillStyle='#f00';sc.fillRect(0,0,100,100);
+  var dst=document.createElement('canvas');dst.width=100;dst.height=100;
+  var dc=dst.getContext('2d');
+  var cases=[[-1e9,-1e9,2e9,2e9],[1e9,1e9,1e9,1e9],[-2e9,-2e9,4e9,4e9],[0,0,1e9,1e9],[1e9,0,-1e9,50]];
+  var reps=[];
+  for(var c=0;c<cases.length;c++){
+    var cc=cases[c];
+    try{
+      dc.drawImage(src,cc[0],cc[1],cc[2],cc[3],0,0,100,100);
+      reps.push(c+':ok');
+    }catch(e){reps.push(c+':THROW:'+e.constructor.name);}
+  }
+  done(reps.join('|'));
+}else if(cur==='fontstr'){
+  setPhase('measureText hostile font strings');
+  var cv2=document.createElement('canvas');cv2.width=200;cv2.height=50;
+  var cx2=cv2.getContext('2d');
+  var fam='Arial';
+  for(var f=0;f<10000;f++)fam+=',Arial'+f;
+  var reps2=[];
+  try{cx2.font='20px '+fam;var w=cx2.measureText('ABCDEF').width;reps2.push('fam10000:w='+w);}catch(e){reps2.push('fam10000:THROW:'+e.constructor.name);}
+  try{cx2.font='2e9px Arial';var w2=cx2.measureText('A').width;reps2.push('huge:w='+w2);}catch(e){reps2.push('huge:THROW:'+e.constructor.name);}
+  try{cx2.font='20px ""';cx2.measureText('A');reps2.push('empty:ok');}catch(e){reps2.push('empty:THROW:'+e.constructor.name);}
+  done(reps2.join('|'));
+}
+
+} /* stage machine */
+
+/* auto-reload checker */
+(function(){
+  var cur='P1181-poke-battery';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>
