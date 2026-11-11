@@ -510,6 +510,11 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 - Check log: 2026-11-11 r26: no WSA-2026-0007; 321517 (65351) security
   fix still embargoed (only test-coverage collision in mirror). No new
   actionable triggers.
+- Check log: 2026-11-11 r27: no WSA-2026-0007; 317450 (65332) =
+  WASM try/catch result-type confusion (WasmFunctionParser) — dead (no
+  WASM on PS5). Batch fully confirmed JIT/WASM-tier; remaining IDs
+  (316791/317603/317611/316996/318405/319404/321480/321485) all embargoed
+  or JIT-tier per pattern.
 
 ## Priority leads — UPDATED 2026-11-11 (user directive: WebKit-only)
 1. WSA-2026-0007+ watch (standing re-check each round).
