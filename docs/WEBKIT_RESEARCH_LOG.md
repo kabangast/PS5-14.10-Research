@@ -466,14 +466,17 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 - **Remaining queue**: 64779 (321485), 64782 (321480) locking bugs; the AI-found batch 65331-65351 (bugs 317142/317349/317450/317603/317611/316791/316918/316996/318348/318405/321517).
 - **Method note**: GitHub commit search matches BOTH bug-id references and canonical-link numbers; the fix is the commit whose MESSAGE contains "bugs.webkit.org/show_bug.cgi?id=<n>".
 
-## Priority leads — UPDATED 2026-11-11 (triage round 1)
-1. **P1175+ triage continuation**: commit-search the remaining queue
-   (64779/64782 + 65331-65351 batch) — the batch is the most promising:
-   10+ state-management/memory fixes from a coordinated 2026 AI-assisted
-   effort, LLInt-relevant, unbackported to the PS5 fork unless Sony chose
-   specific ones.
-2. Feature-gate awareness: prioritize bugs whose code paths exist in the
-   PS5's stripped build (no datalist, no date inputs, no Trusted Types,
-   no JIT, no WASM) — check the trigger's feature before writing probes.
+## 2026-11-11 — P1175 result + SONY BACKPORT PATTERN DISCOVERED
+- **P1175 (CVE-2026-65337, LLInt polymorphic-call IC UAF)**: detect: proxy=true/defGetter=true/noInline=false. ALL 5 trigger variants SURVIVED (last=66 = the proxy's 0x42 return — trigger executes perfectly, no crash). DEAD on our console.
+- **STRATEGIC FINDING — Sony backports recent WebKit fixes**: the 65337 fix is 2026-08-25, yet our 14.10 build (kernel 2026-09-28) does NOT crash — matching the HABT case (2025-10 fix backported). The PS5 WebKit is NOT a frozen 2023 fork; it receives SELECTIVE security backports through at least Aug-Sep 2026. Implications for triage: bugs fixed BEFORE ~Sep 2026 are likely patched on our console (64783 was dead by feature-absence, not backport — but the pattern still holds); **the triage must target fixes AFTER the Sep-28-2026 build date** (post-WSA-2026-0006, e.g. bugs fixed Oct-Nov 2026), plus bugs Sony's selection missed (canvas 43720, metadata 64784).
+- 65337/64715 were JIT-or-LLInt IC bugs; both dead. The canvas 43720 + metadata 64784 (both live) are both pre-2024-vintage code paths Sony never touched — the profitable target class is OLD bugs in code Sony didn't modify, not new fixes they did apply.
+
+## Priority leads — UPDATED 2026-11-11 (backport pattern)
+1. **Post-build-date triage**: watch WSA-2026-0007+ (next advisories) and
+   search commits with dates after 2026-09-28; probe only those.
+2. **Old-bug surface in untouched code**: bugs like 43720/64784 that live
+   in subsystems Sony never patched (canvas, UnlinkedMetadataTable) —
+   audit OTHER old subsystems the same way (the 65331-65351 batch remains
+   worth checking case-by-case — some may be in unpatched subsystems).
 3. Canvas same-type alias + FL leak remain supporting primitives.
 4. Kernel side (Lua entry): only new-bug hunting remains.
