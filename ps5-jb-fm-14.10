@@ -140,10 +140,13 @@ confirmed on two 14.10 consoles (pastawithpesto). We have not tested it.
 EVIDENCE CONFLICTS (resolve, do not average)
 ============================================
 1. IsoHeap ON (our P571v14 empirical) vs OFF (community source audit
-   BPlatform.h:341 + v527 device evidence) — being resolved by P1158.
-2. Cross-type AB(768) reclaim of the freed canvas context: our
-   P693-P705 matrix says DEAD; community v527/v650-v655 says WORKS.
-   P1158 discriminates (flush + forge + anchored read).
+   BPlatform.h:341 + v527 device evidence) — RESOLVED EMPIRICALLY for OUR
+   console: 192B cross-type reclaim WORKS (FL leak), 768B context-slot
+   cross-type reclaim FAILS (P1158/P1159/P1160, 55 stages). The allocator
+   behavior on our console matches neither claim cleanly.
+2. Cross-type AB(768) reclaim of the freed canvas context: our matrix
+   says DEAD; community v527/v650-v655 says WORKS — does not reproduce
+   on our console. Unexplained console divergence.
 3. P1069v3 "leak=yes": RESOLVED by P1069v7/v9 (FontFace then-getter UAF,
    real engine-written heap ptrs at +0x58/+0x68).
 4. CVE-2025-31277: RESOLVED (upstream fix commit 716536ce98d6 real;
@@ -152,33 +155,32 @@ EVIDENCE CONFLICTS (resolve, do not average)
 
 NEXT RESEARCH ACTIONS (priority order)
 ======================================
-1. P1162 (NEXT): p146-style worker-polling observer for the MetadataTable
-   sweep — main thread grooms witness strings and polls .length
-   concurrently while a Worker triggers the call; corruption observed
-   before the sweep crash kills the process.
-2. P1163: bytecode-offset encoding — control the 32-bit values the sweep
-   writes (op_call metadata = bytecode offsets) → JSString m_fiber
-   overwrite → .length read oracle → addrOf → fakeObj.
-3. Canvas same-type alias + FL heap leak remain secondary primitives.
-   Community chain (V650-V655 oracle → forged lineDash Vector R/W) is
-   BLOCKED on our console: cross-type AB(768) reclaim of the freed
-   context fails here (P1158/P1159/P1160) despite working on their console.
+1. P1170 (NEXT): canvas font-path fake-object chain — FL leak (verified)
+   + ctx.font resolution to make the engine write MORE pointers into the
+   reclaimed 192B object; locate the canvas's Font/CSSFontFace object;
+   reclaim it with controlled bytes; measureText/fillText derefs our
+   fake -> crash oracle (mapped/unmapped) or controlled call. Uses ONLY
+   verified primitives (192B cross-type reclaim WORKS on our console).
+2. 768B reclaim mystery: why 192B cross-type works but 768B fails on our
+   console — solving it unlocks the community's V650-V655 oracle +
+   forged lineDash Vector R/W wholesale.
+3. Canvas same-type alias + FL heap leak remain supporting primitives.
 4. Kernel side (Lua entry, parallel): only new-bug hunting remains.
    Do NOT rerun documented dead ends.
 
 RECENT VERIFIED RESULTS (2026-11-11)
 ====================================
 - P1158/P1159/P1160: cross-type AB reclaim of freed canvas context DEAD
-  on our console (16+6+6 stages, all crashes; same-type control survives,
-  FL-leaked mapped targets still crash) — community's IsoHeap-OFF claim
-  does not reproduce here. Their chain blocked at Stage 2 for us.
+  on our console (55 stages, all crashes; same-type control survives,
+  FL-leaked mapped targets still crash).
 - P1161: MetadataTable overflow (CVE-2026-64784) CONFIRMED LIVE on our
   console: 171MB blob COMPILED-OK (8s), N=44,739,243 wrap, call triggers
-  4.29GB forward sweep -> WebProcess death (community p141 parity).
-- P1162: sweep corruption observer — v1 poll() bug fixed in v2; repeated
-  171MB builds exhausted WebProcess memory (community-parity OOM).
-  Needs browser restart for clean observation runs. The sweep is a
-  "write 96B entries at 96B stride" ramp primitive: entry k contains the
-  bytecode offset of call k (~linear ramp) -> arrange targets at
-  buffer+112+96k slots to write chosen values. m_fiber overwrite ->
-  .length oracle -> addrOf is the P1163 plan.
+  the 4.29GB forward sweep -> WebProcess death (community p141 parity).
+- P1162-P1169: code-pointer harvest BLOCKED on our console — 10+ full
+  sweep runs, 1500-1740 readable buffers per run (pre-sprayed,
+  during-sweep, strings), continuous re-scan, ZERO writes observed. The
+  sweep path crosses only engine-internal/freed memory here; community
+  p146 (14/14 strings) does not reproduce. Sweep stays a live primitive
+  but its writes are unreachable to JS on this console.
+- The "not enough free system memory" system dialog is expected for
+  these probes (171MB build + multi-GB sweep); press OK to continue.

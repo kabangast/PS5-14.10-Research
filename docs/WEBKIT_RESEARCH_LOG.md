@@ -427,9 +427,23 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 - **Status: P1162 awaiting clean console state** (browser restart). The corruption-observer architecture is ready; once a clean boot compiles + GO fires, main-thread witness strings are polled every 100ms during the worker's sweep.
 - Exploitation note (for P1163): the sweep writes 96B entries at stride 96 starting at buffer+112; op_call metadata = bytecode offsets = a LINEAR RAMP (offset_k ≈ c×k) — a "write ramp values at 96B stride" primitive. To write value V at target T: place T so it's hit by entry k where offset_k = V. Target must sit at buffer+112+96k → groom with 96B-multiple objects. JSString m_fiber overwrite → .length oracle.
 
-## Priority leads — UPDATED 2026-11-11 (post-P1162)
-**MetadataTable overflow (CVE-2026-64784) is our primary** — confirmed live on our console; forward ramp-write sweep ignoring IsoHeap.
-1. **P1162 (redeploy after browser restart)**: observe sweep corruption of groomed witness strings (worker sweeps, main polls).
-2. **P1163: ramp-value encoding** — arrange targets at 96B-stride slots; overwrite JSString m_fiber with chosen ramp values → length oracle → addrOf.
-3. Canvas same-type alias + FL leak remain secondary. Community chain blocked (no cross-type 768B reclaim here).
+## 2026-11-11 — P1162-P1169: MetadataTable sweep — code-pointer harvest BLOCKED on our console
+- **P1162-P1169 (10+ full sweep runs)**: architecture iterations: worker-polling (p146-style), during-sweep alloc (P1165), continuous re-scan of live buffers (P1167), pre+live re-scan (P1168/P1169 with on-screen HUD). Every run: compile OK, GO fired, process died 9-14s after GO (sweep through ~2-4GB mapped memory), ZERO nonzero writes observed in ANY readable buffer (pre-sprayed 100KB ABs, during-sweep ABs, strings — 1500-1740 buffers scanned per run, multiple passes).
+- **Verdict (our console)**: the sweep's 4.29GB write path traverses only engine-internal/freed (MADV_FREE) memory — it never crosses JS-readable allocations regardless of spray timing or position. The community's p146 result (14/14 strings corrupted) does NOT reproduce here — same class of console divergence as the AB(768) cross-type reclaim failure. The sweep remains a CONFIRMED-LIVE corruption primitive (P1161 parity: COMPILED-OK + crash) but the code-pointer harvest is blocked for us without allocator-layout control.
+- The "not enough free system memory" system dialog during these runs is EXPECTED: the 171MB script build + multi-GB sweep exhausts WebProcess memory; pressing OK and letting the crash-resume continue is the normal flow.
+- P1169 ships the on-screen HUD (status/phase/counters/finds panel) — all future probes include it so console-side progress is visible.
+
+## Priority leads — UPDATED 2026-11-11 (post-P1169)
+**MetadataTable sweep harvest: CLOSED for our console (10+ runs, zero writes in readable memory).**
+1. **NEW PRIMARY — canvas font-path fake-object chain (uses ONLY verified primitives)**:
+   FL leak (verified) → ctx.font resolution → engine writes more pointers into the
+   reclaimed 192B object (readable via AB) → locate the canvas's Font/CSSFontFace
+   object → reclaim THAT 192B object with controlled bytes → measureText/fillText
+   derefs our fake → crash oracle at controlled addresses (mapped/unmapped scan)
+   → and if a field embeds a vtable/WTF::Function, controlled call = code exec.
+   No cross-type 768B reclaim needed — 192B reclaim is VERIFIED on our console.
+2. **768B reclaim mystery** — why does 192B cross-type work but 768B fail on our
+   console? If solved, the community's V650-V655 oracle + lineDash R/W chain
+   unlocks wholesale. Diagnostic probes planned.
+3. Canvas same-type alias + FL leak remain as supporting primitives.
 4. Kernel side (Lua entry): only new-bug hunting remains.
