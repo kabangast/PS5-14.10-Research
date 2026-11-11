@@ -10,18 +10,26 @@
 
 ## DEPLOY_LOCK
 ```
-STATUS: LOCKED
-AGENT: Claude (this session)
-PROBE: P1158-oracle-reclaim (V650 crash-oracle replication anchored on FL-leaked heap ptr)
-DEPLOYED_AT: 2026-11-11T03:05Z
-LAST: P1158
+STATUS: UNLOCKED
+AGENT: (none)
+PROBE: (none)
+DEPLOYED_AT: 2026-11-11T04:52Z
+LAST: P1178 (console idle; next probe awaits WSA-2026-0007 or user direction)
 ```
 
 ## CURRENT ASSIGNMENTS
-- **Claude (Opus):** Canvas CVE-2026-43720 escalation — crash-oracle discriminator + forged lineDash Vector R/W (pastawithpesto chain replication)
+- **Claude (Opus):** WebKit-only standby per user directive — standing advisory/embargo re-check each round + archive maintenance. Live primitives on record: canvas same-type alias R/W (typed), FL heap-ptr leak (192B), metadata sweep (DoS).
 - **Gemini:** Subsystem benchmarking & JSC execution limits mapping -> ALL GOALS STOPPED (Standby)
 
 ## ACTIVITY LOG (newest first)
+
+### 2026-11-11 - Claude (rounds 18-27 consolidation: all known WebKit lines CLOSED; standby mode)
+- P1174 (CVE-2026-64783 datalist UAF): DEAD — no <datalist> on PS5 (datalist=false, listAttr=false).
+- P1175 (CVE-2026-65337 LLInt IC): DEAD — 5/5 trigger variants survived; Sony backports Aug-2026 fixes.
+- P1176-P1178 (P1061 sort-detach escalation): CLOSED — sort writes never reach reclaimed memory; reads are the sort's own captured data (control == reclaim values). Not a primitive.
+- Source-level: CanvasRenderingContext2D = WTF_MAKE_TZONE_ALLOCATED (cross-type reclaim impossible); CSSFontFace = FAST_ALLOCATED (192B reclaimable = FL leak). Save/restore state-stack verified safe (MaxSaveCount cap). StringImpl uninitialized paths fill fully (no stale-read).
+- CVE batch verdict: 65331-65351 family = JIT/WASM-tier (B3/DFG/OMG/IPInt/WasmParser) — all dead on LLInt+Baseline no-WASM console. Triage table in ps5-jb-fm-14.10.
+- Status: WebKit-only waiting state (user directive). Standing procedure: advisory feed check + 2 embargoed-ID commit searches per round; no console probes without a new trigger.
 
 ### 2026-11-11 - Claude (P1158: V650 CRASH-ORACLE REPLICATION — DEPLOYED 05:48 local)
 - Intel pulled from pastawithpesto/PS5-14.10-Jailbreak-Research (master): they are AHEAD of us on CVE-2026-43720 canvas chain. Their confirmed stages: UAF trigger (BMR outer + 2d inner), AB(768) reclaim of freed 768B context slot (v527: lineWidth=9999.99 readback), alias R/W (V630, all 12 APIs), CRASH ORACLE (V650-V655: forge m_stateStack at +112 m_buffer/+120 size/+124 cap in AB, innerCtx.lineWidth reads target+48, SIGSEGV=unmapped), ASLR defeat (V674 APNG overread, 1651 heap pointers), arb-R/W DESIGNED (forged lineDash Vector + getLineDash/setLineDash copy-assign). Their source audit: **IsoHeap OFF on PlayStation** (WTF_MAKE_ISO_ALLOCATED → FastMalloc, BPlatform.h:341), Gigacage OFF, JSC Config unfrozen (startOfStructureHeap writable).
