@@ -438,8 +438,22 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 - Stage 1 (forge +0x58=p1): measureText SURVIVED:111 — no effect. Forging the reclaimed object's fields has zero influence on the canvas font path. **Canvas font-path fake-object chain CLOSED** (consistent with P1154v2: stale canvas font reads unchanged).
 - P1171 (setStatus write + timer deref, community p458 parity): deployed; all 4 stages died inside the FL leak (degraded console memory — the leak crashes silently again; no results recorded). Needs a clean browser restart to run.
 
-## Priority leads — UPDATED 2026-11-11 (post-P1170)
-1. **P1171 (retry after browser restart)**: observe community p458's m_status=3 write into our reclaimed AB (+130) and test the Timer deref: forge +176 (m_thread) with FL-leaked p1/p2/0 → setStatus → crash/survive = deref oracle on OUR console.
-2. **768B reclaim mystery**: why 192B cross-type works but 768B fails on our console — solving it unlocks the community's V650-V655 oracle + lineDash R/W.
+## 2026-11-11 — 768B reclaim mystery RESOLVED via source macros (local webkit_src)
+- **CanvasRenderingContext2D**: `WTF_MAKE_TZONE_ALLOCATED(CanvasRenderingContext2D)` — per-type segregated zone (PS5-era build: WTF_MAKE_ISO_ALLOCATED, same family).
+- **CSSFontFace**: `WTF_DEPRECATED_MAKE_FAST_ALLOCATED_WITH_HEAP_IDENTIFIER(CSSFontFace, CSSFontFace)` — plain fastMalloc.
+- **This exactly explains our 55-stage empirical split**: freed CSSFontFace (192B) is reclaimable by ABs (FL leak works); freed canvas context can NEVER be reclaimed cross-type (its slot returns to the per-type zone) — at ANY size. The community's crash-oracle chain (which requires AB reclaim of the context object) is STRUCTURALLY IMPOSSIBLE on a build with this macro; their v527/v650-v655 "confirmed" results do not reproduce here and are likely console/build divergence or misinterpretation.
+- **Implication**: the canvas object is off-limits for cross-type; our only cross-type UAF channel is the fastMalloc CSSFontFace (192B) — the setStatus write (+130) + Timer deref (+144..+191, m_thread +176) surface (community p458) is the live exploitation lead. P1171 targets exactly that.
+- P1172 (extended size sweep 512-4096) is superseded: cross-type reclaim is impossible at any size; kept only for the same-type control record.
+
+## Priority leads — UPDATED 2026-11-11 (768B mystery resolved)
+1. **P1171 (run on next reload)**: CSSFontFace setStatus UAF — observe the
+   m_status=3 write into our reclaimed AB (+130) and test the Timer deref:
+   forge +176 (m_thread) with FL-leaked p1/p2/0 → setStatus → crash/survive
+   = deref oracle. The face is fastMalloc → reclaim verified → this is the
+   one cross-type object we can control on our console.
+2. **Font/timer field exploration**: map every deref'd field of the
+   reclaimed face via controlled patterns (the p458 Timer RELEASE_ASSERT
+   proves a real deref exists — turn it into an oracle or a controlled
+   call via the leaked heap pointers).
 3. Canvas same-type alias + FL leak remain supporting primitives.
 4. Kernel side (Lua entry): only new-bug hunting remains.
