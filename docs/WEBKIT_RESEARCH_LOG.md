@@ -411,9 +411,19 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 - **P1158 deployed 2026-11-11 05:48 local**: 16-stage crash-resume replication of V650 oracle, anchored on FL-leaked p1/p2 (guaranteed mapped). Stage sweep: AB sizes {768,736,752,784,800,816,832,896,1024} × offsets {112,104,120,128,136,96,88,80}. Survived lineWidth read = reclaim + oracle WORK on our console.
 - **Next**: collect P1158 beacons; if oracle works → V655-style scan around leaked p1 to map the WebProcess heap → forged lineDash Vector R/W (their Stage 6) → vtable hijack (Stage 7).
 
-## Priority leads — UPDATED 2026-11-11 (post-repo-diff)
-**NEW PRIMARY: Canvas CVE-2026-43720 forged-stateStack oracle → lineDash Vector arbitrary R/W** (pastawithpesto chain replication — they have oracle+leak, NOT yet R/W).
-1. **P1158 oracle discriminator** — running. Determines if AB(768) reclaim + +112 oracle works on our console.
-2. **If oracle works**: lineDash Vector forgery → arbitrary read (getLineDash) / write (setLineDash copy-assign) → startOfStructureHeap overwrite (unfrozen JSC config) → type confusion → code exec.
-3. **If oracle fails**: identify why cross-type reclaim differs from their console (allocator flush behavior, size class rounding) — their v527/v650 evidence is strong.
-4. Legacy leads (below) remain as fallback.
+## 2026-11-11 — P1158/P1159/P1160/P1161: crash-oracle + MetadataTable overflow — CONFIRMED LIVE
+- **P1158 (V650 oracle replication)**: FL leak anchor worked (p1/p2 per boot), but ALL 16 forge stages (sizes 736-1024 × offsets 80-136) crashed at the read even with MAPPED targets. 291 beacons, sweep complete.
+- **P1159 (position-encoded spray)**: same-type control stage SURVIVED (lw=1 — UAF + same-type reclaim alive in-run); ALL 6 cross-type AB fills (posenc 768/800/832/896, uniform 9999.99 = v527 replication, posenc_vt) CRASHED.
+- **P1160 (all-valid-pointer fill)**: every qword = FL-leaked p1/p2 (guaranteed mapped). PREREAD fired each stage, then crash at read. ALL 6 stages crashed.
+- **VERDICT (our console)**: cross-type AB reclaim of the freed 768B canvas context DOES NOT WORK here — community's V650-V655 crash oracle + forged-lineDash-Vector R/W chain is BLOCKED at their Stage 2 for us. Same-type reclaim + FL leak (192B cross-type) still work. Our P571v14/P693-P705 "IsoHeap-style segregation" empirical result stands for this console; their "IsoHeap OFF (BPlatform.h:341)" audit does not reproduce here. Same FW, different consoles — allocator behavior discrepancy unexplained.
+- **P1161 (MetadataTable overflow CVE-2026-64784, p141 port)**: v1 stage machine flaw (fn died across reloads) fixed in v2 (single-boot build→load→spray→call).
+  - **Result v2 (04:05 UTC)**: BLD 171MB blob in 6ms (ropes), BLOB parts=14, LOADED ms=7871 ok=true hasFn=true — **COMPILED-OK on our console**. SPRAY 20k×AB(128). CALLING → silence → WebProcess death: the N=44,739,243 wrap (N*96=0x100000020→0x20, 144B table) triggered the 96B-per-entry forward sweep which hit unmapped memory. **Overflow primitive LIVE on our console** — matches community p141 (SIGSEGV).
+  - Browser crash-recovery stalled after this crash (no auto-reload) — manual reload needed; next load reports CALL-CRASHED via stage=1.
+- **Next (exploitation of the sweep)**: port p144 bait-and-switch + p146 worker-polling architecture: main thread grooms witness strings + polls .length concurrently while a Worker triggers the call; the sweep corrupts the groomed targets (community: 14 JSString headers, .length=81400) BEFORE the process dies. Then encode bytecode offsets to control the written metadata bytes → m_fiber overwrite → length oracle → addrOf.
+
+## Priority leads — UPDATED 2026-11-11 (post-P1161)
+**MetadataTable overflow (CVE-2026-64784) is now OUR primary** — confirmed live on our console; it is a forward 32-bit-controlled write sweep that ignores IsoHeap entirely (writes raw bytes through the heap).
+1. **P1162: p146-style worker-polling corruption observer** — prove sweep corrupts groomed targets on OUR console (strings .length change observed before crash).
+2. **P1163: bytecode-offset encoding** — make the sweep write chosen 32-bit values at chosen offsets → JSString m_fiber overwrite → .length oracle = addrOf.
+3. Canvas same-type alias + FL leak remain as secondary primitives; community chain replication blocked (no cross-type 768B reclaim here).
+4. Kernel side (Lua entry) unchanged: only new-bug hunting remains.

