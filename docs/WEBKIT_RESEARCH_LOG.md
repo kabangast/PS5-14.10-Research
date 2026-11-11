@@ -477,14 +477,20 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 - **P1178**: Float64Array(24)/AB(192) + CSSFontFaceSource reclaim in-comparator — comparator values are ONLY my own pattern (0x3ffc...=1.75) + NaN (0x7ff8... = the sort's detached-slot filler). The CONTROL (no reclaim) shows identical values — **the sort reads from its own captured data, not live freed memory**. P1061's "SECRET_LEAKED" values were self-data all along.
 - **VERDICT: the sort-during-detach UAF (P1061) is a behavior anomaly only — no read primitive, no write primitive on freed memory. CLOSED.**
 
-## Priority leads — UPDATED 2026-11-11 (post-P1178)
-All confirmed console bugs are now fully characterized:
-- Canvas UAF: same-type alias R/W (typed only); cross-type impossible (TZone).
-- CSSFontFace UAF: 3-field leak only; no deref surface.
-- MetadataTable sweep: live DoS; writes unreachable.
-- Sort-detach UAF: anomaly only; CLOSED as primitive.
-Remaining forward paths:
-1. **Fresh-CVE line**: fixes AFTER the 2026-09-28 build date (next WSA-2026-0007+)
-   + old bugs in subsystems Sony never patched (canvas/metadata class).
-2. Canvas same-type alias + FL leak remain supporting primitives.
-3. Kernel side (Lua entry): only new-bug hunting remains.
+## 2026-11-11 — Triage round 3: queue drained by embargo walls
+- 317349 (65336): public mirror only has a WASM IPInt commit (br_on_cast LEB128 — WASM absent on PS5 anyway); the security fix is not yet mirrored. Likely DEAD regardless (WASM).
+- 321480 (64782): mirror shows only site-isolation zoom commits; the memory-corruption fix is embargoed.
+- **Pattern**: post-disclosure security fixes re-appear in the mirror with bug IDs (like 313521/313703/317142 did); currently-embargoed ones are invisible to commit-search. The public triage queue is drained — next usable feed is WSA-2026-0007+ (post-build-date fixes) plus periodic re-checks of the embargoed IDs.
+- Consolidated console surface (all measured): canvas same-type alias R/W (typed); CSSFontFace 3-field leak; metadata sweep DoS; sort-detach anomaly. No addrOf/code-pointer/arb-R/W on this build via the known bug set.
+
+## Priority leads — UPDATED 2026-11-11 (post-triage-drain)
+1. **WSA-2026-0007+ watch** (next advisory, post-build-date fixes) + re-check
+   embargoed IDs (317349/317450/317603/317611/316791/316918/316996/318348/
+   318405/321517/321480) periodically via commit search.
+2. Unexplored micro-escalation of verified primitives remains open: the
+   canvas state-buffer (Vector<State> out-of-line 6400B buffer = plain
+   fastMalloc) stale-data read via unzeroed allocations — requires an
+   allocator path that does not fill (StringImpl createUninitialized
+   candidates) — needs source-verification before console time.
+3. Canvas same-type alias + FL leak remain supporting primitives.
+4. Kernel side (Lua entry): only new-bug hunting remains.
