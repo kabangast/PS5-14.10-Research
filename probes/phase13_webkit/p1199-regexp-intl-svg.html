@@ -1,0 +1,703 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1199 RegExp/Intl/SVG Subsystem Stress</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:40vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1199 — REGEXP / INTL / SVG SUBSYSTEM STRESS</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">stage: ?</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var d=document.createElement('div');d.textContent=t;FD.textContent='';FD.appendChild(d);}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1199-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* P1199: Target less-patched WebKit subsystems
+
+   YARR regex compiler (CVE-2023-42843 class): YARR compiles regex
+   to native code even in LLInt mode. Pathological patterns can
+   trigger stack overflows, buffer overruns, or infinite loops in
+   the compiler. Unicode property escapes + backreferences +
+   alternations stress YARR's NFA→DFA conversion.
+
+   ICU/Intl (CVE-2023-32435 class): ICU is a massive C library.
+   Collator, Segmenter, NumberFormat, DateTimeFormat all call into
+   ICU native code. Edge cases in Unicode normalization, bidi,
+   and locale-dependent string comparison.
+
+   SVG filters: SVG filter chains involve native graphics code.
+   Recursive filters, extreme dimensions, and feImage with data URIs
+   stress the filter pipeline outside WebKit's JS GC.
+
+   String.normalize: Directly calls ICU unorm2_normalize which has
+   had multiple buffer overflow CVEs. */
+
+(function run(){
+var STAGES=[
+  'detect',
+  'yarrBackref',        /* YARR backreference + unicode edge cases */
+  'yarrQuantifier',     /* Pathological quantifiers in YARR */
+  'yarrLookbehind',     /* Lookbehind assertions stress */
+  'intlCollator',       /* Intl.Collator with exotic locales */
+  'intlSegmenter',      /* Intl.Segmenter (if available) */
+  'strNormalize',       /* String.normalize ICU edge cases */
+  'svgFilterChain',     /* SVG filter chain stress */
+  'svgFeTurbulence',    /* feTurbulence with extreme params */
+  'regexReplace'        /* String.replace with regex + function */
+];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1199_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1199_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/'+(STAGES.length-1)+' — '+(STAGES[stage]||'done'));
+setCounters('stages done: '+stage+'/'+STAGES.length);
+
+if(stage>=STAGES.length){
+  setStatus('ALL DONE');
+  var summary=JSON.stringify(results).slice(0,800);
+  B('ALL-DONE',summary);
+  log('=== ALL STAGES COMPLETE ===','ok');
+  addFind(summary);
+  try{localStorage.removeItem('p1199_stage');localStorage.removeItem('p1199_res');}catch(e){}
+  return;
+}
+try{localStorage.setItem('p1199_stage',''+(stage+1));}catch(e){}
+var cur=STAGES[stage];
+
+function done(rep){
+  results.push({s:stage,n:cur,r:rep});
+  try{localStorage.setItem('p1199_res',JSON.stringify(results));}catch(e){}
+  B('RESULT','['+cur+']'+rep.slice(0,600));
+  addFind(cur+': '+rep.slice(0,300));
+  setStatus(rep.slice(0,80));
+  log('=== '+cur+' -> '+rep+' ===','ok');
+  B('NEXT','stage='+(stage+1));
+  setTimeout(function(){location.reload(true);},600);
+}
+
+/* ---- detect ---- */
+if(cur==='detect'){
+  setPhase('Feature detection');
+  var info=[];
+  info.push('RegExp='+(typeof RegExp));
+  try{var re=new RegExp('(?<=a)b','u');info.push('lookbehind=YES');}catch(e){info.push('lookbehind=NO');}
+  try{var re2=new RegExp('\\p{Script=Han}','u');info.push('unicodeProp=YES');}catch(e){info.push('unicodeProp=NO');}
+  info.push('Intl='+(typeof Intl));
+  info.push('Collator='+(typeof Intl.Collator));
+  info.push('Segmenter='+(typeof Intl.Segmenter));
+  info.push('NumberFormat='+(typeof Intl.NumberFormat));
+  info.push('normalize='+(typeof String.prototype.normalize));
+  info.push('SVG='+(typeof SVGElement));
+  try{var rr=new RegExp('(a+)+$');info.push('backtrack=YES');}catch(e){info.push('backtrack=NO');}
+  done(info.join('|'));
+
+/* ---- yarrBackref: backreferences + unicode ---- */
+}else if(cur==='yarrBackref'){
+  setPhase('YARR backreference + unicode');
+  B('ATTEMPT','yarrBackref');
+  var anomalies=0,tests=0;
+  var rep='';
+
+  try{
+    /* Test 1: Nested backreferences with unicode */
+    var patterns=[
+      ['(\\u{1F600})(\\1)','u'],          /* Emoji backreference */
+      ['(\\p{L}+)\\1','u'],               /* Unicode letter class + backref */
+      ['(?:(a)(b)(c)\\3\\2\\1)+',''],      /* Multiple backrefs reverse order */
+      ['((a+)(b+))\\1\\2\\3',''],          /* Nested group backrefs */
+      ['(\\ud83d\\ude00)\\1',''],          /* Surrogate pair backref */
+      ['((?:a|b|c){1,100})\\1{1,50}',''],  /* Quantified backref of quantified group */
+    ];
+
+    var inputs=[
+      '\u{1F600}\u{1F600}',
+      'helloHello',
+      'abccbaabccba',
+      'aabbaabbaabb',
+      '😀😀',
+      'abcabcabcabcabc'
+    ];
+
+    for(var i=0;i<patterns.length;i++){
+      try{
+        var re=new RegExp(patterns[i][0],patterns[i][1]);
+        var m=re.exec(inputs[i]||'test');
+        tests++;
+        if(m&&m[0]&&m[0].length>1000){
+          anomalies++;
+          B('ANOMALY','backref-long|idx='+i+'|len='+m[0].length);
+        }
+      }catch(e){
+        /* Compilation errors are fine */
+        tests++;
+      }
+    }
+    rep='tests='+tests+'|anomalies='+anomalies;
+  }catch(e){
+    rep='THROW:'+e.message;
+  }
+  done(rep);
+
+/* ---- yarrQuantifier: pathological quantifiers ---- */
+}else if(cur==='yarrQuantifier'){
+  setPhase('YARR pathological quantifiers');
+  B('ATTEMPT','yarrQuantifier');
+  var anomalies2=0,tests2=0,hangs=0;
+  var rep2='';
+
+  try{
+    /* These patterns stress YARR's backtracking engine */
+    var cases=[
+      {p:'(a+)+$',    s:'a'.repeat(20)+'!', d:'catastrophic backtrack'},
+      {p:'(a|a?)+$',  s:'a'.repeat(18)+'b', d:'ambiguous alternation'},
+      {p:'(.*){1,100}', s:'x'.repeat(50),   d:'greedy nested'},
+      {p:'(?:a{1,100}){1,100}', s:'a'.repeat(200), d:'nested quantifier'},
+      {p:'(a?){200}',  s:'a'.repeat(100),   d:'optional repeat'},
+      {p:'(.+){1,50}b',s:'a'.repeat(30),    d:'no-match greedy'},
+    ];
+
+    for(var j=0;j<cases.length;j++){
+      var t0=Date.now();
+      try{
+        var re2=new RegExp(cases[j].p);
+        var m2=re2.exec(cases[j].s);
+        var dt=Date.now()-t0;
+        tests2++;
+        if(dt>2000){
+          hangs++;
+          B('HANG','quantifier|idx='+j+'|dt='+dt+'|desc='+cases[j].d);
+        }
+      }catch(e){
+        tests2++;
+      }
+    }
+    rep2='tests='+tests2+'|hangs='+hangs+'|anomalies='+anomalies2;
+  }catch(e){
+    rep2='THROW:'+e.message;
+  }
+  done(rep2);
+
+/* ---- yarrLookbehind ---- */
+}else if(cur==='yarrLookbehind'){
+  setPhase('YARR lookbehind stress');
+  B('ATTEMPT','yarrLookbehind');
+  var anomalies3=0,tests3=0;
+  var rep3='';
+
+  try{
+    var lbCases=[
+      {p:'(?<=a{1,100})b',      s:'a'.repeat(50)+'b',   d:'variable lookbehind'},
+      {p:'(?<=\\p{L}{1,50})\\d', f:'u', s:'é'.repeat(30)+'5', d:'unicode lookbehind'},
+      {p:'(?<!a{1,100})b',      s:'b'.repeat(20),        d:'negative variable lookbehind'},
+      {p:'(?<=(.))\\1',         s:'aabbcc',              d:'lookbehind with backref'},
+      {p:'(?<=\\1(a))x',        s:'aax',                 d:'forward ref in lookbehind'},
+      {p:'(?<=a(?=b))b',        s:'ab',                  d:'lookahead inside lookbehind'},
+    ];
+
+    for(var k=0;k<lbCases.length;k++){
+      try{
+        var flags=lbCases[k].f||'';
+        var re3=new RegExp(lbCases[k].p,flags);
+        var m3=re3.exec(lbCases[k].s);
+        tests3++;
+        /* Check for unexpected captures */
+        if(m3&&m3.length>10){
+          anomalies3++;
+          B('ANOMALY','lookbehind-captures|idx='+k+'|groups='+m3.length);
+        }
+      }catch(e){
+        tests3++;
+        /* SyntaxError for unsupported lookbehinds is normal */
+      }
+    }
+    rep3='tests='+tests3+'|anomalies='+anomalies3;
+  }catch(e){
+    rep3='THROW:'+e.message;
+  }
+  done(rep3);
+
+/* ---- intlCollator: exotic locales ---- */
+}else if(cur==='intlCollator'){
+  setPhase('Intl.Collator exotic locales');
+  B('ATTEMPT','intlCollator');
+  var anomalies4=0,tests4=0;
+  var rep4='';
+
+  try{
+    /* Test Collator with various locales - ICU code paths differ by locale */
+    var locales=['zh-Hans-CN','ja-JP','ko-KR','ar-SA','he-IL','th-TH',
+                 'hi-IN','bn-BD','ta-IN','my-MM','km-KH','lo-LA',
+                 'am-ET','ti-ER','ka-GE','hy-AM','und-Zsye'];
+
+    var strs=['世界','こんにちは',
+              '안녕','مرحبا',
+              'שלום','สวัสดี',
+              'नमस्ते','😀😁😂'];
+
+    for(var ll=0;ll<locales.length;ll++){
+      try{
+        var col=new Intl.Collator(locales[ll],{sensitivity:'base',numeric:true});
+        for(var ss=0;ss<strs.length;ss++){
+          var cmp=col.compare(strs[ss],strs[(ss+1)%strs.length]);
+          tests4++;
+        }
+        /* Test with very long strings */
+        var longStr=strs[ll%strs.length]||'a';
+        var repeated='';
+        for(var rr=0;rr<200;rr++) repeated+=longStr;
+        col.compare(repeated,repeated+'z');
+        tests4++;
+      }catch(e){
+        tests4++;
+        if(e.constructor.name!=='RangeError'){
+          anomalies4++;
+          B('ANOMALY','collator|locale='+locales[ll]+'|err='+e.message);
+        }
+      }
+    }
+
+    /* NumberFormat edge cases */
+    try{
+      var nf=new Intl.NumberFormat('ar-SA',{style:'currency',currency:'SAR'});
+      var r1=nf.format(Number.MAX_SAFE_INTEGER);
+      var r2=nf.format(-0);
+      var r3=nf.format(Infinity);
+      var r4=nf.format(NaN);
+      tests4+=4;
+      rep4='nf:maxint='+r1.length+'|neg0='+r2.length;
+    }catch(e){rep4='nf:THROW';}
+
+    rep4+='|tests='+tests4+'|anomalies='+anomalies4;
+  }catch(e){
+    rep4='THROW:'+e.message;
+  }
+  done(rep4);
+
+/* ---- intlSegmenter ---- */
+}else if(cur==='intlSegmenter'){
+  setPhase('Intl.Segmenter');
+  B('ATTEMPT','intlSegmenter');
+  var rep5='';
+
+  if(typeof Intl.Segmenter==='undefined'){
+    done('NO-SEGMENTER');
+    return;
+  }
+
+  try{
+    var anomalies5=0,tests5=0;
+    var seg=new Intl.Segmenter('en',{granularity:'grapheme'});
+
+    /* Test with complex Unicode: ZWJ sequences, regional indicators, combining marks */
+    var complex=[
+      '👨‍👩‍👧‍👦', /* family emoji ZWJ */
+      '🇺🇸',  /* US flag */
+      'à́̂̃̄', /* stacked combining marks */
+      'क्ष',         /* Devanagari conjunct */
+      'é'.repeat(500),         /* Long combining sequence */
+      '🏴󠁧󠁢󠁳󠁣󠁴󠁿', /* flag tag seq */
+      '‍'.repeat(100),          /* ZWJ flood */
+    ];
+
+    for(var c=0;c<complex.length;c++){
+      try{
+        var segs=seg.segment(complex[c]);
+        var count=0;
+        for(var s2 of segs){
+          count++;
+          if(count>10000){anomalies5++;break;}
+        }
+        tests5++;
+      }catch(e){
+        tests5++;
+        if(!(e instanceof RangeError)){
+          anomalies5++;
+          B('ANOMALY','segmenter|idx='+c+'|err='+e.message);
+        }
+      }
+    }
+
+    /* Word segmentation with mixed scripts */
+    var wordSeg=new Intl.Segmenter('ja',{granularity:'word'});
+    var mixed='漢字mixedカタカナ123АБВ';
+    var wordSegs=wordSeg.segment(mixed);
+    var wc=0;
+    for(var w of wordSegs){wc++;tests5++;}
+
+    rep5='tests='+tests5+'|words='+wc+'|anomalies='+anomalies5;
+  }catch(e){
+    rep5='THROW:'+e.constructor.name+':'+e.message;
+  }
+  done(rep5);
+
+/* ---- strNormalize: String.normalize ICU edge cases ---- */
+}else if(cur==='strNormalize'){
+  setPhase('String.normalize ICU stress');
+  B('ATTEMPT','strNormalize');
+  var anomalies6=0,tests6=0;
+  var rep6='';
+
+  try{
+    var forms=['NFC','NFD','NFKC','NFKD'];
+
+    /* Edge cases for ICU normalization */
+    var inputs=[
+      '̀',           /* COMBINING GRAVE TONE MARK → U+0300 under NFC */
+      '́',           /* COMBINING ACUTE TONE MARK → U+0301 */
+      'ﬁ',           /* fi ligature — NFKC decomposes */
+      'Ω',           /* OHM SIGN → OMEGA under NFC */
+      'ẛ',           /* Latin long s with dot — NFKC changes */
+      'Å',          /* A + ring = Å under NFC */
+      '𝄞',     /* MUSICAL SYMBOL G CLEF (surrogate pair) */
+      '̀'.repeat(200), /* Many combining marks */
+      'a' + '̀́̂̃̄̅̆̇̈̉'.repeat(20),
+      '﻿'.repeat(100), /* BOM flood */
+      String.fromCharCode(0xFDD0), /* Noncharacter */
+      '󠀠',     /* Tag space (supplementary) */
+      '‪‫‬‭‮'.repeat(50), /* Bidi control flood */
+    ];
+
+    for(var f=0;f<forms.length;f++){
+      for(var i2=0;i2<inputs.length;i2++){
+        try{
+          var norm=inputs[i2].normalize(forms[f]);
+          tests6++;
+          /* Check for unexpected length expansion */
+          if(norm.length>inputs[i2].length*10&&inputs[i2].length>2){
+            anomalies6++;
+            B('ANOMALY','normalize-expand|form='+forms[f]+'|in='+inputs[i2].length+'|out='+norm.length);
+          }
+          /* Stability check: normalizing again should be idempotent */
+          var norm2=norm.normalize(forms[f]);
+          if(norm!==norm2){
+            anomalies6++;
+            B('ANOMALY','normalize-unstable|form='+forms[f]+'|idx='+i2);
+          }
+        }catch(e){tests6++;}
+      }
+    }
+
+    /* Test: normalize() on very long string */
+    try{
+      var longNorm=('À́').repeat(5000);
+      var t0n=Date.now();
+      var normLong=longNorm.normalize('NFC');
+      var dtn=Date.now()-t0n;
+      tests6++;
+      rep6='longNorm:dt='+dtn+'ms|inLen='+longNorm.length+'|outLen='+normLong.length;
+    }catch(e){rep6='longNorm:THROW';}
+
+    rep6+='|tests='+tests6+'|anomalies='+anomalies6;
+  }catch(e){
+    rep6='THROW:'+e.message;
+  }
+  done(rep6);
+
+/* ---- svgFilterChain ---- */
+}else if(cur==='svgFilterChain'){
+  setPhase('SVG filter chain stress');
+  B('ATTEMPT','svgFilterChain');
+  var anomalies7=0,tests7=0;
+  var rep7='';
+
+  try{
+    var container=document.createElement('div');
+    container.style.cssText='width:1px;height:1px;overflow:hidden;position:absolute;left:-9999px';
+    document.body.appendChild(container);
+
+    /* Create SVG with deep filter chain */
+    var svgNS='http://www.w3.org/2000/svg';
+
+    for(var chain=0;chain<10;chain++){
+      try{
+        var svg=document.createElementNS(svgNS,'svg');
+        svg.setAttribute('width','100');
+        svg.setAttribute('height','100');
+
+        var defs=document.createElementNS(svgNS,'defs');
+        var filter=document.createElementNS(svgNS,'filter');
+        filter.setAttribute('id','f'+chain);
+
+        /* Chain of filter primitives */
+        var depth=20+chain*5;
+        for(var d=0;d<depth;d++){
+          var fe;
+          switch(d%5){
+            case 0:
+              fe=document.createElementNS(svgNS,'feGaussianBlur');
+              fe.setAttribute('stdDeviation',''+((d+1)*0.5));
+              break;
+            case 1:
+              fe=document.createElementNS(svgNS,'feColorMatrix');
+              fe.setAttribute('type','saturate');
+              fe.setAttribute('values',''+(d*0.1));
+              break;
+            case 2:
+              fe=document.createElementNS(svgNS,'feOffset');
+              fe.setAttribute('dx',''+d);
+              fe.setAttribute('dy',''+d);
+              break;
+            case 3:
+              fe=document.createElementNS(svgNS,'feComponentTransfer');
+              var funcR=document.createElementNS(svgNS,'feFuncR');
+              funcR.setAttribute('type','linear');
+              funcR.setAttribute('slope','1.5');
+              fe.appendChild(funcR);
+              break;
+            case 4:
+              fe=document.createElementNS(svgNS,'feMorphology');
+              fe.setAttribute('operator','dilate');
+              fe.setAttribute('radius','1');
+              break;
+          }
+          if(d>0) fe.setAttribute('in','r'+(d-1));
+          fe.setAttribute('result','r'+d);
+          filter.appendChild(fe);
+        }
+        defs.appendChild(filter);
+        svg.appendChild(defs);
+
+        var rect=document.createElementNS(svgNS,'rect');
+        rect.setAttribute('width','100');
+        rect.setAttribute('height','100');
+        rect.setAttribute('fill','red');
+        rect.setAttribute('filter','url(#f'+chain+')');
+        svg.appendChild(rect);
+
+        container.appendChild(svg);
+
+        /* Force render */
+        var bbox=rect.getBBox();
+        tests7++;
+
+        /* Remove while potentially still rendering */
+        container.removeChild(svg);
+        tests7++;
+      }catch(e){
+        tests7++;
+      }
+    }
+
+    container.parentNode.removeChild(container);
+    rep7='tests='+tests7+'|anomalies='+anomalies7;
+  }catch(e){
+    rep7='THROW:'+e.message;
+  }
+  done(rep7);
+
+/* ---- svgFeTurbulence ---- */
+}else if(cur==='svgFeTurbulence'){
+  setPhase('SVG feTurbulence extreme params');
+  B('ATTEMPT','svgFeTurbulence');
+  var anomalies8=0,tests8=0;
+  var rep8='';
+
+  try{
+    var container2=document.createElement('div');
+    container2.style.cssText='width:1px;height:1px;overflow:hidden;position:absolute;left:-9999px';
+    document.body.appendChild(container2);
+    var svgNS2='http://www.w3.org/2000/svg';
+
+    /* Test feTurbulence with extreme parameters */
+    var turbParams=[
+      {bf:'0.0001',no:'1',s:'1234'},
+      {bf:'999',no:'20',s:'9999'},
+      {bf:'0',no:'0',s:'0'},
+      {bf:'-1',no:'-1',s:'-1'},
+      {bf:'1e10',no:'100',s:'2147483647'},
+      {bf:'NaN',no:'NaN',s:'NaN'},
+      {bf:'0.5 0.5',no:'8',s:'42',t:'fractalNoise'},
+      {bf:'0.001',no:'1',s:'0',sw:'65535',sh:'65535'},
+    ];
+
+    for(var tp=0;tp<turbParams.length;tp++){
+      try{
+        var svg2=document.createElementNS(svgNS2,'svg');
+        svg2.setAttribute('width',turbParams[tp].sw||'100');
+        svg2.setAttribute('height',turbParams[tp].sh||'100');
+
+        var defs2=document.createElementNS(svgNS2,'defs');
+        var filt2=document.createElementNS(svgNS2,'filter');
+        filt2.setAttribute('id','turb'+tp);
+
+        var turb=document.createElementNS(svgNS2,'feTurbulence');
+        turb.setAttribute('baseFrequency',turbParams[tp].bf);
+        turb.setAttribute('numOctaves',turbParams[tp].no);
+        turb.setAttribute('seed',turbParams[tp].s);
+        if(turbParams[tp].t) turb.setAttribute('type',turbParams[tp].t);
+
+        filt2.appendChild(turb);
+        defs2.appendChild(filt2);
+        svg2.appendChild(defs2);
+
+        var rect2=document.createElementNS(svgNS2,'rect');
+        rect2.setAttribute('width','100%');
+        rect2.setAttribute('height','100%');
+        rect2.setAttribute('filter','url(#turb'+tp+')');
+        svg2.appendChild(rect2);
+
+        container2.appendChild(svg2);
+
+        /* Force layout + render */
+        try{rect2.getBBox();}catch(e2){}
+        tests8++;
+
+        container2.removeChild(svg2);
+      }catch(e){tests8++;}
+    }
+
+    container2.parentNode.removeChild(container2);
+    rep8='tests='+tests8+'|anomalies='+anomalies8;
+  }catch(e){
+    rep8='THROW:'+e.message;
+  }
+  done(rep8);
+
+/* ---- regexReplace: String.replace with regex + function ---- */
+}else if(cur==='regexReplace'){
+  setPhase('String.replace regex + mutating function');
+  B('ATTEMPT','regexReplace');
+  var anomalies9=0,tests9=0;
+  var rep9='';
+
+  try{
+    /* The replacer function runs during regex matching.
+       If the string or regex is mutated during replacement,
+       it could trigger OOB or UAF in the regex engine. */
+
+    /* Test 1: Replacer that modifies the source string's prototype */
+    var str1='aaa bbb ccc ddd eee';
+    var origReplace=String.prototype.replace;
+    var callCount=0;
+    var result1=str1.replace(/(\w+)/g,function(match,g1,offset,string){
+      callCount++;
+      /* Try to confuse the engine by changing string properties */
+      try{
+        if(callCount===2){
+          /* Redefine String.prototype.replace mid-call */
+          String.prototype.replace=function(){return 'HIJACKED';};
+        }
+      }catch(e){}
+      return match.toUpperCase();
+    });
+    String.prototype.replace=origReplace;
+    tests9++;
+    rep9='replace1:calls='+callCount+'|result='+result1.slice(0,40);
+
+    /* Test 2: Regex with lastIndex mutation */
+    var re4=/(a+)/g;
+    var str2='aaaa bbbb aaaa';
+    var matches2=[];
+    re4.lastIndex=0;
+    var m4;
+    var guard=0;
+    while((m4=re4.exec(str2))!==null&&guard<100){
+      matches2.push(m4[0]);
+      /* Mutate lastIndex during iteration */
+      if(guard===0) re4.lastIndex=0; /* Restart! */
+      guard++;
+    }
+    tests9++;
+    rep9+='|exec-loop:iters='+guard+'|matches='+matches2.length;
+
+    /* Test 3: Symbol.replace override */
+    try{
+      var customRe={};
+      var trapCalls=0;
+      customRe[Symbol.replace]=function(string,replacement){
+        trapCalls++;
+        /* Return something unexpected */
+        return {toString:function(){trapCalls++;return 'trap';}};
+      };
+      customRe[Symbol.match]=true; /* Make it "regex-like" */
+      var r5='test'.replace(customRe,'x');
+      tests9++;
+      rep9+='|symReplace:traps='+trapCalls+'|type='+typeof r5;
+    }catch(e){
+      tests9++;
+      rep9+='|symReplace:THROW';
+    }
+
+    /* Test 4: matchAll with toString trap */
+    try{
+      var evilPattern={};
+      evilPattern[Symbol.matchAll]=function(str){
+        /* Return iterator that mutates on each step */
+        var count=0;
+        return {
+          next:function(){
+            count++;
+            if(count>50) return {done:true};
+            return {done:false,value:['match'+count]};
+          },
+          [Symbol.iterator]:function(){return this;}
+        };
+      };
+      var matches3=[];
+      for(var ma of 'test'[Symbol.matchAll](evilPattern)){
+        matches3.push(ma[0]);
+        if(matches3.length>60) break;
+      }
+      tests9++;
+      rep9+='|matchAll:count='+matches3.length;
+    }catch(e){
+      tests9++;
+      rep9+='|matchAll:THROW';
+    }
+
+    rep9+='|anomalies='+anomalies9+'|tests='+tests9;
+  }catch(e){
+    rep9='THROW:'+e.message;
+  }
+  done(rep9);
+}
+
+})(); /* end IIFE */
+
+/* Reload poller */
+(function(){
+  var cur='P1199-regexp-intl-svg';
+  setTimeout(function check(){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET','/reload.txt?c='+Date.now(),true);
+      x.onload=function(){
+        var t=(x.responseText||'').trim();
+        if(t&&t!==cur){location.reload(true);return;}
+        setTimeout(check,3000);};
+      x.onerror=function(){setTimeout(check,5000);};
+      x.send();
+    }catch(e){setTimeout(check,5000);}
+  },4000);
+})();
+</script>
+</body></html>
