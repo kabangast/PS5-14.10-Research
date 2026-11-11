@@ -510,6 +510,9 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 - Check log: 2026-11-11 r26: no WSA-2026-0007; 321517 (65351) security
   fix still embargoed (only test-coverage collision in mirror). No new
   actionable triggers.
+- Check log: 2026-11-11 r58: no WSA-2026-0007 (still 0006). Console dark
+  (last beacon 20:31 UTC; PS5 needs physical wake). Queue ready: P1189
+  (deployed) -> P1190-P1195. Watchdog + DNS + Apache up.
 - Check log: 2026-11-11 r29: no WSA-2026-0007. Triaged the info-disclosure
   CVE-2026-64753 (bug 315121): "Remove ResourceRequest.m_cachePartition" —
   the vuln was an inconsistency between m_cachePartition and
