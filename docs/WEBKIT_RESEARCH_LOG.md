@@ -450,11 +450,19 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 - **Interpretation**: our leak's stable +0x0=0x1 field may BE m_status (Status::Loading=1) on our build — the engine writes it post-free into our reclaimed AB (P1069v9 deep scan). Our build's CSSFontFace layout must be mapped empirically; the engine's post-free writes into the reclaimed AB are the map's readout.
 - **P1173 deployed**: per-operation full-192B qword dumps (baseline/fontscheck/fontsload/canvasfont/stylerecalc/facecycle) to identify which offsets the engine touches per operation on OUR build.
 
-## Priority leads — UPDATED 2026-11-11 (post-P1171)
-1. **P1173 (running next)**: empirical CSSFontFace field map for our build;
-   then forge the mapped deref fields (timer/thread) with FL-leaked pointers
-   to build the deref oracle.
-2. If the timer/thread deref exists on our build: p1/p2/0 forge matrix ->
-   crash-vs-survive oracle -> extend to a controlled call target.
+## 2026-11-11 — NEW CVE TRIAGE LINE OPENED (WSA-2026-0005/0006)
+- **Method**: WebKit Bugzilla locked for security bugs -> GitHub commit search (api.github.com/search/commits) on the WebKit mirror finds the FIX commits by bug number; the commits embed the exact mechanism + regression test names; raw test files fetched from the mirror.
+- **CVE-2026-64783 (bug 313521, fixed 2026-08-12)**: DataListButtonElement UAF — raw owner reference; `input.type='button'` inside a click listener frees TextFieldInputType mid-dispatch; datalist button's defaultEventHandler virtual-calls the freed owner. Upstream test needs internals/UIHelper (absent on PS5) -> P1174 builds 6 real-world activation variants (bubble/capture click, arrow-coord synthetic click, keyboard, 50x loop). **P1174 DEPLOYED.** This is a fresh WebCore UAF independent of IsoHeap (InputType allocator macro unknown - if fastMalloc, cross-type reclaim + fake vtable becomes possible).
+- **CVE-2026-64787 (bug 313703, fixed 2026-07-01)**: Document UAF in trustedTypeCompliantString (parseHTMLUnsafe/write/execCommand/setHTML/setInnerHTML/insertAdjacentHTML/ContextualFragment paths). Trigger recovered (adoptNode + iframe.remove + innerHTML with require-trusted-types-for CSP) but requires Trusted Types — likely ABSENT on PS5 (Safari 17-era). Feature-check cheap; queue as P1175 with low priority.
+- **CVE-2026-64784 confirmed timeline**: WSA-2026-0006 (29 Sep 2026, one day after our FW build) lists it — consistent with our P1161 live result.
+- Remaining untriaged: CVE-2026-64715 (bug 316347 UAF, ZDI), CVE-2026-64719 (bug 319404 OOB), CVE-2026-64779/64782 (bugs 321485/321480 memory corruption), and the AI-found batch (bugs 317142/317349/317450/317603/317611/316791/316918/316996/318348/318405/321517 = CVE-2026-65331..65351).
+
+## Priority leads — UPDATED 2026-11-11 (CVE triage line)
+1. **P1174 (running next)**: CVE-2026-64783 datalist UAF — if any activation
+   variant crashes, we have a NEW live WebCore UAF on our console; then
+   probe InputType allocator + same/cross-type reclaim for the fake-vtable
+   escalation (the call is a VIRTUAL call through the freed owner!).
+2. **P1175+**: continue the commit-search triage of the remaining WSA-2026
+   bugs (64715/64719/64779/64782 + the 65331-65351 batch).
 3. Canvas same-type alias + FL leak remain supporting primitives.
 4. Kernel side (Lua entry): only new-bug hunting remains.
