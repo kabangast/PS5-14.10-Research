@@ -433,17 +433,13 @@ Entry: DNS spoof → Apache → `http://ecode.np.cs.playstation.net/ecode/redire
 - The "not enough free system memory" system dialog during these runs is EXPECTED: the 171MB script build + multi-GB sweep exhausts WebProcess memory; pressing OK and letting the crash-resume continue is the normal flow.
 - P1169 ships the on-screen HUD (status/phase/counters/finds panel) — all future probes include it so console-side progress is visible.
 
-## Priority leads — UPDATED 2026-11-11 (post-P1169)
-**MetadataTable sweep harvest: CLOSED for our console (10+ runs, zero writes in readable memory).**
-1. **NEW PRIMARY — canvas font-path fake-object chain (uses ONLY verified primitives)**:
-   FL leak (verified) → ctx.font resolution → engine writes more pointers into the
-   reclaimed 192B object (readable via AB) → locate the canvas's Font/CSSFontFace
-   object → reclaim THAT 192B object with controlled bytes → measureText/fillText
-   derefs our fake → crash oracle at controlled addresses (mapped/unmapped scan)
-   → and if a field embeds a vtable/WTF::Function, controlled call = code exec.
-   No cross-type 768B reclaim needed — 192B reclaim is VERIFIED on our console.
-2. **768B reclaim mystery** — why does 192B cross-type work but 768B fail on our
-   console? If solved, the community's V650-V655 oracle + lineDash R/W chain
-   unlocks wholesale. Diagnostic probes planned.
-3. Canvas same-type alias + FL leak remain as supporting primitives.
+## 2026-11-11 — P1170: canvas font-path fake-object chain — RESULT: canvas does NOT deref freed face
+- Stage 0 (enginewrite): FL leak p1=0x10008b6130; after ctx.font='20px s0' + measureText(w=111) + fillText + fonts.check/load, the reclaimed AB still shows ONLY the original leak fields (+0=0x1, +0x58=p1, +0x68=0x10007e9ca0). Canvas font ops do NOT add or change fields — the canvas resolves and CACHES the Font; it never touches the freed CSSFontFace again.
+- Stage 1 (forge +0x58=p1): measureText SURVIVED:111 — no effect. Forging the reclaimed object's fields has zero influence on the canvas font path. **Canvas font-path fake-object chain CLOSED** (consistent with P1154v2: stale canvas font reads unchanged).
+- P1171 (setStatus write + timer deref, community p458 parity): deployed; all 4 stages died inside the FL leak (degraded console memory — the leak crashes silently again; no results recorded). Needs a clean browser restart to run.
+
+## Priority leads — UPDATED 2026-11-11 (post-P1170)
+1. **P1171 (retry after browser restart)**: observe community p458's m_status=3 write into our reclaimed AB (+130) and test the Timer deref: forge +176 (m_thread) with FL-leaked p1/p2/0 → setStatus → crash/survive = deref oracle on OUR console.
+2. **768B reclaim mystery**: why 192B cross-type works but 768B fails on our console — solving it unlocks the community's V650-V655 oracle + lineDash R/W.
+3. Canvas same-type alias + FL leak remain supporting primitives.
 4. Kernel side (Lua entry): only new-bug hunting remains.
