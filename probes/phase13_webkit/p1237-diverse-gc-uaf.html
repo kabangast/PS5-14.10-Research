@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1237</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<!--
+  P1237: Diverse GC UAF Hunting
+
+  P1236 showed FontFace CSSFontFace cleanup is correct for UNLOADED fonts.
+  This probe targets OTHER WebKit objects with GC timing:
+
+  A. Range spanning removed DOM nodes — classic WebKit UAF pattern
+  B. getComputedStyle on orphaned+GC'd element — stale style cache
+  C. CSS @font-face via stylesheet removal — different path than JS API
+  D. NodeIterator on mutated+GC'd tree — iterator invalidation
+  E. createImageBitmap close + GC — bitmap backing store
+  F. MessageChannel port GC — message delivery to freed port
+  G. TreeWalker on GC'd subtree — walker stale reference
+  H. FontFace from valid ArrayBuffer — LOADED font GC test
+-->
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1237-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+function hex(n){return '0x'+n.toString(16);}
+
+log('=== P1237: DIVERSE GC UAF HUNTING ===');
+log('Time: '+new Date().toISOString());
+B('START','P1237-diverse-gc-uaf');
+</script>
+
+<!-- ============================================================ -->
+<!-- A: Range spanning removed DOM nodes + GC                     -->
+<!-- Classic WebKit UAF: Range holds refs to nodes that get freed  -->
+<!-- ============================================================ -->
+
+<script>
+log('\n--- A: Range on removed DOM nodes ---');
+
+window._aWRs = [];
+window._aRange = null;
+
+(function(){
+  // Build a subtree
+  var container = document.createElement('div');
+  container.id = 'range-test';
+  for(var i=0;i<10;i++){
+    var span = document.createElement('span');
+    span.textContent = 'Node-'+i+' ';
+    span.id = 'rn'+i;
+    container.appendChild(span);
+  }
+  document.body.appendChild(container);
+
+  // Create a Range spanning nodes 2-7
+  var range = document.createRange();
+  range.setStart(container.childNodes[2], 0);
+  range.setEnd(container.childNodes[7], 1); // end inside node 7's text
+
+  log('A: Range created: "'+range.toString().slice(0,60)+'"');
+  log('A: startContainer='+range.startContainer.nodeName+' endContainer='+range.endContainer.nodeName);
+
+  window._aRange = range;
+
+  // Now remove nodes 3-6 from the DOM (middle of range)
+  for(var i=3;i<=6;i++){
+    var node = document.getElementById('rn'+i);
+    window._aWRs.push(new WeakRef(node));
+    container.removeChild(node);
+  }
+
+  log('A: Removed nodes 3-6, checking Range...');
+
+  // Range should collapse or adjust
+  try {
+    var afterRemove = range.toString();
+    log('A: Range after remove: "'+afterRemove.slice(0,60)+'"');
+    log('A: collapsed='+range.collapsed+' startOff='+range.startOffset+' endOff='+range.endOffset);
+  } catch(e) {
+    log('A: Range access error: '+e.message);
+  }
+
+  // Remove container too
+  document.body.removeChild(container);
+})();
+
+// Heavy allocation to trigger GC
+for(var i=0;i<500000;i++){var t={a:i};}
+for(var i=0;i<100;i++){new ArrayBuffer(1048576);}
+B('A-setup','range_created');
+</script>
+
+<script>
+for(var i=0;i<500000;i++){var t={ag:i};}
+</script>
+
+<script>
+log('\n--- A: Check after GC ---');
+var aAlive = 0;
+for(var i=0;i<window._aWRs.length;i++){
+  if(window._aWRs[i].deref()) aAlive++;
+}
+log('A: Removed nodes alive: '+aAlive+'/'+window._aWRs.length);
+
+// Now access the Range — nodes may be freed!
+var rangeResult = 'CRASH';
+try {
+  var r = window._aRange;
+  rangeResult = 'collapsed='+r.collapsed+'|str='+r.toString().length;
+  log('A: Range.toString() length='+r.toString().length);
+  log('A: startContainer='+r.startContainer.nodeName);
+  log('A: endContainer='+r.endContainer.nodeName);
+
+  // Try to get bounding rect (forces layout with Range context)
+  var rect = r.getBoundingClientRect();
+  log('A: getBoundingClientRect: '+rect.width+'x'+rect.height);
+  rangeResult += '|rect='+rect.width+'x'+rect.height;
+} catch(e) {
+  rangeResult = 'THREW:'+e.message;
+  log('A: Range error: '+e.message);
+}
+
+B('A-result', 'alive='+aAlive+'|'+rangeResult);
+</script>
+
+<!-- ============================================================ -->
+<!-- B: getComputedStyle on orphaned+GC'd element                 -->
+<!-- CSSComputedStyleDeclaration may hold stale element ref        -->
+<!-- ============================================================ -->
+
+<script>
+log('\n--- B: getComputedStyle on orphan + GC ---');
+
+window._bWR = null;
+window._bCS = null;
+
+(function(){
+  var div = document.createElement('div');
+  div.style.cssText = 'color:red;font-size:24px;width:200px;height:100px;background:blue;border:2px solid green;margin:10px;padding:5px;display:block;position:absolute;left:-9999px;';
+  div.textContent = 'Computed Style Test';
+  document.body.appendChild(div);
+
+  // Get computed style WHILE element is in DOM
+  var cs = getComputedStyle(div);
+  log('B: color='+cs.color+' fontSize='+cs.fontSize+' width='+cs.width);
+
+  window._bCS = cs;
+  window._bWR = new WeakRef(div);
+
+  // Remove from DOM
+  document.body.removeChild(div);
+  log('B: Element removed from DOM');
+
+  // div goes out of scope here
+})();
+
+for(var i=0;i<500000;i++){var t={b:i};}
+for(var i=0;i<100;i++){new ArrayBuffer(1048576);}
+B('B-setup','done');
+</script>
+
+<script>
+for(var i=0;i<500000;i++){var t={bg:i};}
+</script>
+
+<script>
+log('\n--- B: Check after GC ---');
+var bAlive = window._bWR.deref() ? 'ALIVE' : 'DEAD';
+log('B: Element WeakRef = '+bAlive);
+
+// Access computed style — element may be freed!
+var bResult = 'CRASH';
+try {
+  var cs = window._bCS;
+  var color = cs.color;
+  var fontSize = cs.fontSize;
+  var width = cs.width;
+  var display = cs.display;
+  bResult = 'color='+color+'|fs='+fontSize+'|w='+width+'|d='+display;
+  log('B: After GC: color='+color+' fontSize='+fontSize+' width='+width+' display='+display);
+
+  // Try accessing many properties to maximize chance of touching freed memory
+  var props = ['margin','padding','border','position','top','left','right','bottom',
+               'overflow','visibility','opacity','transform','zIndex','float','clear',
+               'lineHeight','letterSpacing','textDecoration','textAlign','verticalAlign'];
+  var pVals = [];
+  for(var i=0;i<props.length;i++){
+    try { pVals.push(props[i]+'='+cs.getPropertyValue(props[i])); } catch(e){}
+  }
+  log('B: '+pVals.length+' properties read successfully');
+} catch(e) {
+  bResult = 'THREW:'+e.message;
+  log('B: Error: '+e.message);
+}
+
+B('B-result', 'alive='+bAlive+'|'+bResult);
+</script>
+
+<!-- ============================================================ -->
+<!-- C: CSS @font-face via stylesheet removal                     -->
+<!-- Different internal path than JS FontFace API                 -->
+<!-- ============================================================ -->
+
+<script>
+log('\n--- C: @font-face stylesheet removal ---');
+
+window._cWR = null;
+
+// Create a style element with @font-face
+var style = document.createElement('style');
+style.textContent = '@font-face { font-family: "CSSTestFont"; src: local(serif); font-weight: normal; }';
+document.head.appendChild(style);
+
+// Create a div using this font
+var testDiv = document.createElement('div');
+testDiv.style.cssText = 'font-family:"CSSTestFont",monospace;font-size:72px;position:absolute;white-space:nowrap;left:-9999px;';
+testDiv.textContent = 'CSS Font Test 1234567890';
+document.body.appendChild(testDiv);
+
+var w_before = testDiv.offsetWidth;
+log('C: Width with @font-face: '+w_before);
+
+// Get the CSSFontFaceRule
+var rule = null;
+try {
+  rule = style.sheet.cssRules[0];
+  log('C: Rule type='+rule.type+' family='+rule.style.getPropertyValue('font-family'));
+} catch(e){
+  log('C: Rule access error: '+e.message);
+}
+
+(function(){
+  // Remove the stylesheet — should remove the @font-face from the engine
+  window._cWR = new WeakRef(style);
+  document.head.removeChild(style);
+  log('C: Stylesheet removed');
+})();
+
+// Measure width after removal
+var w_after = testDiv.offsetWidth;
+log('C: Width after removal: '+w_after);
+
+for(var i=0;i<500000;i++){var t={c:i};}
+for(var i=0;i<100;i++){new ArrayBuffer(1048576);}
+
+window._cDiv = testDiv;
+window._cRule = rule;
+B('C-setup','w_before='+w_before+'|w_after='+w_after);
+</script>
+
+<script>
+for(var i=0;i<500000;i++){var t={cg:i};}
+</script>
+
+<script>
+log('\n--- C: Check after GC ---');
+var cAlive = window._cWR.deref() ? 'ALIVE' : 'DEAD';
+log('C: Style element WeakRef = '+cAlive);
+
+// Measure width — stale font cache?
+var w_gc = window._cDiv.offsetWidth;
+log('C: Width after GC = '+w_gc);
+
+// Try accessing the CSSRule — may be detached
+var ruleResult = 'CRASH';
+try {
+  if(window._cRule){
+    ruleResult = 'type='+window._cRule.type+'|css='+window._cRule.cssText.slice(0,80);
+    log('C: Rule after GC: '+window._cRule.cssText.slice(0,80));
+  } else {
+    ruleResult = 'null';
+  }
+} catch(e) {
+  ruleResult = 'THREW:'+e.message;
+  log('C: Rule error: '+e.message);
+}
+
+// Force a style recalc
+window._cDiv.style.fontSize = '73px';
+var w_forced = window._cDiv.offsetWidth;
+window._cDiv.style.fontSize = '72px';
+var w_restored = window._cDiv.offsetWidth;
+log('C: Forced recalc: '+w_forced+' → '+w_restored);
+
+document.body.removeChild(window._cDiv);
+B('C-result', 'alive='+cAlive+'|w_gc='+w_gc+'|rule='+ruleResult+'|forced='+w_forced);
+</script>
+
+<!-- ============================================================ -->
+<!-- D: NodeIterator on mutated+GC'd tree                         -->
+<!-- Iterator may hold stale pointers to freed nodes              -->
+<!-- ============================================================ -->
+
+<script>
+log('\n--- D: NodeIterator on mutated tree + GC ---');
+
+window._dWRs = [];
+window._dIterator = null;
+
+(function(){
+  var container = document.createElement('div');
+  for(var i=0;i<20;i++){
+    var p = document.createElement('p');
+    p.textContent = 'Para-'+i;
+    p.className = 'iter-node';
+    container.appendChild(p);
+  }
+  document.body.appendChild(container);
+
+  // Create iterator
+  var iter = document.createNodeIterator(container, NodeFilter.SHOW_ELEMENT);
+
+  // Advance to node 5
+  for(var i=0;i<6;i++) iter.nextNode();
+  log('D: Iterator at node 5: '+iter.referenceNode.textContent);
+
+  window._dIterator = iter;
+
+  // Remove nodes 3-15 (around the iterator position)
+  var children = container.querySelectorAll('.iter-node');
+  for(var i=3;i<=15;i++){
+    window._dWRs.push(new WeakRef(children[i]));
+    container.removeChild(children[i]);
+  }
+  log('D: Removed nodes 3-15');
+
+  // Remove container from DOM
+  document.body.removeChild(container);
+})();
+
+for(var i=0;i<500000;i++){var t={d:i};}
+for(var i=0;i<100;i++){new ArrayBuffer(1048576);}
+B('D-setup','done');
+</script>
+
+<script>
+for(var i=0;i<500000;i++){var t={dg:i};}
+</script>
+
+<script>
+log('\n--- D: Check after GC ---');
+var dAlive = 0;
+for(var i=0;i<window._dWRs.length;i++){
+  if(window._dWRs[i].deref()) dAlive++;
+}
+log('D: Removed nodes alive: '+dAlive+'/'+window._dWRs.length);
+
+// Navigate the iterator — it references removed/freed nodes!
+var dResult = 'CRASH';
+try {
+  var iter = window._dIterator;
+  var ref = iter.referenceNode;
+  log('D: referenceNode = '+(ref?ref.textContent:'null'));
+
+  // Try nextNode/previousNode
+  var next = iter.nextNode();
+  log('D: nextNode = '+(next?next.textContent:'null'));
+
+  var prev = iter.previousNode();
+  log('D: previousNode = '+(prev?prev.textContent:'null'));
+
+  dResult = 'ref='+(ref?ref.textContent:'null')+'|next='+(next?next.textContent:'null')+'|prev='+(prev?prev.textContent:'null');
+} catch(e) {
+  dResult = 'THREW:'+e.message;
+  log('D: Iterator error: '+e.message);
+}
+
+B('D-result', 'alive='+dAlive+'|'+dResult);
+</script>
+
+<!-- ============================================================ -->
+<!-- E: createImageBitmap close + GC                              -->
+<!-- ImageBitmap has backing store that may dangle                -->
+<!-- ============================================================ -->
+
+<script>
+log('\n--- E: ImageBitmap close + GC ---');
+
+window._eWR = null;
+window._eBitmapResult = 'pending';
+
+// Check if createImageBitmap exists
+if(typeof createImageBitmap === 'function'){
+  log('E: createImageBitmap available');
+
+  // Create a canvas with known content
+  var c = document.createElement('canvas');
+  c.width = 64; c.height = 64;
+  var ctx = c.getContext('2d');
+  ctx.fillStyle = '#FF0000';
+  ctx.fillRect(0,0,64,64);
+  ctx.fillStyle = '#00FF00';
+  ctx.fillRect(16,16,32,32);
+
+  // createImageBitmap is async — we'll check the result later via a global
+  // But since it's a Promise, we can't get it synchronously.
+  // Instead test close() behavior synchronously on what we can
+
+  // Let's test: transfer ImageData to/from worker concept
+  var imgData = ctx.getImageData(0,0,64,64);
+  log('E: ImageData created: '+imgData.width+'x'+imgData.height+' ('+imgData.data.length+' bytes)');
+
+  // Clone with transfer
+  try {
+    var cloned = structuredClone(imgData, {transfer: [imgData.data.buffer]});
+    log('E: structuredClone transferred ImageData buffer');
+    log('E: Original buffer detached? byteLength='+imgData.data.buffer.byteLength);
+    log('E: Clone buffer: byteLength='+cloned.data.buffer.byteLength);
+
+    // Try to read from original (detached)
+    var origRead = 'CRASH';
+    try {
+      origRead = imgData.data[0]; // Should be undefined or throw
+      origRead = 'val='+origRead;
+    } catch(e) {
+      origRead = 'THREW:'+e.message;
+    }
+    log('E: Read from original data[0]: '+origRead);
+
+    // Try to use original ImageData in putImageData
+    var putResult = 'CRASH';
+    try {
+      var c2 = document.createElement('canvas');
+      c2.width = 64; c2.height = 64;
+      var ctx2 = c2.getContext('2d');
+      ctx2.putImageData(imgData, 0, 0);
+      putResult = 'OK';
+    } catch(e) {
+      putResult = 'THREW:'+e.message;
+    }
+    log('E: putImageData with detached: '+putResult);
+
+    window._eBitmapResult = 'transfer=ok|origBuf='+imgData.data.buffer.byteLength+'|read='+origRead+'|put='+putResult;
+  } catch(e) {
+    log('E: structuredClone transfer error: '+e.message);
+    window._eBitmapResult = 'transfer_error:'+e.message;
+  }
+} else {
+  log('E: createImageBitmap NOT available');
+  window._eBitmapResult = 'no_createImageBitmap';
+}
+
+B('E-result', window._eBitmapResult);
+</script>
+
+<!-- ============================================================ -->
+<!-- F: MessageChannel port GC                                    -->
+<!-- Does message delivery crash when target port is freed?       -->
+<!-- ============================================================ -->
+
+<script>
+log('\n--- F: MessageChannel port GC ---');
+
+window._fWR = null;
+window._fReceived = [];
+window._fPort1 = null;
+
+(function(){
+  if(typeof MessageChannel === 'undefined'){
+    log('F: MessageChannel NOT available');
+    B('F-result','no_MessageChannel');
+    return;
+  }
+
+  var mc = new MessageChannel();
+  window._fPort1 = mc.port1;
+
+  // Set up listener on port1
+  mc.port1.onmessage = function(e){
+    window._fReceived.push(e.data);
+  };
+
+  // Send messages from port2, then release port2
+  mc.port2.postMessage('msg1');
+  mc.port2.postMessage('msg2');
+  mc.port2.postMessage('msg3');
+
+  log('F: Sent 3 messages via port2');
+
+  window._fWR = new WeakRef(mc.port2);
+  // port2 goes out of scope
+})();
+
+log('F: port2 released, received so far: '+window._fReceived.length);
+for(var i=0;i<500000;i++){var t={f:i};}
+B('F-setup','msgs_sent');
+</script>
+
+<script>
+for(var i=0;i<500000;i++){var t={fg:i};}
+</script>
+
+<script>
+log('\n--- F: Check after GC ---');
+var fAlive = window._fWR ? (window._fWR.deref() ? 'ALIVE' : 'DEAD') : 'N/A';
+log('F: port2 WeakRef = '+fAlive);
+log('F: Messages received: '+window._fReceived.length+' = ['+window._fReceived.join(',')+']');
+
+// Try sending from port1 (reverse direction) to potentially freed port2
+var sendResult = 'CRASH';
+try {
+  window._fPort1.postMessage('reverse1');
+  sendResult = 'OK';
+} catch(e) {
+  sendResult = 'THREW:'+e.message;
+}
+log('F: Send to GC\'d port2: '+sendResult);
+
+B('F-result', 'alive='+fAlive+'|recv='+window._fReceived.length+'|send='+sendResult);
+</script>
+
+<!-- ============================================================ -->
+<!-- G: TreeWalker on GC'd subtree                                -->
+<!-- Walker may traverse freed nodes                              -->
+<!-- ============================================================ -->
+
+<script>
+log('\n--- G: TreeWalker on GC\'d subtree ---');
+
+window._gWR = null;
+window._gWalker = null;
+
+(function(){
+  var tree = document.createElement('div');
+  tree.id = 'walker-root';
+  // Build a 3-level deep tree
+  for(var i=0;i<5;i++){
+    var level1 = document.createElement('div');
+    level1.textContent = 'L1-'+i;
+    for(var j=0;j<3;j++){
+      var level2 = document.createElement('span');
+      level2.textContent = 'L2-'+i+'-'+j;
+      level1.appendChild(level2);
+    }
+    tree.appendChild(level1);
+  }
+  document.body.appendChild(tree);
+
+  // Create TreeWalker
+  var walker = document.createTreeWalker(tree, NodeFilter.SHOW_ALL);
+
+  // Advance deep into the tree
+  for(var i=0;i<8;i++) walker.nextNode();
+  log('G: Walker at: '+walker.currentNode.textContent);
+
+  window._gWalker = walker;
+  window._gWR = new WeakRef(tree);
+
+  // Remove entire tree from DOM
+  document.body.removeChild(tree);
+  log('G: Tree removed from DOM');
+})();
+
+for(var i=0;i<500000;i++){var t={g:i};}
+for(var i=0;i<100;i++){new ArrayBuffer(1048576);}
+B('G-setup','done');
+</script>
+
+<script>
+for(var i=0;i<500000;i++){var t={gg:i};}
+</script>
+
+<script>
+log('\n--- G: Check after GC ---');
+var gAlive = window._gWR.deref() ? 'ALIVE' : 'DEAD';
+log('G: Tree root WeakRef = '+gAlive);
+
+// Navigate the walker — tree may be freed!
+var gResult = 'CRASH';
+try {
+  var w = window._gWalker;
+  var cur = w.currentNode;
+  log('G: currentNode = '+(cur?cur.textContent:'null'));
+
+  var next = w.nextNode();
+  log('G: nextNode = '+(next?next.textContent:'null'));
+
+  // Try to walk the entire remaining tree
+  var count = 0;
+  while(w.nextNode() && count < 50) count++;
+  log('G: Walked '+count+' more nodes');
+
+  gResult = 'cur='+(cur?cur.textContent:'null')+'|walked='+count;
+} catch(e) {
+  gResult = 'THREW:'+e.message;
+  log('G: Walker error: '+e.message);
+}
+
+B('G-result', 'alive='+gAlive+'|'+gResult);
+</script>
+
+<!-- ============================================================ -->
+<!-- H: FontFace from valid ArrayBuffer (inline TrueType)         -->
+<!-- Per spec, ArrayBuffer source → status=loaded immediately     -->
+<!-- ============================================================ -->
+
+<script>
+log('\n--- H: FontFace from ArrayBuffer ---');
+
+window._hWR = null;
+window._hFR = new FinalizationRegistry(function(v){window._hFRfired=true;});
+window._hFRfired = false;
+
+// Generate a minimal valid TrueType font
+// This creates a font with a single glyph that's wider than most system fonts
+function makeMinimalFont(){
+  // Minimal OpenType/TrueType with tables: head, hhea, maxp, OS/2, name, cmap, post, glyf, loca
+  // We'll try creating FontFace with different source types
+
+  // Method 1: Try empty ArrayBuffer (should fail gracefully)
+  var emptyResult = 'unknown';
+  try {
+    var f = new FontFace('EmptyFont', new ArrayBuffer(0));
+    emptyResult = 'status='+f.status;
+  } catch(e) {
+    emptyResult = 'threw:'+e.message;
+  }
+  log('H: Empty ArrayBuffer: '+emptyResult);
+
+  // Method 2: Try small buffer with TrueType magic
+  var buf = new ArrayBuffer(64);
+  var v = new DataView(buf);
+  v.setUint32(0, 0x00010000); // sfVersion = TrueType
+  v.setUint16(4, 0); // numTables = 0
+  var smallResult = 'unknown';
+  try {
+    var f = new FontFace('SmallFont', buf);
+    smallResult = 'status='+f.status;
+  } catch(e) {
+    smallResult = 'threw:'+e.message;
+  }
+  log('H: Minimal TT header: '+smallResult);
+
+  // Method 3: Try larger buffer with more valid structure
+  var buf2 = new ArrayBuffer(512);
+  var v2 = new Uint8Array(buf2);
+  // Copy WOFF2 magic: wOF2
+  v2[0]=0x77; v2[1]=0x4F; v2[2]=0x46; v2[3]=0x32;
+  var woffResult = 'unknown';
+  try {
+    var f = new FontFace('WoffFont', buf2);
+    woffResult = 'status='+f.status;
+  } catch(e) {
+    woffResult = 'threw:'+e.message;
+  }
+  log('H: WOFF2 magic: '+woffResult);
+
+  // Method 4: Fetch a real font synchronously from our server
+  var fetchResult = 'unknown';
+  try {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/beacon.php?tag=P1237-fontcheck&data=fetch', false);
+    xhr.send();
+    // We don't have a real font file, but let's see what we get
+    fetchResult = 'xhr='+xhr.status;
+  } catch(e) {
+    fetchResult = 'xhr_error:'+e.message;
+  }
+  log('H: Fetch attempt: '+fetchResult);
+
+  return {empty: emptyResult, small: smallResult, woff: woffResult, fetch: fetchResult};
+}
+
+var fontTests = makeMinimalFont();
+
+// Method 5: Use local() source with load()
+var localResult = 'unknown';
+try {
+  var face = new FontFace('LocalTest', 'local(serif)');
+  localResult = 'created|status='+face.status;
+
+  // Add to document.fonts
+  document.fonts.add(face);
+  localResult += '|added|size='+document.fonts.size;
+
+  // Render with it
+  var div = document.createElement('div');
+  div.style.cssText = 'font-family:"LocalTest",monospace;font-size:72px;white-space:nowrap;position:absolute;left:-9999px;';
+  div.textContent = 'ABCDEF 123456';
+  document.body.appendChild(div);
+
+  var w_local = div.offsetWidth;
+  localResult += '|w='+w_local;
+  log('H: local(serif) face: status='+face.status+' width='+w_local);
+
+  // Register for GC tracking
+  window._hWR = new WeakRef(face);
+  window._hFR.register(face, 'local-font');
+
+  // Delete and release
+  document.fonts.delete(face);
+
+  // Check width after delete (font may still be cached)
+  var w_afterDel = div.offsetWidth;
+  localResult += '|w_del='+w_afterDel;
+  log('H: Width after delete: '+w_afterDel);
+
+  window._hDiv = div;
+} catch(e) {
+  localResult = 'error:'+e.message;
+  log('H: local() error: '+e.message);
+}
+
+for(var i=0;i<500000;i++){var t={h:i};}
+
+B('H-setup', localResult);
+</script>
+
+<script>
+for(var i=0;i<500000;i++){var t={hg:i};}
+for(var i=0;i<100;i++){new ArrayBuffer(1048576);}
+</script>
+
+<script>
+log('\n--- H: Check after GC ---');
+var hAlive = window._hWR ? (window._hWR.deref()?'ALIVE':'DEAD') : 'N/A';
+log('H: FontFace WeakRef = '+hAlive);
+log('H: FR fired = '+window._hFRfired);
+
+// Check width after GC — cached font data may be freed!
+var hGCResult = 'unknown';
+if(window._hDiv){
+  try {
+    var w_gc = window._hDiv.offsetWidth;
+    log('H: Width after GC = '+w_gc);
+
+    // Force layout recalc
+    window._hDiv.style.fontSize = '73px';
+    var w_f = window._hDiv.offsetWidth;
+    window._hDiv.style.fontSize = '72px';
+    var w_r = window._hDiv.offsetWidth;
+    log('H: Forced recalc: '+w_f+' → '+w_r);
+
+    hGCResult = 'w='+w_gc+'|forced='+w_f+'|rest='+w_r;
+    document.body.removeChild(window._hDiv);
+  } catch(e) {
+    hGCResult = 'THREW:'+e.message;
+  }
+}
+
+B('H-result', 'alive='+hAlive+'|fr='+window._hFRfired+'|'+hGCResult);
+</script>
+
+<!-- ============================================================ -->
+<!-- FINAL SUMMARY                                                -->
+<!-- ============================================================ -->
+
+<script>
+log('\n=== P1237 FINAL SUMMARY ===');
+
+var aA=0;
+for(var i=0;i<window._aWRs.length;i++) if(window._aWRs[i].deref()) aA++;
+var gS = window._gWR?(window._gWR.deref()?'alive':'DEAD'):'N/A';
+var bS = window._bWR?(window._bWR.deref()?'alive':'DEAD'):'N/A';
+var cS = window._cWR?(window._cWR.deref()?'alive':'DEAD'):'N/A';
+var fS = window._fWR?(window._fWR.deref()?'alive':'DEAD'):'N/A';
+var hS = window._hWR?(window._hWR.deref()?'alive':'DEAD'):'N/A';
+
+log('A Range+removed: nodes='+aA);
+log('B ComputedStyle: elem='+bS);
+log('C @font-face: style='+cS);
+log('D NodeIterator: (checked above)');
+log('E ImageBitmap: (sync test)');
+log('F MessageCh: port2='+fS);
+log('G TreeWalker: root='+gS);
+log('H FontFace/AB: face='+hS+'|fr='+window._hFRfired);
+
+B('FINAL', 'A_nodes='+aA+'|B='+bS+'|C='+cS+'|F='+fS+'|G='+gS+'|H='+hS+'|H_fr='+window._hFRfired);
+B('DONE','all');
+log('\n=== P1237 COMPLETE ===');
+</script>
+
+</body>
+</html>

@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1253</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1253-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1253: DANGLING RANGE + BOUNDARY FIXUP ===');
+B('START','P1253');
+
+function mkFrame(){
+  var ifr=document.createElement('iframe');
+  ifr.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(ifr);
+  ifr.contentDocument.open();
+  ifr.contentDocument.write('<html><body></body></html>');
+  ifr.contentDocument.close();
+  return {win:ifr.contentWindow, doc:ifr.contentDocument, ifr:ifr};
+}
+</script>
+
+<!-- A: Dead-realm Range with removed boundary nodes -->
+<script>
+log('\n--- A: Range boundary node removal after realm death ---');
+(function(){
+  var container=document.createElement('div');
+  container.id='A-cont';
+  var nodes=[];
+  for(var i=0;i<8;i++){
+    var s=document.createElement('span');
+    s.textContent='A'+i;
+    s.id='A'+i;
+    container.appendChild(s);
+    nodes.push(s);
+  }
+  document.body.appendChild(container);
+
+  var f=mkFrame();
+
+  // Create Range in iframe spanning nodes A2..A5
+  var range=f.doc.createRange();
+  range.setStart(nodes[2], 0);
+  range.setEnd(nodes[5], 0);
+  B('A1','range_set|str='+range.toString()+'|sc='+range.startContainer.id+'|ec='+range.endContainer.id);
+
+  // Detach iframe — Range's owning document is dead
+  document.body.removeChild(f.ifr);
+  B('A2','iframe_dead');
+
+  // Check Range still works
+  try{
+    B('A3','pre_remove|str='+range.toString()+'|sc='+range.startContainer.id+'|ec='+range.endContainer.id);
+  }catch(e){B('A3','err:'+e.message.slice(0,40));}
+
+  // NOW REMOVE the start boundary node (A2) from the DOM
+  // Range fixup should collapse start to A2's parent, BUT the Range's document is dead
+  nodes[2].remove();
+  B('A4','removed_A2');
+
+  // Check Range after start node removal
+  try{
+    var sc=range.startContainer;
+    var so=range.startOffset;
+    var ec=range.endContainer;
+    var eo=range.endOffset;
+    B('A5','after_start_rm|sc='+(sc.id||sc.nodeName)+'|so='+so+'|ec='+(ec.id||ec.nodeName)+'|eo='+eo);
+  }catch(e){B('A5','err:'+e.name+':'+e.message.slice(0,40));}
+
+  // Try toString — accesses the now-removed start container
+  try{
+    var str=range.toString();
+    B('A6','str_after_rm='+str);
+  }catch(e){B('A6','str_err:'+e.name+':'+e.message.slice(0,40));}
+
+  // Remove the end node too
+  nodes[5].remove();
+  try{
+    B('A7','both_rm|sc='+(range.startContainer.id||range.startContainer.nodeName)+
+      '|ec='+(range.endContainer.id||range.endContainer.nodeName));
+  }catch(e){B('A7','err:'+e.name+':'+e.message.slice(0,40));}
+
+  // Try extractContents with both boundary nodes removed
+  try{
+    var frag=range.extractContents();
+    B('A8','extract_after_rm|children='+frag.childNodes.length+'|text='+frag.textContent.slice(0,30));
+  }catch(e){B('A8','extract_err:'+e.name+':'+e.message.slice(0,40));}
+
+  // Try insertNode after removal
+  try{
+    var injected=document.createElement('b');
+    injected.textContent='INJECTED_DANGLING';
+    range.insertNode(injected);
+    B('A9','insert_after_rm|html='+container.innerHTML.slice(0,60));
+  }catch(e){B('A9','insert_err:'+e.name+':'+e.message.slice(0,40));}
+
+  container.remove();
+})();
+</script>
+
+<!-- B: Dead-realm Range + replaceChild on boundary parent -->
+<script>
+log('\n--- B: Range + replaceChild ---');
+(function(){
+  var container=document.createElement('div');
+  container.id='B-cont';
+  var inner=document.createElement('div');
+  inner.id='B-inner';
+  for(var i=0;i<5;i++){
+    var s=document.createElement('span');
+    s.textContent='B'+i;
+    s.id='B'+i;
+    inner.appendChild(s);
+  }
+  container.appendChild(inner);
+  document.body.appendChild(container);
+
+  var f=mkFrame();
+  var range=f.doc.createRange();
+  range.setStart(inner.childNodes[1], 0); // B1
+  range.setEnd(inner.childNodes[3], 0);   // B3
+  B('B1','range_set|str='+range.toString());
+
+  // Detach iframe
+  document.body.removeChild(f.ifr);
+
+  // Replace the ENTIRE inner div (parent of boundary nodes)
+  var replacement=document.createElement('div');
+  replacement.id='B-new';
+  replacement.innerHTML='<em>REPLACED</em>';
+  container.replaceChild(replacement, inner);
+
+  // Range's boundary nodes are now in a detached subtree
+  try{
+    var sc=range.startContainer;
+    B('B2','after_replace|sc='+(sc.id||sc.nodeName)+'|parent='+(sc.parentNode?sc.parentNode.id:'null'));
+  }catch(e){B('B2','err:'+e.message.slice(0,40));}
+
+  // Try operations on the orphaned Range
+  try{
+    B('B3','str='+range.toString());
+  }catch(e){B('B3','str_err:'+e.message.slice(0,40));}
+
+  try{
+    var frag=range.cloneContents();
+    B('B4','clone='+frag.textContent.slice(0,30));
+  }catch(e){B('B4','clone_err:'+e.message.slice(0,40));}
+
+  // Try to insertNode from orphaned Range into the NEW DOM
+  try{
+    range.selectNodeContents(replacement); // Re-target to new node
+    B('B5','retarget_ok|str='+range.toString().slice(0,30));
+  }catch(e){B('B5','retarget_err:'+e.message.slice(0,40));}
+
+  container.remove();
+})();
+</script>
+
+<!-- C: Dead-realm Range + innerHTML nuke -->
+<script>
+log('\n--- C: Range + innerHTML nuke ---');
+(function(){
+  var container=document.createElement('div');
+  container.id='C-cont';
+  for(var i=0;i<10;i++){
+    var p=document.createElement('p');
+    p.textContent='C'+i;
+    p.id='C'+i;
+    container.appendChild(p);
+  }
+  document.body.appendChild(container);
+
+  var f=mkFrame();
+  var range=f.doc.createRange();
+  range.setStart(container.childNodes[2], 0); // C2
+  range.setEnd(container.childNodes[7], 0);   // C7
+
+  B('C1','range_set|str='+range.toString().slice(0,40));
+
+  // Detach iframe
+  document.body.removeChild(f.ifr);
+
+  // NUKE all children via innerHTML — destroys all boundary nodes
+  container.innerHTML='<div id="C-fresh">FRESH CONTENT</div>';
+
+  try{
+    var sc=range.startContainer;
+    var ec=range.endContainer;
+    B('C2','after_nuke|sc='+(sc.id||sc.nodeName)+'|ec='+(ec.id||ec.nodeName)+
+      '|sc_parent='+(sc.parentNode?sc.parentNode.id:'DETACHED')+
+      '|ec_parent='+(ec.parentNode?ec.parentNode.id:'DETACHED'));
+  }catch(e){B('C2','err:'+e.message.slice(0,40));}
+
+  // GC pressure — try to free the old nodes
+  for(var g=0;g<5;g++){
+    var garbage=[];
+    for(var i=0;i<3000;i++) garbage.push(new ArrayBuffer(2048));
+    garbage=null;
+  }
+
+  // Now access the Range — boundary nodes may be freed!
+  try{
+    var str=range.toString();
+    B('C3','str_after_gc='+str.slice(0,40));
+  }catch(e){B('C3','str_err:'+e.name+':'+e.message.slice(0,40));}
+
+  try{
+    var sc_text=range.startContainer.textContent;
+    B('C4','sc_text='+sc_text.slice(0,20));
+  }catch(e){B('C4','sc_err:'+e.name+':'+e.message.slice(0,40));}
+
+  try{
+    var frag=range.extractContents();
+    B('C5','extract='+frag.childNodes.length+'|text='+frag.textContent.slice(0,30));
+  }catch(e){B('C5','extract_err:'+e.name+':'+e.message.slice(0,40));}
+
+  // Try to insert into the live DOM through the dead/orphaned Range
+  try{
+    var node=document.createElement('b');
+    node.textContent='FROM_DEAD_RANGE';
+    range.insertNode(node);
+    B('C6','insert='+container.innerHTML.slice(0,60));
+  }catch(e){B('C6','insert_err:'+e.name+':'+e.message.slice(0,40));}
+
+  container.remove();
+})();
+</script>
+
+<!-- D: NodeIterator filter divergence — WHY does it return 0? -->
+<script>
+log('\n--- D: NodeIterator investigation ---');
+(function(){
+  var container=document.createElement('div');
+  for(var i=0;i<5;i++){
+    var s=document.createElement('span');
+    s.textContent='D'+i;
+    container.appendChild(s);
+  }
+  document.body.appendChild(container);
+
+  // Test 1: NodeIterator with null filter (no filter)
+  var f1=mkFrame();
+  var ni1=document.createNodeIterator(container, 1, null);
+  document.body.removeChild(f1.ifr);
+  var c1=0;
+  while(ni1.nextNode()) c1++;
+  B('D1','null_filter='+c1);
+
+  // Test 2: NodeIterator with main-frame filter
+  var ni2=document.createNodeIterator(container, 1, {acceptNode:function(){return 1;}});
+  var c2=0;
+  while(ni2.nextNode()) c2++;
+  B('D2','main_filter='+c2);
+
+  // Test 3: NodeIterator with dead-realm filter, BUT check for exceptions
+  var f2=mkFrame();
+  var filterCalls=0;
+  var lastErr=null;
+  // Wrap the dead-realm filter to catch errors
+  var deadFn=f2.win.eval('(function(n){return 1;})');
+  document.body.removeChild(f2.ifr);
+
+  var ni3=document.createNodeIterator(container, 1, {
+    acceptNode: function(n){
+      filterCalls++;
+      try{
+        var r=deadFn(n);
+        return r;
+      }catch(e){
+        lastErr=e.name+':'+e.message;
+        return 1; // Accept anyway
+      }
+    }
+  });
+  var c3=0;
+  while(ni3.nextNode()) c3++;
+  B('D3','wrapped_dead|count='+c3+'|calls='+filterCalls+'|err='+lastErr);
+
+  // Test 4: Create NI, advance 2, detach, advance more (like P1252 B but simpler)
+  var f3=mkFrame();
+  var deadFilter=f3.win.eval('(function(n){return 1;})');
+  var ni4=document.createNodeIterator(container, 1, {acceptNode:deadFilter});
+  ni4.nextNode(); ni4.nextNode(); // advance 2
+  B('D4a','advanced_2');
+  document.body.removeChild(f3.ifr);
+  var c4=0;
+  try{
+    while(ni4.nextNode()) c4++;
+  }catch(e){B('D4b','iterate_err:'+e.name+':'+e.message.slice(0,40));}
+  B('D4c','after_detach='+c4);
+
+  container.remove();
+})();
+</script>
+
+<!-- E: Dead-realm Range on text nodes (finer granularity) -->
+<script>
+log('\n--- E: Dead-realm Range on text nodes ---');
+(function(){
+  var container=document.createElement('div');
+  container.innerHTML='Hello <b>World</b> this is <i>a test</i> string.';
+  document.body.appendChild(container);
+
+  var f=mkFrame();
+  var range=f.doc.createRange();
+
+  // Set boundaries INSIDE text nodes
+  var textNode=container.firstChild; // "Hello "
+  var boldText=container.childNodes[1].firstChild; // "World"
+  range.setStart(textNode, 2); // "llo "
+  range.setEnd(boldText, 3); // "Wor"
+
+  B('E1','range_in_text|str='+range.toString());
+
+  // Detach
+  document.body.removeChild(f.ifr);
+
+  // Modify the text nodes directly
+  textNode.textContent='MODIFIED '; // Changes "Hello " to "MODIFIED "
+  try{
+    B('E2','after_text_mod|str='+range.toString()+'|sc_len='+range.startContainer.length);
+  }catch(e){B('E2','err:'+e.message.slice(0,40));}
+
+  // Split the text node at the Range boundary
+  try{
+    var newNode=textNode.splitText(2); // Split at offset 2
+    B('E3','after_split|str='+range.toString()+'|sc='+(range.startContainer===textNode?'orig':'new'));
+  }catch(e){B('E3','split_err:'+e.message.slice(0,40));}
+
+  // Delete the text node entirely
+  textNode.remove();
+  try{
+    B('E4','after_text_rm|str='+range.toString()+'|sc_name='+range.startContainer.nodeName);
+  }catch(e){B('E4','rm_err:'+e.message.slice(0,40));}
+
+  // Normalize — merges adjacent text nodes
+  container.normalize();
+  try{
+    B('E5','after_normalize|str='+range.toString()+'|sc_name='+range.startContainer.nodeName);
+  }catch(e){B('E5','norm_err:'+e.message.slice(0,40));}
+
+  container.remove();
+})();
+</script>
+
+<!-- F: Mass dead-realm Ranges with concurrent mutation -->
+<script>
+log('\n--- F: Mass Ranges + mutation ---');
+(function(){
+  var container=document.createElement('div');
+  container.id='F-cont';
+  for(var i=0;i<20;i++){
+    var s=document.createElement('span');
+    s.textContent='F'+i;
+    s.id='F'+i;
+    container.appendChild(s);
+  }
+  document.body.appendChild(container);
+
+  // Create 50 Ranges from 50 different dead iframes
+  var ranges=[];
+  for(var i=0;i<50;i++){
+    var f=mkFrame();
+    var r=f.doc.createRange();
+    var start=i%18;
+    var end=Math.min(start+2, 19);
+    r.setStart(container.childNodes[start], 0);
+    r.setEnd(container.childNodes[end], 0);
+    ranges.push(r);
+    document.body.removeChild(f.ifr);
+  }
+  B('F1','created='+ranges.length+' dead ranges');
+
+  // GC to clean up iframe documents
+  for(var g=0;g<5;g++){
+    var garbage=[];
+    for(var i=0;i<3000;i++) garbage.push(new ArrayBuffer(2048));
+    garbage=null;
+  }
+
+  // Check how many ranges still work
+  var working=0, broken=0;
+  for(var i=0;i<ranges.length;i++){
+    try{
+      ranges[i].toString();
+      working++;
+    }catch(e){broken++;}
+  }
+  B('F2','after_gc|working='+working+'|broken='+broken);
+
+  // Now mutate the DOM while ranges are alive
+  // Remove nodes that many ranges reference
+  container.childNodes[5].remove();
+  container.childNodes[10].remove();
+  container.childNodes[14].remove();
+
+  // Check again
+  working=0; broken=0;
+  for(var i=0;i<ranges.length;i++){
+    try{
+      ranges[i].toString();
+      working++;
+    }catch(e){broken++;}
+  }
+  B('F3','after_mutation|working='+working+'|broken='+broken);
+
+  // innerHTML nuke — destroy ALL boundary nodes
+  container.innerHTML='<b>NUKED</b>';
+  working=0; broken=0;
+  var strs=[];
+  for(var i=0;i<ranges.length;i++){
+    try{
+      var s=ranges[i].toString();
+      working++;
+      if(i<3) strs.push(s.slice(0,10));
+    }catch(e){broken++;}
+  }
+  B('F4','after_nuke|working='+working+'|broken='+broken+'|samples='+strs.join(';'));
+
+  // GC again after nuke
+  for(var g=0;g<10;g++){
+    var garbage=[];
+    for(var i=0;i<5000;i++) garbage.push(new ArrayBuffer(2048));
+    garbage=null;
+  }
+
+  // Final check — do the ranges crash?
+  working=0; broken=0;
+  for(var i=0;i<ranges.length;i++){
+    try{
+      ranges[i].toString();
+      working++;
+    }catch(e){broken++;}
+  }
+  B('F5','after_final_gc|working='+working+'|broken='+broken);
+
+  container.remove();
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1253 COMPLETE ===');
+}, 5000);
+</script>
+
+</body>
+</html>

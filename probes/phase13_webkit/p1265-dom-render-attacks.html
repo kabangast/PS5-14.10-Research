@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1265</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1265-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1265: DOM/RENDER ENGINE ATTACKS ===');
+B('START','P1265');
+</script>
+
+<!-- A: Feature detection — Custom Elements, Shadow DOM, etc -->
+<script>
+log('\n--- A: Feature detection ---');
+(function(){
+  try{
+    var features={};
+    features.customElements=typeof customElements!=='undefined';
+    features.shadowDOM=typeof Element.prototype.attachShadow==='function';
+    features.MutationObserver=typeof MutationObserver!=='undefined';
+    features.IntersectionObserver=typeof IntersectionObserver!=='undefined';
+    features.ResizeObserver=typeof ResizeObserver!=='undefined';
+    features.Range=typeof Range!=='undefined';
+    features.Selection=typeof window.getSelection==='function';
+    features.TreeWalker=typeof document.createTreeWalker==='function';
+    features.NodeIterator=typeof document.createNodeIterator==='function';
+    features.requestAnimationFrame=typeof requestAnimationFrame==='function';
+    features.CSS_animations=typeof document.body.style.animation!=='undefined';
+    features.CSS_transitions=typeof document.body.style.transition!=='undefined';
+    features.SVG=typeof SVGElement!=='undefined';
+    features.createElementNS=typeof document.createElementNS==='function';
+    features.adoptNode=typeof document.adoptNode==='function';
+    features.importNode=typeof document.importNode==='function';
+    features.ImageBitmap=typeof createImageBitmap==='function';
+    features.Blob=typeof Blob!=='undefined';
+    features.FileReader=typeof FileReader!=='undefined';
+    features.Canvas=typeof HTMLCanvasElement!=='undefined';
+    features.OffscreenCanvas=typeof OffscreenCanvas!=='undefined';
+
+    var fStr=[];
+    for(var k in features) fStr.push(k+'='+(features[k]?'Y':'N'));
+    B('A1',fStr.join('|'));
+
+    // Check gc() availability
+    features.gc=typeof gc==='function';
+    features.collectGarbage=typeof collectGarbage==='function';
+    features.GCController=typeof GCController!=='undefined';
+    B('A2','gc='+features.gc+'|collectGarbage='+features.collectGarbage+
+      '|GCController='+features.GCController);
+
+  }catch(e){B('A0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- B: SVG <use> with removed target -->
+<script>
+log('\n--- B: SVG use + removed target ---');
+(function(){
+  try{
+    var svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+    svg.setAttribute('width','100');
+    svg.setAttribute('height','100');
+    svg.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(svg);
+
+    // Create a target element
+    var rect=document.createElementNS('http://www.w3.org/2000/svg','rect');
+    rect.setAttribute('id','target1');
+    rect.setAttribute('width','50');
+    rect.setAttribute('height','50');
+    rect.setAttribute('fill','red');
+    svg.appendChild(rect);
+
+    // Create <use> referencing it
+    var use=document.createElementNS('http://www.w3.org/2000/svg','use');
+    use.setAttributeNS('http://www.w3.org/1999/xlink','href','#target1');
+    svg.appendChild(use);
+
+    B('B1','use_created|target_in_dom='+!!document.getElementById('target1'));
+
+    // Remove the target
+    svg.removeChild(rect);
+    B('B2','target_removed|use_in_dom='+svg.contains(use));
+
+    // Force layout
+    void svg.getBoundingClientRect();
+    void use.getBoundingClientRect();
+
+    // Re-add a different element with same id
+    var circle=document.createElementNS('http://www.w3.org/2000/svg','circle');
+    circle.setAttribute('id','target1');
+    circle.setAttribute('r','25');
+    circle.setAttribute('fill','blue');
+    svg.appendChild(circle);
+
+    // Force layout again
+    void svg.getBoundingClientRect();
+    void use.getBoundingClientRect();
+
+    B('B3','new_target_added|use_bbox='+JSON.stringify(use.getBBox()));
+
+    // Rapid add/remove cycles
+    for(var i=0;i<50;i++){
+      svg.removeChild(circle);
+      void svg.offsetWidth; // Force sync layout
+      svg.appendChild(circle);
+      void svg.offsetWidth;
+    }
+    B('B4','50_cycles_ok');
+
+    svg.parentNode.removeChild(svg);
+  }catch(e){B('B0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- C: MutationObserver re-entrancy — mutate in callback -->
+<script>
+log('\n--- C: MutationObserver re-entrancy ---');
+(function(){
+  try{
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(container);
+
+    var callbackCount=0;
+    var maxDepth=0;
+    var currentDepth=0;
+
+    var observer=new MutationObserver(function(mutations){
+      callbackCount++;
+      currentDepth++;
+      if(currentDepth>maxDepth) maxDepth=currentDepth;
+
+      if(currentDepth<10){
+        // Re-entrant mutation: add a child in the callback
+        var child=document.createElement('span');
+        child.textContent='depth_'+currentDepth;
+        container.appendChild(child);
+        // Also remove the first child if it exists
+        if(container.firstChild&&container.childNodes.length>5){
+          container.removeChild(container.firstChild);
+        }
+      }
+      currentDepth--;
+    });
+
+    observer.observe(container, {childList:true, subtree:true});
+
+    // Trigger initial mutation
+    container.appendChild(document.createElement('div'));
+
+    // Wait for microtask queue to flush
+    Promise.resolve().then(function(){
+      B('C1','callbacks='+callbackCount+'|maxDepth='+maxDepth+
+        '|children='+container.childNodes.length);
+
+      // Disconnect and stress test
+      observer.disconnect();
+      var obs2=new MutationObserver(function(muts){
+        callbackCount++;
+        // Remove ALL children in the callback
+        while(container.firstChild) container.removeChild(container.firstChild);
+      });
+      obs2.observe(container,{childList:true});
+
+      // Add 100 children rapidly
+      for(var i=0;i<100;i++){
+        container.appendChild(document.createElement('span'));
+      }
+
+      setTimeout(function(){
+        B('C2','callbacks='+callbackCount+'|children='+container.childNodes.length);
+        obs2.disconnect();
+        container.parentNode.removeChild(container);
+      },100);
+    });
+
+  }catch(e){B('C0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- D: Range manipulation during DOM mutation -->
+<script>
+log('\n--- D: Range + DOM mutation ---');
+(function(){
+  try{
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    container.innerHTML='<p>one</p><p>two</p><p>three</p><p>four</p><p>five</p>';
+    document.body.appendChild(container);
+
+    var range=document.createRange();
+    range.setStart(container.childNodes[1], 0); // Start at <p>two
+    range.setEnd(container.childNodes[3], 0);   // End at <p>four
+
+    B('D1','range='+range.toString()+'|nodes='+container.childNodes.length);
+
+    // Delete the start node while range is active
+    container.removeChild(container.childNodes[1]);
+    B('D2','after_remove|range_collapsed='+range.collapsed+
+      '|range_str='+range.toString()+
+      '|nodes='+container.childNodes.length);
+
+    // Extract the range contents
+    try{
+      var frag=range.extractContents();
+      B('D3','extracted|frag_children='+frag.childNodes.length+
+        '|container_nodes='+container.childNodes.length);
+    }catch(e){
+      B('D3','extract_err:'+e.name+':'+e.message.slice(0,60));
+    }
+
+    // Create range, set to nodes, then move nodes to different document
+    var container2=document.createElement('div');
+    container2.innerHTML='<span>A</span><span>B</span><span>C</span>';
+    document.body.appendChild(container2);
+
+    var range2=document.createRange();
+    range2.selectNode(container2.childNodes[1]); // Select <span>B
+
+    // Adopt the node to a different document (iframe doc)
+    var ifr=document.createElement('iframe');
+    ifr.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+    document.body.appendChild(ifr);
+    ifr.contentDocument.open();
+    ifr.contentDocument.write('<html><body></body></html>');
+    ifr.contentDocument.close();
+
+    try{
+      var adopted=ifr.contentDocument.adoptNode(container2.childNodes[1]);
+      B('D4','adopted|range2_collapsed='+range2.collapsed+
+        '|adopted_owner='+(adopted.ownerDocument===ifr.contentDocument));
+    }catch(e){
+      B('D4','adopt_err:'+e.name+':'+e.message.slice(0,60));
+    }
+
+    // Try to use the range after its node was adopted away
+    try{
+      var str=range2.toString();
+      B('D5','range_after_adopt='+str+'|collapsed='+range2.collapsed);
+    }catch(e){
+      B('D5','range_err:'+e.name);
+    }
+
+    container.parentNode.removeChild(container);
+    container2.parentNode.removeChild(container2);
+    ifr.parentNode.removeChild(ifr);
+
+  }catch(e){B('D0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- E: Iframe destroy cycle for GC -->
+<script>
+log('\n--- E: Iframe destroy GC cycle ---');
+(function(){
+  try{
+    var cleanupCount=0;
+    var registry=new FinalizationRegistry(function(idx){
+      cleanupCount++;
+    });
+
+    // Create objects, register them
+    var refs=[];
+    for(var i=0;i<20;i++){
+      var o={i:i, data:new Array(100).fill('x')};
+      refs.push(new WeakRef(o));
+      registry.register(o, i);
+    }
+    // o released each iteration
+
+    B('E1','created=20');
+
+    // Destroy iframe cycles — might trigger GC
+    for(var round=0;round<20;round++){
+      var ifr=document.createElement('iframe');
+      ifr.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+      document.body.appendChild(ifr);
+      ifr.contentDocument.open();
+      // Fill iframe with lots of DOM nodes
+      var html='<html><body>';
+      for(var j=0;j<200;j++) html+='<div class="c'+j+'">'+j+'</div>';
+      html+='</body></html>';
+      ifr.contentDocument.write(html);
+      ifr.contentDocument.close();
+      // Destroy it
+      ifr.parentNode.removeChild(ifr);
+    }
+
+    var alive=0;
+    for(var i=0;i<20;i++){
+      if(refs[i].deref()!==undefined) alive++;
+    }
+    B('E2','alive='+alive+'|cleaned='+cleanupCount);
+
+    // More aggressive: create/destroy with navigation
+    for(var round=0;round<10;round++){
+      var ifr2=document.createElement('iframe');
+      ifr2.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+      document.body.appendChild(ifr2);
+      // Navigate it
+      ifr2.src='about:blank';
+      ifr2.parentNode.removeChild(ifr2);
+    }
+
+    // Check again after a microtask
+    Promise.resolve().then(function(){
+      alive=0;
+      for(var i=0;i<20;i++){
+        if(refs[i].deref()!==undefined) alive++;
+      }
+      B('E3','alive='+alive+'|cleaned='+cleanupCount);
+    });
+
+  }catch(e){B('E0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- F: CSS animation + element removal -->
+<script>
+log('\n--- F: CSS animation + removal race ---');
+(function(){
+  try{
+    // Create style with animation
+    var style=document.createElement('style');
+    style.textContent=
+      '@keyframes grow{from{width:10px}to{width:200px}}'+
+      '.animated{animation:grow 0.1s linear infinite;position:absolute;left:-9999px;'+
+      'width:10px;height:10px;background:red}';
+    document.head.appendChild(style);
+
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(container);
+
+    // Create and animate 50 elements, then remove them rapidly
+    var elements=[];
+    for(var i=0;i<50;i++){
+      var el=document.createElement('div');
+      el.className='animated';
+      el.textContent='anim_'+i;
+      container.appendChild(el);
+      elements.push(el);
+    }
+
+    B('F1','animated='+elements.length);
+
+    // Use RAF to catch mid-animation state
+    requestAnimationFrame(function(){
+      // Measure some
+      var widths=[];
+      for(var i=0;i<5;i++){
+        widths.push(elements[i].getBoundingClientRect().width);
+      }
+      B('F2','widths='+widths.join(','));
+
+      // Remove all while animating
+      for(var i=0;i<elements.length;i++){
+        container.removeChild(elements[i]);
+      }
+      B('F3','removed_all|container_children='+container.childNodes.length);
+
+      // Re-add them in reverse
+      for(var i=elements.length-1;i>=0;i--){
+        container.appendChild(elements[i]);
+      }
+
+      requestAnimationFrame(function(){
+        var widths2=[];
+        for(var i=0;i<5;i++){
+          widths2.push(elements[i].getBoundingClientRect().width);
+        }
+        B('F4','after_readd_widths='+widths2.join(','));
+
+        // Cleanup
+        container.parentNode.removeChild(container);
+        style.parentNode.removeChild(style);
+      });
+    });
+
+  }catch(e){B('F0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- G: TreeWalker over mutating tree -->
+<script>
+log('\n--- G: TreeWalker + mutation ---');
+(function(){
+  try{
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    for(var i=0;i<20;i++){
+      var p=document.createElement('p');
+      p.textContent='node_'+i;
+      container.appendChild(p);
+    }
+    document.body.appendChild(container);
+
+    var tw=document.createTreeWalker(container, NodeFilter.SHOW_ELEMENT, null);
+    var visited=[];
+    var node=tw.firstChild();
+
+    while(node){
+      visited.push(node.textContent);
+      // Remove the NEXT sibling during traversal
+      if(node.nextSibling){
+        container.removeChild(node.nextSibling);
+      }
+      node=tw.nextNode();
+    }
+
+    B('G1','visited='+visited.length+'|nodes='+visited.slice(0,10).join(','));
+
+    // NodeIterator version
+    container.innerHTML='';
+    for(var i=0;i<20;i++){
+      var s=document.createElement('span');
+      s.textContent='iter_'+i;
+      container.appendChild(s);
+    }
+
+    var ni=document.createNodeIterator(container, NodeFilter.SHOW_ELEMENT);
+    var visited2=[];
+    var n=ni.nextNode(); // Skip container itself
+
+    while(n){
+      visited2.push(n.textContent);
+      // Insert a new node BEFORE current position
+      if(visited2.length===5){
+        var inserted=document.createElement('b');
+        inserted.textContent='INSERTED';
+        container.insertBefore(inserted, n);
+      }
+      n=ni.nextNode();
+    }
+    B('G2','visited2='+visited2.length+'|first10='+visited2.slice(0,10).join(','));
+
+    container.parentNode.removeChild(container);
+  }catch(e){B('G0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- H: Canvas operations + ImageBitmap -->
+<script>
+log('\n--- H: Canvas + ImageBitmap ---');
+(function(){
+  try{
+    var c=document.createElement('canvas');
+    c.width=256;c.height=256;
+    var ctx=c.getContext('2d');
+    if(!ctx){B('H1','no_2d_context');return;}
+
+    // Draw pattern
+    for(var i=0;i<256;i++){
+      ctx.fillStyle='rgb('+i+',0,'+(255-i)+')';
+      ctx.fillRect(i,0,1,256);
+    }
+
+    // getImageData — any pointer leak in pixel data?
+    var imgData=ctx.getImageData(0,0,256,256);
+    B('H1','imagedata|len='+imgData.data.length+
+      '|w='+imgData.width+'|h='+imgData.height);
+
+    // Check pixel data buffer
+    var u32=new Uint32Array(imgData.data.buffer);
+    var nonzero=0;
+    for(var i=0;i<u32.length;i++){
+      if(u32[i]!==0) nonzero++;
+    }
+    B('H2','nonzero_pixels='+nonzero);
+
+    // toDataURL
+    var dataUrl=c.toDataURL('image/png');
+    B('H3','dataurl_len='+dataUrl.length+'|prefix='+dataUrl.slice(0,30));
+
+    // toBlob
+    c.toBlob(function(blob){
+      B('H4','blob_size='+blob.size+'|type='+blob.type);
+
+      // createImageBitmap
+      if(typeof createImageBitmap==='function'){
+        createImageBitmap(blob).then(function(bmp){
+          B('H5','bitmap|w='+bmp.width+'|h='+bmp.height);
+          // Draw bitmap back and compare
+          var c2=document.createElement('canvas');
+          c2.width=256;c2.height=256;
+          var ctx2=c2.getContext('2d');
+          ctx2.drawImage(bmp,0,0);
+          var d2=ctx2.getImageData(0,0,1,1);
+          B('H6','roundtrip_pixel='+d2.data[0]+','+d2.data[1]+','+d2.data[2]+','+d2.data[3]);
+          bmp.close();
+        }).catch(function(e){
+          B('H5','bitmap_err:'+e.name+':'+e.message.slice(0,60));
+        });
+      }else{
+        B('H5','no_createImageBitmap');
+      }
+    },'image/png');
+
+  }catch(e){B('H0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1265 COMPLETE ===');
+}, 5000);
+</script>
+
+</body>
+</html>

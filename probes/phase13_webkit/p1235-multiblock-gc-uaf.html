@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1235</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<!--
+  P1235: Multi-block GC + WeakRef UAF
+
+  KEY INSIGHT: WeakRef.deref() keeps target alive until end of current Job.
+  Each <script> block is a separate Job. Between blocks, GC can collect.
+
+  Strategy:
+  Block 1: Create targets, take WeakRefs, release strong refs, allocate heavily
+  Block 2: NEW JOB — check deref(), if null = GC happened!
+  Block 3: If GC works, attempt FontFace UAF exploit chain
+-->
+
+<script>
+// Shared state across blocks
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1235-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+
+log('=== P1235: MULTI-BLOCK GC + WEAKREF UAF ===');
+log('Time: '+new Date().toISOString());
+B('START','P1235-multiblock-gc-uaf');
+
+// ============================================================
+// BLOCK 1: Create targets, WeakRefs, release, allocate
+// ============================================================
+log('\n--- BLOCK 1: Create + Release + Allocate ---');
+
+// Test A: Plain objects
+window._wrPlain = [];
+window._wrPlainCount = 10;
+(function(){
+  for(var i=0;i<10;i++){
+    var obj = {id:'plain_'+i, payload:new Array(500).fill(i)};
+    window._wrPlain.push(new WeakRef(obj));
+  }
+})();
+var pAlive1 = 0;
+for(var i=0;i<window._wrPlain.length;i++) if(window._wrPlain[i].deref()) pAlive1++;
+log('A plain objects: '+pAlive1+'/10 alive (DONT deref again in this block!)');
+
+// Test B: FontFace objects
+window._wrFonts = [];
+document.fonts.clear();
+(function(){
+  for(var i=0;i<10;i++){
+    var fb = new ArrayBuffer(128);
+    var face = new FontFace('Block1Font'+i, fb);
+    window._wrFonts.push(new WeakRef(face));
+  }
+})();
+// DO NOT deref here — that would keep them alive!
+log('B font faces: 10 created, refs released');
+
+// Test C: FontFace that WAS in document.fonts
+window._wrFontsAdded = [];
+(function(){
+  for(var i=0;i<10;i++){
+    var fb = new ArrayBuffer(128);
+    var face = new FontFace('Block1Added'+i, fb);
+    document.fonts.add(face);
+    window._wrFontsAdded.push(new WeakRef(face));
+    document.fonts.delete(face);
+  }
+})();
+log('C added+deleted fonts: 10 created+deleted, refs released');
+
+// Test D: Large objects (more GC pressure)
+window._wrLarge = [];
+(function(){
+  for(var i=0;i<5;i++){
+    var obj = {id:'large_'+i, big:new Array(100000).fill(i)};
+    window._wrLarge.push(new WeakRef(obj));
+  }
+})();
+log('D large objects: 5 created, refs released');
+
+// Test E: FinalizationRegistry
+window._frFired = [];
+window._fr = new FinalizationRegistry(function(val){
+  window._frFired.push(val);
+});
+(function(){
+  for(var i=0;i<10;i++){
+    var obj = {id:'fr_'+i};
+    window._fr.register(obj, 'token_'+i);
+  }
+})();
+log('E finalization: 10 registered');
+
+// NOW: heavy allocation to trigger GC BEFORE this block ends
+// But DON'T call deref() — let the liveness expire at block end
+log('Allocating heavily...');
+for(var i=0;i<500000;i++){
+  var t = {x:i, y:[i,i+1]};
+}
+for(var i=0;i<200;i++){
+  new ArrayBuffer(1048576);
+}
+// More objects in GC heap
+for(var i=0;i<200000;i++){
+  var t = [i, 'str_'+i, {nested:true}];
+}
+log('Block 1 allocation done');
+B('BLOCK1','done');
+</script>
+
+<!-- Between blocks: JSC can run GC! The current Job ended. -->
+
+<script>
+// ============================================================
+// BLOCK 2: Check WeakRefs — this is a NEW Job!
+// The "keep alive" from Block 1's deref() has expired.
+// ============================================================
+log('\n--- BLOCK 2: Check GC Results (NEW JOB) ---');
+
+// Check plain objects
+var pAlive2 = 0;
+for(var i=0;i<window._wrPlain.length;i++){
+  if(window._wrPlain[i].deref()) pAlive2++;
+}
+log('A plain objects: '+pAlive2+'/'+window._wrPlainCount+' alive');
+if(pAlive2 < window._wrPlainCount) {
+  log('*** PLAIN OBJECTS COLLECTED! '+(window._wrPlainCount-pAlive2)+' freed ***');
+}
+
+// Check font faces (never added to document.fonts)
+var fAlive2 = 0;
+for(var i=0;i<window._wrFonts.length;i++){
+  if(window._wrFonts[i].deref()) fAlive2++;
+}
+log('B font faces: '+fAlive2+'/10 alive');
+if(fAlive2 < 10) {
+  log('*** FONT FACES COLLECTED! '+(10-fAlive2)+' freed ***');
+}
+
+// Check fonts that were added+deleted
+var faAlive2 = 0;
+for(var i=0;i<window._wrFontsAdded.length;i++){
+  if(window._wrFontsAdded[i].deref()) faAlive2++;
+}
+log('C added+deleted fonts: '+faAlive2+'/10 alive');
+if(faAlive2 < 10) {
+  log('*** ADDED+DELETED FONTS COLLECTED! ***');
+}
+
+// Check large objects
+var lAlive2 = 0;
+for(var i=0;i<window._wrLarge.length;i++){
+  if(window._wrLarge[i].deref()) lAlive2++;
+}
+log('D large objects: '+lAlive2+'/5 alive');
+
+// Check finalization
+log('E finalization callbacks: '+window._frFired.length+' fired');
+if(window._frFired.length > 0) {
+  log('FR tokens: '+window._frFired.join(','));
+}
+
+var summary = 'plain='+pAlive2+'/10|fonts='+fAlive2+'/10|added='+faAlive2+'/10|large='+lAlive2+'/5|fr='+window._frFired.length;
+B('BLOCK2', summary);
+
+// If nothing collected, do MORE allocation and check in block 3
+if(pAlive2 === 10 && fAlive2 === 10) {
+  log('\nNothing collected yet — more allocation...');
+  for(var i=0;i<500000;i++){
+    var t = {round2:i, data:[i,i*2]};
+  }
+  for(var i=0;i<500;i++){
+    new ArrayBuffer(1048576);
+  }
+  // Create+destroy DOM nodes
+  for(var i=0;i<20000;i++){
+    var d = document.createElement('span');
+    d.textContent = 'node'+i;
+  }
+  log('Block 2 extra allocation done');
+}
+</script>
+
+<script>
+// ============================================================
+// BLOCK 3: Second check after Block 2's allocation
+// ============================================================
+log('\n--- BLOCK 3: Second GC Check ---');
+
+var pAlive3 = 0;
+for(var i=0;i<window._wrPlain.length;i++){
+  if(window._wrPlain[i].deref()) pAlive3++;
+}
+var fAlive3 = 0;
+for(var i=0;i<window._wrFonts.length;i++){
+  if(window._wrFonts[i].deref()) fAlive3++;
+}
+var faAlive3 = 0;
+for(var i=0;i<window._wrFontsAdded.length;i++){
+  if(window._wrFontsAdded[i].deref()) faAlive3++;
+}
+var lAlive3 = 0;
+for(var i=0;i<window._wrLarge.length;i++){
+  if(window._wrLarge[i].deref()) lAlive3++;
+}
+
+log('A plain: '+pAlive3+'/10');
+log('B fonts: '+fAlive3+'/10');
+log('C added: '+faAlive3+'/10');
+log('D large: '+lAlive3+'/5');
+log('E FR: '+window._frFired.length+' callbacks');
+
+var summary3 = 'plain='+pAlive3+'|fonts='+fAlive3+'|added='+faAlive3+'|large='+lAlive3+'|fr='+window._frFired.length;
+B('BLOCK3', summary3);
+
+// If STILL nothing, try even more rounds
+if(pAlive3 === 10 && fAlive3 === 10) {
+  log('\nStill nothing — nuclear allocation round...');
+  // Create tons of short-lived closures (definitely GC heap)
+  for(var round=0;round<10;round++){
+    var arr = [];
+    for(var i=0;i<100000;i++){
+      arr.push(function(x){return function(){return x+1};}(i));
+    }
+    arr = null; // Release the whole array
+  }
+  // Map objects
+  for(var i=0;i<50000;i++){
+    var m = new Map();
+    m.set('k'+i, {v:i});
+  }
+  // Set objects
+  for(var i=0;i<50000;i++){
+    var s = new Set([i, i+1, i+2, {obj:i}]);
+  }
+  log('Nuclear allocation done');
+}
+</script>
+
+<script>
+// ============================================================
+// BLOCK 4: Third check
+// ============================================================
+log('\n--- BLOCK 4: Third GC Check ---');
+
+var pAlive4=0,fAlive4=0,faAlive4=0,lAlive4=0;
+for(var i=0;i<window._wrPlain.length;i++) if(window._wrPlain[i].deref()) pAlive4++;
+for(var i=0;i<window._wrFonts.length;i++) if(window._wrFonts[i].deref()) fAlive4++;
+for(var i=0;i<window._wrFontsAdded.length;i++) if(window._wrFontsAdded[i].deref()) faAlive4++;
+for(var i=0;i<window._wrLarge.length;i++) if(window._wrLarge[i].deref()) lAlive4++;
+
+log('A plain: '+pAlive4+'/10');
+log('B fonts: '+fAlive4+'/10');
+log('C added: '+faAlive4+'/10');
+log('D large: '+lAlive4+'/5');
+log('E FR: '+window._frFired.length);
+
+B('BLOCK4', 'plain='+pAlive4+'|fonts='+fAlive4+'|added='+faAlive4+'|large='+lAlive4+'|fr='+window._frFired.length);
+</script>
+
+<script>
+// ============================================================
+// BLOCK 5: Try sync XHR between checks (event loop pump)
+// ============================================================
+log('\n--- BLOCK 5: Sync XHR pump test ---');
+
+// Create fresh targets
+window._wrXhr = [];
+(function(){
+  for(var i=0;i<5;i++){
+    var obj = {xhr_target:i, data:new Array(1000)};
+    window._wrXhr.push(new WeakRef(obj));
+  }
+})();
+// DO NOT deref — release and allocate
+for(var i=0;i<300000;i++){var t={xhr_alloc:i};}
+
+// Sync XHR — does this pump the event loop enough for GC?
+for(var pump=0;pump<5;pump++){
+  try{
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET','/beacon.php?tag=P1235-pump'+pump+'&data=pump&t='+Date.now(),false);
+    xhr.send(null);
+  }catch(e){}
+  // Allocate between pumps
+  for(var i=0;i<100000;i++){var t={pump:pump,i:i};}
+}
+</script>
+
+<script>
+// ============================================================
+// BLOCK 6: Check after XHR pumps
+// ============================================================
+log('\n--- BLOCK 6: Post-XHR Check ---');
+
+var xhrAlive = 0;
+for(var i=0;i<window._wrXhr.length;i++){
+  if(window._wrXhr[i].deref()) xhrAlive++;
+}
+log('XHR pump targets: '+xhrAlive+'/5 alive');
+
+// Also check original targets one more time
+var pFinal=0,fFinal=0;
+for(var i=0;i<window._wrPlain.length;i++) if(window._wrPlain[i].deref()) pFinal++;
+for(var i=0;i<window._wrFonts.length;i++) if(window._wrFonts[i].deref()) fFinal++;
+
+log('Original plain: '+pFinal+'/10');
+log('Original fonts: '+fFinal+'/10');
+log('FR callbacks total: '+window._frFired.length);
+
+B('BLOCK6', 'xhr='+xhrAlive+'/5|plain='+pFinal+'|fonts='+fFinal+'|fr='+window._frFired.length);
+</script>
+
+<script>
+// ============================================================
+// BLOCK 7: Worker-mediated GC attempt
+// Worker posts back, creating a new macrotask on main thread
+// ============================================================
+log('\n--- BLOCK 7: Worker message GC ---');
+
+window._wrWorkerTest = [];
+(function(){
+  for(var i=0;i<5;i++){
+    var obj = {worker_target:i, arr:new Array(5000).fill(i)};
+    window._wrWorkerTest.push(new WeakRef(obj));
+  }
+})();
+
+// Create worker that just posts back
+var wCode = 'onmessage=function(){postMessage("gc");};';
+var wBlob = new Blob([wCode],{type:'application/javascript'});
+var wUrl = URL.createObjectURL(wBlob);
+window._gcWorker = new Worker(wUrl);
+window._gcWorkerDone = false;
+window._gcWorker.onmessage = function(){
+  window._gcWorkerDone = true;
+};
+window._gcWorker.postMessage('go');
+
+// Heavy allocation while waiting
+for(var i=0;i<500000;i++){var t={wt:i};}
+
+log('Worker message sent, allocating while waiting...');
+B('BLOCK7','worker_sent');
+</script>
+
+<script>
+// ============================================================
+// BLOCK 8: Check after Worker message (new macrotask)
+// ============================================================
+log('\n--- BLOCK 8: Post-Worker Check ---');
+log('Worker replied: '+window._gcWorkerDone);
+
+// More allocation
+for(var i=0;i<300000;i++){var t={b8:i};}
+
+var wAlive = 0;
+for(var i=0;i<window._wrWorkerTest.length;i++){
+  if(window._wrWorkerTest[i].deref()) wAlive++;
+}
+log('Worker test targets: '+wAlive+'/5 alive');
+
+if(window._gcWorker) {
+  window._gcWorker.terminate();
+}
+
+B('BLOCK8', 'workerDone='+window._gcWorkerDone+'|alive='+wAlive);
+</script>
+
+<script>
+// ============================================================
+// BLOCK 9: innerHTML GC — destroy and recreate DOM subtree
+// innerHTML replacement orphans JS objects held by DOM nodes
+// ============================================================
+log('\n--- BLOCK 9: innerHTML orphan test ---');
+
+// Create a div with event handlers that hold objects
+var container = document.createElement('div');
+container.id = 'gc_container';
+document.body.appendChild(container);
+
+window._wrDOM = [];
+(function(){
+  for(var i=0;i<10;i++){
+    var child = document.createElement('div');
+    var captured = {dom_obj:i, data:new Array(1000)};
+    child.onclick = function(){ return captured; };
+    container.appendChild(child);
+    window._wrDOM.push(new WeakRef(captured));
+  }
+})();
+log('Created 10 DOM children with captured objects');
+
+// Destroy the subtree via innerHTML
+container.innerHTML = '';
+document.body.removeChild(container);
+container = null;
+
+// Heavy allocation
+for(var i=0;i<500000;i++){var t={dom:i};}
+for(var i=0;i<200;i++){new ArrayBuffer(1048576);}
+
+log('DOM destroyed, heavy allocation done');
+B('BLOCK9','dom_destroyed');
+</script>
+
+<script>
+// ============================================================
+// BLOCK 10: Final comprehensive check
+// ============================================================
+log('\n--- BLOCK 10: FINAL COMPREHENSIVE CHECK ---');
+
+var results = {};
+
+// All WeakRef groups
+var groups = [
+  {name:'plain', refs:window._wrPlain},
+  {name:'fonts', refs:window._wrFonts},
+  {name:'fonts_added', refs:window._wrFontsAdded},
+  {name:'large', refs:window._wrLarge},
+  {name:'xhr', refs:window._wrXhr},
+  {name:'worker', refs:window._wrWorkerTest},
+  {name:'dom', refs:window._wrDOM}
+];
+
+var anyCollected = false;
+for(var g=0;g<groups.length;g++){
+  var alive = 0;
+  var total = groups[g].refs.length;
+  for(var i=0;i<total;i++){
+    if(groups[g].refs[i].deref()) alive++;
+  }
+  results[groups[g].name] = alive+'/'+total;
+  log(groups[g].name+': '+alive+'/'+total+(alive<total?' *** COLLECTED ***':''));
+  if(alive < total) anyCollected = true;
+}
+
+log('\nFinalizationRegistry: '+window._frFired.length+' callbacks');
+if(window._frFired.length > 0) {
+  log('FR tokens: '+window._frFired.slice(0,10).join(','));
+}
+
+log('\n=== VERDICT: '+(anyCollected ? 'GC WORKS! Objects collected between blocks!' : 'GC DID NOT COLLECT across 10 blocks')+' ===');
+
+var finalData = [];
+for(var k in results) finalData.push(k+'='+results[k]);
+finalData.push('fr='+window._frFired.length);
+finalData.push('collected='+anyCollected);
+B('FINAL', finalData.join('|'));
+
+log('\n=== P1235 COMPLETE ===');
+B('DONE','all|collected='+anyCollected);
+</script>
+
+</body>
+</html>

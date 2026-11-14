@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1246</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1246-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1246: FONT/MEDIA/IFRAME/REGEX ===');
+log('Time: '+new Date().toISOString());
+B('START','P1246');
+</script>
+
+<!-- A: FontFace from crafted ArrayBuffer -->
+<script>
+log('\n--- A: FontFace crafted data ---');
+var aR=[];
+
+// A1: FontFace API availability + basic test
+try{
+  aR.push('A1:FF='+(typeof FontFace)+'|FFS='+(typeof FontFaceSet));
+  aR.push('A1:docFonts='+(typeof document.fonts));
+}catch(e){aR.push('A1:ERR:'+e.message.slice(0,60));}
+
+// A2: FontFace from data URL (minimal valid TrueType)
+try{
+  // Minimal TrueType header (not a real font, will fail to load)
+  var ttf=new ArrayBuffer(64);
+  var view=new DataView(ttf);
+  // TrueType magic: 0x00010000
+  view.setUint32(0,0x00010000);
+  view.setUint16(4,0); // numTables=0
+  view.setUint16(6,0); // searchRange
+  view.setUint16(8,0); // entrySelector
+  view.setUint16(10,0); // rangeShift
+
+  var ff=new FontFace('test1',ttf);
+  ff.load().then(function(){
+    B('A2','LOADED_MINIMAL_TTF:status='+ff.status);
+  }).catch(function(e){
+    B('A2','minimal_ttf:status='+ff.status+'|err='+e.message.slice(0,50));
+  });
+  aR.push('A2:created|status='+ff.status);
+}catch(e){aR.push('A2:ERR:'+e.message.slice(0,60));}
+
+// A3: FontFace from zero-length buffer
+try{
+  var ff3=new FontFace('test3',new ArrayBuffer(0));
+  ff3.load().then(function(){
+    B('A3','LOADED_EMPTY');
+  }).catch(function(e){
+    B('A3','empty:'+e.message.slice(0,50));
+  });
+}catch(e){aR.push('A3:ERR:'+e.message.slice(0,60));}
+
+// A4: FontFace with WOFF2 magic but garbage body
+try{
+  var woff2=new ArrayBuffer(128);
+  var wv=new DataView(woff2);
+  wv.setUint32(0,0x774F4632); // wOF2 magic
+  wv.setUint32(4,0x00010000); // flavor (TrueType)
+  wv.setUint32(8,128);        // length
+  wv.setUint16(12,1);         // numTables
+  wv.setUint16(14,0);         // reserved
+  wv.setUint32(16,1000);      // totalSfntSize
+  wv.setUint32(20,50);        // totalCompressedSize
+  // Fill rest with pattern
+  for(var i=24;i<128;i++)new Uint8Array(woff2)[i]=i&0xFF;
+
+  var ff4=new FontFace('test4',woff2);
+  ff4.load().then(function(){
+    B('A4','LOADED_BAD_WOFF2');
+  }).catch(function(e){
+    B('A4','bad_woff2:status='+ff4.status+'|err='+e.message.slice(0,50));
+  });
+}catch(e){aR.push('A4:ERR:'+e.message.slice(0,60));}
+
+// A5: FontFace with OTF magic + crafted tables
+try{
+  var otf=new ArrayBuffer(256);
+  var ov=new DataView(otf);
+  ov.setUint32(0,0x4F54544F); // OTTO (OpenType CFF)
+  ov.setUint16(4,3);          // numTables=3
+  ov.setUint16(6,32);         // searchRange
+  ov.setUint16(8,1);          // entrySelector
+  ov.setUint16(10,16);        // rangeShift
+  // Table 1: head (fake)
+  ov.setUint32(12,0x68656164); // 'head'
+  ov.setUint32(16,0);          // checksum
+  ov.setUint32(20,100);        // offset
+  ov.setUint32(24,54);         // length
+  // Table 2: cmap
+  ov.setUint32(28,0x636D6170); // 'cmap'
+  ov.setUint32(32,0);
+  ov.setUint32(36,160);        // offset
+  ov.setUint32(40,20);         // length
+  // Table 3: name (extreme offset)
+  ov.setUint32(44,0x6E616D65); // 'name'
+  ov.setUint32(48,0);
+  ov.setUint32(52,0xFFFFFF00); // offset WAY past buffer
+  ov.setUint32(56,0x10000);    // length = 64KB
+
+  var ff5=new FontFace('test5',otf);
+  ff5.load().then(function(){
+    B('A5','LOADED_BAD_OTF');
+  }).catch(function(e){
+    B('A5','bad_otf:status='+ff5.status+'|err='+e.message.slice(0,50));
+  });
+}catch(e){aR.push('A5:ERR:'+e.message.slice(0,60));}
+
+// A6: FontFace with huge declared table pointing past buffer
+try{
+  var huge=new ArrayBuffer(64);
+  var hv=new DataView(huge);
+  hv.setUint32(0,0x00010000); // TrueType
+  hv.setUint16(4,1);          // numTables=1
+  // Single table with offset/length past buffer
+  hv.setUint32(12,0x676C7966); // 'glyf'
+  hv.setUint32(16,0);
+  hv.setUint32(20,0);          // offset=0 (within buffer)
+  hv.setUint32(24,0x7FFFFFFF); // length=2GB (way past buffer!)
+
+  var ff6=new FontFace('test6',huge);
+  ff6.load().then(function(){
+    B('A6','LOADED_HUGE_TABLE');
+  }).catch(function(e){
+    B('A6','huge_table:'+e.message.slice(0,50));
+  });
+}catch(e){aR.push('A6:ERR:'+e.message.slice(0,60));}
+
+B('A',aR.join('||'));
+log('A: '+aR.join(' | '));
+</script>
+
+<!-- B: Media elements -->
+<script>
+log('\n--- B: Media elements ---');
+var bR=[];
+
+// B1: Audio/Video element availability
+try{
+  var audio=document.createElement('audio');
+  var video=document.createElement('video');
+  bR.push('B1:audio='+(audio?'yes':'no')+'|video='+(video?'yes':'no'));
+  bR.push('B1:audioCtx='+(typeof AudioContext)+'|webkitAC='+(typeof webkitAudioContext));
+  bR.push('B1:MediaSource='+(typeof MediaSource)+'|MediaRecorder='+(typeof MediaRecorder));
+  bR.push('B1:SpeechSynth='+(typeof speechSynthesis)+'|SpeechRecog='+(typeof SpeechRecognition||typeof webkitSpeechRecognition));
+}catch(e){bR.push('B1:ERR:'+e.message.slice(0,60));}
+
+// B2: Audio/Video canPlayType
+try{
+  var a=document.createElement('audio');
+  var types=['audio/mp3','audio/ogg','audio/wav','audio/aac','audio/flac',
+    'audio/webm','video/mp4','video/webm','video/ogg'];
+  var r=[];
+  for(var i=0;i<types.length;i++){
+    r.push(types[i].split('/')[1]+':'+a.canPlayType(types[i]));
+  }
+  bR.push('B2:'+r.join(','));
+}catch(e){bR.push('B2:ERR:'+e.message.slice(0,60));}
+
+// B3: Audio from data URI
+try{
+  var audio2=document.createElement('audio');
+  // Minimal WAV: 44-byte header, 4 bytes of silence
+  var wav=new ArrayBuffer(48);
+  var wv=new DataView(wav);
+  // RIFF header
+  wv.setUint32(0,0x52494646,false); // "RIFF"
+  wv.setUint32(4,40,true);          // File size - 8
+  wv.setUint32(8,0x57415645,false);  // "WAVE"
+  // fmt chunk
+  wv.setUint32(12,0x666D7420,false); // "fmt "
+  wv.setUint32(16,16,true);          // Chunk size
+  wv.setUint16(20,1,true);           // PCM
+  wv.setUint16(22,1,true);           // Mono
+  wv.setUint32(24,44100,true);       // Sample rate
+  wv.setUint32(28,88200,true);       // Byte rate
+  wv.setUint16(32,2,true);           // Block align
+  wv.setUint16(34,16,true);          // Bits per sample
+  // data chunk
+  wv.setUint32(36,0x64617461,false); // "data"
+  wv.setUint32(40,4,true);           // Data size
+  wv.setUint16(44,0,true);           // Silence
+  wv.setUint16(46,0,true);           // Silence
+
+  var blob=new Blob([wav],{type:'audio/wav'});
+  var url=URL.createObjectURL(blob);
+  audio2.src=url;
+  audio2.onloadedmetadata=function(){
+    bR.push('B3:duration='+audio2.duration+'|channels='+audio2.mozChannelCount);
+    B('B3','loaded:dur='+audio2.duration);
+    URL.revokeObjectURL(url);
+  };
+  audio2.onerror=function(){
+    B('B3','audio_err:code='+audio2.error.code+'|msg='+audio2.error.message);
+    URL.revokeObjectURL(url);
+  };
+  audio2.load();
+}catch(e){bR.push('B3:ERR:'+e.message.slice(0,60));}
+
+B('B',bR.join('||'));
+log('B: '+bR.join(' | '));
+</script>
+
+<!-- C: iframe / window.open -->
+<script>
+log('\n--- C: iframe/window ---');
+var cR=[];
+
+// C1: iframe creation
+try{
+  var iframe=document.createElement('iframe');
+  iframe.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  iframe.sandbox='allow-scripts allow-same-origin';
+  document.body.appendChild(iframe);
+  cR.push('C1:iframe_created');
+
+  // Try to access contentWindow/Document
+  try{
+    var cw=iframe.contentWindow;
+    var cd=iframe.contentDocument;
+    cR.push('C1:cw='+(cw?'yes':'no')+'|cd='+(cd?'yes':'no'));
+  }catch(e){cR.push('C1:access_err:'+e.message.slice(0,30));}
+  document.body.removeChild(iframe);
+}catch(e){cR.push('C1:ERR:'+e.message.slice(0,60));}
+
+// C2: iframe with blob URL
+try{
+  var iframeHtml='<html><body><script>parent.postMessage("hello_from_iframe","*");<\/script></body></html>';
+  var blob=new Blob([iframeHtml],{type:'text/html'});
+  var blobUrl=URL.createObjectURL(blob);
+  var iframe2=document.createElement('iframe');
+  iframe2.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+
+  window.addEventListener('message',function handler(e){
+    if(e.data==='hello_from_iframe'){
+      B('C2','iframe_msg_received');
+      window.removeEventListener('message',handler);
+    }
+  });
+
+  iframe2.src=blobUrl;
+  document.body.appendChild(iframe2);
+  cR.push('C2:iframe_blob_created');
+
+  // Cleanup after 2s
+  setTimeout(function(){
+    try{document.body.removeChild(iframe2);}catch(e){}
+    URL.revokeObjectURL(blobUrl);
+  },2000);
+}catch(e){cR.push('C2:ERR:'+e.message.slice(0,60));}
+
+// C3: iframe srcdoc
+try{
+  var iframe3=document.createElement('iframe');
+  iframe3.srcdoc='<html><body><script>parent.postMessage("srcdoc_msg","*");<\/script></body></html>';
+  iframe3.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+
+  window.addEventListener('message',function handler2(e){
+    if(e.data==='srcdoc_msg'){
+      B('C3','srcdoc_msg_received');
+      window.removeEventListener('message',handler2);
+    }
+  });
+
+  document.body.appendChild(iframe3);
+  cR.push('C3:srcdoc_created');
+  setTimeout(function(){try{document.body.removeChild(iframe3);}catch(e){}},2000);
+}catch(e){cR.push('C3:ERR:'+e.message.slice(0,60));}
+
+// C4: window.open
+try{
+  var w=window.open('','_blank');
+  if(w){
+    cR.push('C4:window_open=yes|closed='+w.closed);
+    try{w.close();}catch(e){}
+  }else{
+    cR.push('C4:window_open=blocked');
+  }
+}catch(e){cR.push('C4:ERR:'+e.message.slice(0,60));}
+
+B('C',cR.join('||'));
+log('C: '+cR.join(' | '));
+</script>
+
+<!-- D: Dynamic import + module features -->
+<script>
+log('\n--- D: Dynamic import/modules ---');
+var dR=[];
+
+// D1: dynamic import availability
+try{
+  // Try import() — creates a module from blob URL
+  var moduleCode='export const value = 42; export default function(){ return "hello"; }';
+  var moduleBlob=new Blob([moduleCode],{type:'application/javascript'});
+  var moduleUrl=URL.createObjectURL(moduleBlob);
+
+  import(moduleUrl).then(function(mod){
+    B('D1','import_ok:value='+mod.value+'|default='+mod.default());
+    URL.revokeObjectURL(moduleUrl);
+  }).catch(function(e){
+    B('D1','import_err:'+e.message.slice(0,60));
+    URL.revokeObjectURL(moduleUrl);
+  });
+  dR.push('D1:import_attempted');
+}catch(e){dR.push('D1:'+e.message.slice(0,60));}
+
+// D2: eval with import()
+try{
+  var result=eval('typeof import');
+  dR.push('D2:typeof_import='+result);
+}catch(e){dR.push('D2:'+e.message.slice(0,40));}
+
+// D3: globalThis
+try{
+  dR.push('D3:globalThis='+(typeof globalThis)+'|same='+(globalThis===window));
+}catch(e){dR.push('D3:'+e.message.slice(0,40));}
+
+B('D',dR.join('||'));
+log('D: '+dR.join(' | '));
+</script>
+
+<!-- E: Regex engine stress -->
+<script>
+log('\n--- E: Regex stress ---');
+var eR=[];
+
+// E1: Catastrophic backtracking (ReDoS)
+try{
+  var t0=performance.now();
+  // This pattern has exponential backtracking potential
+  var re1=/^(a+)+$/;
+  var input='a'.repeat(25)+'!'; // Should be slow
+  var result=re1.test(input);
+  var t1=performance.now();
+  eR.push('E1:result='+result+'|time='+(t1-t0).toFixed(0)+'ms|input_len=25');
+}catch(e){eR.push('E1:ERR:'+e.message.slice(0,60));}
+
+// E2: Even worse ReDoS
+try{
+  var t0=performance.now();
+  var re2=/^(a|aa)+$/;
+  var input2='a'.repeat(24)+'!';
+  var result2=re2.test(input2);
+  var t1=performance.now();
+  eR.push('E2:result='+result2+'|time='+(t1-t0).toFixed(0)+'ms');
+}catch(e){eR.push('E2:ERR:'+e.message.slice(0,60));}
+
+// E3: Very large capture groups
+try{
+  var parts=[];
+  for(var i=0;i<100;i++)parts.push('(a)');
+  var re3=new RegExp(parts.join('')); // 100 capture groups
+  var match=re3.exec('a'.repeat(100));
+  eR.push('E3:groups='+(match?match.length:'none'));
+}catch(e){eR.push('E3:ERR:'+e.message.slice(0,60));}
+
+// E4: Named capture groups + lookbehind
+try{
+  var r4=[];
+  try{var re4=/(?<name>abc)/;r4.push('named:'+re4.exec('abc').groups.name);}
+  catch(e){r4.push('named:ERR');}
+  try{var re5=/(?<=foo)bar/;r4.push('lookbehind:'+re5.test('foobar'));}
+  catch(e){r4.push('lookbehind:ERR');}
+  try{var re6=/(?<!foo)bar/;r4.push('neg_lb:'+re6.test('bazbar'));}
+  catch(e){r4.push('neg_lb:ERR');}
+  try{var re7=/\p{Script=Latin}/u;r4.push('unicode_prop:'+re7.test('a'));}
+  catch(e){r4.push('unicode_prop:ERR');}
+  eR.push('E4:'+r4.join('|'));
+}catch(e){eR.push('E4:ERR:'+e.message.slice(0,60));}
+
+// E5: Regex with many alternations
+try{
+  var alts=[];
+  for(var i=0;i<1000;i++)alts.push('alt'+i);
+  var re8=new RegExp(alts.join('|'));
+  var t0=performance.now();
+  var found=re8.test('alt999');
+  var t1=performance.now();
+  eR.push('E5:1000_alts='+found+'|time='+(t1-t0).toFixed(0)+'ms');
+}catch(e){eR.push('E5:ERR:'+e.message.slice(0,60));}
+
+// E6: dotAll + multiline flags
+try{
+  var r6=[];
+  try{var re=new RegExp('.','s');r6.push('dotAll:'+(re.dotAll));}catch(e){r6.push('dotAll:ERR');}
+  try{var re=new RegExp('.','v');r6.push('v_flag:yes');}catch(e){r6.push('v_flag:no');}
+  try{var re=new RegExp('.','d');r6.push('d_flag:yes');}catch(e){r6.push('d_flag:no');}
+  eR.push('E6:'+r6.join('|'));
+}catch(e){eR.push('E6:ERR:'+e.message.slice(0,60));}
+
+B('E',eR.join('||'));
+log('E: '+eR.join(' | '));
+</script>
+
+<!-- F: Cache API + storage -->
+<script>
+log('\n--- F: Cache API + Storage ---');
+var fR=[];
+
+// F1: Cache API availability
+try{
+  fR.push('F1:caches='+(typeof caches)+'|CacheStorage='+(typeof CacheStorage));
+  if(typeof caches!=='undefined'){
+    caches.open('test').then(function(cache){
+      B('F1b','cache_open_ok');
+      return caches.delete('test');
+    }).catch(function(e){
+      B('F1b','cache_err:'+e.message.slice(0,40));
+    });
+  }
+}catch(e){fR.push('F1:ERR:'+e.message.slice(0,60));}
+
+// F2: localStorage
+try{
+  localStorage.setItem('p1246_test','value');
+  var read=localStorage.getItem('p1246_test');
+  localStorage.removeItem('p1246_test');
+  fR.push('F2:localStorage='+read);
+}catch(e){fR.push('F2:'+e.message.slice(0,40));}
+
+// F3: sessionStorage
+try{
+  sessionStorage.setItem('p1246_test','session_val');
+  var read2=sessionStorage.getItem('p1246_test');
+  sessionStorage.removeItem('p1246_test');
+  fR.push('F3:sessionStorage='+read2);
+}catch(e){fR.push('F3:'+e.message.slice(0,40));}
+
+// F4: Storage quota
+try{
+  if(navigator.storage&&navigator.storage.estimate){
+    navigator.storage.estimate().then(function(est){
+      B('F4','quota='+est.quota+'|usage='+est.usage);
+    }).catch(function(e){
+      B('F4','estimate_err:'+e.message.slice(0,40));
+    });
+  }else{fR.push('F4:no_storage_api');}
+}catch(e){fR.push('F4:ERR:'+e.message.slice(0,60));}
+
+// F5: Cookie access
+try{
+  document.cookie='p1246_test=cookie_val;path=/';
+  var cookies=document.cookie;
+  fR.push('F5:cookies_len='+cookies.length+'|has_test='+cookies.indexOf('p1246_test'));
+}catch(e){fR.push('F5:'+e.message.slice(0,40));}
+
+B('F',fR.join('||'));
+log('F: '+fR.join(' | '));
+</script>
+
+<!-- G: Navigator/screen info gathering -->
+<script>
+log('\n--- G: Navigator/screen info ---');
+var gR=[];
+
+try{
+  var n=navigator;
+  gR.push('G1:ua='+n.userAgent.slice(0,80));
+  gR.push('G1:platform='+n.platform+'|lang='+n.language);
+  gR.push('G1:hw='+n.hardwareConcurrency+'|mem='+(n.deviceMemory||'N/A'));
+  gR.push('G1:online='+n.onLine+'|cookieEnabled='+n.cookieEnabled);
+  gR.push('G1:maxTouch='+n.maxTouchPoints);
+}catch(e){gR.push('G1:ERR:'+e.message.slice(0,60));}
+
+try{
+  var s=screen;
+  gR.push('G2:screen='+s.width+'x'+s.height+'|avail='+s.availWidth+'x'+s.availHeight+
+    '|depth='+s.colorDepth+'|pixel='+s.pixelDepth);
+  gR.push('G2:dpr='+window.devicePixelRatio+'|innerW='+window.innerWidth+'|innerH='+window.innerHeight);
+}catch(e){gR.push('G2:ERR:'+e.message.slice(0,60));}
+
+// G3: Permissions API
+try{
+  if(navigator.permissions){
+    var perms=['geolocation','notifications','camera','microphone','clipboard-read','clipboard-write'];
+    var chain=Promise.resolve();
+    var results=[];
+    for(var i=0;i<perms.length;i++){
+      (function(perm){
+        chain=chain.then(function(){
+          return navigator.permissions.query({name:perm}).then(function(r){
+            results.push(perm+':'+r.state);
+          }).catch(function(e){
+            results.push(perm+':'+e.message.slice(0,15));
+          });
+        });
+      })(perms[i]);
+    }
+    chain.then(function(){
+      B('G3','perms='+results.join(','));
+    });
+  }else{gR.push('G3:no_permissions_api');}
+}catch(e){gR.push('G3:ERR:'+e.message.slice(0,60));}
+
+B('G',gR.join('||'));
+log('G: '+gR.join(' | '));
+</script>
+
+<!-- FINAL -->
+<script>
+setTimeout(function(){
+  log('\n=== P1246 COMPLETE ===');
+  B('DONE','all');
+}, 8000);
+</script>
+
+</body>
+</html>

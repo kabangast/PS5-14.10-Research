@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1231</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0a;color:#00ff41;font:14px/1.5 monospace;padding:12px}
+h3{color:#00ccff;margin:8px 0 4px;font-size:16px}
+pre{white-space:pre-wrap;word-break:break-all;margin:2px 0;font-size:13px}
+</style>
+</head>
+<body>
+<h3>P1231: Image Decoder + CSS Parser Stress</h3>
+<pre id="log"></pre>
+<script>
+var L=document.getElementById('log');
+function log(m){L.textContent+=m+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1231-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+B('START','P1231-image-css-stress');
+log('=== P1231: Image Decoder + CSS Parser Stress ===');
+log('');
+
+var R={};
+
+// ============================================================
+// EXP A: createImageBitmap with malformed images
+// Fire async decode with crafted binary — if decoder crashes,
+// we lose beacons (which IS the signal). Craft several types.
+// ============================================================
+try{
+  log('[A] Malformed image decode...');
+  var a_fired=0;
+  var a_resolved=0;
+  var a_rejected=0;
+  var a_errors=[];
+
+  // A1: Truncated PNG (valid header, cut mid-IHDR)
+  var pngHead=[0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A, // PNG sig
+    0x00,0x00,0x00,0x0D, // IHDR length
+    0x49,0x48,0x44,0x52, // IHDR type
+    0x00,0x00,0x10,0x00, // width 4096
+    0x00,0x00,0x10,0x00]; // height 4096 (TRUNCATED - missing color type, etc)
+  var pngBuf=new Uint8Array(pngHead).buffer;
+  try{
+    var blob1=new Blob([pngBuf],{type:'image/png'});
+    createImageBitmap(blob1).then(function(bmp){
+      a_resolved++;
+      B('A1-OK','w='+bmp.width+'|h='+bmp.height);
+    }).catch(function(e){
+      a_rejected++;
+      a_errors.push('A1:'+e.message);
+    });
+    a_fired++;
+  }catch(e){a_errors.push('A1sync:'+e.message);}
+
+  // A2: PNG with huge dimensions (DoS / integer overflow)
+  var pngHuge=[0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,
+    0x00,0x00,0x00,0x0D,
+    0x49,0x48,0x44,0x52,
+    0x7F,0xFF,0xFF,0xFF, // width MAX
+    0x7F,0xFF,0xFF,0xFF, // height MAX
+    0x08,0x06, // 8-bit RGBA
+    0x00,0x00,0x00, // no interlace
+    0x00,0x00,0x00,0x00]; // CRC placeholder
+  try{
+    var blob2=new Blob([new Uint8Array(pngHuge)],{type:'image/png'});
+    createImageBitmap(blob2).then(function(bmp){
+      a_resolved++;
+      B('A2-OK','HUGE:w='+bmp.width+'|h='+bmp.height);
+    }).catch(function(e){
+      a_rejected++;
+      a_errors.push('A2:'+e.message.slice(0,60));
+    });
+    a_fired++;
+  }catch(e){a_errors.push('A2sync:'+e.message);}
+
+  // A3: JPEG with invalid markers (0xFF 0x00 sequences)
+  var jpgBad=new Uint8Array(512);
+  jpgBad[0]=0xFF;jpgBad[1]=0xD8; // SOI
+  jpgBad[2]=0xFF;jpgBad[3]=0xE0; // APP0
+  jpgBad[4]=0x00;jpgBad[5]=0x10; // length 16
+  // Fill rest with 0xFF 0x00 (byte stuffing in wrong context)
+  for(var i=6;i<510;i+=2){jpgBad[i]=0xFF;jpgBad[i+1]=0x00;}
+  jpgBad[510]=0xFF;jpgBad[511]=0xD9; // EOI
+  try{
+    var blob3=new Blob([jpgBad],{type:'image/jpeg'});
+    createImageBitmap(blob3).then(function(bmp){
+      a_resolved++;
+      B('A3-OK','w='+bmp.width+'|h='+bmp.height);
+    }).catch(function(e){
+      a_rejected++;
+      a_errors.push('A3:'+e.message.slice(0,60));
+    });
+    a_fired++;
+  }catch(e){a_errors.push('A3sync:'+e.message);}
+
+  // A4: BMP with negative height (top-down bitmap, potential underflow)
+  var bmpBad=new ArrayBuffer(70);
+  var bv=new DataView(bmpBad);
+  bv.setUint8(0,0x42);bv.setUint8(1,0x4D); // BM
+  bv.setUint32(2,70,true); // file size
+  bv.setUint32(10,54,true); // pixel offset
+  bv.setUint32(14,40,true); // DIB header size
+  bv.setInt32(18,2,true); // width 2
+  bv.setInt32(22,-2147483647,true); // height INT_MIN+1 (extreme negative)
+  bv.setUint16(26,1,true); // planes
+  bv.setUint16(28,32,true); // bpp 32
+  try{
+    var blob4=new Blob([bmpBad],{type:'image/bmp'});
+    createImageBitmap(blob4).then(function(bmp){
+      a_resolved++;
+      B('A4-OK','BMP-NEG:w='+bmp.width+'|h='+bmp.height);
+    }).catch(function(e){
+      a_rejected++;
+      a_errors.push('A4:'+e.message.slice(0,60));
+    });
+    a_fired++;
+  }catch(e){a_errors.push('A4sync:'+e.message);}
+
+  // A5: GIF with LZW bomb (tiny header, enormous decompressed)
+  var gifBomb=[
+    0x47,0x49,0x46,0x38,0x39,0x61, // GIF89a
+    0xFF,0x7F, // width 32767
+    0xFF,0x7F, // height 32767
+    0xF7, // GCT flag, 256 colors
+    0x00,0x00]; // bg, aspect
+  // Global color table (256*3 = 768 bytes)
+  var gifArr=new Uint8Array(gifBomb.length+768+20);
+  gifArr.set(gifBomb);
+  // Fill GCT + minimal image descriptor + trailer
+  var off=gifBomb.length+768;
+  gifArr[off]=0x2C; // image descriptor
+  gifArr[off+1]=0;gifArr[off+2]=0;gifArr[off+3]=0;gifArr[off+4]=0;
+  gifArr[off+5]=0xFF;gifArr[off+6]=0x7F; // width
+  gifArr[off+7]=0xFF;gifArr[off+8]=0x7F; // height
+  gifArr[off+9]=0x00; // no local CT
+  gifArr[off+10]=0x08; // LZW min code 8
+  gifArr[off+11]=0x01; // 1 byte sub-block
+  gifArr[off+12]=0x00; // data
+  gifArr[off+13]=0x00; // block terminator
+  gifArr[off+14]=0x3B; // trailer
+  try{
+    var blob5=new Blob([gifArr],{type:'image/gif'});
+    createImageBitmap(blob5).then(function(bmp){
+      a_resolved++;
+      B('A5-OK','GIF-BOMB:w='+bmp.width+'|h='+bmp.height);
+    }).catch(function(e){
+      a_rejected++;
+      a_errors.push('A5:'+e.message.slice(0,60));
+    });
+    a_fired++;
+  }catch(e){a_errors.push('A5sync:'+e.message);}
+
+  R.a='fired='+a_fired+'|sync_errs='+a_errors.join(';');
+  B('EXP-A',R.a);
+  log('  fired='+a_fired+' errors: '+a_errors.join('; '));
+}catch(e){B('EXP-A-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP B: CSS parser stress — complex properties that allocate
+// internal objects, filters, transforms, gradients
+// ============================================================
+try{
+  log('[B] CSS parser stress...');
+  var b_crashes=0;
+  var b_ok=0;
+
+  // B1: Deeply nested CSS calc()
+  try{
+    var div=document.createElement('div');
+    document.body.appendChild(div);
+    var calc='calc(';
+    for(var i=0;i<50;i++)calc+='1px + calc(';
+    calc+='0px';
+    for(var i=0;i<51;i++)calc+=')';
+    div.style.width=calc;
+    var w=getComputedStyle(div).width;
+    b_ok++;
+    R.b1='w='+w;
+    document.body.removeChild(div);
+  }catch(e){R.b1='err:'+e.message;b_crashes++;}
+
+  // B2: CSS filter chain stress
+  try{
+    var div2=document.createElement('div');
+    div2.style.width='100px';div2.style.height='100px';
+    document.body.appendChild(div2);
+    var filters=[];
+    for(var i=0;i<100;i++){
+      filters.push('blur('+i+'px)');
+      filters.push('brightness('+(1+i*0.01)+')');
+      filters.push('contrast('+(1+i*0.01)+')');
+      filters.push('drop-shadow('+i+'px '+i+'px '+i+'px red)');
+    }
+    div2.style.filter=filters.join(' ');
+    var f=getComputedStyle(div2).filter;
+    R.b2='filterLen='+f.length+'|applied='+(f!=='none');
+    document.body.removeChild(div2);
+    b_ok++;
+  }catch(e){R.b2='err:'+e.message;b_crashes++;}
+
+  // B3: CSS gradient with extreme stops
+  try{
+    var div3=document.createElement('div');
+    div3.style.width='100px';div3.style.height='100px';
+    document.body.appendChild(div3);
+    var stops=[];
+    for(var i=0;i<500;i++){
+      stops.push('rgb('+((i*7)%256)+','+((i*13)%256)+','+((i*17)%256)+') '+(i*0.2)+'%');
+    }
+    div3.style.background='linear-gradient('+stops.join(',')+')';
+    var bg=getComputedStyle(div3).background;
+    R.b3='bgLen='+bg.length+'|applied='+(bg!=='');
+    document.body.removeChild(div3);
+    b_ok++;
+  }catch(e){R.b3='err:'+e.message;b_crashes++;}
+
+  // B4: CSS transform matrix3d chain
+  try{
+    var div4=document.createElement('div');
+    div4.style.width='10px';div4.style.height='10px';
+    document.body.appendChild(div4);
+    var transforms=[];
+    for(var i=0;i<200;i++){
+      transforms.push('matrix3d(1,0,0,0,0,1,0,0,0,0,1,0,'+(i%100)+','+(i%100)+',0,1)');
+    }
+    div4.style.transform=transforms.join(' ');
+    var t=getComputedStyle(div4).transform;
+    R.b4='tLen='+t.length+'|type='+typeof t;
+    document.body.removeChild(div4);
+    b_ok++;
+  }catch(e){R.b4='err:'+e.message;b_crashes++;}
+
+  // B5: @keyframes stress — many rules, rapid toggle
+  try{
+    var style=document.createElement('style');
+    var css='';
+    for(var i=0;i<100;i++){
+      css+='@keyframes kf'+i+'{';
+      for(var j=0;j<=100;j+=5){
+        css+=j+'%{transform:rotate('+((i*j)%360)+'deg);opacity:'+(j/100)+'}';
+      }
+      css+='}';
+    }
+    style.textContent=css;
+    document.head.appendChild(style);
+    var div5=document.createElement('div');
+    div5.style.width='10px';div5.style.height='10px';
+    document.body.appendChild(div5);
+    // Rapidly switch animations
+    for(var i=0;i<100;i++){
+      div5.style.animation='kf'+(i%100)+' 0.001s linear';
+      void div5.offsetHeight; // force style recalc
+    }
+    R.b5='ok|rules=100|switches=100';
+    document.body.removeChild(div5);
+    document.head.removeChild(style);
+    b_ok++;
+  }catch(e){R.b5='err:'+e.message;b_crashes++;}
+
+  R.b='ok='+b_ok+'|crashes='+b_crashes;
+  B('EXP-B',R.b+'|b1:'+R.b1+'|b2:'+R.b2+'|b3:'+R.b3+'|b4:'+R.b4+'|b5:'+R.b5);
+  log('  ok='+b_ok+' crashes='+b_crashes);
+  log('  '+R.b1+' | '+R.b2);
+  log('  '+R.b3+' | '+R.b4+' | '+R.b5);
+}catch(e){B('EXP-B-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP C: SVG parser stress — extreme path data, clip paths,
+// filter chains, foreignObject nesting
+// ============================================================
+try{
+  log('[C] SVG parser stress...');
+  var c_results=[];
+
+  // C1: SVG path with extreme coordinates
+  try{
+    var svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+    svg.setAttribute('width','10');svg.setAttribute('height','10');
+    var path=document.createElementNS('http://www.w3.org/2000/svg','path');
+    var d='M 0 0 ';
+    for(var i=0;i<500;i++){
+      d+='C '+((i*9999999)%1e15)+' '+((i*7777777)%1e15)+' ';
+      d+=((i*5555555)%1e15)+' '+((i*3333333)%1e15)+' ';
+      d+=((i*1111111)%1e15)+' '+((i*2222222)%1e15)+' ';
+    }
+    path.setAttribute('d',d);
+    svg.appendChild(path);
+    document.body.appendChild(svg);
+    var bbox=path.getBBox();
+    c_results.push('C1:bbox='+bbox.width.toFixed(0)+'x'+bbox.height.toFixed(0));
+    document.body.removeChild(svg);
+  }catch(e){c_results.push('C1:err:'+e.message.slice(0,40));}
+
+  // C2: Deeply nested clipPath references
+  try{
+    var svg2=document.createElementNS('http://www.w3.org/2000/svg','svg');
+    svg2.setAttribute('width','10');svg2.setAttribute('height','10');
+    var defs=document.createElementNS('http://www.w3.org/2000/svg','defs');
+    for(var i=0;i<50;i++){
+      var cp=document.createElementNS('http://www.w3.org/2000/svg','clipPath');
+      cp.id='cp'+i;
+      var rect=document.createElementNS('http://www.w3.org/2000/svg','rect');
+      rect.setAttribute('width','100');rect.setAttribute('height','100');
+      if(i>0)rect.setAttribute('clip-path','url(#cp'+(i-1)+')');
+      cp.appendChild(rect);
+      defs.appendChild(cp);
+    }
+    svg2.appendChild(defs);
+    var r=document.createElementNS('http://www.w3.org/2000/svg','rect');
+    r.setAttribute('width','10');r.setAttribute('height','10');
+    r.setAttribute('fill','red');
+    r.setAttribute('clip-path','url(#cp49)');
+    svg2.appendChild(r);
+    document.body.appendChild(svg2);
+    void svg2.getBoundingClientRect();
+    c_results.push('C2:ok|depth=50');
+    document.body.removeChild(svg2);
+  }catch(e){c_results.push('C2:err:'+e.message.slice(0,40));}
+
+  // C3: SVG filter chain with feConvolveMatrix (heavy computation)
+  try{
+    var svg3=document.createElementNS('http://www.w3.org/2000/svg','svg');
+    svg3.setAttribute('width','50');svg3.setAttribute('height','50');
+    var defs3=document.createElementNS('http://www.w3.org/2000/svg','defs');
+    var filt=document.createElementNS('http://www.w3.org/2000/svg','filter');
+    filt.id='heavy';
+    for(var i=0;i<20;i++){
+      var fe=document.createElementNS('http://www.w3.org/2000/svg','feConvolveMatrix');
+      fe.setAttribute('kernelMatrix','0 -1 0 -1 5 -1 0 -1 0');
+      fe.setAttribute('order','3');
+      if(i>0)fe.setAttribute('in','result'+(i-1));
+      fe.setAttribute('result','result'+i);
+      filt.appendChild(fe);
+    }
+    defs3.appendChild(filt);
+    svg3.appendChild(defs3);
+    var r3=document.createElementNS('http://www.w3.org/2000/svg','rect');
+    r3.setAttribute('width','50');r3.setAttribute('height','50');
+    r3.setAttribute('fill','blue');
+    r3.setAttribute('filter','url(#heavy)');
+    svg3.appendChild(r3);
+    document.body.appendChild(svg3);
+    void svg3.getBoundingClientRect();
+    c_results.push('C3:ok|filters=20');
+    document.body.removeChild(svg3);
+  }catch(e){c_results.push('C3:err:'+e.message.slice(0,40));}
+
+  R.c=c_results.join('|');
+  B('EXP-C',R.c);
+  log('  '+R.c);
+}catch(e){B('EXP-C-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP D: RegExp backtracking + catastrophic patterns
+// Complex regex on crafted strings — can trigger ReDoS or
+// internal buffer issues in the regex engine
+// ============================================================
+try{
+  log('[D] RegExp stress...');
+
+  // D1: Catastrophic backtracking (bounded)
+  var d1_time=0;
+  try{
+    var start=Date.now();
+    var re=/(a+)+b/;
+    var str='a'.repeat(25)+'c'; // force maximum backtracking
+    var result=re.test(str);
+    d1_time=Date.now()-start;
+    R.d1='time='+d1_time+'ms|result='+result;
+  }catch(e){R.d1='err:'+e.message;}
+
+  // D2: Named capture groups stress
+  try{
+    var groups=[];
+    for(var i=0;i<50;i++){
+      groups.push('(?<g'+i+'>[a-z])');
+    }
+    var re2=new RegExp(groups.join(''));
+    var str2='abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwx';
+    var m=re2.exec(str2);
+    R.d2='groups='+(m?Object.keys(m.groups).length:0)+'|g0='+(m?m.groups.g0:'null');
+  }catch(e){R.d2='err:'+e.message;}
+
+  // D3: Unicode regex with astral planes
+  try{
+    var re3=/[\u{10000}-\u{10FFFF}]+/u;
+    var astral='';
+    for(var i=0;i<1000;i++){
+      astral+=String.fromCodePoint(0x10000+(i*17)%0xFFFFF);
+    }
+    var m3=re3.exec(astral);
+    R.d3='match='+(m3?m3[0].length:0)+'|srcLen='+astral.length;
+  }catch(e){R.d3='err:'+e.message;}
+
+  // D4: RegExp lastIndex manipulation during exec
+  try{
+    var re4=/a/g;
+    var str4='aaaaaa';
+    var results=[];
+    re4.lastIndex=3;
+    var m4;
+    var iters=0;
+    while((m4=re4.exec(str4))!==null&&iters<100){
+      results.push(m4.index);
+      re4.lastIndex=re4.lastIndex-1; // backward!
+      iters++;
+    }
+    R.d4='iters='+iters+'|indices='+results.slice(0,10).join(',');
+  }catch(e){R.d4='err:'+e.message;}
+
+  B('EXP-D','D1:'+R.d1+'|D2:'+R.d2+'|D3:'+R.d3+'|D4:'+R.d4);
+  log('  D1: '+R.d1);
+  log('  D2: '+R.d2);
+  log('  D3: '+R.d3);
+  log('  D4: '+R.d4);
+}catch(e){B('EXP-D-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP E: TextEncoder/TextDecoder edge cases
+// Invalid sequences, encoding mismatch, huge buffers
+// ============================================================
+try{
+  log('[E] TextEncoder/Decoder edge cases...');
+
+  // E1: Invalid UTF-8 sequences
+  try{
+    var decoder=new TextDecoder('utf-8',{fatal:false});
+    var invalid=new Uint8Array([
+      0xC0,0xAF, // overlong 2-byte
+      0xE0,0x80,0xAF, // overlong 3-byte
+      0xF0,0x80,0x80,0xAF, // overlong 4-byte
+      0xED,0xA0,0x80, // surrogate half
+      0xF4,0x90,0x80,0x80, // above U+10FFFF
+      0xFF,0xFE, // invalid start bytes
+      0x80,0x81,0x82 // continuation without start
+    ]);
+    var decoded=decoder.decode(invalid);
+    var replacements=0;
+    for(var i=0;i<decoded.length;i++){
+      if(decoded.charCodeAt(i)===0xFFFD)replacements++;
+    }
+    R.e1='len='+decoded.length+'|replacements='+replacements;
+  }catch(e){R.e1='err:'+e.message;}
+
+  // E2: TextDecoder fatal mode on invalid
+  try{
+    var fatalDecoder=new TextDecoder('utf-8',{fatal:true});
+    var threwCount=0;
+    var sequences=[
+      [0xC0,0xAF],[0xED,0xA0,0x80],[0xFF],[0x80]
+    ];
+    for(var i=0;i<sequences.length;i++){
+      try{
+        fatalDecoder.decode(new Uint8Array(sequences[i]));
+      }catch(e){threwCount++;}
+    }
+    R.e2='threw='+threwCount+'/'+sequences.length;
+  }catch(e){R.e2='err:'+e.message;}
+
+  // E3: Encode/decode roundtrip with BOM and zero-width chars
+  try{
+    var encoder=new TextEncoder();
+    var decoder3=new TextDecoder('utf-8');
+    var tricky='﻿​‌‍﻿\u0000￿';
+    var encoded=encoder.encode(tricky);
+    var roundtrip=decoder3.decode(encoded);
+    R.e3='match='+(tricky===roundtrip)+'|encLen='+encoded.length+'|decLen='+roundtrip.length;
+  }catch(e){R.e3='err:'+e.message;}
+
+  B('EXP-E','E1:'+R.e1+'|E2:'+R.e2+'|E3:'+R.e3);
+  log('  E1: '+R.e1);
+  log('  E2: '+R.e2);
+  log('  E3: '+R.e3);
+}catch(e){B('EXP-E-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP F: Intl stress — complex locale processing
+// Intl.Segmenter, NumberFormat, DateTimeFormat with exotic opts
+// ============================================================
+try{
+  log('[F] Intl stress...');
+
+  // F1: Intl.Segmenter (if available)
+  try{
+    if(typeof Intl.Segmenter!=='undefined'){
+      var seg=new Intl.Segmenter('ja',{granularity:'grapheme'});
+      // Mix of emoji, ZWJ sequences, CJK
+      var text='\u{1F468}‍\u{1F469}‍\u{1F467}‍\u{1F466}'+
+        '\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}'+
+        '世界';
+      var segs=[];
+      for(var s of seg.segment(text))segs.push(s.segment.length);
+      R.f1='segments='+segs.length+'|lens='+segs.join(',');
+    }else{
+      R.f1='no_segmenter';
+    }
+  }catch(e){R.f1='err:'+e.message;}
+
+  // F2: NumberFormat stress — all styles, all locales
+  try{
+    var locales=['ar-SA','zh-CN','ja-JP','ko-KR','th-TH','hi-IN','he-IL','fa-IR'];
+    var fmtResults=[];
+    for(var i=0;i<locales.length;i++){
+      try{
+        var nf=new Intl.NumberFormat(locales[i],{
+          style:'currency',
+          currency:'USD',
+          notation:'compact',
+          compactDisplay:'long',
+          signDisplay:'always'
+        });
+        fmtResults.push(locales[i]+':'+nf.format(1234567.89).length);
+      }catch(e){fmtResults.push(locales[i]+':err');}
+    }
+    R.f2='results='+fmtResults.join(';');
+  }catch(e){R.f2='err:'+e.message;}
+
+  // F3: DateTimeFormat with all possible options
+  try{
+    var dtf=new Intl.DateTimeFormat('en-US',{
+      dateStyle:undefined,
+      weekday:'long',
+      era:'long',
+      year:'numeric',
+      month:'long',
+      day:'numeric',
+      hour:'numeric',
+      minute:'numeric',
+      second:'numeric',
+      fractionalSecondDigits:3,
+      timeZoneName:'long',
+      hour12:false
+    });
+    var parts=dtf.formatToParts(new Date(0));
+    R.f3='parts='+parts.length+'|types='+parts.map(function(p){return p.type;}).join(',');
+  }catch(e){R.f3='err:'+e.message;}
+
+  B('EXP-F','F1:'+R.f1+'|F2:'+R.f2+'|F3:'+R.f3);
+  log('  F1: '+R.f1);
+  log('  F2: '+R.f2);
+  log('  F3: '+R.f3);
+}catch(e){B('EXP-F-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP G: Worker + FontFace race condition
+// Create Worker, load fonts, terminate worker during load
+// ============================================================
+try{
+  log('[G] Worker+FontFace race...');
+
+  // G1: Worker that creates FontFace and gets terminated
+  var g_beacons=0;
+  try{
+    var workerCode=
+      "var count=0;"+
+      "try{"+
+      "  for(var i=0;i<100;i++){"+
+      "    var ff=new FontFace('test'+i,'url(data:font/woff2;base64,AAAA)');"+
+      "    self.fonts.add(ff);"+
+      "    ff.load().catch(function(){});"+
+      "    count++;"+
+      "  }"+
+      "}catch(e){}"+
+      "self.postMessage('created:'+count);";
+
+    var blob=new Blob([workerCode],{type:'application/javascript'});
+    var url=URL.createObjectURL(blob);
+    var results=[];
+
+    for(var trial=0;trial<10;trial++){
+      var w=new Worker(url);
+      var gotMsg=false;
+      w.onmessage=function(e){gotMsg=true;results.push(e.data);};
+      // Terminate quickly — race with font loading
+      w.terminate();
+      results.push('t'+trial+':terminated');
+    }
+    URL.revokeObjectURL(url);
+    R.g1='trials=10|results='+results.slice(0,6).join(';');
+  }catch(e){R.g1='err:'+e.message;}
+
+  // G2: Worker message during shutdown
+  try{
+    var workerCode2=
+      "self.onmessage=function(e){"+
+      "  for(var i=0;i<10000;i++){"+
+      "    self.postMessage('msg'+i);"+
+      "  }"+
+      "};";
+    var blob2=new Blob([workerCode2],{type:'application/javascript'});
+    var url2=URL.createObjectURL(blob2);
+    var w2=new Worker(url2);
+    var msgCount=0;
+    w2.onmessage=function(){msgCount++;};
+    w2.postMessage('go');
+    // Immediate terminate during message flood
+    w2.terminate();
+    R.g2='msgs='+msgCount;
+    URL.revokeObjectURL(url2);
+  }catch(e){R.g2='err:'+e.message;}
+
+  B('EXP-G','G1:'+R.g1+'|G2:'+R.g2);
+  log('  G1: '+R.g1);
+  log('  G2: '+R.g2);
+}catch(e){B('EXP-G-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP H: createImageBitmap + canvas pixel readback
+// Decode image then read pixels synchronously via canvas
+// ============================================================
+try{
+  log('[H] Canvas pixel readback...');
+
+  // H1: Create valid tiny PNG, decode, draw to canvas, read pixels
+  // Minimal 1x1 red PNG
+  var png1x1=[
+    0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A,
+    0x00,0x00,0x00,0x0D,0x49,0x48,0x44,0x52,
+    0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,
+    0x08,0x02,0x00,0x00,0x00,0x90,0x77,0x53,
+    0xDE,0x00,0x00,0x00,0x0C,0x49,0x44,0x41,
+    0x54,0x08,0xD7,0x63,0xF8,0xCF,0xC0,0x00,
+    0x00,0x00,0x03,0x00,0x01,0x36,0x28,0x19,
+    0x00,0x00,0x00,0x00,0x00,0x49,0x45,0x4E,
+    0x44,0xAE,0x42,0x60,0x82
+  ];
+  var pngBlob=new Blob([new Uint8Array(png1x1)],{type:'image/png'});
+
+  // Fire the async decode — we can't wait for it synchronously
+  // but we CAN set up a canvas test
+  var canvasOk=false;
+  try{
+    var canvas=document.createElement('canvas');
+    canvas.width=100;canvas.height=100;
+    var ctx=canvas.getContext('2d');
+    if(ctx){
+      // Draw directly without image decode
+      ctx.fillStyle='#FF0000';
+      ctx.fillRect(0,0,50,50);
+      ctx.fillStyle='#00FF00';
+      ctx.fillRect(50,0,50,50);
+      var pixels=ctx.getImageData(0,0,100,1);
+      // Check pixel data integrity
+      var red_ok=(pixels.data[0]===255&&pixels.data[1]===0&&pixels.data[2]===0);
+      var green_ok=(pixels.data[200]===0&&pixels.data[201]===255&&pixels.data[202]===0);
+      // Check for uninitialized memory in unfilled area
+      var uninit=0;
+      var fullPixels=ctx.getImageData(0,0,100,100);
+      for(var i=0;i<fullPixels.data.length;i+=4){
+        var x=Math.floor((i/4)%100);
+        var y=Math.floor((i/4)/100);
+        if(y>=50){ // bottom half should be transparent (0,0,0,0)
+          if(fullPixels.data[i]!==0||fullPixels.data[i+1]!==0||
+             fullPixels.data[i+2]!==0||fullPixels.data[i+3]!==0)uninit++;
+        }
+      }
+      R.h1='red='+red_ok+'|green='+green_ok+'|uninit='+uninit;
+      canvasOk=true;
+    }else{
+      R.h1='no_2d_context';
+    }
+  }catch(e){R.h1='err:'+e.message;}
+
+  // H2: Canvas toDataURL / toBlob
+  try{
+    if(canvasOk){
+      var dataUrl=canvas.toDataURL('image/png');
+      R.h2='dataUrlLen='+dataUrl.length+'|prefix='+dataUrl.slice(0,30);
+    }else{
+      R.h2='skip_no_canvas';
+    }
+  }catch(e){R.h2='err:'+e.message;}
+
+  B('EXP-H','H1:'+R.h1+'|H2:'+R.h2);
+  log('  H1: '+R.h1);
+  log('  H2: '+R.h2);
+}catch(e){B('EXP-H-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// Collect async image decode results before final beacon
+// We wait a very short spin (not setTimeout) to let promises resolve
+// ============================================================
+var spinStart=Date.now();
+while(Date.now()-spinStart<200){} // 200ms busy-wait for image promises
+
+B('ASYNC-STATUS','resolved='+a_resolved+'|rejected='+a_rejected+'|errs='+a_errors.join(';'));
+B('DONE','all');
+log('');
+log('Async images: resolved='+a_resolved+' rejected='+a_rejected);
+log('=== P1231 COMPLETE ===');
+</script>
+</body>
+</html>

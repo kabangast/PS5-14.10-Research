@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1232</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0a;color:#00ff41;font:14px/1.5 monospace;padding:12px}
+h3{color:#00ccff;margin:8px 0 4px;font-size:16px}
+pre{white-space:pre-wrap;word-break:break-all;margin:2px 0;font-size:13px}
+</style>
+</head>
+<body>
+<h3>P1232: Crafted Fonts + DOM Mutation Observers</h3>
+<pre id="log"></pre>
+<script>
+var L=document.getElementById('log');
+function log(m){L.textContent+=m+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1232-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+B('START','P1232-fonts-dom-observers');
+log('=== P1232: Crafted Fonts + DOM Mutation Observers ===');
+log('');
+
+var R={};
+
+// ============================================================
+// EXP A: FontFace with crafted WOFF2/TrueType binary data
+// Real (minimal) font headers to exercise the parser deeper
+// ============================================================
+try{
+  log('[A] Crafted font parsing...');
+  var a_loaded=0;
+  var a_errors=[];
+
+  // Helper: build minimal TrueType font buffer
+  function makeTTF(opts){
+    var buf=new ArrayBuffer(opts.size||256);
+    var v=new DataView(buf);
+    // TrueType header
+    v.setUint32(0,0x00010000); // sfVersion
+    v.setUint16(4,opts.numTables||1); // numTables
+    v.setUint16(6,16); // searchRange
+    v.setUint16(8,0); // entrySelector
+    v.setUint16(10,16); // rangeShift
+    // Table record (12 bytes each)
+    // 'head' table
+    v.setUint8(12,0x68);v.setUint8(13,0x65);v.setUint8(14,0x61);v.setUint8(15,0x64);
+    v.setUint32(16,0); // checksum
+    v.setUint32(20,opts.headOffset||28); // offset
+    v.setUint32(24,opts.headLength||54); // length
+    // head table data at offset 28
+    if(!opts.skipHead){
+      v.setUint32(28,0x00010000); // version
+      v.setUint32(32,0x00005000); // fontRevision
+      v.setUint32(36,opts.checksumAdj||0); // checksumAdjustment
+      v.setUint32(40,0x5F0F3CF5); // magicNumber
+      v.setUint16(44,opts.flags||0x000B); // flags
+      v.setUint16(46,opts.unitsPerEm||1000); // unitsPerEm
+      // dates, bbox...
+    }
+    if(opts.corrupt)opts.corrupt(v,buf);
+    return buf;
+  }
+
+  // A1: Minimal valid-ish TTF (should fail gracefully)
+  try{
+    var ttf1=makeTTF({size:256,numTables:1});
+    var ff1=new FontFace('test1',ttf1);
+    ff1.load().then(function(){a_loaded++;}).catch(function(e){a_errors.push('A1:'+e.message.slice(0,50));});
+  }catch(e){a_errors.push('A1sync:'+e.message);}
+
+  // A2: TTF with numTables=65535 (huge table directory overflow)
+  try{
+    var ttf2=makeTTF({size:256,numTables:65535});
+    var ff2=new FontFace('test2',ttf2);
+    ff2.load().then(function(){a_loaded++;}).catch(function(e){a_errors.push('A2:'+e.message.slice(0,50));});
+  }catch(e){a_errors.push('A2sync:'+e.message);}
+
+  // A3: TTF with head table pointing past buffer
+  try{
+    var ttf3=makeTTF({size:256,headOffset:99999,headLength:54});
+    var ff3=new FontFace('test3',ttf3);
+    ff3.load().then(function(){a_loaded++;}).catch(function(e){a_errors.push('A3:'+e.message.slice(0,50));});
+  }catch(e){a_errors.push('A3sync:'+e.message);}
+
+  // A4: TTF with unitsPerEm=0 (division by zero potential)
+  try{
+    var ttf4=makeTTF({size:256,unitsPerEm:0});
+    var ff4=new FontFace('test4',ttf4);
+    ff4.load().then(function(){a_loaded++;}).catch(function(e){a_errors.push('A4:'+e.message.slice(0,50));});
+  }catch(e){a_errors.push('A4sync:'+e.message);}
+
+  // A5: TTF with negative head length (integer underflow)
+  try{
+    var ttf5=makeTTF({size:256,headLength:0xFFFFFFFF});
+    var ff5=new FontFace('test5',ttf5);
+    ff5.load().then(function(){a_loaded++;}).catch(function(e){a_errors.push('A5:'+e.message.slice(0,50));});
+  }catch(e){a_errors.push('A5sync:'+e.message);}
+
+  // A6: TTF with corrupt magic number (fuzzer-style)
+  try{
+    var ttf6=makeTTF({size:256,corrupt:function(v){
+      v.setUint32(40,0xDEADBEEF); // wrong magic
+      // Fill rest with random-ish data
+      for(var i=48;i<256;i++)v.setUint8(i,(i*0x9E3779B9)>>>24);
+    }});
+    var ff6=new FontFace('test6',ttf6);
+    ff6.load().then(function(){a_loaded++;}).catch(function(e){a_errors.push('A6:'+e.message.slice(0,50));});
+  }catch(e){a_errors.push('A6sync:'+e.message);}
+
+  // A7: WOFF2 signature with garbage body
+  try{
+    var woff2=new ArrayBuffer(128);
+    var wv=new DataView(woff2);
+    wv.setUint32(0,0x774F4632); // 'wOF2' signature
+    wv.setUint32(4,0x00010000); // flavor (TrueType)
+    wv.setUint32(8,128); // length
+    wv.setUint16(12,1); // numTables
+    // Fill rest with 0xFF
+    for(var i=14;i<128;i++)wv.setUint8(i,0xFF);
+    var ff7=new FontFace('test7',woff2);
+    ff7.load().then(function(){a_loaded++;}).catch(function(e){a_errors.push('A7:'+e.message.slice(0,50));});
+  }catch(e){a_errors.push('A7sync:'+e.message);}
+
+  // A8: OpenType CFF signature
+  try{
+    var otf=new ArrayBuffer(256);
+    var ov=new DataView(otf);
+    ov.setUint32(0,0x4F54544F); // 'OTTO' (CFF-based OpenType)
+    ov.setUint16(4,1);ov.setUint16(6,16);
+    var ff8=new FontFace('test8',otf);
+    ff8.load().then(function(){a_loaded++;}).catch(function(e){a_errors.push('A8:'+e.message.slice(0,50));});
+  }catch(e){a_errors.push('A8sync:'+e.message);}
+
+  R.a='fired=8|sync_errs='+a_errors.filter(function(e){return e.indexOf('sync')>=0;}).join(';');
+  B('EXP-A',R.a);
+  log('  '+R.a);
+}catch(e){B('EXP-A-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP B: MutationObserver + rapid DOM mutation
+// Observer callbacks during heavy style recalculation
+// ============================================================
+try{
+  log('[B] MutationObserver stress...');
+
+  // B1: Observe childList + characterData during rapid mutations
+  var b1_mutations=0;
+  var b1_types={};
+  try{
+    var container=document.createElement('div');
+    document.body.appendChild(container);
+    var obs=new MutationObserver(function(records){
+      for(var i=0;i<records.length;i++){
+        b1_mutations++;
+        b1_types[records[i].type]=(b1_types[records[i].type]||0)+1;
+        // During callback: mutate MORE DOM (re-entrant)
+        if(b1_mutations<50){
+          var span=document.createElement('span');
+          span.textContent='m'+b1_mutations;
+          container.appendChild(span);
+        }
+      }
+    });
+    obs.observe(container,{childList:true,characterData:true,subtree:true});
+    // Rapid mutations
+    for(var i=0;i<100;i++){
+      var el=document.createElement('div');
+      el.textContent='node'+i;
+      container.appendChild(el);
+    }
+    // Force synchronous delivery
+    var pending=obs.takeRecords();
+    b1_mutations+=pending.length;
+    obs.disconnect();
+    document.body.removeChild(container);
+    R.b1='mutations='+b1_mutations+'|types='+JSON.stringify(b1_types)+'|pending='+pending.length;
+  }catch(e){R.b1='err:'+e.message;}
+
+  // B2: MutationObserver that removes observed node during callback
+  var b2_removed=0;
+  try{
+    var div=document.createElement('div');
+    document.body.appendChild(div);
+    for(var i=0;i<20;i++){
+      var child=document.createElement('p');
+      child.id='p'+i;
+      child.textContent='text'+i;
+      div.appendChild(child);
+    }
+    var obs2=new MutationObserver(function(records){
+      for(var i=0;i<records.length;i++){
+        // Remove nodes that were just added
+        if(records[i].addedNodes.length>0){
+          for(var j=0;j<records[i].addedNodes.length;j++){
+            try{
+              records[i].addedNodes[j].remove();
+              b2_removed++;
+            }catch(e){}
+          }
+        }
+      }
+    });
+    obs2.observe(div,{childList:true,subtree:true});
+    // Add more nodes — observer will try to remove them
+    for(var i=20;i<40;i++){
+      var child=document.createElement('p');
+      child.textContent='new'+i;
+      div.appendChild(child);
+    }
+    obs2.takeRecords();
+    obs2.disconnect();
+    R.b2='removed='+b2_removed+'|children='+div.childNodes.length;
+    document.body.removeChild(div);
+  }catch(e){R.b2='err:'+e.message;}
+
+  // B3: Attribute mutation during style recalc (observer changes class)
+  var b3_styleChanges=0;
+  try{
+    var style=document.createElement('style');
+    style.textContent='.red{color:red;width:50px} .blue{color:blue;width:100px} .green{color:green;width:150px}';
+    document.head.appendChild(style);
+    var target=document.createElement('div');
+    target.className='red';
+    target.textContent='test';
+    document.body.appendChild(target);
+
+    var obs3=new MutationObserver(function(records){
+      for(var i=0;i<records.length;i++){
+        if(records[i].type==='attributes'&&records[i].attributeName==='class'){
+          b3_styleChanges++;
+          // Change class DURING observation callback
+          if(b3_styleChanges<10){
+            var classes=['red','blue','green'];
+            target.className=classes[b3_styleChanges%3];
+            void target.offsetWidth; // force style recalc
+          }
+        }
+      }
+    });
+    obs3.observe(target,{attributes:true});
+    // Trigger
+    target.className='blue';
+    void target.offsetWidth;
+    obs3.takeRecords();
+    obs3.disconnect();
+    R.b3='changes='+b3_styleChanges+'|finalClass='+target.className+'|width='+getComputedStyle(target).width;
+    document.body.removeChild(target);
+    document.head.removeChild(style);
+  }catch(e){R.b3='err:'+e.message;}
+
+  B('EXP-B','B1:'+R.b1+'|B2:'+R.b2+'|B3:'+R.b3);
+  log('  B1: '+R.b1);
+  log('  B2: '+R.b2);
+  log('  B3: '+R.b3);
+}catch(e){B('EXP-B-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP C: Selection/Range API + contenteditable
+// Manipulate selections across DOM mutations
+// ============================================================
+try{
+  log('[C] Selection/Range stress...');
+
+  // C1: Create range spanning nodes, then delete middle node
+  try{
+    var div=document.createElement('div');
+    div.innerHTML='<span id="s1">AAA</span><span id="s2">BBB</span><span id="s3">CCC</span>';
+    document.body.appendChild(div);
+    var range=document.createRange();
+    range.setStart(div.querySelector('#s1').firstChild,1);
+    range.setEnd(div.querySelector('#s3').firstChild,2);
+    // Delete middle node while range spans it
+    div.querySelector('#s2').remove();
+    // Read range after deletion
+    var collapsed=range.collapsed;
+    var startOk=false;
+    try{var sc=range.startContainer;startOk=true;}catch(e){}
+    var str='';
+    try{str=range.toString();}catch(e){str='ERR:'+e.message;}
+    R.c1='collapsed='+collapsed+'|startOk='+startOk+'|str='+str;
+    document.body.removeChild(div);
+  }catch(e){R.c1='err:'+e.message;}
+
+  // C2: contenteditable with execCommand during selection
+  try{
+    var edit=document.createElement('div');
+    edit.contentEditable=true;
+    edit.innerHTML='Hello <b>World</b> Test';
+    document.body.appendChild(edit);
+    // Select "World"
+    var range2=document.createRange();
+    var bold=edit.querySelector('b');
+    if(bold&&bold.firstChild){
+      range2.selectNodeContents(bold.firstChild);
+      var sel=window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range2);
+      // Execute commands on selection
+      var cmds=['bold','italic','underline','strikeThrough',
+                'insertHTML','formatBlock','removeFormat'];
+      var results=[];
+      for(var i=0;i<cmds.length;i++){
+        try{
+          var r=document.execCommand(cmds[i],false,cmds[i]==='insertHTML'?'<em>X</em>':null);
+          results.push(cmds[i]+':'+r);
+        }catch(e){results.push(cmds[i]+':err');}
+      }
+      R.c2='cmds='+results.join(';')+'|html='+edit.innerHTML.slice(0,100);
+    }else{
+      R.c2='no_bold';
+    }
+    document.body.removeChild(edit);
+  }catch(e){R.c2='err:'+e.message;}
+
+  // C3: extractContents + deleteContents + cloneContents rapid cycle
+  try{
+    var div3=document.createElement('div');
+    for(var i=0;i<50;i++){
+      var p=document.createElement('p');
+      p.textContent='para '+i+' with some text content';
+      div3.appendChild(p);
+    }
+    document.body.appendChild(div3);
+    var range3=document.createRange();
+    var ops=0;
+    for(var cycle=0;cycle<20;cycle++){
+      if(div3.childNodes.length<2)break;
+      var start=Math.floor(Math.random()*div3.childNodes.length);
+      var end=Math.min(start+3,div3.childNodes.length-1);
+      try{
+        range3.setStartBefore(div3.childNodes[start]);
+        range3.setEndAfter(div3.childNodes[end]);
+        if(cycle%3===0){
+          var clone=range3.cloneContents();
+          div3.appendChild(clone);
+        }else if(cycle%3===1){
+          range3.deleteContents();
+        }else{
+          var frag=range3.extractContents();
+          div3.insertBefore(frag,div3.firstChild);
+        }
+        ops++;
+      }catch(e){}
+    }
+    R.c3='ops='+ops+'|children='+div3.childNodes.length;
+    document.body.removeChild(div3);
+  }catch(e){R.c3='err:'+e.message;}
+
+  B('EXP-C','C1:'+R.c1+'|C2:'+R.c2+'|C3:'+R.c3);
+  log('  C1: '+R.c1);
+  log('  C2: '+R.c2);
+  log('  C3: '+R.c3);
+}catch(e){B('EXP-C-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP D: DOMParser + XMLSerializer edge cases
+// Entity expansion, CDATA, namespace confusion
+// ============================================================
+try{
+  log('[D] DOMParser stress...');
+
+  // D1: XML billion laughs (entity expansion bomb)
+  try{
+    var xml='<?xml version="1.0"?><!DOCTYPE lolz ['+
+      '<!ENTITY lol "lol">'+
+      '<!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;">'+
+      '<!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;">'+
+      '<!ENTITY lol4 "&lol3;&lol3;&lol3;&lol3;&lol3;">'+
+      ']><root>&lol4;</root>';
+    var parser=new DOMParser();
+    var doc=parser.parseFromString(xml,'text/xml');
+    var err=doc.querySelector('parsererror');
+    R.d1=err?'blocked:'+err.textContent.slice(0,60):'expanded:'+doc.documentElement.textContent.length;
+  }catch(e){R.d1='err:'+e.message;}
+
+  // D2: SVG with foreignObject containing HTML with scripts
+  try{
+    var svgXml='<svg xmlns="http://www.w3.org/2000/svg">'+
+      '<foreignObject width="100" height="100">'+
+      '<body xmlns="http://www.w3.org/1999/xhtml">'+
+      '<script>window.__D2_EXEC=true;<\/script>'+
+      '<div id="fo-test">FO Content</div>'+
+      '</body></foreignObject></svg>';
+    var parser2=new DOMParser();
+    var doc2=parser2.parseFromString(svgXml,'image/svg+xml');
+    var foDiv=doc2.getElementById('fo-test');
+    R.d2='parsed='+(doc2.documentElement.tagName)+
+      '|fo='+(foDiv?foDiv.textContent:'null')+
+      '|scriptExec='+(window.__D2_EXEC||false);
+  }catch(e){R.d2='err:'+e.message;}
+
+  // D3: Namespace confusion — same element name in different namespaces
+  try{
+    var nsXml='<root xmlns:a="http://a.test" xmlns:b="http://b.test">'+
+      '<a:item>A</a:item><b:item>B</b:item>'+
+      '<a:item xmlns:a="http://c.test">C</a:item>'+
+      '</root>';
+    var parser3=new DOMParser();
+    var doc3=parser3.parseFromString(nsXml,'text/xml');
+    var items=doc3.documentElement.getElementsByTagName('*');
+    var nsMap={};
+    for(var i=0;i<items.length;i++){
+      nsMap[items[i].localName+'_'+i]=items[i].namespaceURI;
+    }
+    R.d3='items='+items.length+'|ns='+JSON.stringify(nsMap);
+  }catch(e){R.d3='err:'+e.message;}
+
+  // D4: XMLSerializer on modified parsed document
+  try{
+    var html='<div><p>Hello</p><p>World</p></div>';
+    var parser4=new DOMParser();
+    var doc4=parser4.parseFromString(html,'text/html');
+    // Modify heavily
+    var body=doc4.body;
+    for(var i=0;i<100;i++){
+      var node=doc4.createElement('span');
+      node.textContent='n'+i;
+      body.appendChild(node);
+    }
+    // Remove half
+    while(body.childNodes.length>50)body.removeChild(body.lastChild);
+    var serializer=new XMLSerializer();
+    var result=serializer.serializeToString(doc4);
+    R.d4='serializedLen='+result.length+'|children='+body.childNodes.length;
+  }catch(e){R.d4='err:'+e.message;}
+
+  B('EXP-D','D1:'+R.d1+'|D2:'+R.d2+'|D3:'+R.d3+'|D4:'+R.d4);
+  log('  D1(xxe): '+R.d1);
+  log('  D2(fo): '+R.d2);
+  log('  D3(ns): '+R.d3);
+  log('  D4(ser): '+R.d4);
+}catch(e){B('EXP-D-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP E: CSS custom properties (variables) stress
+// Circular references, deep inheritance, rapid changes
+// ============================================================
+try{
+  log('[E] CSS variables stress...');
+
+  // E1: Circular variable reference
+  try{
+    var div=document.createElement('div');
+    div.style.setProperty('--a','var(--b)');
+    div.style.setProperty('--b','var(--c)');
+    div.style.setProperty('--c','var(--a)');
+    div.style.setProperty('color','var(--a)');
+    document.body.appendChild(div);
+    var color=getComputedStyle(div).color;
+    R.e1='color='+color; // Should fallback/be invalid
+    document.body.removeChild(div);
+  }catch(e){R.e1='err:'+e.message;}
+
+  // E2: Deep variable inheritance chain
+  try{
+    var root=document.createElement('div');
+    document.body.appendChild(root);
+    var current=root;
+    root.style.setProperty('--v','hello');
+    for(var i=0;i<100;i++){
+      var child=document.createElement('div');
+      child.style.setProperty('--v'+i,'var(--v)_'+i);
+      current.appendChild(child);
+      current=child;
+    }
+    // Read deepest
+    var deepVal=getComputedStyle(current).getPropertyValue('--v');
+    var deepV99=getComputedStyle(current).getPropertyValue('--v99');
+    R.e2='deep='+deepVal+'|v99='+deepV99+'|depth=100';
+    document.body.removeChild(root);
+  }catch(e){R.e2='err:'+e.message;}
+
+  // E3: Rapid variable toggle causing style invalidation
+  try{
+    var div3=document.createElement('div');
+    div3.style.setProperty('--size','10px');
+    div3.style.width='var(--size)';
+    div3.style.height='var(--size)';
+    document.body.appendChild(div3);
+    var widths=[];
+    for(var i=0;i<200;i++){
+      div3.style.setProperty('--size',(i%50)+'px');
+      void div3.offsetWidth; // force recalc
+      if(i%50===0)widths.push(getComputedStyle(div3).width);
+    }
+    R.e3='toggles=200|widths='+widths.join(',');
+    document.body.removeChild(div3);
+  }catch(e){R.e3='err:'+e.message;}
+
+  B('EXP-E','E1:'+R.e1+'|E2:'+R.e2+'|E3:'+R.e3);
+  log('  E1: '+R.e1);
+  log('  E2: '+R.e2);
+  log('  E3: '+R.e3);
+}catch(e){B('EXP-E-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP F: structuredClone edge cases
+// Complex object graphs, circular refs, error objects
+// ============================================================
+try{
+  log('[F] structuredClone edge cases...');
+
+  // F1: Deep circular reference
+  try{
+    var a={x:1};var b={y:2,ref:a};a.ref=b;
+    var clone=structuredClone(a);
+    R.f1='cloned=true|circular='+(clone.ref.ref===clone)+'|x='+clone.x+'|y='+clone.ref.y;
+  }catch(e){R.f1='err:'+e.message;}
+
+  // F2: Clone with many different types
+  try{
+    var complex={
+      num:42, str:'hello', bool:true, nul:null, undef:undefined,
+      arr:[1,2,[3,4]], date:new Date(0), re:/test/gi,
+      map:new Map([[1,'a'],[2,'b']]),
+      set:new Set([1,2,3]),
+      ab:new ArrayBuffer(16),
+      ta:new Uint8Array([1,2,3,4]),
+      err:new Error('test'),
+      blob:new Blob(['data'])
+    };
+    var clone2=structuredClone(complex);
+    var types=[];
+    for(var k in clone2){
+      types.push(k+':'+typeof clone2[k]);
+    }
+    R.f2='keys='+Object.keys(clone2).join(',')+
+      '|date='+(clone2.date instanceof Date)+
+      '|map='+(clone2.map instanceof Map)+
+      '|set='+(clone2.set instanceof Set)+
+      '|ab='+(clone2.ab instanceof ArrayBuffer)+
+      '|abLen='+clone2.ab.byteLength;
+  }catch(e){R.f2='err:'+e.message;}
+
+  // F3: Transfer + clone mix
+  try{
+    var buf1=new ArrayBuffer(64);
+    var buf2=new ArrayBuffer(64);
+    new Uint8Array(buf1).fill(0xAA);
+    new Uint8Array(buf2).fill(0xBB);
+    var obj={a:buf1,b:buf2,c:'keep'};
+    // Transfer buf1, clone buf2
+    var clone3=structuredClone(obj,{transfer:[buf1]});
+    R.f3='buf1detached='+(buf1.byteLength===0)+
+      '|clone_a='+clone3.a.byteLength+
+      '|clone_b='+clone3.b.byteLength+
+      '|b_val='+new Uint8Array(clone3.b)[0]+
+      '|a_val='+new Uint8Array(clone3.a)[0];
+  }catch(e){R.f3='err:'+e.message;}
+
+  // F4: Clone large deeply nested object
+  try{
+    var deep={};
+    var cur=deep;
+    for(var i=0;i<500;i++){
+      cur.next={val:i,data:new ArrayBuffer(8)};
+      cur=cur.next;
+    }
+    var t0=Date.now();
+    var dClone=structuredClone(deep);
+    var t1=Date.now();
+    // Verify depth
+    var depth=0;
+    cur=dClone;
+    while(cur.next){depth++;cur=cur.next;}
+    R.f4='depth='+depth+'|time='+(t1-t0)+'ms|lastVal='+cur.val;
+  }catch(e){R.f4='err:'+e.message;}
+
+  B('EXP-F','F1:'+R.f1+'|F2:'+R.f2+'|F3:'+R.f3+'|F4:'+R.f4);
+  log('  F1: '+R.f1);
+  log('  F2: '+R.f2);
+  log('  F3: '+R.f3);
+  log('  F4: '+R.f4);
+}catch(e){B('EXP-F-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP G: ResizeObserver + IntersectionObserver stress
+// Rapid resizing during observation, callback re-entrancy
+// ============================================================
+try{
+  log('[G] Observer stress...');
+
+  // G1: ResizeObserver callback that resizes the target (infinite loop?)
+  var g1_calls=0;
+  try{
+    var box=document.createElement('div');
+    box.style.width='100px';box.style.height='100px';
+    document.body.appendChild(box);
+    if(typeof ResizeObserver!=='undefined'){
+      var ro=new ResizeObserver(function(entries){
+        g1_calls++;
+        if(g1_calls<20){
+          // Resize in callback — potential infinite loop
+          box.style.width=(100+g1_calls*10)+'px';
+        }
+      });
+      ro.observe(box);
+      // Trigger
+      box.style.width='200px';
+      void box.offsetWidth;
+      // Wait for sync delivery
+      var spins=0;
+      while(g1_calls<1&&spins<1000){spins++;void box.offsetWidth;}
+      ro.disconnect();
+      R.g1='calls='+g1_calls+'|spins='+spins;
+    }else{
+      R.g1='no_ResizeObserver';
+    }
+    document.body.removeChild(box);
+  }catch(e){R.g1='err:'+e.message;}
+
+  // G2: IntersectionObserver (if available)
+  try{
+    if(typeof IntersectionObserver!=='undefined'){
+      var g2_entries=0;
+      var target=document.createElement('div');
+      target.style.width='10px';target.style.height='10px';
+      document.body.appendChild(target);
+      var io=new IntersectionObserver(function(entries){
+        g2_entries+=entries.length;
+      });
+      io.observe(target);
+      // Rapidly move in/out of viewport
+      for(var i=0;i<50;i++){
+        target.style.position='absolute';
+        target.style.top=(i%2===0?'0px':'-9999px');
+        void target.offsetHeight;
+      }
+      io.disconnect();
+      R.g2='entries='+g2_entries;
+      document.body.removeChild(target);
+    }else{
+      R.g2='no_IntersectionObserver';
+    }
+  }catch(e){R.g2='err:'+e.message;}
+
+  B('EXP-G','G1:'+R.g1+'|G2:'+R.g2);
+  log('  G1: '+R.g1);
+  log('  G2: '+R.g2);
+}catch(e){B('EXP-G-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP H: FontFace heap pointer check
+// Read the 2 pointers that engine writes into FontFace ArrayBuffer
+// ============================================================
+try{
+  log('[H] FontFace pointer leak check...');
+
+  // H1: Create FontFace from ArrayBuffer, check if engine writes pointers
+  var h_pointers=[];
+  try{
+    for(var trial=0;trial<5;trial++){
+      // Create sentinel-filled buffer
+      var buf=new ArrayBuffer(256);
+      var u8=new Uint8Array(buf);
+      for(var i=0;i<256;i++)u8[i]=0xCC;
+      var u64=new BigUint64Array(buf);
+
+      // Create FontFace with this buffer
+      var ff=new FontFace('probe'+trial,buf);
+      try{ff.load().catch(function(){});}catch(e){}
+
+      // Check if any values changed from sentinel
+      var changed=[];
+      for(var i=0;i<u64.length;i++){
+        if(u64[i]!==0xCCCCCCCCCCCCCCCCn){
+          changed.push('i'+i+':0x'+u64[i].toString(16));
+        }
+      }
+      if(changed.length>0)h_pointers.push('t'+trial+':'+changed.join(','));
+    }
+    R.h1='trials=5|changes='+h_pointers.length+'|vals='+h_pointers.join(';');
+  }catch(e){R.h1='err:'+e.message;}
+
+  // H2: FontFace with url() — check status transitions
+  try{
+    var ff2=new FontFace('urltest','url(data:font/woff2;base64,d09GMgA)');
+    var statuses=[ff2.status];
+    try{ff2.load().catch(function(){});}catch(e){}
+    statuses.push(ff2.status);
+    R.h2='statuses='+statuses.join(',');
+  }catch(e){R.h2='err:'+e.message;}
+
+  B('EXP-H','H1:'+R.h1+'|H2:'+R.h2);
+  log('  H1: '+R.h1);
+  log('  H2: '+R.h2);
+}catch(e){B('EXP-H-ERR',e.message);log('  ERROR: '+e.message);}
+
+// Wait for async font loads
+var spin=Date.now();
+while(Date.now()-spin<300){}
+B('ASYNC-FONTS','loaded='+a_loaded+'|errs='+a_errors.join(';'));
+
+B('DONE','all');
+log('');
+log('Font async: loaded='+a_loaded+' errors='+a_errors.length);
+log('=== P1232 COMPLETE ===');
+</script>
+</body>
+</html>

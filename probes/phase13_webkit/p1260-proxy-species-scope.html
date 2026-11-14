@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1260</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1260-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1260: PROXY SPECIES + SCOPE CONFUSION ===');
+B('START','P1260');
+</script>
+
+<!-- A: Does filter use [[Set]] on the species result? (Proxy trap test) -->
+<script>
+log('\n--- A: Filter species Proxy set trap ---');
+(function(){
+  var setLog=[];
+  var defineLog=[];
+  var target={};
+  var proxy=new Proxy(target, {
+    set:function(t,p,v,r){
+      setLog.push(p+'='+v);
+      t[p]=v;
+      return true;
+    },
+    defineProperty:function(t,p,d){
+      defineLog.push(p+'='+JSON.stringify(d.value));
+      Object.defineProperty(t,p,d);
+      return true;
+    }
+  });
+
+  var arr=[1,2,3,4,5,6,7,8,9,10];
+  arr.constructor={};
+  arr.constructor[Symbol.species]=function(len){ return proxy; };
+
+  try{
+    var result=arr.filter(function(x){return x>5;});
+    B('A1','set_calls='+setLog.length+'|set='+setLog.join(';')+
+      '|define_calls='+defineLog.length+'|define='+defineLog.join(';')+
+      '|result_is_proxy='+(result===proxy));
+  }catch(e){B('A1','err:'+e.name+':'+e.message.slice(0,80));}
+
+  // A2: Same for map
+  setLog=[];defineLog=[];
+  target={};
+  var proxy2=new Proxy(target,{
+    set:function(t,p,v,r){setLog.push(p+'='+typeof v+':'+v);t[p]=v;return true;},
+    defineProperty:function(t,p,d){defineLog.push(p);Object.defineProperty(t,p,d);return true;}
+  });
+  arr=[10,20,30];
+  arr.constructor={};
+  arr.constructor[Symbol.species]=function(len){return proxy2;};
+
+  try{
+    var result2=arr.map(function(x){return x*2;});
+    B('A2','set='+setLog.join(';')+'|define='+defineLog.join(';'));
+  }catch(e){B('A2','err:'+e.name+':'+e.message.slice(0,80));}
+
+  // A3: slice with Proxy species
+  setLog=[];defineLog=[];
+  target={};
+  var proxy3=new Proxy(target,{
+    set:function(t,p,v,r){setLog.push(p+'='+typeof v);t[p]=v;return true;},
+    defineProperty:function(t,p,d){defineLog.push(p);Object.defineProperty(t,p,d);return true;}
+  });
+  arr=[100,200,300,400,500];
+  arr.constructor={};
+  arr.constructor[Symbol.species]=function(len){return proxy3;};
+
+  try{
+    var result3=arr.slice(1,4);
+    B('A3','set='+setLog.join(';')+'|define='+defineLog.join(';')+
+      '|t0='+target[0]+'|t1='+target[1]+'|t2='+target[2]);
+  }catch(e){B('A3','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- B: Proxy species set trap receives OBJECTS — can we inspect raw JSValues? -->
+<script>
+log('\n--- B: Proxy set trap with object values ---');
+(function(){
+  var trapValues=[];
+  var target={};
+  var proxy=new Proxy(target, {
+    set:function(t,p,v,r){
+      // v is the raw JS value being written
+      var info=typeof v;
+      if(typeof v==='object'&&v!==null){
+        info+=':'+v.constructor.name;
+        // Can we see internal properties?
+        var keys=Object.getOwnPropertyNames(v);
+        info+=':keys='+keys.slice(0,5).join(',');
+      }
+      trapValues.push(p+'|'+info);
+      t[p]=v;
+      return true;
+    },
+    defineProperty:function(t,p,d){
+      if(d.value!==undefined){
+        var v=d.value;
+        trapValues.push('DP:'+p+'|'+typeof v);
+      }
+      Object.defineProperty(t,p,d);
+      return true;
+    }
+  });
+
+  var obj1={secret:42};
+  var obj2=document.createElement('div');
+  var obj3=function(){return 'fn';};
+  var arr4=[1,2,3];
+
+  var arr=[obj1, obj2, obj3, arr4, null, 'hello', 42n];
+  arr.constructor={};
+  arr.constructor[Symbol.species]=function(len){return proxy;};
+
+  try{
+    // Use filter (which might use [[Set]] unlike map's [[CreateDataProperty]])
+    var result=arr.filter(function(x){return true;}); // Keep all
+    B('B1','traps='+trapValues.length+'|data='+trapValues.join(';'));
+
+    // Verify objects are the same reference
+    B('B2','same0='+(target[0]===obj1)+
+      '|same1='+(target[1]===obj2)+
+      '|same2='+(target[2]===obj3)+
+      '|same3='+(target[3]===arr4));
+  }catch(e){B('B1','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- C: Proxy set trap + Float64Array backing buffer overlap attempt -->
+<script>
+log('\n--- C: Proxy set → write to TypedArray buffer ---');
+(function(){
+  // When the Proxy set trap fires, we HAVE the raw JS value
+  // Can we store it in a way that reveals the pointer?
+  var buf=new ArrayBuffer(64);
+  var f64=new Float64Array(buf);
+  var u64=new BigUint64Array(buf);
+  for(var i=0;i<u64.length;i++) u64[i]=0xEEEEEEEEEEEEEEEEn;
+
+  var target={};
+  var proxy=new Proxy(target, {
+    set:function(t,p,v,r){
+      var idx=parseInt(p);
+      if(!isNaN(idx) && idx<8){
+        // Write the value into the Float64Array
+        // This goes through TypedArray [[Set]] which coerces
+        f64[idx]=v;
+      }
+      t[p]=v;
+      return true;
+    }
+  });
+
+  var obj={marker:0xBEEF};
+  var arr=[obj, 1.1, 'test', true, null, undefined, 42, obj];
+  arr.constructor={};
+  arr.constructor[Symbol.species]=function(len){return proxy;};
+
+  try{
+    arr.filter(function(x){return true;});
+    var bits=[];
+    for(var i=0;i<8;i++){
+      bits.push(i+':0x'+u64[i].toString(16));
+    }
+    B('C1','bits='+bits.join(';'));
+    // Index 0 should have obj → NaN (0x7ff8...) if coerced, or pointer if not
+    // Index 1 should have 1.1 → IEEE 754
+  }catch(e){B('C1','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- D: JSON.parse reviver mutation -->
+<script>
+log('\n--- D: JSON.parse reviver ---');
+(function(){
+  // D1: Reviver that modifies the object being constructed
+  var reviverLog=[];
+  try{
+    var parsed=JSON.parse('{"a":1,"b":2,"c":3,"d":4,"e":5}', function(key, value){
+      reviverLog.push(key+':'+typeof value);
+      if(key==='c'){
+        // Modify already-parsed values
+        this.a=999;
+        this.b='hijacked';
+        // Delete upcoming keys
+        delete this.d;
+      }
+      return value;
+    });
+    B('D1','a='+parsed.a+'|b='+parsed.b+'|c='+parsed.c+
+      '|d='+parsed.d+'|e='+parsed.e+
+      '|log='+reviverLog.join(';'));
+  }catch(e){B('D1','err:'+e.name+':'+e.message.slice(0,80));}
+
+  // D2: Reviver with nested arrays — can we confuse length?
+  try{
+    var parsed2=JSON.parse('[1,2,3,4,5,6,7,8]', function(key, value){
+      if(key==='3'){
+        // Mutate the array during parsing
+        this.length=20;
+        this[15]=0xDEAD;
+      }
+      return value;
+    });
+    B('D2','len='+parsed2.length+
+      '|v3='+parsed2[3]+'|v7='+parsed2[7]+
+      '|v15='+parsed2[15]+'|isArr='+Array.isArray(parsed2));
+  }catch(e){B('D2','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- E: with statement + Proxy scope object -->
+<script>
+log('\n--- E: with + Proxy scope ---');
+(function(){
+  var lookupLog=[];
+  var scope=new Proxy({x:10, y:20, z:30}, {
+    has:function(t,p){
+      lookupLog.push('has:'+p);
+      return p in t;
+    },
+    get:function(t,p){
+      lookupLog.push('get:'+p);
+      if(p==='x') return 999; // Lie about x's value
+      return t[p];
+    },
+    set:function(t,p,v){
+      lookupLog.push('set:'+p+'='+v);
+      t[p]=v;
+      return true;
+    }
+  });
+
+  try{
+    var result;
+    with(scope){
+      result=x+y+z;
+    }
+    B('E1','result='+result+
+      '|lookups='+lookupLog.length+
+      '|log='+lookupLog.slice(0,15).join(';'));
+  }catch(e){B('E1','err:'+e.name+':'+e.message.slice(0,80));}
+
+  // E2: with scope that returns different values on repeated access
+  var accessCount={};
+  var scope2=new Proxy({}, {
+    has:function(t,p){return true;}, // Claim to have everything
+    get:function(t,p){
+      if(!accessCount[p]) accessCount[p]=0;
+      accessCount[p]++;
+      if(p==='valueOf'||p===Symbol.toPrimitive) return undefined;
+      if(p==='toString') return function(){return 'scope';};
+      return accessCount[p]*100; // Return different value each time
+    }
+  });
+
+  try{
+    var a,b;
+    with(scope2){
+      a=x;
+      b=x; // Same variable, should get different value
+    }
+    B('E2','a='+a+'|b='+b+'|same='+(a===b));
+  }catch(e){B('E2','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- F: Arguments aliasing in sloppy mode -->
+<script>
+log('\n--- F: Arguments object aliasing ---');
+(function(){
+  // F1: Classic arguments aliasing
+  function aliasTest(a, b, c){
+    var origA=a, origB=b;
+    arguments[0]=999;
+    arguments[1]='hijacked';
+    return 'a='+a+'|b='+b+'|c='+c+
+      '|origA='+origA+'|origB='+origB+
+      '|args0='+arguments[0]+'|args1='+arguments[1];
+  }
+  B('F1',aliasTest(1,2,3));
+
+  // F2: Arguments aliasing with TypedArray-like operations
+  function aliasOps(a,b,c,d,e,f,g,h){
+    // arguments is array-like with aliased parameters
+    var argsCopy=Array.from(arguments);
+    arguments[3]=0xDEAD;
+    // Did d change?
+    var result='d='+d+'|args3='+arguments[3]+
+      '|copy3='+argsCopy[3]+'|aliased='+(d===0xDEAD);
+
+    // Can we use arguments as source for TypedArray operations?
+    var arr=new Float64Array(arguments.length);
+    for(var i=0;i<arguments.length;i++) arr[i]=arguments[i];
+
+    // Now modify through alias
+    arguments[0]=42.42;
+    result+='|a_after='+a+'|arr0='+arr[0];
+    return result;
+  }
+  B('F2',aliasOps(1.1,2.2,3.3,4.4,5.5,6.6,7.7,8.8));
+
+  // F3: Arguments length mutation
+  function argsLenTest(a,b,c){
+    var origLen=arguments.length;
+    // Can we add more arguments?
+    arguments[5]=555;
+    arguments[10]=1010;
+    return 'origLen='+origLen+'|len='+arguments.length+
+      '|a5='+arguments[5]+'|a10='+arguments[10]+
+      '|callee='+(typeof arguments.callee);
+  }
+  B('F3',argsLenTest(1,2,3));
+})();
+</script>
+
+<!-- G: RegExp lastIndex mutation during exec -->
+<script>
+log('\n--- G: RegExp mutation during exec ---');
+(function(){
+  // G1: Getter on lastIndex that changes during exec
+  var re=/a/g;
+  var execCount=0;
+  Object.defineProperty(re, 'lastIndex', {
+    get:function(){ execCount++; return 0; }, // Always return 0 → infinite match?
+    set:function(v){}, // Swallow sets
+    configurable:true
+  });
+
+  try{
+    var str='aaaaabbbbb';
+    var matches=[];
+    var match;
+    var safety=0;
+    while((match=re.exec(str))!==null && safety<20){
+      matches.push(match.index);
+      safety++;
+    }
+    B('G1','matches='+matches.length+'|indices='+matches.join(',')+
+      '|execs='+execCount+'|safety='+safety);
+  }catch(e){B('G1','err:'+e.name+':'+e.message.slice(0,80));}
+
+  // G2: String.replace with function + re-entrant match
+  var replaceLog=[];
+  try{
+    var result='hello world test'.replace(/\w+/g, function(m, offset, str){
+      replaceLog.push(m+':'+offset);
+      if(m==='world'){
+        // Try to modify the source string's internal state
+        // (Can't actually modify JS strings, but test what happens)
+      }
+      return m.toUpperCase();
+    });
+    B('G2','result='+result+
+      '|calls='+replaceLog.length+'|log='+replaceLog.join(';'));
+  }catch(e){B('G2','err:'+e.name+':'+e.message.slice(0,80));}
+
+  // G3: String.split with regex that changes during split
+  var splitRe=/,/g;
+  var splitCount=0;
+  Object.defineProperty(splitRe, Symbol.split, {
+    value:function(str, limit){
+      splitCount++;
+      // Custom split that returns controlled data
+      return ['CUSTOM', 'SPLIT', str];
+    }
+  });
+  try{
+    var parts='a,b,c,d'.split(splitRe);
+    B('G3','parts='+parts.join('|')+'|splitCount='+splitCount);
+  }catch(e){B('G3','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- H: ResizableArrayBuffer if available -->
+<script>
+log('\n--- H: RAB + species combo ---');
+(function(){
+  // Check if RAB is available
+  try{
+    var rab=new ArrayBuffer(64, {maxByteLength:256});
+    B('H1','RAB=yes|len='+rab.byteLength+'|max='+rab.maxByteLength+
+      '|resizable='+rab.resizable);
+
+    // RAB + species: map into a growable view, resize during write
+    var view=new Float64Array(rab);
+    var u64=new BigUint64Array(rab);
+    for(var i=0;i<u64.length;i++) u64[i]=0xAAAAAAAAAAAAAAAAn;
+
+    var arr=[1,2,3,4,5,6,7,8];
+    arr.constructor={};
+    arr.constructor[Symbol.species]=function(len){return view;};
+
+    var resized=false;
+    try{
+      var result=arr.map(function(x,i){
+        if(i===3 && !resized){
+          resized=true;
+          // Grow the buffer during map
+          rab.resize(256);
+        }
+        return x*10;
+      });
+      B('H2','resized='+resized+'|buf_len='+rab.byteLength+
+        '|view_len='+view.length);
+      var bits=[];
+      var u64After=new BigUint64Array(rab);
+      for(var i=0;i<Math.min(u64After.length,16);i++){
+        if(u64After[i]!==0xAAAAAAAAAAAAAAAAn && u64After[i]!==0n){
+          bits.push(i+':0x'+u64After[i].toString(16));
+        }
+      }
+      B('H3','changed_bits='+bits.length+'|data='+bits.slice(0,8).join(';'));
+    }catch(e){B('H2','map_err:'+e.name+':'+e.message.slice(0,80));}
+  }catch(e){
+    B('H1','RAB=no:'+e.name+':'+e.message.slice(0,60));
+  }
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1260 COMPLETE ===');
+}, 5000);
+</script>
+
+</body>
+</html>

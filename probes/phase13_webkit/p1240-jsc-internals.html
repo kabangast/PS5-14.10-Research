@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1240</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1240-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1240: JSC LLINT INTERNALS ===');
+log('Time: '+new Date().toISOString());
+B('START','P1240-jsc-internals-v2');
+</script>
+
+<!-- A: Proxy type confusion -->
+<script>
+log('\n--- A: Proxy type confusion ---');
+var aR=[];
+
+// A1: Proxy.get returns object with valueOf for length (safe: max 5)
+try{
+  var cc=0;
+  var p=new Proxy({},{
+    get:function(t,prop){
+      cc++;
+      if(prop==='length') return {valueOf:function(){return 5;}};
+      if(prop===Symbol.iterator) return undefined;
+      if(typeof prop==='string'&&!isNaN(prop)) return 'val_'+prop;
+      return undefined;
+    },
+    has:function(){return true;}
+  });
+  var arr=Array.from(p);
+  aR.push('A1:len='+arr.length+'|cc='+cc+'|v0='+arr[0]);
+}catch(e){aR.push('A1:ERR:'+e.message.slice(0,60));}
+
+// A2: Proxy ownKeys with non-string keys
+try{
+  var p2=new Proxy({a:1,b:2},{
+    ownKeys:function(){return ['a','b'];}
+  });
+  var k=Object.keys(p2);
+  aR.push('A2:keys='+k.join(','));
+}catch(e){aR.push('A2:ERR:'+e.message.slice(0,60));}
+
+// A3: Proxy get trap returning different value each time
+try{
+  var ctr=0;
+  var p3=new Proxy({},{
+    get:function(t,prop){
+      ctr++;
+      if(prop==='constructor') return Array;
+      if(prop==='length') return ctr<5?10:0;
+      return ctr;
+    }
+  });
+  var v1=p3.length,v2=p3.length,v3=p3.length;
+  aR.push('A3:v1='+v1+'|v2='+v2+'|v3='+v3);
+}catch(e){aR.push('A3:ERR:'+e.message.slice(0,60));}
+
+// A4: Proxy as prototype — cache invalidation
+try{
+  var tc=0;
+  var proto=new Proxy({},{
+    get:function(t,prop,recv){tc++;if(prop==='x')return tc;return undefined;}
+  });
+  var o=Object.create(proto);
+  o.y=42;
+  var x1=o.x,x2=o.x;
+  o.x='own';
+  var x3=o.x;
+  delete o.x;
+  var x4=o.x;
+  aR.push('A4:x1='+x1+'|x2='+x2+'|x3='+x3+'|x4='+x4+'|tc='+tc);
+}catch(e){aR.push('A4:ERR:'+e.message.slice(0,60));}
+
+// A5: Proxy with has trap confusion — "in" operator lies
+try{
+  var hasCalls=[];
+  var p5=new Proxy({a:1},{
+    has:function(t,prop){hasCalls.push(prop);return prop==='ghost';}
+  });
+  var r1=('a' in p5),r2=('ghost' in p5),r3=('b' in p5);
+  aR.push('A5:a='+r1+'|ghost='+r2+'|b='+r3+'|calls='+hasCalls.join(','));
+}catch(e){aR.push('A5:ERR:'+e.message.slice(0,60));}
+
+B('A',aR.join('||'));
+log('A: '+aR.join(' | '));
+</script>
+
+<!-- B: for-in structure invalidation -->
+<script>
+log('\n--- B: for-in structure invalidation ---');
+var bR=[];
+
+// B1: Delete properties during for-in
+try{
+  var o={a:1,b:2,c:3,d:4,e:5,f:6,g:7,h:8};
+  var seen=[];
+  for(var k in o){seen.push(k);if(k==='c'){delete o.d;delete o.e;}}
+  bR.push('B1:'+seen.join(','));
+}catch(e){bR.push('B1:ERR:'+e.message.slice(0,60));}
+
+// B2: Add properties during for-in (capped at 100)
+try{
+  var o2={a:1,b:2};
+  var s2=[];
+  for(var k in o2){s2.push(k);if(k==='a'){for(var i=0;i<100;i++)o2['n'+i]=i;}}
+  bR.push('B2:seen='+s2.length);
+}catch(e){bR.push('B2:ERR:'+e.message.slice(0,60));}
+
+// B3: Mass delete during for-in (dictionary conversion)
+try{
+  var o3={};for(var i=0;i<50;i++)o3['p'+i]=i;
+  var s3=[];
+  for(var k in o3){s3.push(k);if(k==='p5'){for(var i=10;i<40;i++)delete o3['p'+i];}}
+  bR.push('B3:seen='+s3.length);
+}catch(e){bR.push('B3:ERR:'+e.message.slice(0,60));}
+
+// B4: Change prototype during for-in
+try{
+  var base={x:1,y:2};
+  var o4=Object.create(base);o4.a=10;
+  var s4=[];
+  for(var k in o4){s4.push(k+'='+o4[k]);if(k==='a')Object.setPrototypeOf(o4,{z:99,w:88});}
+  bR.push('B4:'+s4.join(','));
+}catch(e){bR.push('B4:ERR:'+e.message.slice(0,60));}
+
+// B5: for-in with Proxy that changes shape on each iteration
+try{
+  var iterN=0;
+  var pp=new Proxy({a:1,b:2,c:3},{
+    ownKeys:function(t){iterN++;return Object.keys(t).concat(['dyn_'+iterN]);},
+    getOwnPropertyDescriptor:function(t,p){return{value:1,enumerable:true,configurable:true};}
+  });
+  var s5=[];for(var k in pp){s5.push(k);if(s5.length>20)break;}
+  bR.push('B5:'+s5.join(','));
+}catch(e){bR.push('B5:ERR:'+e.message.slice(0,60));}
+
+B('B',bR.join('||'));
+</script>
+
+<!-- C: RegExp lastIndex side effects -->
+<script>
+log('\n--- C: RegExp lastIndex mutation ---');
+var cR=[];
+
+// C1: RegExp with getter lastIndex
+try{
+  var re=/a/g;
+  var se=0;
+  Object.defineProperty(re,'lastIndex',{
+    get:function(){se++;return 0;},
+    set:function(v){se+=100;}
+  });
+  var m=re.exec('aaa');
+  cR.push('C1:match='+(m?m[0]:'null')+'|se='+se);
+}catch(e){cR.push('C1:ERR:'+e.message.slice(0,60));}
+
+// C2: Replace with toString object
+try{
+  var rp='aXbXcXd'.replace(/X/g,function(m,off){
+    return {toString:function(){return '['+off+']';}};
+  });
+  cR.push('C2:'+rp);
+}catch(e){cR.push('C2:ERR:'+e.message.slice(0,60));}
+
+// C3: RegExp backtracking (safe — only 16 chars)
+try{
+  var re3=new RegExp('(a+)+b');
+  var t0=Date.now();
+  var m3=re3.exec('aaaaaaaaaaaaaaaa');
+  cR.push('C3:match='+(m3?'yes':'no')+'|ms='+(Date.now()-t0));
+}catch(e){cR.push('C3:ERR:'+e.message.slice(0,60));}
+
+// C4: matchAll iteration
+try{
+  var it='abc'[Symbol.matchAll](/./g);
+  var ir=[];var n;var cnt=0;
+  while(!(n=it.next()).done&&cnt<10){ir.push(n.value[0]);cnt++;}
+  cR.push('C4:'+ir.join(','));
+}catch(e){cR.push('C4:ERR:'+e.message.slice(0,60));}
+
+// C5: RegExp with Symbol.match override
+try{
+  var fakeRe={};
+  fakeRe[Symbol.match]=function(str){return ['fake',str.length];};
+  var mr='hello'.match(fakeRe);
+  cR.push('C5:'+JSON.stringify(mr));
+}catch(e){cR.push('C5:ERR:'+e.message.slice(0,60));}
+
+B('C',cR.join('||'));
+</script>
+
+<!-- D: Array length mutation during iteration -->
+<script>
+log('\n--- D: Array length mutation ---');
+var dR=[];
+
+// D1: forEach with shrink
+try{
+  var a=[1,2,3,4,5,6,7,8,9,10];var s=[];
+  a.forEach(function(v,i){s.push(v);if(i===2)a.length=4;});
+  dR.push('D1:'+s.join(',')+'|len='+a.length);
+}catch(e){dR.push('D1:ERR:'+e.message.slice(0,60));}
+
+// D2: map with grow
+try{
+  var a2=[10,20,30,40,50];
+  var mp=a2.map(function(v,i){if(i===1){a2.length=100;a2[99]=999;}return v*2;});
+  dR.push('D2:mapped='+mp.length+'|src='+a2.length);
+}catch(e){dR.push('D2:ERR:'+e.message.slice(0,60));}
+
+// D3: reduce with delete
+try{
+  var a3=[1,2,3,4,5,6,7,8];
+  var sm=a3.reduce(function(acc,v,i){if(i===2){delete a3[4];delete a3[5];delete a3[6];}return acc+v;},0);
+  dR.push('D3:sum='+sm);
+}catch(e){dR.push('D3:ERR:'+e.message.slice(0,60));}
+
+// D4: Sparse array with side-effecting getter
+try{
+  var a4=[1,,3,,5,,7,,9];
+  Object.defineProperty(a4,'1',{get:function(){a4[3]=999;return 2;},configurable:true});
+  var f=[];for(var i=0;i<a4.length;i++){if(i in a4)f.push(i+':'+a4[i]);}
+  dR.push('D4:'+f.join(','));
+}catch(e){dR.push('D4:ERR:'+e.message.slice(0,60));}
+
+// D5: Array.prototype.sort with comparator that modifies array
+try{
+  var a5=[5,3,1,4,2];
+  var sortCalls=0;
+  a5.sort(function(x,y){
+    sortCalls++;
+    if(sortCalls===3)a5.push(99);
+    if(sortCalls===5)a5.length=2;
+    return x-y;
+  });
+  dR.push('D5:sorted='+a5.join(',')+'|calls='+sortCalls);
+}catch(e){dR.push('D5:ERR:'+e.message.slice(0,60));}
+
+B('D',dR.join('||'));
+</script>
+
+<!-- E: arguments aliasing (non-strict) -->
+<script>
+log('\n--- E: arguments aliasing ---');
+var eR=[];
+
+function testAlias(a,b,c){
+  var r=[];
+  r.push('a='+a);
+  arguments[0]='mod';
+  r.push('after:a='+a);
+  a='direct';
+  r.push('arg0='+arguments[0]);
+  delete arguments[1];
+  r.push('b='+b+'|arg1='+arguments[1]);
+  arguments[5]='extra';
+  r.push('arg5='+arguments[5]+'|len='+arguments.length);
+  return r.join('|');
+}
+eR.push('E1:'+testAlias(1,2,3));
+
+function testReentrant(){
+  var orig=arguments;
+  function inner(){orig[0]='hacked';return arguments[0];}
+  var before=arguments[0];
+  var ir=inner.call(null,'inner_val');
+  return 'before='+before+'|inner='+ir+'|after='+arguments[0];
+}
+eR.push('E2:'+testReentrant('original'));
+
+function testCallee(n){
+  if(n<=0)return 'done';
+  arguments[0]=n-1;
+  return n+','+arguments.callee(n);
+}
+try{eR.push('E3:'+testCallee(5));}catch(e){eR.push('E3:ERR:'+e.message.slice(0,60));}
+
+// E4: arguments length vs actual params
+function testArgLen(){
+  var r=[];
+  r.push('len='+arguments.length);
+  r.push('0='+arguments[0]+'|1='+arguments[1]+'|2='+arguments[2]);
+  // Access beyond length
+  r.push('10='+arguments[10]);
+  arguments.length=1;
+  r.push('afterSetLen:1='+arguments[1]+'|len='+arguments.length);
+  return r.join('|');
+}
+eR.push('E4:'+testArgLen('x','y','z'));
+
+B('E',eR.join('||'));
+</script>
+
+<!-- F: Self-modifying properties -->
+<script>
+log('\n--- F: Self-modifying properties ---');
+var fR=[];
+
+// F1: Getter that redefines itself
+try{
+  var o={};var gc=0;
+  Object.defineProperty(o,'x',{
+    get:function(){gc++;if(gc===1)Object.defineProperty(o,'x',{value:42,writable:true,configurable:true});return gc;},
+    configurable:true
+  });
+  var v1=o.x,v2=o.x,v3=o.x;
+  fR.push('F1:v1='+v1+'|v2='+v2+'|v3='+v3+'|gc='+gc);
+}catch(e){fR.push('F1:ERR:'+e.message.slice(0,60));}
+
+// F2: Getter that changes object shape
+try{
+  var o2={a:1};
+  Object.defineProperty(o2,'b',{
+    get:function(){for(var i=0;i<100;i++)o2['n'+i]=i;return 2;},
+    configurable:true
+  });
+  var s=0;
+  for(var i=0;i<10;i++){s+=o2.a;if(i===5)s+=o2.b;s+=o2.a;}
+  fR.push('F2:sum='+s+'|props='+Object.keys(o2).length);
+}catch(e){fR.push('F2:ERR:'+e.message.slice(0,60));}
+
+// F3: Setter that restructures
+try{
+  var o3={};for(var i=0;i<64;i++)o3['p'+i]=i;
+  Object.defineProperty(o3,'trigger',{
+    set:function(v){for(var i=0;i<32;i++)delete o3['p'+i];for(var i=0;i<32;i++)o3['p'+i]={v:i};},
+    configurable:true
+  });
+  var bf=o3.p5;o3.trigger=true;var af=o3.p5;
+  fR.push('F3:before='+bf+'|after='+JSON.stringify(af));
+}catch(e){fR.push('F3:ERR:'+e.message.slice(0,60));}
+
+// F4: defineProperty flood
+try{
+  var o4={};
+  for(var i=0;i<500;i++)Object.defineProperty(o4,'p'+i,{value:i,writable:(i%2===0),enumerable:(i%3===0),configurable:true});
+  for(var i=0;i<500;i++)delete o4['p'+i];
+  fR.push('F4:ok|keys='+Object.keys(o4).length);
+}catch(e){fR.push('F4:ERR:'+e.message.slice(0,60));}
+
+// F5: Getter that deletes itself mid-access
+try{
+  var o5={};var fc=0;
+  Object.defineProperty(o5,'self_destruct',{
+    get:function(){fc++;delete o5.self_destruct;return 'boom';},
+    configurable:true
+  });
+  var r1=o5.self_destruct;
+  var r2=o5.self_destruct;
+  fR.push('F5:r1='+r1+'|r2='+r2+'|fc='+fc+'|has='+('self_destruct' in o5));
+}catch(e){fR.push('F5:ERR:'+e.message.slice(0,60));}
+
+B('F',fR.join('||'));
+</script>
+
+<!-- G: Symbol.toPrimitive confusion -->
+<script>
+log('\n--- G: Symbol.toPrimitive confusion ---');
+var gR=[];
+
+// G1: toPrimitive returning wrong type for hint
+try{
+  var evil={};
+  evil[Symbol.toPrimitive]=function(hint){
+    if(hint==='number')return 'not_num';
+    if(hint==='string')return 42;
+    return true;
+  };
+  var n= +evil,s=''+evil;
+  var d;try{d=evil==42;}catch(e){d='threw:'+e.message.slice(0,30);}
+  gR.push('G1:num='+n+'|str='+s+'|def='+d);
+}catch(e){gR.push('G1:ERR:'+e.message.slice(0,60));}
+
+// G2: toPrimitive that modifies receiver
+try{
+  var o={value:1};
+  o[Symbol.toPrimitive]=function(){this.value*=2;return this.value;};
+  var r1=o+0,r2=o+0,r3=o+0;
+  gR.push('G2:r1='+r1+'|r2='+r2+'|r3='+r3+'|val='+o.value);
+}catch(e){gR.push('G2:ERR:'+e.message.slice(0,60));}
+
+// G3: Map doesn't call toPrimitive
+try{
+  var m=new Map();var pc=0;
+  var k={};k[Symbol.toPrimitive]=function(){pc++;return pc;};
+  m.set(k,'v1');m.set(k,'v2');
+  gR.push('G3:size='+m.size+'|prims='+pc+'|val='+m.get(k));
+}catch(e){gR.push('G3:ERR:'+e.message.slice(0,60));}
+
+// G4: valueOf vs toString priority in different contexts
+try{
+  var o2={valueOf:function(){return 100;},toString:function(){return 'str';}};
+  var r=[];
+  r.push('plus:'+(o2+0));
+  r.push('concat:'+(o2+''));
+  r.push('template:'+(''+o2));
+  r.push('number:'+(+o2));
+  r.push('cmp:'+(o2>50));
+  gR.push('G4:'+r.join('|'));
+}catch(e){gR.push('G4:ERR:'+e.message.slice(0,60));}
+
+B('G',gR.join('||'));
+</script>
+
+<!-- H: JSON.parse reviver mutation -->
+<script>
+log('\n--- H: JSON.parse reviver ---');
+var hR=[];
+
+// H1: Reviver modifies already-parsed values
+try{
+  var rc=[];
+  var p=JSON.parse('{"a":1,"b":2,"c":3,"d":4,"e":5}',function(k,v){
+    rc.push(k);
+    if(k==='c'){this.a='mut';this.b={n:1};this.extra='inj';delete this.d;}
+    return v;
+  });
+  hR.push('H1:a='+p.a+'|b='+JSON.stringify(p.b)+'|d='+p.d+'|x='+p.extra+'|order='+rc.join(','));
+}catch(e){hR.push('H1:ERR:'+e.message.slice(0,60));}
+
+// H2: Reviver replaces root with ArrayBuffer
+try{
+  var buf=new ArrayBuffer(32);var view=new Uint8Array(buf);for(var i=0;i<32;i++)view[i]=0x41;
+  var p2=JSON.parse('{"x":1}',function(k,v){if(k==='')return buf;return v;});
+  hR.push('H2:type='+typeof p2+'|isBuf='+(p2 instanceof ArrayBuffer)+'|len='+(p2.byteLength||'?'));
+}catch(e){hR.push('H2:ERR:'+e.message.slice(0,60));}
+
+// H3: toJSON creating circular ref
+try{
+  var o={cnt:0,toJSON:function(){this.cnt++;if(this.cnt>3)return 'stop';return{v:this.cnt,self:this};}};
+  var s=JSON.stringify(o);
+  hR.push('H3:'+s.slice(0,80));
+}catch(e){hR.push('H3:ERR:'+e.message.slice(0,60));}
+
+// H4: Reviver that returns undefined (deletes keys)
+try{
+  var p3=JSON.parse('{"a":1,"b":2,"c":3,"d":4}',function(k,v){
+    if(k==='b'||k==='d')return undefined;
+    return v;
+  });
+  hR.push('H4:keys='+Object.keys(p3).join(',')+'|a='+p3.a+'|b='+p3.b);
+}catch(e){hR.push('H4:ERR:'+e.message.slice(0,60));}
+
+B('H',hR.join('||'));
+</script>
+
+<!-- I: Intl edge cases + misc JSC internals -->
+<script>
+log('\n--- I: Intl + misc ---');
+var iR=[];
+
+// I1: Intl.Segmenter with complex Unicode
+try{
+  if(typeof Intl.Segmenter!=='undefined'){
+    var seg=new Intl.Segmenter('en',{granularity:'grapheme'});
+    var s='\u{1F468}‍\u{1F469}‍\u{1F467}';
+    var segs=[];for(var x of seg.segment(s))segs.push(x.segment.length);
+    iR.push('I1:segs='+segs.join(','));
+  }else{iR.push('I1:noSeg');}
+}catch(e){iR.push('I1:ERR:'+e.message.slice(0,60));}
+
+// I2: Extreme number formatting
+try{
+  var nf=new Intl.NumberFormat('en',{maximumFractionDigits:20});
+  var lens=[Number.MAX_SAFE_INTEGER,Number.MIN_VALUE,-0,Infinity,NaN].map(function(v){return nf.format(v).length;});
+  iR.push('I2:'+lens.join(','));
+}catch(e){iR.push('I2:ERR:'+e.message.slice(0,60));}
+
+// I3: WeakRef + FinalizationRegistry timing
+try{
+  var cleanups=0;
+  var fr=new FinalizationRegistry(function(v){cleanups++;});
+  (function(){var o={big:new Array(10000)};fr.register(o,'test');})();
+  // Force GC pressure
+  for(var i=0;i<100;i++){var tmp=new ArrayBuffer(65536);}
+  iR.push('I3:cleanups='+cleanups);
+}catch(e){iR.push('I3:ERR:'+e.message.slice(0,60));}
+
+// I4: Promise microtask ordering
+try{
+  var order=[];
+  Promise.resolve().then(function(){order.push('p1');});
+  Promise.resolve().then(function(){order.push('p2');
+    Promise.resolve().then(function(){order.push('p3');});
+  });
+  Promise.resolve().then(function(){order.push('p4');});
+  // Sync code runs first
+  order.push('sync');
+  iR.push('I4:'+order.join(','));
+}catch(e){iR.push('I4:ERR:'+e.message.slice(0,60));}
+
+// I5: with statement scope confusion (non-strict)
+try{
+  var o={x:1,y:2};
+  var x=10;
+  var r;
+  with(o){
+    r='x='+x+'|y='+y;
+    x=99;
+    z=77; // Creates on global, not on o
+  }
+  iR.push('I5:'+r+'|o.x='+o.x+'|o.z='+o.z+'|global_z='+z);
+}catch(e){iR.push('I5:ERR:'+e.message.slice(0,60));}
+
+B('I',iR.join('||'));
+</script>
+
+<!-- J: Property access edge cases -->
+<script>
+log('\n--- J: Property access edge cases ---');
+var jR=[];
+
+// J1: __proto__ manipulation
+try{
+  var o={};
+  o.__proto__={secret:42};
+  jR.push('J1:secret='+o.secret+'|proto='+Object.getPrototypeOf(o).secret);
+}catch(e){jR.push('J1:ERR:'+e.message.slice(0,60));}
+
+// J2: Numeric property edge cases
+try{
+  var o2={};
+  o2[0]=0;o2[4294967294]='max_idx';o2[4294967295]='over_max';o2[-1]='neg';
+  o2[1.5]='float';o2[NaN]='nan';o2[Infinity]='inf';
+  var r=[];
+  r.push('0:'+o2[0]+'|max:'+o2[4294967294]+'|over:'+o2[4294967295]);
+  r.push('neg:'+o2[-1]+'|float:'+o2[1.5]+'|nan:'+o2[NaN]+'|inf:'+o2[Infinity]);
+  jR.push('J2:'+r.join('|'));
+}catch(e){jR.push('J2:ERR:'+e.message.slice(0,60));}
+
+// J3: Object.create(null) — no prototype at all
+try{
+  var o3=Object.create(null);
+  o3.x=1;
+  var hasToString=(typeof o3.toString);
+  var r3;try{r3=''+o3;}catch(e){r3='threw:'+e.message.slice(0,30);}
+  jR.push('J3:toString='+hasToString+'|coerce='+r3);
+}catch(e){jR.push('J3:ERR:'+e.message.slice(0,60));}
+
+// J4: Prototype pollution via constructor
+try{
+  function Foo(){}
+  Foo.prototype.polluted='yes';
+  var f=new Foo();
+  var r4=f.polluted;
+  Foo.prototype=null;
+  var f2;try{f2=new Foo();}catch(e){f2='threw';}
+  jR.push('J4:poll='+r4+'|f2='+typeof f2);
+}catch(e){jR.push('J4:ERR:'+e.message.slice(0,60));}
+
+// J5: Property descriptor frozen object mutation attempt
+try{
+  var o5=Object.freeze({a:1,b:[2,3]});
+  var r5=[];
+  try{o5.a=99;r5.push('set:ok');}catch(e){r5.push('set:threw');}
+  r5.push('a='+o5.a);
+  // But nested array is NOT frozen!
+  o5.b.push(4);
+  r5.push('b='+o5.b.join(','));
+  jR.push('J5:'+r5.join('|'));
+}catch(e){jR.push('J5:ERR:'+e.message.slice(0,60));}
+
+B('J',jR.join('||'));
+</script>
+
+<!-- FINAL -->
+<script>
+log('\n=== P1240v2 COMPLETE ===');
+B('DONE','all_v2');
+</script>
+
+</body>
+</html>

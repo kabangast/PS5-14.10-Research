@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1242</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1242-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1242: WEB API BOUNDARIES ===');
+log('Time: '+new Date().toISOString());
+B('START','P1242');
+</script>
+
+<!-- A: structuredClone edge cases -->
+<script>
+log('\n--- A: structuredClone ---');
+var aR=[];
+
+// A1: Clone with transfer — verify detachment
+try{
+  var buf=new ArrayBuffer(64);
+  var view=new Uint8Array(buf);
+  for(var i=0;i<64;i++)view[i]=i;
+  var clone=structuredClone(buf,{transfer:[buf]});
+  var cloneView=new Uint8Array(clone);
+  aR.push('A1:orig_len='+buf.byteLength+'|clone_len='+clone.byteLength+
+    '|clone[0]='+cloneView[0]+'|clone[63]='+cloneView[63]);
+}catch(e){aR.push('A1:ERR:'+e.message.slice(0,60));}
+
+// A2: Clone TypedArray with shared buffer + transfer
+try{
+  var buf2=new ArrayBuffer(32);
+  var u8=new Uint8Array(buf2);
+  var u32=new Uint32Array(buf2);
+  u32[0]=0xDEADBEEF;
+  var clone2=structuredClone(u8,{transfer:[buf2]});
+  aR.push('A2:orig_buf='+buf2.byteLength+'|clone_type='+clone2.constructor.name+
+    '|clone_len='+clone2.length+'|clone[0]='+clone2[0]);
+}catch(e){aR.push('A2:ERR:'+e.message.slice(0,60));}
+
+// A3: Clone complex object graph
+try{
+  var a={x:1};var b={y:2,ref:a};a.back=b;
+  var clone3=structuredClone(a);
+  aR.push('A3:x='+clone3.x+'|back_y='+clone3.back.y+'|circular='+(clone3.back.ref===clone3));
+}catch(e){aR.push('A3:ERR:'+e.message.slice(0,60));}
+
+// A4: Clone Map/Set
+try{
+  var m=new Map([[1,'a'],[2,'b']]);
+  var s=new Set([1,2,3]);
+  var cm=structuredClone(m);
+  var cs=structuredClone(s);
+  aR.push('A4:map_size='+cm.size+'|map_get='+cm.get(1)+'|set_size='+cs.size+'|set_has='+cs.has(2));
+}catch(e){aR.push('A4:ERR:'+e.message.slice(0,60));}
+
+// A5: Clone Date, RegExp, Error
+try{
+  var d=new Date(1234567890000);
+  var re=/test/gi;
+  var err=new Error('msg');
+  var cd=structuredClone(d);
+  var cre=structuredClone(re);
+  var r5=[];
+  r5.push('date='+cd.getTime());
+  r5.push('re='+cre.source+'|flags='+cre.flags);
+  try{var cerr=structuredClone(err);r5.push('err='+cerr.message);}
+  catch(e){r5.push('err_clone:'+e.message.slice(0,30));}
+  aR.push('A5:'+r5.join('|'));
+}catch(e){aR.push('A5:ERR:'+e.message.slice(0,60));}
+
+// A6: Clone with non-cloneable objects
+try{
+  var r6=[];
+  try{structuredClone(function(){});r6.push('fn:ok');}catch(e){r6.push('fn:threw');}
+  try{structuredClone(Symbol('s'));r6.push('sym:ok');}catch(e){r6.push('sym:threw');}
+  try{structuredClone(document.body);r6.push('dom:ok');}catch(e){r6.push('dom:threw');}
+  try{
+    var p=new Proxy({},{});
+    structuredClone(p);r6.push('proxy:ok');
+  }catch(e){r6.push('proxy:'+e.message.slice(0,20));}
+  aR.push('A6:'+r6.join('|'));
+}catch(e){aR.push('A6:ERR:'+e.message.slice(0,60));}
+
+// A7: Double transfer same buffer
+try{
+  var buf7=new ArrayBuffer(16);
+  try{
+    structuredClone(null,{transfer:[buf7,buf7]});
+    aR.push('A7:double_ok');
+  }catch(e){aR.push('A7:double:'+e.message.slice(0,40));}
+}catch(e){aR.push('A7:ERR:'+e.message.slice(0,60));}
+
+B('A',aR.join('||'));
+log('A: '+aR.join(' | '));
+</script>
+
+<!-- B: postMessage + MessageChannel -->
+<script>
+log('\n--- B: postMessage/MessageChannel ---');
+var bR=[];
+
+// B1: MessageChannel basic + transfer
+try{
+  var mc=new MessageChannel();
+  var received=null;
+  mc.port2.onmessage=function(e){received=e.data;};
+  var buf=new ArrayBuffer(16);
+  new Uint8Array(buf).set([1,2,3,4]);
+  mc.port1.postMessage({type:'test',buf:buf},[buf]);
+  bR.push('B1:sent|orig_buf='+buf.byteLength);
+}catch(e){bR.push('B1:ERR:'+e.message.slice(0,60));}
+
+// B2: postMessage to self with various types
+try{
+  var types=[];
+  var testData=[
+    42, 'hello', true, null, undefined,
+    [1,2,3], {a:1}, new Date(), /regex/g,
+    new Map([[1,2]]), new Set([1,2,3]),
+    new ArrayBuffer(8), new Uint8Array([1,2,3]),
+    new Blob(['test'],{type:'text/plain'})
+  ];
+  for(var i=0;i<testData.length;i++){
+    try{
+      var clone=structuredClone(testData[i]);
+      types.push(i+':ok');
+    }catch(e){types.push(i+':fail');}
+  }
+  bR.push('B2:'+types.join(','));
+}catch(e){bR.push('B2:ERR:'+e.message.slice(0,60));}
+
+// B3: MessageChannel port transfer
+try{
+  var mc3=new MessageChannel();
+  var mc3b=new MessageChannel();
+  // Transfer port through another channel
+  mc3.port1.postMessage({port:mc3b.port1},[mc3b.port1]);
+  bR.push('B3:port_transfer_ok');
+}catch(e){bR.push('B3:ERR:'+e.message.slice(0,60));}
+
+// B4: postMessage with very large data
+try{
+  var big=new ArrayBuffer(1024*1024); // 1MB
+  var t0=Date.now();
+  var clone=structuredClone(big);
+  var t1=Date.now();
+  bR.push('B4:1MB_clone_ms='+(t1-t0)+'|clone_len='+clone.byteLength);
+}catch(e){bR.push('B4:ERR:'+e.message.slice(0,60));}
+
+B('B',bR.join('||'));
+log('B: '+bR.join(' | '));
+</script>
+
+<!-- C: Blob/URL/Fetch -->
+<script>
+log('\n--- C: Blob/URL/Fetch ---');
+var cR=[];
+
+// C1: Blob creation + read via sync XHR
+try{
+  var blob=new Blob(['Hello World'],{type:'text/plain'});
+  var url=URL.createObjectURL(blob);
+  cR.push('C1:size='+blob.size+'|type='+blob.type+'|url='+url.slice(0,40));
+  URL.revokeObjectURL(url);
+}catch(e){cR.push('C1:ERR:'+e.message.slice(0,60));}
+
+// C2: Blob URL after revoke
+try{
+  var blob2=new Blob(['test']);
+  var url2=URL.createObjectURL(blob2);
+  URL.revokeObjectURL(url2);
+  var xhr=new XMLHttpRequest();
+  xhr.open('GET',url2,false);
+  try{xhr.send();cR.push('C2:revoked_status='+xhr.status);}
+  catch(e){cR.push('C2:revoked_xhr:'+e.message.slice(0,30));}
+}catch(e){cR.push('C2:ERR:'+e.message.slice(0,60));}
+
+// C3: Blob slicing edge cases
+try{
+  var blob3=new Blob(['ABCDEFGHIJ']);
+  var s1=blob3.slice(0,5);
+  var s2=blob3.slice(-5);
+  var s3=blob3.slice(3,3); // Zero-length
+  var s4=blob3.slice(8,3); // Inverted (should be empty)
+  var s5=blob3.slice(0,1000); // Past end
+  cR.push('C3:s1='+s1.size+'|s2='+s2.size+'|s3='+s3.size+'|s4='+s4.size+'|s5='+s5.size);
+}catch(e){cR.push('C3:ERR:'+e.message.slice(0,60));}
+
+// C4: Multiple Blob URLs — accumulation
+try{
+  var urls=[];
+  for(var i=0;i<100;i++){
+    urls.push(URL.createObjectURL(new Blob(['data'+i])));
+  }
+  cR.push('C4:created='+urls.length+'|sample='+urls[0].slice(0,40));
+  // Revoke all
+  for(var i=0;i<urls.length;i++)URL.revokeObjectURL(urls[i]);
+  cR.push('C4:revoked');
+}catch(e){cR.push('C4:ERR:'+e.message.slice(0,60));}
+
+// C5: URL parsing edge cases
+try{
+  var tests=[
+    'http://[::1]:8080/path',
+    'http://user:pass@host/path',
+    'blob:null/test',
+    'data:text/plain;base64,SGVsbG8=',
+    'javascript:void(0)',
+  ];
+  var r5=[];
+  for(var i=0;i<tests.length;i++){
+    try{var u=new URL(tests[i]);r5.push(i+':'+u.protocol);}
+    catch(e){r5.push(i+':invalid');}
+  }
+  cR.push('C5:'+r5.join(','));
+}catch(e){cR.push('C5:ERR:'+e.message.slice(0,60));}
+
+B('C',cR.join('||'));
+log('C: '+cR.join(' | '));
+</script>
+
+<!-- D: Crypto API -->
+<script>
+log('\n--- D: Crypto API ---');
+var dR=[];
+
+// D1: crypto.getRandomValues
+try{
+  var buf=new Uint8Array(32);
+  crypto.getRandomValues(buf);
+  var nonzero=0;for(var i=0;i<32;i++)if(buf[i]!==0)nonzero++;
+  dR.push('D1:nonzero='+nonzero+'/32|sample='+buf[0]+','+buf[1]+','+buf[2]);
+}catch(e){dR.push('D1:ERR:'+e.message.slice(0,60));}
+
+// D2: crypto.getRandomValues with large buffer
+try{
+  var big=new Uint8Array(65536);
+  crypto.getRandomValues(big);
+  dR.push('D2:65536_ok|last='+big[65535]);
+}catch(e){dR.push('D2:ERR:'+e.message.slice(0,60));}
+
+// D3: crypto.getRandomValues with too-large buffer
+try{
+  var huge=new Uint8Array(65537);
+  crypto.getRandomValues(huge);
+  dR.push('D3:65537_ok');
+}catch(e){dR.push('D3:65537:'+e.message.slice(0,40));}
+
+// D4: crypto.randomUUID
+try{
+  if(typeof crypto.randomUUID==='function'){
+    var uuid=crypto.randomUUID();
+    dR.push('D4:uuid='+uuid);
+  }else{dR.push('D4:no_randomUUID');}
+}catch(e){dR.push('D4:ERR:'+e.message.slice(0,60));}
+
+// D5: SubtleCrypto availability
+try{
+  var subtle=crypto.subtle||crypto.webkitSubtle;
+  dR.push('D5:subtle='+(subtle?'yes':'no')+'|type='+typeof subtle);
+}catch(e){dR.push('D5:ERR:'+e.message.slice(0,60));}
+
+B('D',dR.join('||'));
+log('D: '+dR.join(' | '));
+</script>
+
+<!-- E: DOM serialization / innerHTML edge cases -->
+<script>
+log('\n--- E: DOM serialization ---');
+var eR=[];
+
+// E1: innerHTML round-trip with malformed HTML
+try{
+  var d=document.createElement('div');
+  d.innerHTML='<p>text<p>more<br><hr><img src=x>';
+  eR.push('E1:out='+d.innerHTML.slice(0,80));
+}catch(e){eR.push('E1:ERR:'+e.message.slice(0,60));}
+
+// E2: innerHTML with script injection (should be safe)
+try{
+  var d2=document.createElement('div');
+  d2.innerHTML='<img src=x onerror="B(\'XSS\',1)">';
+  // Script in innerHTML shouldn't execute
+  eR.push('E2:html='+d2.innerHTML.slice(0,60)+'|children='+d2.children.length);
+}catch(e){eR.push('E2:ERR:'+e.message.slice(0,60));}
+
+// E3: DOMParser with various MIME types
+try{
+  var parser=new DOMParser();
+  var r3=[];
+  try{
+    var doc1=parser.parseFromString('<root><child/></root>','text/xml');
+    r3.push('xml:'+doc1.documentElement.tagName);
+  }catch(e){r3.push('xml:err');}
+  try{
+    var doc2=parser.parseFromString('<p>test</p>','text/html');
+    r3.push('html:'+doc2.body.innerHTML.slice(0,20));
+  }catch(e){r3.push('html:err');}
+  try{
+    var doc3=parser.parseFromString('<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>','image/svg+xml');
+    r3.push('svg:'+doc3.documentElement.tagName);
+  }catch(e){r3.push('svg:err');}
+  eR.push('E3:'+r3.join('|'));
+}catch(e){eR.push('E3:ERR:'+e.message.slice(0,60));}
+
+// E4: createTreeWalker on parsed document
+try{
+  var parser2=new DOMParser();
+  var doc=parser2.parseFromString('<html><head></head><body><div id="a"><span>text</span></div><div id="b"></div></body></html>','text/html');
+  var tw=document.createTreeWalker(doc.body,NodeFilter.SHOW_ELEMENT);
+  var nodes=[];
+  while(tw.nextNode())nodes.push(tw.currentNode.tagName);
+  eR.push('E4:'+nodes.join(','));
+}catch(e){eR.push('E4:ERR:'+e.message.slice(0,60));}
+
+// E5: Range on parsed document
+try{
+  var d5=document.createElement('div');
+  d5.innerHTML='<span>hello</span><span>world</span>';
+  var range=document.createRange();
+  range.setStart(d5.firstChild.firstChild,2);
+  range.setEnd(d5.lastChild.firstChild,3);
+  var frag=range.cloneContents();
+  var tmp=document.createElement('div');
+  tmp.appendChild(frag);
+  eR.push('E5:extracted='+tmp.innerHTML);
+}catch(e){eR.push('E5:ERR:'+e.message.slice(0,60));}
+
+B('E',eR.join('||'));
+log('E: '+eR.join(' | '));
+</script>
+
+<!-- F: CSS/Style edge cases -->
+<script>
+log('\n--- F: CSS edge cases ---');
+var fR=[];
+
+// F1: CSS.supports availability
+try{
+  if(typeof CSS!=='undefined'&&CSS.supports){
+    var r=[];
+    r.push('flex:'+CSS.supports('display','flex'));
+    r.push('grid:'+CSS.supports('display','grid'));
+    r.push('subgrid:'+CSS.supports('display','subgrid'));
+    r.push('vars:'+CSS.supports('color','var(--x)'));
+    r.push('container:'+CSS.supports('container-type','inline-size'));
+    fR.push('F1:'+r.join('|'));
+  }else{fR.push('F1:no_CSS.supports');}
+}catch(e){fR.push('F1:ERR:'+e.message.slice(0,60));}
+
+// F2: CSS custom properties (variables)
+try{
+  var d=document.createElement('div');
+  d.style.setProperty('--test','red');
+  var val=d.style.getPropertyValue('--test');
+  // Calc with custom properties
+  d.style.setProperty('--size','10px');
+  d.style.width='calc(var(--size) * 2)';
+  fR.push('F2:var='+val+'|width='+d.style.width);
+}catch(e){fR.push('F2:ERR:'+e.message.slice(0,60));}
+
+// F3: Very long CSS value
+try{
+  var d3=document.createElement('div');
+  var longVal='';for(var i=0;i<10000;i++)longVal+='a';
+  d3.style.setProperty('--long',longVal);
+  var read=d3.style.getPropertyValue('--long');
+  fR.push('F3:set_len='+longVal.length+'|read_len='+read.length);
+}catch(e){fR.push('F3:ERR:'+e.message.slice(0,60));}
+
+// F4: CSS Typed OM availability
+try{
+  if(typeof CSSStyleValue!=='undefined'){
+    fR.push('F4:TypedOM=yes');
+  }else if(typeof CSS!=='undefined'&&typeof CSS.number==='function'){
+    fR.push('F4:CSS.number=yes');
+  }else{
+    fR.push('F4:TypedOM=no');
+  }
+}catch(e){fR.push('F4:ERR:'+e.message.slice(0,60));}
+
+B('F',fR.join('||'));
+log('F: '+fR.join(' | '));
+</script>
+
+<!-- G: History/Navigation API -->
+<script>
+log('\n--- G: History/Navigation ---');
+var gR=[];
+
+// G1: History state
+try{
+  var origLen=history.length;
+  history.replaceState({test:1},'','');
+  var state=history.state;
+  gR.push('G1:len='+origLen+'|state='+JSON.stringify(state));
+}catch(e){gR.push('G1:ERR:'+e.message.slice(0,60));}
+
+// G2: History pushState limits
+try{
+  var pushed=0;
+  for(var i=0;i<50;i++){
+    try{history.pushState({i:i},'','');pushed++;}catch(e){break;}
+  }
+  gR.push('G2:pushed='+pushed+'|len='+history.length);
+  // Go back to avoid messing up navigation
+  history.go(-pushed);
+}catch(e){gR.push('G2:ERR:'+e.message.slice(0,60));}
+
+// G3: Large state object
+try{
+  var bigState={};
+  for(var i=0;i<1000;i++)bigState['k'+i]=i;
+  history.replaceState(bigState,'','');
+  var readBack=history.state;
+  gR.push('G3:keys='+Object.keys(readBack).length);
+}catch(e){gR.push('G3:ERR:'+e.message.slice(0,60));}
+
+// G4: location properties
+try{
+  var loc=window.location;
+  gR.push('G4:proto='+loc.protocol+'|host='+loc.hostname+'|path='+loc.pathname.slice(0,40));
+}catch(e){gR.push('G4:ERR:'+e.message.slice(0,60));}
+
+B('G',gR.join('||'));
+log('G: '+gR.join(' | '));
+</script>
+
+<!-- H: Performance/Timing APIs -->
+<script>
+log('\n--- H: Performance/Timing ---');
+var hR=[];
+
+// H1: performance.now precision
+try{
+  var samples=[];
+  for(var i=0;i<20;i++){
+    var t=performance.now();
+    samples.push(t);
+  }
+  var diffs=[];
+  for(var i=1;i<samples.length;i++){
+    var d=samples[i]-samples[i-1];
+    if(d>0)diffs.push(d.toFixed(4));
+  }
+  hR.push('H1:first='+samples[0].toFixed(4)+'|diffs='+diffs.slice(0,5).join(','));
+}catch(e){hR.push('H1:ERR:'+e.message.slice(0,60));}
+
+// H2: Date.now vs performance.now
+try{
+  var d1=Date.now();var p1=performance.now();
+  for(var i=0;i<100000;i++){} // Busy wait
+  var d2=Date.now();var p2=performance.now();
+  hR.push('H2:date_ms='+(d2-d1)+'|perf_ms='+(p2-p1).toFixed(4));
+}catch(e){hR.push('H2:ERR:'+e.message.slice(0,60));}
+
+// H3: Performance entries
+try{
+  var entries=performance.getEntries();
+  var types={};
+  for(var i=0;i<entries.length;i++){
+    var t=entries[i].entryType;
+    types[t]=(types[t]||0)+1;
+  }
+  var summary=[];
+  for(var k in types)summary.push(k+':'+types[k]);
+  hR.push('H3:total='+entries.length+'|'+summary.join(','));
+}catch(e){hR.push('H3:ERR:'+e.message.slice(0,60));}
+
+// H4: performance.timing (deprecated but may leak info)
+try{
+  var t=performance.timing;
+  if(t){
+    hR.push('H4:navStart='+t.navigationStart+'|domComplete='+t.domComplete+
+      '|loadEnd='+t.loadEventEnd);
+  }else{hR.push('H4:no_timing');}
+}catch(e){hR.push('H4:ERR:'+e.message.slice(0,60));}
+
+B('H',hR.join('||'));
+log('H: '+hR.join(' | '));
+</script>
+
+<!-- FINAL -->
+<script>
+log('\n=== P1242 COMPLETE ===');
+B('DONE','all');
+</script>
+
+</body>
+</html>

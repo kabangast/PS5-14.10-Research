@@ -1,0 +1,513 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1228 JSC primitives</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:13px/1.4 'Courier New',monospace;padding:10px}
+#s{font-size:18px;font-weight:bold;color:#ffd75e;padding:8px 0}
+#r{color:#ff55c8;white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.6}
+</style>
+</head><body>
+<div id="s">P1228 BOOTING...</div>
+<div id="r"></div>
+<script>
+'use strict';
+/* ═══════════════════════════════════════════════════════════════════
+   P1228: JSC Engine-Level Primitive Search
+
+   Since CSSFontFace dangling pointer and GC approaches are dead,
+   we need JSC-level primitives that work WITHOUT JIT.
+
+   EXPERIMENTS:
+   A) RegExp internals — crafted patterns, lastIndex manipulation,
+      RegExp.prototype[Symbol.replace] with complex replacers
+   B) Intl API — NumberFormat, DateTimeFormat, Collator edge cases
+   C) structuredClone type confusion — clone complex objects
+   D) TypedArray.prototype.set() overlap races
+   E) ArrayBuffer neutering races (Worker transfer + concurrent access)
+   F) Proxy + Reflect traps (side-effect-based confusion)
+   G) DataView on transferred (detached) buffer
+   H) String rope internals (long string concatenation)
+   ═══════════════════════════════════════════════════════════════════ */
+
+var S=document.getElementById('s'),R=document.getElementById('r');
+function msg(t){R.textContent+=(R.textContent?'\n':'')+t;}
+
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1228-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+window.onerror=function(m,s,l){B('ERR',m+'@'+l);};
+
+B('START','jsc-primitives');
+S.textContent='P1228 RUNNING...';
+msg('=== P1228: JSC Primitive Search ===');
+msg('');
+
+/* ═══════ EXP A: RegExp edge cases ═══════ */
+msg('=== EXP A: RegExp ===');
+
+var regResults=[];
+
+/* A1: RegExp lastIndex overflow */
+try{
+  var re=new RegExp('a','g');
+  re.lastIndex=0xFFFFFFFF;
+  var m=re.exec('aaa');
+  regResults.push('lastIndex_overflow='+(m===null?'null':'match'));
+  re.lastIndex=Number.MAX_SAFE_INTEGER;
+  m=re.exec('aaa');
+  regResults.push('lastIndex_maxsafe='+(m===null?'null':'match'));
+}catch(e){regResults.push('lastIndex_err='+e.message);}
+
+/* A2: RegExp[Symbol.replace] with side-effect replacer */
+try{
+  var callCount=0;
+  var replacer=function(match,offset,str){
+    callCount++;
+    if(callCount===1){
+      /* Mutate the string's underlying storage during replacement */
+      return 'X'.repeat(10000);
+    }
+    return match;
+  };
+  var testStr='aaaaabbbbb'.repeat(100);
+  var re2=/a/g;
+  var result=testStr.replace(re2,replacer);
+  regResults.push('replace_calls='+callCount+'|rlen='+result.length);
+}catch(e){regResults.push('replace_err='+e.message);}
+
+/* A3: RegExp with backreference overflow */
+try{
+  var pattern='(a)\\1{100000}';
+  var re3=new RegExp(pattern);
+  var m3=re3.exec('a'.repeat(200001));
+  regResults.push('backref_100k='+(m3?'match:'+m3[0].length:'null'));
+}catch(e){regResults.push('backref_err='+e.message);}
+
+/* A4: Nested quantifiers (ReDoS-shaped, might expose buffer issues) */
+try{
+  var re4=/(a+)+$/;
+  var start=performance.now();
+  var m4=re4.exec('a'.repeat(20)+'!');
+  var elapsed=performance.now()-start;
+  regResults.push('nested_quant='+elapsed.toFixed(1)+'ms|match='+(m4?'yes':'no'));
+}catch(e){regResults.push('nested_err='+e.message);}
+
+B('A-REGEXP',regResults.join('|'));
+msg('RegExp: '+regResults.join(' '));
+
+/* ═══════ EXP B: Intl API ═══════ */
+msg('');msg('=== EXP B: Intl API ===');
+
+var intlResults=[];
+
+/* B1: Intl availability */
+try{
+  intlResults.push('Intl='+(typeof Intl));
+  intlResults.push('NF='+(typeof Intl.NumberFormat));
+  intlResults.push('DTF='+(typeof Intl.DateTimeFormat));
+  intlResults.push('Collator='+(typeof Intl.Collator));
+  intlResults.push('PluralRules='+(typeof Intl.PluralRules));
+  intlResults.push('RelativeTimeFormat='+(typeof Intl.RelativeTimeFormat));
+  intlResults.push('ListFormat='+(typeof Intl.ListFormat));
+  intlResults.push('Segmenter='+(typeof Intl.Segmenter));
+  intlResults.push('DisplayNames='+(typeof Intl.DisplayNames));
+  intlResults.push('Locale='+(typeof Intl.Locale));
+}catch(e){intlResults.push('intl_err='+e.message);}
+
+/* B2: NumberFormat edge cases */
+try{
+  var nf=new Intl.NumberFormat('en',{notation:'compact',compactDisplay:'long'});
+  intlResults.push('compact='+nf.format(123456789));
+
+  /* Extreme values */
+  var nf2=new Intl.NumberFormat('en',{maximumFractionDigits:100});
+  intlResults.push('maxfrac100='+nf2.format(Math.PI).length+'ch');
+
+  /* formatToParts */
+  var parts=nf.formatToParts(123456789);
+  intlResults.push('parts='+parts.length);
+}catch(e){intlResults.push('nf_err='+e.message);}
+
+/* B3: Locale with extreme options */
+try{
+  var loc=new Intl.Locale('en-US',{calendar:'buddhist',numberingSystem:'thai'});
+  intlResults.push('locale='+loc.toString());
+}catch(e){intlResults.push('locale_err='+e.message);}
+
+B('B-INTL',intlResults.join('|'));
+msg('Intl: '+intlResults.join(' '));
+
+/* ═══════ EXP C: structuredClone edge cases ═══════ */
+msg('');msg('=== EXP C: structuredClone ===');
+
+var cloneResults=[];
+
+/* C1: Clone with transfer */
+try{
+  var ab=new ArrayBuffer(256);
+  var v=new Uint8Array(ab);
+  for(var i=0;i<256;i++)v[i]=i;
+  var cloned=structuredClone(ab,{transfer:[ab]});
+  cloneResults.push('transfer_ok=true|orig_detached='+(ab.byteLength===0));
+  var cv=new Uint8Array(cloned);
+  cloneResults.push('clone_intact='+(cv[0]===0&&cv[255]===255));
+}catch(e){cloneResults.push('transfer_err='+e.message);}
+
+/* C2: Clone complex nested object */
+try{
+  var complex={
+    buf:new ArrayBuffer(64),
+    date:new Date(),
+    regex:/test/gi,
+    map:new Map([[1,'a'],[2,'b']]),
+    set:new Set([1,2,3]),
+    nested:{arr:[1,2,3],buf:new ArrayBuffer(32)}
+  };
+  var c2=structuredClone(complex);
+  cloneResults.push('complex_clone=ok');
+  cloneResults.push('buf_same='+(c2.buf===complex.buf));
+  cloneResults.push('map_size='+c2.map.size);
+}catch(e){cloneResults.push('complex_err='+e.message);}
+
+/* C3: Clone self-referential object */
+try{
+  var self_ref={a:1};
+  self_ref.self=self_ref;
+  var c3=structuredClone(self_ref);
+  cloneResults.push('selfref=ok|is_self='+(c3.self===c3));
+}catch(e){cloneResults.push('selfref_err='+e.message);}
+
+/* C4: Clone with Error objects */
+try{
+  var err=new Error('test');
+  err.custom='data';
+  var c4=structuredClone(err);
+  cloneResults.push('error_clone='+c4.message+'|custom='+c4.custom);
+}catch(e){cloneResults.push('error_err='+e.message);}
+
+/* C5: Clone Blob */
+try{
+  var blob=new Blob(['hello'],{type:'text/plain'});
+  var c5=structuredClone(blob);
+  cloneResults.push('blob_clone=ok|size='+c5.size+'|type='+c5.type);
+}catch(e){cloneResults.push('blob_err='+e.message);}
+
+B('C-CLONE',cloneResults.join('|'));
+msg('Clone: '+cloneResults.join(' '));
+
+/* ═══════ EXP D: TypedArray overlap + race ═══════ */
+msg('');msg('=== EXP D: TypedArray overlap ===');
+
+var taResults=[];
+
+/* D1: set() with overlapping source/dest in same buffer */
+try{
+  var ab=new ArrayBuffer(1024);
+  var src=new Uint8Array(ab,0,512);
+  var dst=new Uint8Array(ab,256,512);
+  for(var i=0;i<512;i++)src[i]=i&0xFF;
+  dst.set(src); /* overlapping copy within same buffer */
+  /* Check if data was corrupted */
+  var ok=dst[0]===0&&dst[255]===255;
+  taResults.push('overlap_set='+ok);
+}catch(e){taResults.push('overlap_err='+e.message);}
+
+/* D2: Float64Array / BigUint64Array aliasing */
+try{
+  var ab2=new ArrayBuffer(64);
+  var f64=new Float64Array(ab2);
+  var u64=new BigUint64Array(ab2);
+  var u8=new Uint8Array(ab2);
+
+  /* Write NaN-boxed value via Float64 */
+  f64[0]=NaN;
+  var nanBits=u64[0].toString(16);
+  taResults.push('nan_bits=0x'+nanBits);
+
+  /* Write specific bit pattern via BigUint64 */
+  u64[1]=0x7FF8000000000001n; /* signaling NaN */
+  var snanVal=f64[1];
+  taResults.push('snan_float='+snanVal+'|isNaN='+isNaN(snanVal));
+
+  /* JSC uses NaN-boxing for values. Write a pattern that looks like a JSC pointer */
+  u64[2]=0x0000000100000000n; /* looks like tagged integer */
+  taResults.push('tagged_int_float='+f64[2]);
+
+  /* Write something that looks like a JSC cell pointer */
+  u64[3]=0x0108000000000000n;
+  taResults.push('cell_ptr_float='+f64[3]);
+}catch(e){taResults.push('alias_err='+e.message);}
+
+/* D3: ArrayBuffer.prototype.slice() edge cases */
+try{
+  var ab3=new ArrayBuffer(100);
+  var v3=new Uint8Array(ab3);
+  for(var i=0;i<100;i++)v3[i]=i;
+
+  /* Negative indices */
+  var s1=ab3.slice(-10);
+  taResults.push('slice_neg10='+s1.byteLength);
+  var s1v=new Uint8Array(s1);
+  taResults.push('slice_val='+(s1v[0]===90));
+
+  /* start > end */
+  var s2=ab3.slice(50,30);
+  taResults.push('slice_reverse='+s2.byteLength);
+
+  /* Huge indices */
+  var s3=ab3.slice(0,0x7FFFFFFF);
+  taResults.push('slice_huge='+s3.byteLength);
+}catch(e){taResults.push('slice_err='+e.message);}
+
+B('D-TYPED',taResults.join('|'));
+msg('TypedArray: '+taResults.join(' '));
+
+/* ═══════ EXP E: ArrayBuffer detach race ═══════ */
+msg('');msg('=== EXP E: Detach race ===');
+
+var detachResults=[];
+
+/* E1: Access detached buffer views */
+try{
+  var ab=new ArrayBuffer(256);
+  var v1=new Uint8Array(ab);
+  var v2=new Float64Array(ab);
+  var dv=new DataView(ab);
+  v1[0]=0xAA;v1[1]=0xBB;
+
+  /* Transfer to detach */
+  structuredClone(ab,{transfer:[ab]});
+
+  /* Try to access views of detached buffer */
+  try{var x=v1[0];detachResults.push('u8_read='+x);}
+  catch(e2){detachResults.push('u8_read=err:'+e2.message);}
+
+  try{var x=v2[0];detachResults.push('f64_read='+x);}
+  catch(e2){detachResults.push('f64_read=err:'+e2.message);}
+
+  try{var x=dv.getUint8(0);detachResults.push('dv_read='+x);}
+  catch(e2){detachResults.push('dv_read=err:'+e2.message);}
+
+  try{v1[0]=0xFF;detachResults.push('u8_write=ok');}
+  catch(e2){detachResults.push('u8_write=err:'+e2.message);}
+
+  try{dv.setUint8(0,0xFF);detachResults.push('dv_write=ok');}
+  catch(e2){detachResults.push('dv_write=err:'+e2.message);}
+
+  detachResults.push('ab_len='+ab.byteLength+'|v1_len='+v1.length);
+}catch(e){detachResults.push('detach_err='+e.message);}
+
+B('E-DETACH',detachResults.join('|'));
+msg('Detach: '+detachResults.join(' '));
+
+/* ═══════ EXP F: Proxy traps ═══════ */
+msg('');msg('=== EXP F: Proxy traps ===');
+
+var proxyResults=[];
+
+/* F1: Proxy as Array-like with length side effects */
+try{
+  var trapLog=[];
+  var handler={
+    get:function(target,prop){
+      trapLog.push('get:'+String(prop));
+      if(prop==='length')return 0x7FFFFFFF;
+      if(prop==='constructor')return Array;
+      return target[prop];
+    },
+    has:function(target,prop){
+      trapLog.push('has:'+String(prop));
+      return prop in target;
+    }
+  };
+  var proxy=new Proxy([1,2,3],handler);
+
+  /* Array.from with proxy */
+  try{
+    var fromResult=Array.from({length:3,0:'a',1:'b',2:'c'});
+    proxyResults.push('array_from='+fromResult.length);
+  }catch(e2){proxyResults.push('array_from_err='+e2.message);}
+
+  /* Array.prototype.concat with proxy species */
+  try{
+    var arr=[1,2,3];
+    arr.constructor={};
+    arr.constructor[Symbol.species]=function(len){
+      proxyResults.push('species_called='+len);
+      return new Array(len);
+    };
+    var concatResult=arr.concat([4,5]);
+    proxyResults.push('concat_len='+concatResult.length);
+  }catch(e2){proxyResults.push('concat_err='+e2.message);}
+
+  proxyResults.push('traps='+trapLog.length);
+}catch(e){proxyResults.push('proxy_err='+e.message);}
+
+/* F2: Proxy with getPrototypeOf trap */
+try{
+  var pHandler={
+    getPrototypeOf:function(target){
+      return null;
+    },
+    get:function(target,prop){
+      if(prop===Symbol.toPrimitive)return function(hint){
+        if(hint==='number')return 42;
+        return 'proxy';
+      };
+      return target[prop];
+    }
+  };
+  var p2=new Proxy({},pHandler);
+  proxyResults.push('toPrim_num='+(+p2));
+  proxyResults.push('toPrim_str='+(''+p2));
+}catch(e){proxyResults.push('proxy2_err='+e.message);}
+
+B('F-PROXY',proxyResults.join('|'));
+msg('Proxy: '+proxyResults.join(' '));
+
+/* ═══════ EXP G: String rope / concat limits ═══════ */
+msg('');msg('=== EXP G: String ropes ===');
+
+var strResults=[];
+
+/* G1: Very long string concatenation (rope tree) */
+try{
+  var s='A';
+  for(var i=0;i<25;i++)s=s+s; /* 2^25 = 33M chars */
+  strResults.push('rope_len='+s.length);
+  /* Access middle to force flattening */
+  var mid=s.charAt(s.length/2);
+  strResults.push('rope_mid='+mid);
+}catch(e){strResults.push('rope_err='+e.message);}
+
+/* G2: String.prototype.replace with huge replacement */
+try{
+  var base='ABCDEFGHIJ'.repeat(1000);
+  var replaced=base.replace(/A/g,'X'.repeat(10000));
+  strResults.push('replace_len='+replaced.length);
+}catch(e){strResults.push('replace_err='+e.message);}
+
+/* G3: String fromCharCode with many args */
+try{
+  var args=[];
+  for(var i=0;i<10000;i++)args.push(65+(i%26));
+  var bigStr=String.fromCharCode.apply(null,args);
+  strResults.push('fromCC='+bigStr.length);
+}catch(e){strResults.push('fromCC_err='+e.message);}
+
+/* G4: JSON.parse with deep nesting */
+try{
+  var deep='{"a":'.repeat(100)+'1'+'}';
+  for(var i=1;i<100;i++)deep+='}';
+  var parsed=JSON.parse(deep);
+  strResults.push('json_deep=ok');
+}catch(e){strResults.push('json_deep='+e.message);}
+
+B('G-STRING',strResults.join('|'));
+msg('String: '+strResults.join(' '));
+
+/* ═══════ EXP H: Worker concurrent transfer race ═══════ */
+msg('');msg('=== EXP H: Worker transfer race ===');
+
+var raceCode=[
+  'self.onmessage=function(e){',
+  '  if(e.data.type==="race"){',
+  '    var bufs=[];',
+  '    for(var i=0;i<100;i++){',
+  '      var ab=new ArrayBuffer(192);',
+  '      var v=new Uint8Array(ab);',
+  '      for(var j=0;j<192;j++)v[j]=0xCC;',
+  '      bufs.push(ab);',
+  '    }',
+  '    /* Transfer all at once */  ',
+  '    self.postMessage({type:"bufs",count:bufs.length},bufs);',
+  '  }else if(e.data.type==="concurrent"){',
+  '    /* Allocate and immediately transfer in tight loop */  ',
+  '    var results=[];',
+  '    for(var round=0;round<10;round++){',
+  '      var ab=new ArrayBuffer(192);',
+  '      var v=new Uint8Array(ab);',
+  '      for(var j=0;j<192;j++)v[j]=round;',
+  '      try{',
+  '        self.postMessage({type:"single",round:round,buf:ab},[ab]);',
+  '        results.push("t"+round);',
+  '      }catch(err){',
+  '        results.push("e"+round+":"+err.message.slice(0,20));',
+  '      }',
+  '    }',
+  '    self.postMessage({type:"race-done",results:results.join(",")});',
+  '  }',
+  '};',
+  'self.postMessage({type:"ready"});'
+].join('\n');
+
+try{
+  var blob=new Blob([raceCode],{type:'application/javascript'});
+  var url=URL.createObjectURL(blob);
+  var w=new Worker(url);
+  var raceResults=[];
+  var raceCount=0;
+  var raceBufs=[];
+
+  w.onmessage=function(e){
+    var d=e.data;
+    if(d.type==='ready'){
+      /* Start concurrent transfer test */
+      w.postMessage({type:'concurrent'});
+    }else if(d.type==='single'){
+      raceCount++;
+      if(d.buf instanceof ArrayBuffer){
+        raceBufs.push(d.buf);
+        var v=new Uint8Array(d.buf);
+        /* Check if the buffer has expected content */
+        var ok=v[0]===d.round&&v[191]===d.round;
+        if(!ok)raceResults.push('MISMATCH_r'+d.round+'='+v[0]);
+      }
+    }else if(d.type==='race-done'){
+      raceResults.push('worker_results='+d.results);
+      raceResults.push('received='+raceCount+'|bufs='+raceBufs.length);
+
+      /* Now: CSSFontFace reclaim + worker buffer interleave */
+      /* Free CSSFontFace, then check if any worker-transferred buffer */
+      /* overlaps with the freed slot (bmalloc LIFO) */
+
+      B('H-RACE',raceResults.join('|'));
+      msg('Race: '+raceResults.join(' '));
+      w.terminate();
+      finalize();
+    }
+  };
+
+  w.onerror=function(e){
+    B('H-ERR',e.message||'unknown');
+    msg('Worker race err: '+(e.message||'unknown'));
+    finalize();
+  };
+
+  setTimeout(function(){
+    B('H-TIMEOUT','race-timeout');
+    finalize();
+  },8000);
+
+}catch(e){
+  B('H-CREATE-ERR',e.message);
+  msg('Worker create err: '+e.message);
+  finalize();
+}
+
+function finalize(){
+  msg('');msg('=== P1228 COMPLETE ===');
+  S.textContent='P1228 COMPLETE';
+  B('DONE','all');
+}
+
+setTimeout(finalize,25000);
+</script>
+</body></html>

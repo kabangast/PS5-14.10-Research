@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1264</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1264-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1264: TRANSFER RACE + GC ===');
+B('START','P1264');
+</script>
+
+<!-- A: JS-object GC pressure (not ArrayBuffers) to trigger FinalizationRegistry -->
+<script>
+log('\n--- A: JS object GC pressure ---');
+(function(){
+  try{
+    var cleaned=[];
+    var registry=new FinalizationRegistry(function(idx){
+      cleaned.push(idx);
+    });
+
+    var N=50;
+    var refs=[];
+    for(var i=0;i<N;i++){
+      var o={idx:i, s:'x'.repeat(100), a:[1,2,3,4,5]};
+      refs.push(new WeakRef(o));
+      registry.register(o, i);
+    }
+    // Drop all strong refs
+    // (var o in loop scope is overwritten each iteration, but let's be explicit)
+
+    B('A1','created='+N);
+
+    // Pure JS object pressure — millions of small objects
+    for(var round=0;round<5;round++){
+      var junk=[];
+      for(var j=0;j<100000;j++){
+        junk.push({a:j, b:'str'+j, c:[j,j+1]});
+      }
+      junk=null; // Release
+    }
+
+    var alive=0,dead=0;
+    for(var i=0;i<N;i++){
+      if(refs[i].deref()!==undefined) alive++; else dead++;
+    }
+    B('A2','alive='+alive+'|dead='+dead+
+      '|cleaned='+cleaned.length+
+      '|cleaned_ids='+cleaned.slice(0,10).join(','));
+
+    // Even heavier: strings
+    for(var round=0;round<3;round++){
+      var strs=[];
+      for(var j=0;j<50000;j++){
+        strs.push('a'.repeat(200)+j);
+      }
+      strs=null;
+    }
+
+    alive=0;dead=0;
+    for(var i=0;i<N;i++){
+      if(refs[i].deref()!==undefined) alive++; else dead++;
+    }
+    B('A3','alive='+alive+'|dead='+dead+
+      '|cleaned='+cleaned.length);
+
+  }catch(e){B('A0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- B: structuredClone transfer + stale view access -->
+<script>
+log('\n--- B: structuredClone transfer + stale view ---');
+(function(){
+  try{
+    var buf=new ArrayBuffer(64);
+    var f64=new Float64Array(buf);
+    var u64=new BigUint64Array(buf);
+    f64[0]=1.1; f64[1]=2.2; f64[2]=3.3;
+    u64[3]=0xDEADBEEFCAFEBABEn;
+
+    B('B1','before|buf_len='+buf.byteLength+'|f64_len='+f64.length+
+      '|f64[0]='+f64[0]+'|u64[3]=0x'+u64[3].toString(16));
+
+    // Transfer the buffer
+    var clone=structuredClone(buf, {transfer:[buf]});
+
+    B('B2','after_transfer|orig_len='+buf.byteLength+
+      '|clone_len='+clone.byteLength+
+      '|orig_detached='+(buf.byteLength===0));
+
+    // Try to read from old view (should be detached)
+    try{
+      var v=f64[0];
+      B('B3','stale_read='+v+'|isUndef='+(v===undefined)+
+        '|VULN='+(v!==undefined&&v!==0));
+    }catch(e){
+      B('B3','stale_read_err:'+e.name);
+    }
+
+    // Try to write to old view
+    try{
+      f64[0]=999.999;
+      B('B4','stale_write=done');
+    }catch(e){
+      B('B4','stale_write_err:'+e.name);
+    }
+
+    // Check clone has the data
+    var cf64=new Float64Array(clone);
+    B('B5','clone[0]='+cf64[0]+'|clone[1]='+cf64[1]+'|clone[2]='+cf64[2]);
+
+    // Try BigUint64Array on stale buffer
+    try{
+      var v2=u64[3];
+      B('B6','stale_u64=0x'+(v2?v2.toString(16):'undef')+
+        '|isUndef='+(v2===undefined));
+    }catch(e){
+      B('B6','stale_u64_err:'+e.name);
+    }
+
+  }catch(e){B('B0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- C: Worker transfer race — transfer ArrayBuffer while writing to a view -->
+<script>
+log('\n--- C: Worker transfer race ---');
+(function(){
+  try{
+    var workerCode='('+function(){
+      self.onmessage=function(e){
+        var buf=e.data;
+        var u8=new Uint8Array(buf);
+        var report=[];
+        // Read the transferred buffer
+        for(var i=0;i<Math.min(u8.length,16);i++){
+          report.push(u8[i]);
+        }
+        self.postMessage({
+          len:buf.byteLength,
+          first16:report.join(','),
+          type:buf.constructor.name
+        });
+      };
+    }.toString()+')()';
+
+    var blob=new Blob([workerCode],{type:'application/javascript'});
+    var url=URL.createObjectURL(blob);
+    var w=new Worker(url);
+
+    w.onmessage=function(e){
+      B('C2','worker_got|len='+e.data.len+
+        '|first16='+e.data.first16+
+        '|type='+e.data.type);
+    };
+
+    // Create buffer, fill with pattern
+    var buf=new ArrayBuffer(256);
+    var u8=new Uint8Array(buf);
+    for(var i=0;i<256;i++) u8[i]=i;
+    var f64=new Float64Array(buf);
+
+    // Transfer to worker
+    w.postMessage(buf, [buf]);
+
+    // IMMEDIATELY try to read/write the stale view
+    var staleReads=[];
+    for(var i=0;i<4;i++){
+      try{
+        var v=f64[i];
+        staleReads.push(i+':'+(v===undefined?'undef':v));
+      }catch(e){
+        staleReads.push(i+':ERR:'+e.name);
+      }
+    }
+    B('C1','stale_reads='+staleReads.join(';')+
+      '|buf_detached='+(buf.byteLength===0));
+
+    // Try writing
+    try{
+      f64[0]=12345.678;
+      B('C3','stale_write=done|buf_len='+buf.byteLength);
+    }catch(e){
+      B('C3','stale_write_err:'+e.name);
+    }
+
+    setTimeout(function(){
+      w.terminate();
+      URL.revokeObjectURL(url);
+    }, 2000);
+
+  }catch(e){B('C0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- D: Double transfer — transfer same buffer twice in rapid succession -->
+<script>
+log('\n--- D: Double transfer race ---');
+(function(){
+  try{
+    var wCode='('+function(){
+      self.onmessage=function(e){
+        self.postMessage({len:e.data.byteLength, msg:e.data.msg||'buf'});
+      };
+    }.toString()+')()';
+
+    var blob=new Blob([wCode],{type:'application/javascript'});
+    var url=URL.createObjectURL(blob);
+    var w1=new Worker(url);
+    var w2=new Worker(url);
+
+    var results=[];
+    w1.onmessage=function(e){results.push('w1:'+JSON.stringify(e.data));checkDone();};
+    w2.onmessage=function(e){results.push('w2:'+JSON.stringify(e.data));checkDone();};
+    function checkDone(){
+      if(results.length>=1){
+        B('D2','results='+results.join('|'));
+      }
+    }
+
+    var buf=new ArrayBuffer(128);
+    new Uint8Array(buf).fill(0xAA);
+
+    // Try to transfer to w1
+    try{
+      w1.postMessage(buf, [buf]);
+      B('D1a','transfer1_ok|buf_len='+buf.byteLength);
+    }catch(e){
+      B('D1a','transfer1_err:'+e.name+':'+e.message.slice(0,60));
+    }
+
+    // Immediately try to transfer AGAIN to w2 (should fail — already detached)
+    try{
+      w2.postMessage(buf, [buf]);
+      B('D1b','transfer2_ok|VULN!|buf_len='+buf.byteLength);
+    }catch(e){
+      B('D1b','transfer2_err:'+e.name+':'+e.message.slice(0,60));
+    }
+
+    setTimeout(function(){
+      w1.terminate();w2.terminate();URL.revokeObjectURL(url);
+    }, 2000);
+
+  }catch(e){B('D0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- E: MessagePort transfer with callback interleaving -->
+<script>
+log('\n--- E: MessagePort transfer interleave ---');
+(function(){
+  try{
+    var mc=new MessageChannel();
+    var received=[];
+
+    mc.port1.onmessage=function(e){
+      if(e.data instanceof ArrayBuffer){
+        var u8=new Uint8Array(e.data);
+        received.push('buf:'+e.data.byteLength+':'+u8[0]);
+      }else{
+        received.push('msg:'+e.data);
+      }
+      if(received.length>=3){
+        B('E2','received='+received.join('|'));
+      }
+    };
+
+    // Create buffer and view
+    var buf=new ArrayBuffer(32);
+    var u8=new Uint8Array(buf);
+    u8[0]=0x42; u8[1]=0x43;
+
+    // Post the buffer as transferable to port2
+    mc.port2.postMessage(buf, [buf]);
+    B('E1','transferred|buf_len='+buf.byteLength+
+      '|detached='+(buf.byteLength===0));
+
+    // Try to use the detached view
+    try{
+      var v=u8[0];
+      B('E1b','stale_view='+v+'|isUndef='+(v===undefined));
+    }catch(e){
+      B('E1b','stale_err:'+e.name);
+    }
+
+    // Now post a regular message and another buffer
+    var buf2=new ArrayBuffer(16);
+    new Uint8Array(buf2)[0]=0x99;
+    mc.port2.postMessage('hello');
+    mc.port2.postMessage(buf2, [buf2]);
+
+    setTimeout(function(){
+      mc.port1.close();mc.port2.close();
+    }, 2000);
+
+  }catch(e){B('E0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- F: Regex lastIndex + iterator protocol -->
+<script>
+log('\n--- F: Regex lastIndex manipulation ---');
+(function(){
+  try{
+    // F1: matchAll returns an iterator — can we mutate the regex during iteration?
+    var re=/\w+/g;
+    var str='hello world foo bar baz';
+    var iter=str.matchAll(re);
+    var matches=[];
+    var first=iter.next();
+    matches.push(first.value[0]);
+
+    // Mutate the regex's lastIndex (matchAll should use a copy)
+    re.lastIndex=100;
+    var second=iter.next();
+    matches.push(second.value?second.value[0]:'DONE');
+
+    // Read rest
+    var r;
+    while(!(r=iter.next()).done) matches.push(r.value[0]);
+
+    B('F1','matches='+matches.join(',')+
+      '|re_lastIndex='+re.lastIndex);
+
+    // F2: RegExp.prototype[Symbol.replace] with side effects
+    var callLog=[];
+    var customRe={
+      [Symbol.match]: function(str){
+        callLog.push('match:'+str.length);
+        return ['found'];
+      },
+      [Symbol.replace]: function(str, repl){
+        callLog.push('replace:'+str.length);
+        return str.toUpperCase();
+      },
+      flags: 'g',
+      global: true
+    };
+    var replResult='test string'.replace(customRe, 'X');
+    B('F2','result='+replResult+'|log='+callLog.join(';'));
+
+    // F3: Symbol.split with mutation
+    var splitCalls=[];
+    var customSplit={
+      [Symbol.split]: function(str, limit){
+        splitCalls.push('split:'+str.length+':'+limit);
+        return ['A','B','C'];
+      }
+    };
+    var splitResult='hello world'.split(customSplit, 2);
+    B('F3','split='+splitResult.join(',')+
+      '|calls='+splitCalls.join(';'));
+
+  }catch(e){B('F0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- G: Worker as high-res timer + main-thread races -->
+<script>
+log('\n--- G: Worker timer + race ---');
+(function(){
+  try{
+    var timerCode='('+function(){
+      var counter=0;
+      var shared;
+      self.onmessage=function(e){
+        if(e.data==='start'){
+          // Tight increment loop
+          var c=0;
+          var t0=Date.now();
+          while(Date.now()-t0<100){
+            c++;
+          }
+          self.postMessage({count:c, ms:Date.now()-t0});
+        }
+      };
+    }.toString()+')()';
+
+    var blob=new Blob([timerCode],{type:'application/javascript'});
+    var url=URL.createObjectURL(blob);
+    var w=new Worker(url);
+
+    w.onmessage=function(e){
+      B('G1','worker_count='+e.data.count+'|ms='+e.data.ms+
+        '|rate='+(e.data.count/e.data.ms).toFixed(0)+'/ms');
+    };
+
+    w.postMessage('start');
+
+    // Meanwhile measure main thread
+    var mainCount=0;
+    var t0=Date.now();
+    while(Date.now()-t0<100){
+      mainCount++;
+    }
+    B('G2','main_count='+mainCount+'|ms='+(Date.now()-t0)+
+      '|rate='+(mainCount/100).toFixed(0)+'/ms');
+
+    setTimeout(function(){
+      w.terminate();URL.revokeObjectURL(url);
+    }, 2000);
+
+  }catch(e){B('G0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- H: Massive GC attempt with closures -->
+<script>
+log('\n--- H: Closure-based GC trigger ---');
+(function(){
+  try{
+    var cleaned=[];
+    var registry=new FinalizationRegistry(function(idx){
+      cleaned.push(idx);
+    });
+
+    // Create targets
+    var refs=[];
+    for(var i=0;i<20;i++){
+      var o={i:i};
+      refs.push(new WeakRef(o));
+      registry.register(o, i);
+    }
+    // o goes out of scope each iteration
+
+    B('H1','targets=20');
+
+    // Massive closure + object pressure
+    for(var round=0;round<20;round++){
+      var arr=[];
+      for(var j=0;j<50000;j++){
+        arr.push(function(x){return function(){return x;};}(j));
+      }
+      // Also strings to pressure JSC string allocator
+      for(var j=0;j<10000;j++){
+        arr.push(String.fromCharCode(j%65536).repeat(50));
+      }
+      arr=null;
+    }
+
+    var alive=0;
+    for(var i=0;i<20;i++){
+      if(refs[i].deref()!==undefined) alive++;
+    }
+    B('H2','alive='+alive+'|cleaned='+cleaned.length);
+
+    // Even more: regex compilation pressure
+    for(var round=0;round<5;round++){
+      var regs=[];
+      for(var j=0;j<5000;j++){
+        regs.push(new RegExp('a{'+j+'}b{'+j+'}'));
+      }
+      regs=null;
+    }
+
+    alive=0;
+    for(var i=0;i<20;i++){
+      if(refs[i].deref()!==undefined) alive++;
+    }
+    B('H3','alive='+alive+'|cleaned='+cleaned.length);
+
+  }catch(e){B('H0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1264 COMPLETE ===');
+}, 4000);
+</script>
+
+</body>
+</html>

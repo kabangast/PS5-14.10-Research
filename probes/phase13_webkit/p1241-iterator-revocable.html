@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1241</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1241-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1241: ITERATOR + REVOCABLE + EVAL ===');
+log('Time: '+new Date().toISOString());
+B('START','P1241');
+</script>
+
+<!-- A: Map/Set iterator invalidation during iteration -->
+<script>
+log('\n--- A: Map/Set iterator invalidation ---');
+var aR=[];
+
+// A1: Delete Map entries during iteration
+try{
+  var m=new Map();for(var i=0;i<10;i++)m.set('k'+i,i);
+  var seen=[];
+  m.forEach(function(v,k){
+    seen.push(k);
+    if(k==='k3'){m.delete('k4');m.delete('k5');m.set('k99',99);}
+  });
+  aR.push('A1:seen='+seen.join(',')+'|size='+m.size);
+}catch(e){aR.push('A1:ERR:'+e.message.slice(0,60));}
+
+// A2: Set iterator with add/delete
+try{
+  var s=new Set([1,2,3,4,5,6,7,8]);
+  var seen2=[];
+  for(var v of s){
+    seen2.push(v);
+    if(v===3){s.delete(4);s.delete(5);s.add(99);}
+  }
+  aR.push('A2:'+seen2.join(','));
+}catch(e){aR.push('A2:ERR:'+e.message.slice(0,60));}
+
+// A3: Map iterator with clear during iteration
+try{
+  var m3=new Map([['a',1],['b',2],['c',3],['d',4]]);
+  var seen3=[];
+  for(var e of m3){
+    seen3.push(e[0]);
+    if(e[0]==='b')m3.clear();
+  }
+  aR.push('A3:'+seen3.join(',')+'|size='+m3.size);
+}catch(e){aR.push('A3:ERR:'+e.message.slice(0,60));}
+
+// A4: Multiple concurrent iterators on same Map
+try{
+  var m4=new Map([['a',1],['b',2],['c',3]]);
+  var it1=m4[Symbol.iterator](),it2=m4[Symbol.iterator]();
+  var r=[];
+  r.push('i1:'+it1.next().value);
+  r.push('i2:'+it2.next().value);
+  m4.set('d',4);
+  r.push('i1:'+it1.next().value);
+  m4.delete('c');
+  r.push('i2:'+it2.next().value);
+  r.push('i1:'+it1.next().value);
+  r.push('i2:'+it2.next().value);
+  aR.push('A4:'+r.join('|'));
+}catch(e){aR.push('A4:ERR:'+e.message.slice(0,60));}
+
+// A5: WeakMap behavior — can we detect GC?
+try{
+  var wm=new WeakMap();
+  var keys=[];
+  for(var i=0;i<100;i++){var k={id:i};wm.set(k,i);keys.push(k);}
+  // Check all accessible
+  var allPresent=true;
+  for(var i=0;i<100;i++){if(!wm.has(keys[i])){allPresent=false;break;}}
+  // Drop half the references
+  for(var i=0;i<50;i++)keys[i]=null;
+  // GC pressure
+  for(var i=0;i<200;i++){var tmp=new ArrayBuffer(65536);}
+  // Check remaining
+  var remain=0;
+  for(var i=50;i<100;i++){if(wm.has(keys[i]))remain++;}
+  aR.push('A5:allPre='+allPresent+'|remain='+remain);
+}catch(e){aR.push('A5:ERR:'+e.message.slice(0,60));}
+
+B('A',aR.join('||'));
+log('A: '+aR.join(' | '));
+</script>
+
+<!-- B: Proxy.revocable timing attacks -->
+<script>
+log('\n--- B: Proxy.revocable ---');
+var bR=[];
+
+// B1: Revoke during trap execution
+try{
+  var revoke;
+  var trapCalls=0;
+  var r=Proxy.revocable({x:1,y:2,z:3},{
+    get:function(t,p){
+      trapCalls++;
+      if(trapCalls===2)revoke();
+      return t[p];
+    }
+  });
+  revoke=r.revoke;
+  var p=r.proxy;
+  var results=[];
+  try{results.push('x='+p.x);}catch(e){results.push('x:'+e.message.slice(0,30));}
+  try{results.push('y='+p.y);}catch(e){results.push('y:'+e.message.slice(0,30));}
+  try{results.push('z='+p.z);}catch(e){results.push('z:'+e.message.slice(0,30));}
+  bR.push('B1:'+results.join('|')+'|tc='+trapCalls);
+}catch(e){bR.push('B1:ERR:'+e.message.slice(0,60));}
+
+// B2: Revoke during ownKeys enumeration
+try{
+  var rev2;
+  var r2=Proxy.revocable({a:1,b:2,c:3},{
+    ownKeys:function(t){
+      rev2();
+      return ['a','b','c'];
+    },
+    getOwnPropertyDescriptor:function(t,p){
+      return {value:t[p],enumerable:true,configurable:true};
+    }
+  });
+  rev2=r2.revoke;
+  var keys;
+  try{keys=Object.keys(r2.proxy);}catch(e){keys='threw:'+e.message.slice(0,40);}
+  bR.push('B2:keys='+keys);
+}catch(e){bR.push('B2:ERR:'+e.message.slice(0,60));}
+
+// B3: Revoke between has and get
+try{
+  var rev3;
+  var phase=0;
+  var r3=Proxy.revocable({x:42},{
+    has:function(t,p){phase=1;return true;},
+    get:function(t,p){
+      if(phase===1){rev3();phase=2;}
+      return t[p];
+    }
+  });
+  rev3=r3.revoke;
+  var result;
+  try{
+    if('x' in r3.proxy){result='has:true,get='+r3.proxy.x;}
+  }catch(e){result='threw:'+e.message.slice(0,40);}
+  bR.push('B3:'+result+'|phase='+phase);
+}catch(e){bR.push('B3:ERR:'+e.message.slice(0,60));}
+
+// B4: Double revoke
+try{
+  var r4=Proxy.revocable({},{});
+  r4.revoke();
+  r4.revoke(); // Should be no-op
+  try{r4.proxy.x;}catch(e){bR.push('B4:double_revoke_ok|'+e.message.slice(0,30));}
+}catch(e){bR.push('B4:ERR:'+e.message.slice(0,60));}
+
+// B5: Revocable proxy as Map key — revoke then access
+try{
+  var r5=Proxy.revocable({},{});
+  var m5=new Map();
+  m5.set(r5.proxy,'value');
+  var before=m5.get(r5.proxy);
+  r5.revoke();
+  var after;
+  try{after=m5.get(r5.proxy);}catch(e){after='threw:'+e.message.slice(0,30);}
+  bR.push('B5:before='+before+'|after='+after+'|size='+m5.size);
+}catch(e){bR.push('B5:ERR:'+e.message.slice(0,60));}
+
+B('B',bR.join('||'));
+log('B: '+bR.join(' | '));
+</script>
+
+<!-- C: eval/Function constructor edge cases -->
+<script>
+log('\n--- C: eval/Function edge cases ---');
+var cR=[];
+
+// C1: eval with scope manipulation
+try{
+  var secret='hidden';
+  var r=eval('secret');
+  cR.push('C1:direct='+r);
+}catch(e){cR.push('C1:ERR:'+e.message.slice(0,60));}
+
+// C2: Indirect eval (global scope)
+try{
+  var secret2='local_secret';
+  var geval=(0,eval);
+  var r2;
+  try{r2=geval('secret2');}catch(e){r2='threw:'+e.message.slice(0,30);}
+  cR.push('C2:indirect='+r2);
+}catch(e){cR.push('C2:ERR:'+e.message.slice(0,60));}
+
+// C3: Function constructor — can it access local scope?
+try{
+  var localVar='should_not_see';
+  var fn=new Function('return typeof localVar');
+  cR.push('C3:typeof='+fn());
+}catch(e){cR.push('C3:ERR:'+e.message.slice(0,60));}
+
+// C4: eval modifying local scope
+try{
+  var a=1;
+  eval('a=42;var b=99;');
+  cR.push('C4:a='+a+'|b='+b);
+}catch(e){cR.push('C4:ERR:'+e.message.slice(0,60));}
+
+// C5: eval creating functions that close over eval scope
+try{
+  var evaled=eval('(function(){var x=123;return function(){return x;}})()');
+  cR.push('C5:closure='+evaled());
+}catch(e){cR.push('C5:ERR:'+e.message.slice(0,60));}
+
+// C6: Function.prototype.toString — can we read source?
+try{
+  var src=Array.prototype.map.toString();
+  var natLen=src.length;
+  var isNative=src.indexOf('[native code]')>=0;
+  cR.push('C6:native='+isNative+'|len='+natLen);
+}catch(e){cR.push('C6:ERR:'+e.message.slice(0,60));}
+
+// C7: Overwrite built-in then restore
+try{
+  var origPush=Array.prototype.push;
+  var hijacked=false;
+  Array.prototype.push=function(){hijacked=true;return origPush.apply(this,arguments);};
+  var arr=[];arr.push(1);
+  Array.prototype.push=origPush;
+  cR.push('C7:hijacked='+hijacked+'|arr='+arr.join(','));
+}catch(e){cR.push('C7:ERR:'+e.message.slice(0,60));}
+
+B('C',cR.join('||'));
+log('C: '+cR.join(' | '));
+</script>
+
+<!-- D: Error/stack trace information -->
+<script>
+log('\n--- D: Error stack traces ---');
+var dR=[];
+
+// D1: Error.stack content
+try{
+  var e=new Error('test');
+  var stack=e.stack||'';
+  var lines=stack.split('\n');
+  dR.push('D1:lines='+lines.length+'|first='+lines[0].slice(0,80));
+}catch(e){dR.push('D1:ERR:'+e.message.slice(0,60));}
+
+// D2: Stack from nested calls — address leak?
+try{
+  function deep3(){return new Error('deep');}
+  function deep2(){return deep3();}
+  function deep1(){return deep2();}
+  var err=deep1();
+  var s=err.stack||'';
+  // Look for hex addresses
+  var addrs=s.match(/0x[0-9a-f]+/gi)||[];
+  var has_hex=addrs.length>0;
+  dR.push('D2:has_hex='+has_hex+'|addrs='+addrs.slice(0,5).join(',')+'|lines='+s.split('\n').length);
+}catch(e){dR.push('D2:ERR:'+e.message.slice(0,60));}
+
+// D3: Stack overflow depth + address info
+try{
+  var depth=0;
+  function recurse(){depth++;recurse();}
+  try{recurse();}catch(e){
+    var s=e.stack||'';
+    var addrs=s.match(/0x[0-9a-f]+/gi)||[];
+    dR.push('D3:depth='+depth+'|stack_len='+s.length+'|hex='+addrs.slice(0,3).join(','));
+  }
+}catch(e){dR.push('D3:ERR:'+e.message.slice(0,60));}
+
+// D4: Error.prepareStackTrace (V8-specific, likely absent)
+try{
+  var hasPrepare=typeof Error.prepareStackTrace;
+  var hasCaptureStack=typeof Error.captureStackTrace;
+  dR.push('D4:prepare='+hasPrepare+'|capture='+hasCaptureStack);
+}catch(e){dR.push('D4:ERR:'+e.message.slice(0,60));}
+
+// D5: Error subclass stack
+try{
+  class CustomError extends Error{constructor(m){super(m);this.name='CustomError';}}
+  var ce=new CustomError('custom');
+  dR.push('D5:name='+ce.name+'|stack_has_name='+(ce.stack.indexOf('CustomError')>=0));
+}catch(e){dR.push('D5:ERR:'+e.message.slice(0,60));}
+
+B('D',dR.join('||'));
+log('D: '+dR.join(' | '));
+</script>
+
+<!-- E: String.normalize + ICU edge cases -->
+<script>
+log('\n--- E: String/ICU edge cases ---');
+var eR=[];
+
+// E1: String.normalize edge cases
+try{
+  var tests=[
+    'Å',   // A + combining ring = Å
+    'Å',         // Precomposed Å
+    'ﬁ',         // fi ligature
+    'ΐ',         // Greek iota with dialytika and tonos
+    '\uD800',         // Lone high surrogate
+    '\uDC00',         // Lone low surrogate
+  ];
+  var r=[];
+  for(var i=0;i<tests.length;i++){
+    try{
+      var nfc=tests[i].normalize('NFC');
+      var nfd=tests[i].normalize('NFD');
+      r.push(i+':nfc='+nfc.length+'|nfd='+nfd.length);
+    }catch(e){r.push(i+':ERR');}
+  }
+  eR.push('E1:'+r.join(','));
+}catch(e){eR.push('E1:ERR:'+e.message.slice(0,60));}
+
+// E2: String comparison edge cases
+try{
+  var r2=[];
+  r2.push('cafe:'+('café'==='café'));
+  r2.push('norm:'+('café'.normalize()==='café'.normalize()));
+  r2.push('locale:'+('café'.localeCompare('café')));
+  r2.push('ss:'+('ß'.normalize('NFKD')==='ss'));
+  eR.push('E2:'+r2.join('|'));
+}catch(e){eR.push('E2:ERR:'+e.message.slice(0,60));}
+
+// E3: Very long string operations
+try{
+  var long='';for(var i=0;i<50000;i++)long+='a';
+  var t0=Date.now();
+  var idx=long.indexOf('b');
+  var t1=Date.now();
+  var rep=long.replace(/a/,'b');
+  var t2=Date.now();
+  eR.push('E3:idx='+idx+'|search_ms='+(t1-t0)+'|replace_ms='+(t2-t1)+'|rep_len='+rep.length);
+}catch(e){eR.push('E3:ERR:'+e.message.slice(0,60));}
+
+// E4: String.fromCodePoint edge cases
+try{
+  var r4=[];
+  r4.push('max:'+String.fromCodePoint(0x10FFFF).length);
+  try{r4.push('over:'+String.fromCodePoint(0x110000));}catch(e){r4.push('over:threw');}
+  try{r4.push('neg:'+String.fromCodePoint(-1));}catch(e){r4.push('neg:threw');}
+  r4.push('zero:'+String.fromCodePoint(0).charCodeAt(0));
+  eR.push('E4:'+r4.join('|'));
+}catch(e){eR.push('E4:ERR:'+e.message.slice(0,60));}
+
+B('E',eR.join('||'));
+log('E: '+eR.join(' | '));
+</script>
+
+<!-- F: TypedArray species + subclass confusion -->
+<script>
+log('\n--- F: TypedArray species ---');
+var fR=[];
+
+// F1: TypedArray subclass with custom Symbol.species
+try{
+  class MyArray extends Uint8Array{
+    static get [Symbol.species](){return Uint32Array;}
+  }
+  var a=new MyArray(8);
+  for(var i=0;i<8;i++)a[i]=i+1;
+  var sub=a.subarray(0,4);
+  fR.push('F1:src_type='+a.constructor.name+'|sub_type='+sub.constructor.name+
+    '|sub_len='+sub.length+'|sub_bytes='+sub.byteLength+'|sub[0]='+sub[0]);
+}catch(e){fR.push('F1:ERR:'+e.message.slice(0,60));}
+
+// F2: Array subclass with Symbol.species returning TypedArray
+try{
+  class SpeciesArray extends Array{
+    static get [Symbol.species](){return Array;}
+  }
+  var sa=new SpeciesArray(1,2,3,4,5);
+  var mapped=sa.map(function(x){return x*2;});
+  var filtered=sa.filter(function(x){return x>2;});
+  fR.push('F2:map_type='+mapped.constructor.name+'|filter_type='+filtered.constructor.name);
+}catch(e){fR.push('F2:ERR:'+e.message.slice(0,60));}
+
+// F3: TypedArray from with mapping that changes buffer
+try{
+  var src=new Uint8Array([1,2,3,4,5]);
+  var dst=Uint8Array.from(src,function(v,i){
+    if(i===2)src[4]=99;
+    return v*10;
+  });
+  fR.push('F3:dst='+Array.from(dst).join(',')+'|src4='+src[4]);
+}catch(e){fR.push('F3:ERR:'+e.message.slice(0,60));}
+
+// F4: DataView on SharedArrayBuffer-like patterns (SAB absent)
+try{
+  var buf=new ArrayBuffer(64);
+  var dv1=new DataView(buf,0,32);
+  var dv2=new DataView(buf,16,32);
+  dv1.setUint32(16,0xDEADBEEF);
+  var overlap=dv2.getUint32(0);
+  fR.push('F4:overlap=0x'+overlap.toString(16));
+}catch(e){fR.push('F4:ERR:'+e.message.slice(0,60));}
+
+// F5: TypedArray set with overlapping source
+try{
+  var ta=new Uint32Array([1,2,3,4,5,6,7,8]);
+  ta.set(ta.subarray(2,6),0);
+  fR.push('F5:'+Array.from(ta).join(','));
+}catch(e){fR.push('F5:ERR:'+e.message.slice(0,60));}
+
+B('F',fR.join('||'));
+log('F: '+fR.join(' | '));
+</script>
+
+<!-- G: Promise/async edge cases -->
+<script>
+log('\n--- G: Promise edge cases ---');
+var gR=[];
+
+// G1: Promise.resolve with thenable that throws
+try{
+  var thenable={then:function(resolve,reject){throw new Error('thenable_throw');}};
+  var result='pending';
+  Promise.resolve(thenable).then(
+    function(v){result='resolved:'+v;},
+    function(e){result='rejected:'+e.message;}
+  );
+  // Result is async but let's see what we get synchronously
+  gR.push('G1:sync='+result);
+}catch(e){gR.push('G1:ERR:'+e.message.slice(0,60));}
+
+// G2: Promise.all with iterator that modifies array
+try{
+  var promises=[Promise.resolve(1),Promise.resolve(2),Promise.resolve(3)];
+  var allResult='pending';
+  Promise.all(promises).then(function(v){allResult='done:'+v.join(',');});
+  gR.push('G2:sync='+allResult);
+}catch(e){gR.push('G2:ERR:'+e.message.slice(0,60));}
+
+// G3: Promise constructor executor throws
+try{
+  var p=new Promise(function(resolve,reject){
+    resolve('first');
+    reject('second');
+    throw new Error('third');
+  });
+  var r='pending';
+  p.then(function(v){r='resolved:'+v;},function(e){r='rejected:'+e;});
+  gR.push('G3:sync='+r);
+}catch(e){gR.push('G3:ERR:'+e.message.slice(0,60));}
+
+// G4: Promise with Symbol.species
+try{
+  var speciesCalled=false;
+  class MyPromise extends Promise{
+    static get [Symbol.species](){speciesCalled=true;return Promise;}
+  }
+  var mp=new MyPromise(function(r){r(42);});
+  var chained=mp.then(function(v){return v*2;});
+  gR.push('G4:species='+speciesCalled+'|chain_type='+chained.constructor.name);
+}catch(e){gR.push('G4:ERR:'+e.message.slice(0,60));}
+
+B('G',gR.join('||'));
+log('G: '+gR.join(' | '));
+</script>
+
+<!-- H: Generator/Iterator protocol abuse -->
+<script>
+log('\n--- H: Generator protocol ---');
+var hR=[];
+
+// H1: Generator with throw during iteration
+try{
+  function* gen(){
+    try{yield 1;yield 2;yield 3;}
+    catch(e){yield 'caught:'+e;}
+    yield 4;
+  }
+  var g=gen();
+  var r=[];
+  r.push(g.next().value);
+  r.push(g.next().value);
+  r.push(g.throw('ERR').value);
+  r.push(g.next().value);
+  r.push(g.next().done);
+  hR.push('H1:'+r.join(','));
+}catch(e){hR.push('H1:ERR:'+e.message.slice(0,60));}
+
+// H2: Generator return during iteration
+try{
+  function* gen2(){yield 1;yield 2;yield 3;}
+  var g2=gen2();
+  var r2=[];
+  r2.push(g2.next().value);
+  r2.push(JSON.stringify(g2.return('early')));
+  r2.push(JSON.stringify(g2.next()));
+  hR.push('H2:'+r2.join('|'));
+}catch(e){hR.push('H2:ERR:'+e.message.slice(0,60));}
+
+// H3: Custom iterable with side effects
+try{
+  var iterCount=0;
+  var obj={
+    [Symbol.iterator]:function(){
+      var i=0;
+      return{
+        next:function(){
+          iterCount++;
+          if(i>=5)return{done:true};
+          return{value:i++,done:false};
+        },
+        return:function(){iterCount+=100;return{done:true};}
+      };
+    }
+  };
+  var arr=[];for(var v of obj){arr.push(v);if(v===2)break;}
+  hR.push('H3:arr='+arr.join(',')+'|ic='+iterCount);
+}catch(e){hR.push('H3:ERR:'+e.message.slice(0,60));}
+
+// H4: Spread with custom iterator
+try{
+  var spreadCount=0;
+  var fake={[Symbol.iterator]:function(){
+    var i=0;
+    return{next:function(){spreadCount++;return i<5?{value:i++}:{done:true};}};
+  }};
+  var arr2=[...fake];
+  hR.push('H4:arr='+arr2.join(',')+'|sc='+spreadCount);
+}catch(e){hR.push('H4:ERR:'+e.message.slice(0,60));}
+
+// H5: Destructuring with iterator protocol
+try{
+  var dc=0;
+  var iter={[Symbol.iterator]:function(){
+    return{next:function(){dc++;return dc<=3?{value:dc*10}:{done:true};}};
+  }};
+  var [a,b,...rest]=iter;
+  hR.push('H5:a='+a+'|b='+b+'|rest='+rest.join(',')+'|dc='+dc);
+}catch(e){hR.push('H5:ERR:'+e.message.slice(0,60));}
+
+B('H',hR.join('||'));
+log('H: '+hR.join(' | '));
+</script>
+
+<!-- I: Reflect API + handler invariant violations -->
+<script>
+log('\n--- I: Reflect + invariants ---');
+var iR=[];
+
+// I1: Reflect.construct with newTarget manipulation
+try{
+  function Foo(){this.type='foo';}
+  function Bar(){this.type='bar';}
+  var obj=Reflect.construct(Foo,[],Bar);
+  iR.push('I1:type='+obj.type+'|proto='+(obj instanceof Bar)+'|ctorName='+obj.constructor.name);
+}catch(e){iR.push('I1:ERR:'+e.message.slice(0,60));}
+
+// I2: Proxy handler invariant — non-configurable property must be reported
+try{
+  var target={};
+  Object.defineProperty(target,'fixed',{value:42,configurable:false});
+  var p=new Proxy(target,{
+    getOwnPropertyDescriptor:function(t,p){
+      if(p==='fixed')return{value:99,configurable:true,writable:true,enumerable:true};
+      return Object.getOwnPropertyDescriptor(t,p);
+    }
+  });
+  var desc;
+  try{desc=Object.getOwnPropertyDescriptor(p,'fixed');}catch(e){desc='threw:'+e.message.slice(0,40);}
+  iR.push('I2:desc='+JSON.stringify(desc));
+}catch(e){iR.push('I2:ERR:'+e.message.slice(0,60));}
+
+// I3: Reflect.apply with exotic this
+try{
+  var r3=Reflect.apply(Array.prototype.join,[1,2,3],['-']);
+  iR.push('I3:join='+r3);
+}catch(e){iR.push('I3:ERR:'+e.message.slice(0,60));}
+
+// I4: Proxy defineProperty invariant — can't add to non-extensible
+try{
+  var t4={};
+  Object.preventExtensions(t4);
+  var p4=new Proxy(t4,{
+    defineProperty:function(t,p,d){return true;}
+  });
+  var r4;
+  try{Object.defineProperty(p4,'new_prop',{value:1});r4='ok';}
+  catch(e){r4='threw:'+e.message.slice(0,40);}
+  iR.push('I4:'+r4);
+}catch(e){iR.push('I4:ERR:'+e.message.slice(0,60));}
+
+// I5: Reflect.ownKeys ordering
+try{
+  var o5={};
+  o5[2]='two';o5[0]='zero';o5.b='b';o5[1]='one';o5.a='a';
+  o5[Symbol('s')]='sym';
+  var keys=Reflect.ownKeys(o5);
+  iR.push('I5:'+keys.map(function(k){return String(k);}).join(','));
+}catch(e){iR.push('I5:ERR:'+e.message.slice(0,60));}
+
+B('I',iR.join('||'));
+log('I: '+iR.join(' | '));
+</script>
+
+<!-- FINAL -->
+<script>
+log('\n=== P1241 COMPLETE ===');
+B('DONE','all');
+</script>
+
+</body>
+</html>

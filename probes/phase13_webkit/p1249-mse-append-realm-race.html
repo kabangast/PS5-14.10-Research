@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1249</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1249-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1249: MSE APPEND + REALM TEARDOWN RACE ===');
+log('Time: '+new Date().toISOString());
+B('START','P1249');
+
+// Shared: minimal MP4 init segment builder
+function buildMP4Init(){
+  var buf=new ArrayBuffer(512);
+  var d=new DataView(buf);
+  var pos=0;
+  function w32(v){d.setUint32(pos,v);pos+=4;}
+  function w16(v){d.setUint16(pos,v);pos+=2;}
+  function w8(v){d.setUint8(pos,v);pos+=1;}
+  function wstr(s){for(var i=0;i<s.length;i++){d.setUint8(pos,s.charCodeAt(i));pos++;}}
+  function box(type,fn){var sp=pos;w32(0);wstr(type);fn();d.setUint32(sp,pos-sp);}
+
+  box('ftyp',function(){wstr('isom');w32(0x200);wstr('isomiso2avc1mp41');});
+  box('moov',function(){
+    box('mvhd',function(){
+      w32(0);w32(0);w32(0);w32(90000);w32(0);w32(0x00010000);w16(0x0100);
+      for(var i=0;i<10;i++)w8(0);
+      w32(0x00010000);w32(0);w32(0);w32(0);w32(0x00010000);w32(0);
+      w32(0);w32(0);w32(0x40000000);for(var i=0;i<24;i++)w8(0);w32(2);
+    });
+    box('trak',function(){
+      box('tkhd',function(){
+        w32(3);w32(0);w32(0);w32(1);w32(0);w32(0);w32(0);w32(0);
+        w16(0);w16(0);w16(0);w16(0);
+        w32(0x00010000);w32(0);w32(0);w32(0);w32(0x00010000);w32(0);
+        w32(0);w32(0);w32(0x40000000);w32(320<<16);w32(240<<16);
+      });
+      box('mdia',function(){
+        box('mdhd',function(){w32(0);w32(0);w32(0);w32(90000);w32(0);w16(0x55C4);w16(0);});
+        box('hdlr',function(){
+          w32(0);w32(0);wstr('vide');w32(0);w32(0);w32(0);
+          wstr('VideoHandler');w8(0);
+        });
+        box('minf',function(){
+          box('vmhd',function(){w32(1);w16(0);w16(0);w16(0);w16(0);});
+          box('dinf',function(){box('dref',function(){w32(0);w32(1);box('url ',function(){w32(1);});});});
+          box('stbl',function(){
+            box('stsd',function(){
+              w32(0);w32(1);
+              box('avc1',function(){
+                for(var i=0;i<6;i++)w8(0);w16(1);
+                for(var i=0;i<16;i++)w8(0);
+                w16(320);w16(240);w32(0x00480000);w32(0x00480000);w32(0);w16(1);
+                for(var i=0;i<32;i++)w8(0);
+                w16(0x0018);w16(0xFFFF);
+                box('avcC',function(){
+                  w8(1);w8(0x42);w8(0xE0);w8(0x1E);w8(0xFF);w8(0xE1);
+                  w16(7);w8(0x67);w8(0x42);w8(0xE0);w8(0x1E);w8(0xDA);w8(0x02);w8(0xD0);
+                  w8(0x01);w16(4);w8(0x68);w8(0xCE);w8(0x38);w8(0x80);
+                });
+              });
+            });
+            box('stts',function(){w32(0);w32(0);});
+            box('stsc',function(){w32(0);w32(0);});
+            box('stsz',function(){w32(0);w32(0);w32(0);});
+            box('stco',function(){w32(0);w32(0);});
+          });
+        });
+      });
+    });
+  });
+  return new Uint8Array(buf,0,pos);
+}
+
+// Build moof+mdat segment (crafted, minimal)
+function buildMediaSegment(seqNum, pts, size){
+  var buf=new ArrayBuffer(256+size);
+  var d=new DataView(buf);
+  var pos=0;
+  function w32(v){d.setUint32(pos,v);pos+=4;}
+  function w16(v){d.setUint16(pos,v);pos+=2;}
+  function w8(v){d.setUint8(pos,v);pos+=1;}
+  function wstr(s){for(var i=0;i<s.length;i++){d.setUint8(pos,s.charCodeAt(i));pos++;}}
+  function box(type,fn){var sp=pos;w32(0);wstr(type);fn();d.setUint32(sp,pos-sp);}
+
+  // styp
+  box('styp',function(){wstr('msdh');w32(0);wstr('msdhmsix');});
+
+  // moof
+  box('moof',function(){
+    box('mfhd',function(){w32(0);w32(seqNum);});
+    box('traf',function(){
+      box('tfhd',function(){
+        w32(0x020000); // flags: default-base-is-moof
+        w32(1); // track_ID
+      });
+      box('tfdt',function(){
+        w32(0x01000000); // version 1
+        w32(0); w32(pts); // baseMediaDecodeTime (64-bit)
+      });
+      box('trun',function(){
+        w32(0x000301); // version 0, flags: duration+size+first-sample-flags
+        w32(1);        // sample_count
+        w32(0); // first_sample_flags
+        w32(3000);   // sample_duration (1/30 of 90000)
+        w32(size);   // sample_size
+      });
+    });
+  });
+
+  // mdat
+  var mdatStart=pos;
+  w32(size+8);
+  wstr('mdat');
+  // Fill with pattern
+  for(var i=0;i<size;i++){
+    w8((i+seqNum)&0xFF);
+  }
+
+  return new Uint8Array(buf,0,pos);
+}
+</script>
+
+<!-- A: MSE appendBuffer with init segment -->
+<script>
+log('\n--- A: MSE appendBuffer ---');
+(function(){
+  var vid=document.createElement('video');
+  vid.muted=true;
+  vid.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(vid);
+
+  var ms=new MediaSource();
+  ms.addEventListener('sourceopen',function(){
+    var state=ms.readyState;
+    if(state!=='open'){B('A1','not_open:'+state);return;}
+
+    try{
+      var sb=ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+      B('A1','sb_created|mode='+sb.mode);
+
+      // Append init segment
+      var initSeg=buildMP4Init();
+      B('A2','init_size='+initSeg.byteLength);
+
+      sb.addEventListener('updateend',function onInitEnd(){
+        sb.removeEventListener('updateend',onInitEnd);
+        B('A3','init_appended|buffered='+sb.buffered.length+'|updating='+sb.updating);
+
+        // Try to read buffered ranges
+        try{
+          var ranges='';
+          for(var i=0;i<sb.buffered.length;i++){
+            ranges+=sb.buffered.start(i)+'-'+sb.buffered.end(i)+' ';
+          }
+          B('A3b','ranges='+ranges+'|dur='+ms.duration);
+        }catch(e){B('A3b','range_err:'+e.message.slice(0,40));}
+
+        // Append media segment
+        try{
+          var seg1=buildMediaSegment(1,0,100);
+          sb.appendBuffer(seg1);
+          sb.addEventListener('updateend',function onSeg1(){
+            sb.removeEventListener('updateend',onSeg1);
+            var ranges2='';
+            for(var i=0;i<sb.buffered.length;i++){
+              ranges2+=sb.buffered.start(i).toFixed(3)+'-'+sb.buffered.end(i).toFixed(3)+' ';
+            }
+            B('A4','seg1_ok|ranges='+ranges2);
+
+            // Append second segment
+            try{
+              var seg2=buildMediaSegment(2,3000,200);
+              sb.appendBuffer(seg2);
+              sb.addEventListener('updateend',function onSeg2(){
+                sb.removeEventListener('updateend',onSeg2);
+                var ranges3='';
+                for(var i=0;i<sb.buffered.length;i++){
+                  ranges3+=sb.buffered.start(i).toFixed(3)+'-'+sb.buffered.end(i).toFixed(3)+' ';
+                }
+                B('A5','seg2_ok|ranges='+ranges3);
+
+                // Append garbage (should error)
+                try{
+                  var garbage=new Uint8Array(256);
+                  for(var i=0;i<256;i++)garbage[i]=0xFF;
+                  sb.appendBuffer(garbage);
+                  sb.addEventListener('updateend',function onGarb(){
+                    sb.removeEventListener('updateend',onGarb);
+                    B('A6','garbage_updateend|buf='+sb.buffered.length);
+                  });
+                  sb.addEventListener('error',function onGErr(){
+                    sb.removeEventListener('error',onGErr);
+                    B('A6','garbage_error|buf='+sb.buffered.length);
+                  });
+                }catch(e){B('A6','garbage_throw:'+e.message.slice(0,40));}
+
+              });
+            }catch(e){B('A5','seg2_err:'+e.message.slice(0,40));}
+          });
+          sb.addEventListener('error',function onSeg1Err(){
+            sb.removeEventListener('error',onSeg1Err);
+            B('A4','seg1_error');
+          });
+        }catch(e){B('A4','seg1_throw:'+e.message.slice(0,40));}
+      });
+
+      sb.addEventListener('error',function onInitErr(){
+        sb.removeEventListener('error',onInitErr);
+        B('A3','init_error');
+      });
+
+      sb.appendBuffer(initSeg);
+    }catch(e){B('A1','err:'+e.message.slice(0,60));}
+  });
+
+  vid.src=URL.createObjectURL(ms);
+})();
+</script>
+
+<!-- B: MSE abort during append -->
+<script>
+log('\n--- B: MSE abort race ---');
+(function(){
+  var vid2=document.createElement('video');
+  vid2.muted=true;
+  vid2.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(vid2);
+
+  var ms2=new MediaSource();
+  ms2.addEventListener('sourceopen',function(){
+    if(ms2.readyState!=='open')return;
+    try{
+      var sb2=ms2.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+      var initSeg=buildMP4Init();
+      sb2.appendBuffer(initSeg);
+
+      // Abort while appending
+      try{
+        sb2.abort();
+        B('B1','abort_during_append|updating='+sb2.updating);
+      }catch(e){B('B1','abort_err:'+e.name+':'+e.message.slice(0,40));}
+
+      // Append again after abort
+      sb2.addEventListener('updateend',function(){
+        try{
+          var seg=buildMediaSegment(1,0,50);
+          sb2.appendBuffer(seg);
+          B('B2','reappend_after_abort|updating='+sb2.updating);
+        }catch(e){B('B2','reappend_err:'+e.message.slice(0,40));}
+      });
+    }catch(e){B('B','sb_err:'+e.message.slice(0,40));}
+  });
+  vid2.src=URL.createObjectURL(ms2);
+})();
+</script>
+
+<!-- C: MSE multiple SourceBuffers -->
+<script>
+log('\n--- C: Multiple SourceBuffers ---');
+(function(){
+  var vid3=document.createElement('video');
+  vid3.muted=true;
+  vid3.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(vid3);
+
+  var ms3=new MediaSource();
+  ms3.addEventListener('sourceopen',function(){
+    if(ms3.readyState!=='open')return;
+    try{
+      var sbV=ms3.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+      B('C1','video_sb|mode='+sbV.mode);
+
+      try{
+        var sbA=ms3.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+        B('C2','audio_sb|mode='+sbA.mode+'|total='+ms3.sourceBuffers.length);
+      }catch(e){B('C2','audio_err:'+e.message.slice(0,40));}
+
+      // Try HEVC
+      try{
+        var sbH=ms3.addSourceBuffer('video/mp4; codecs="hev1.1.6.L93.B0"');
+        B('C3','hevc_sb|total='+ms3.sourceBuffers.length);
+      }catch(e){B('C3','hevc_err:'+e.name+':'+e.message.slice(0,40));}
+
+      // removeSourceBuffer
+      try{
+        ms3.removeSourceBuffer(sbV);
+        B('C4','removed_video|remaining='+ms3.sourceBuffers.length);
+      }catch(e){B('C4','remove_err:'+e.message.slice(0,40));}
+
+    }catch(e){B('C','err:'+e.message.slice(0,40));}
+  });
+  vid3.src=URL.createObjectURL(ms3);
+})();
+</script>
+
+<!-- D: Microtask race during realm teardown -->
+<script>
+log('\n--- D: Realm teardown microtask race ---');
+var dR=[];
+
+// D1: Promise chain in iframe — detach mid-chain
+try{
+  var chainResults=[];
+  var iframe=document.createElement('iframe');
+  iframe.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(iframe);
+  var iWin=iframe.contentWindow;
+
+  // Build a long promise chain in iframe's realm
+  var p=iWin.Promise.resolve(0);
+  for(var i=0;i<20;i++){
+    (function(idx){
+      p=p.then(function(v){
+        chainResults.push(idx+':'+v);
+        if(idx===5){
+          // Detach iframe mid-chain!
+          try{document.body.removeChild(iframe);}catch(e){}
+        }
+        return v+1;
+      });
+    })(i);
+  }
+
+  p.then(function(final){
+    B('D1','chain_done|final='+final+'|steps='+chainResults.length+'|detach_at=5');
+  }).catch(function(e){
+    B('D1','chain_err:'+e.message.slice(0,40)+'|steps='+chainResults.length);
+  });
+
+  dR.push('D1:chain_setup');
+}catch(e){dR.push('D1:ERR:'+e.message.slice(0,60));}
+
+// D2: queueMicrotask in iframe, detach before execution
+try{
+  var microRan=false;
+  var iframe2=document.createElement('iframe');
+  iframe2.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(iframe2);
+
+  // Queue microtask in iframe
+  if(iframe2.contentWindow.queueMicrotask){
+    iframe2.contentWindow.queueMicrotask(function(){
+      microRan=true;
+      B('D2','microtask_from_dead_realm');
+    });
+  }else{
+    // Fallback: use Promise.resolve().then()
+    iframe2.contentWindow.Promise.resolve().then(function(){
+      microRan=true;
+      B('D2','promise_micro_from_dead_realm');
+    });
+  }
+
+  // Detach immediately — before microtask runs
+  document.body.removeChild(iframe2);
+  dR.push('D2:detached_before_micro');
+}catch(e){dR.push('D2:ERR:'+e.message.slice(0,60));}
+
+// D3: Nested iframes — detach parent while child has pending work
+try{
+  var iframe3=document.createElement('iframe');
+  iframe3.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(iframe3);
+
+  var iDoc3=iframe3.contentDocument;
+  iDoc3.open();
+  iDoc3.write('<html><body><iframe id="child"></iframe><script>'+
+    'var child=document.getElementById("child");'+
+    'var cDoc=child.contentDocument;'+
+    'cDoc.open();cDoc.write("<html><body><script>'+
+    'window.NESTED=true;'+
+    'Promise.resolve().then(function(){window.NESTED_MICRO=true;});'+
+    '<\\/script></body></html>");cDoc.close();'+
+    'window.CHILD_NESTED=child.contentWindow.NESTED;'+
+    '<\/script></body></html>');
+  iDoc3.close();
+
+  var childNested=iframe3.contentWindow.CHILD_NESTED;
+  dR.push('D3:nested='+childNested);
+
+  // Detach parent (which detaches child too)
+  document.body.removeChild(iframe3);
+
+  dR.push('D3:parent_detached');
+}catch(e){dR.push('D3:ERR:'+e.message.slice(0,60));}
+
+B('D',dR.join('||'));
+log('D: '+dR.join(' | '));
+</script>
+
+<!-- E: adoptNode GC race (aggressive) -->
+<script>
+log('\n--- E: adoptNode GC race ---');
+var eR=[];
+
+// E1: Mass adoptNode from dead realms + event storm
+try{
+  var adoptedNodes=[];
+  var listenersFired=0;
+
+  for(var round=0;round<20;round++){
+    var f=document.createElement('iframe');
+    f.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+    document.body.appendChild(f);
+
+    var iDoc=f.contentDocument;
+    // Create 10 nodes with event listeners
+    for(var j=0;j<10;j++){
+      var div=iDoc.createElement('div');
+      div.textContent='r'+round+'n'+j;
+      div.dataset.round=round;
+      div.dataset.node=j;
+      (function(r,n){
+        div.addEventListener('ping',function(e){
+          listenersFired++;
+        });
+      })(round,j);
+      document.adoptNode(div);
+      adoptedNodes.push(div);
+    }
+
+    // Detach iframe
+    document.body.removeChild(f);
+  }
+
+  // GC pressure between adoption and event dispatch
+  var pressure=[];
+  for(var i=0;i<50000;i++)pressure.push(new ArrayBuffer(100));
+  pressure=null;
+
+  // Fire events on all adopted nodes
+  for(var i=0;i<adoptedNodes.length;i++){
+    try{
+      adoptedNodes[i].dispatchEvent(new Event('ping'));
+    }catch(e){}
+  }
+
+  eR.push('E1:adopted='+adoptedNodes.length+'|fired='+listenersFired);
+}catch(e){eR.push('E1:ERR:'+e.message.slice(0,60));}
+
+// E2: adoptNode with complex event data across realm boundary
+try{
+  var iframe=document.createElement('iframe');
+  iframe.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(iframe);
+
+  var iDiv=iframe.contentDocument.createElement('div');
+  var capturedEvent=null;
+
+  iDiv.addEventListener('data',function(e){
+    capturedEvent=e;
+  });
+
+  document.adoptNode(iDiv);
+  document.body.appendChild(iDiv);
+  document.body.removeChild(iframe);
+
+  // Dispatch CustomEvent with complex detail from main frame
+  var detail={
+    buffer:new ArrayBuffer(64),
+    nested:{array:[1,2,3],map:new Map([[1,'a'],[2,'b']])},
+    func:function(){return 'from_main';}
+  };
+  new Uint8Array(detail.buffer).fill(0xAB);
+
+  iDiv.dispatchEvent(new CustomEvent('data',{detail:detail}));
+
+  if(capturedEvent){
+    var d=capturedEvent.detail;
+    var bufOk=new Uint8Array(d.buffer)[0]===0xAB;
+    var nestedOk=d.nested.array.length===3;
+    var funcOk=d.func()==='from_main';
+    eR.push('E2:captured|buf='+bufOk+'|nested='+nestedOk+'|func='+funcOk);
+  }
+
+  document.body.removeChild(iDiv);
+}catch(e){eR.push('E2:ERR:'+e.message.slice(0,60));}
+
+B('E',eR.join('||'));
+log('E: '+eR.join(' | '));
+</script>
+
+<!-- F: SourceBuffer mode + timestampOffset manipulation -->
+<script>
+log('\n--- F: SB mode + offset ---');
+(function(){
+  var vid4=document.createElement('video');
+  vid4.muted=true;
+  vid4.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(vid4);
+
+  var ms4=new MediaSource();
+  ms4.addEventListener('sourceopen',function(){
+    if(ms4.readyState!=='open')return;
+    try{
+      var sb=ms4.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+
+      // Test mode change
+      try{
+        sb.mode='sequence';
+        B('F1','mode_change|mode='+sb.mode);
+      }catch(e){B('F1','mode_err:'+e.message.slice(0,40));}
+
+      // Test timestampOffset
+      try{
+        sb.timestampOffset=5.0;
+        B('F2','tsOffset='+sb.timestampOffset);
+      }catch(e){B('F2','tsOff_err:'+e.message.slice(0,40));}
+
+      // Test appendWindowStart/End
+      try{
+        sb.appendWindowStart=1.0;
+        sb.appendWindowEnd=10.0;
+        B('F3','window='+sb.appendWindowStart+'-'+sb.appendWindowEnd);
+      }catch(e){B('F3','window_err:'+e.message.slice(0,40));}
+
+      // Append init + try various segment sizes
+      var initSeg=buildMP4Init();
+      sb.appendBuffer(initSeg);
+      sb.addEventListener('updateend',function onInit(){
+        sb.removeEventListener('updateend',onInit);
+
+        // Try very large segment
+        try{
+          var bigSeg=buildMediaSegment(1,0,65536); // 64KB payload
+          sb.appendBuffer(bigSeg);
+          sb.addEventListener('updateend',function onBig(){
+            sb.removeEventListener('updateend',onBig);
+            B('F4','big_seg_ok|buf='+sb.buffered.length);
+
+            // Try remove
+            try{
+              sb.remove(0,100);
+              sb.addEventListener('updateend',function onRm(){
+                sb.removeEventListener('updateend',onRm);
+                B('F5','remove_ok|buf='+sb.buffered.length);
+              });
+            }catch(e){B('F5','remove_err:'+e.message.slice(0,40));}
+          });
+          sb.addEventListener('error',function onBigErr(){
+            sb.removeEventListener('error',onBigErr);
+            B('F4','big_seg_error');
+          });
+        }catch(e){B('F4','big_throw:'+e.message.slice(0,40));}
+      });
+    }catch(e){B('F','err:'+e.message.slice(0,40));}
+  });
+  vid4.src=URL.createObjectURL(ms4);
+})();
+</script>
+
+<!-- FINAL -->
+<script>
+setTimeout(function(){
+  log('\n=== P1249 COMPLETE ===');
+  B('DONE','all');
+}, 10000);
+</script>
+
+</body>
+</html>

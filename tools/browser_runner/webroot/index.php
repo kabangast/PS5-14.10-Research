@@ -2,10 +2,26 @@
 // PS5 probe launcher — served when the PS5 opens User Guide
 // URL: https://manuals.playstation.net/document/en/ps5/
 
-// Check if a specific probe is requested
+// Control endpoint for the autonomous dashboard poller.
+// Returns the current probe tag as plain text, always 200 via the catch-all route.
+if (isset($_GET['ctl'])) {
+    header('Content-Type: text/plain');
+    header('Cache-Control: no-store, no-cache, must-revalidate');
+    $ctl = @file_get_contents(__DIR__ . '/ctl.txt');
+    echo trim($ctl !== false ? $ctl : '');
+    exit;
+}
+
+// Primary: serve the deployed probe from the standard deploy target
+$deployTarget = 'C:/xampp/htdocs/document/en/ps5/index.html';
+if (file_exists($deployTarget)) {
+    readfile($deployTarget);
+    exit;
+}
+
+// Fallback: check if a specific probe is requested
 $probe = isset($_GET['p']) ? basename($_GET['p']) : '';
 
-// Default: serve p568 (Canvas UAF reclaim) — p567 feature detect done
 if (!$probe) {
     $probe = 'p568';
 }

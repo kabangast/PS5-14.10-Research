@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1267</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1267-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1267: UPGRADE QUEUE POISON + LIFECYCLE ABUSE ===');
+B('START','P1267');
+</script>
+
+<!-- A: Upgrade queue poisoning — destroy queued elements during upgrade -->
+<script>
+log('\n--- A: Upgrade queue poison (innerHTML re-creates self) ---');
+(function(){
+  try{
+    var cbLog=[];
+    var round=0;
+    customElements.define('x-reborn', class extends HTMLElement {
+      connectedCallback(){
+        round++;
+        cbLog.push('cc:'+this.id+':r'+round);
+        if(this.id==='rb2' && round<=2){
+          // Re-create self + siblings via innerHTML — poisons the upgrade queue
+          this.parentNode.innerHTML=
+            '<x-reborn id="rb1"></x-reborn>'+
+            '<x-reborn id="rb2"></x-reborn>'+
+            '<x-reborn id="rb3"></x-reborn>';
+        }
+      }
+      disconnectedCallback(){
+        cbLog.push('dc:'+this.id+':r'+round);
+      }
+    });
+
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(container);
+
+    container.innerHTML=
+      '<x-reborn id="rb1"></x-reborn>'+
+      '<x-reborn id="rb2"></x-reborn>'+
+      '<x-reborn id="rb3"></x-reborn>';
+
+    B('A1','log='+cbLog.join(';')+'|children='+container.children.length+
+      '|round='+round);
+
+    container.parentNode.removeChild(container);
+  }catch(e){B('A0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- B: Nested CE constructor — A creates B, B modifies A -->
+<script>
+log('\n--- B: Nested CE constructor ---');
+(function(){
+  try{
+    var cbLog=[];
+
+    customElements.define('x-outer', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('outer-cc');
+        // Create inner custom element inside self
+        var inner=document.createElement('x-inner');
+        inner.id='inner1';
+        this.appendChild(inner);
+        cbLog.push('outer-cc-after-append');
+      }
+    });
+
+    customElements.define('x-inner', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('inner-cc');
+        // Modify parent (outer element) during inner's connection
+        if(this.parentNode){
+          this.parentNode.setAttribute('data-modified','true');
+          // Try to remove self from parent during own connection
+          // this.parentNode.removeChild(this); // too dangerous, skip
+          // Instead, modify the parent's shadow root
+          try{
+            if(!this.parentNode.shadowRoot){
+              this.parentNode.attachShadow({mode:'open'});
+              this.parentNode.shadowRoot.innerHTML='<slot></slot><span>INJECTED</span>';
+              cbLog.push('shadow-injected');
+            }
+          }catch(e){
+            cbLog.push('shadow-err:'+e.name);
+          }
+        }
+      }
+    });
+
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(container);
+
+    var outer=document.createElement('x-outer');
+    outer.id='outer1';
+    container.appendChild(outer);
+
+    B('B1','log='+cbLog.join(';')+
+      '|outer_modified='+outer.getAttribute('data-modified')+
+      '|outer_shadow='+!!outer.shadowRoot+
+      '|outer_children='+outer.children.length);
+
+    container.parentNode.removeChild(container);
+  }catch(e){B('B0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- C: attributeChangedCallback during connectedCallback -->
+<script>
+log('\n--- C: attributeChanged during connected ---');
+(function(){
+  try{
+    var cbLog=[];
+    customElements.define('x-attrwatch', class extends HTMLElement {
+      static get observedAttributes(){ return ['data-state','data-count']; }
+      connectedCallback(){
+        cbLog.push('cc');
+        // Set attributes during own connection
+        this.setAttribute('data-state','connecting');
+        this.setAttribute('data-count','1');
+        cbLog.push('cc-after-set');
+      }
+      attributeChangedCallback(name, old, val){
+        cbLog.push('attr:'+name+':'+old+'->'+val);
+        // During attribute change, set ANOTHER attribute
+        if(name==='data-state' && val==='connecting'){
+          this.setAttribute('data-count','2');
+        }
+      }
+      disconnectedCallback(){
+        cbLog.push('dc');
+        // Set attribute during disconnection
+        this.setAttribute('data-state','disconnecting');
+      }
+    });
+
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(container);
+
+    var el=document.createElement('x-attrwatch');
+    el.id='aw1';
+    container.appendChild(el);
+
+    B('C1','log='+cbLog.join(';')+
+      '|state='+el.getAttribute('data-state')+
+      '|count='+el.getAttribute('data-count'));
+
+    // Remove (triggers disconnectedCallback which sets attr)
+    container.removeChild(el);
+    B('C2','after_remove|log='+cbLog.join(';')+
+      '|state='+el.getAttribute('data-state'));
+
+    container.parentNode.removeChild(container);
+  }catch(e){B('C0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- D: FormAssociated custom elements (if available) -->
+<script>
+log('\n--- D: FormAssociated CE ---');
+(function(){
+  try{
+    // Check if ElementInternals is available
+    var hasInternals=typeof ElementInternals!=='undefined';
+    B('D1','ElementInternals='+hasInternals);
+
+    if(!hasInternals){B('D2','skip_no_internals');return;}
+
+    var cbLog=[];
+    customElements.define('x-formfield', class extends HTMLElement {
+      static formAssociated=true;
+      constructor(){
+        super();
+        try{
+          this._internals=this.attachInternals();
+          cbLog.push('internals_ok');
+        }catch(e){
+          cbLog.push('internals_err:'+e.name);
+        }
+      }
+      connectedCallback(){
+        cbLog.push('cc');
+        if(this._internals){
+          try{
+            this._internals.setFormValue('test_value');
+            cbLog.push('setValue_ok');
+          }catch(e){cbLog.push('setValue_err:'+e.name);}
+        }
+      }
+      formAssociatedCallback(form){
+        cbLog.push('formAssoc:'+(form?form.id:'null'));
+      }
+      formResetCallback(){
+        cbLog.push('formReset');
+      }
+      formDisabledCallback(disabled){
+        cbLog.push('formDisabled:'+disabled);
+      }
+    });
+
+    var form=document.createElement('form');
+    form.id='testform';
+    form.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(form);
+
+    var field=document.createElement('x-formfield');
+    field.setAttribute('name','myfield');
+    form.appendChild(field);
+
+    B('D3','log='+cbLog.join(';'));
+
+    // Test form reset
+    form.reset();
+    B('D4','after_reset|log='+cbLog.join(';'));
+
+    // Test disabled
+    field.setAttribute('disabled','');
+    B('D5','after_disable|log='+cbLog.join(';'));
+
+    // Remove from form and re-add
+    form.removeChild(field);
+    form.appendChild(field);
+    B('D6','reinsert|log='+cbLog.join(';'));
+
+    form.parentNode.removeChild(form);
+  }catch(e){B('D0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- E: Live HTMLCollection during rapid CE upgrade -->
+<script>
+log('\n--- E: Live HTMLCollection + CE upgrade ---');
+(function(){
+  try{
+    var cbLog=[];
+    var liveCollection;
+
+    customElements.define('x-live', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('cc:'+this.id);
+        // Read the live collection length during upgrade
+        if(liveCollection){
+          cbLog.push('live_len:'+liveCollection.length);
+          // Try accessing specific indices
+          for(var i=0;i<Math.min(liveCollection.length,5);i++){
+            var item=liveCollection[i];
+            cbLog.push('item['+i+']='+(item?item.id:'NULL'));
+          }
+        }
+        // During upgrade, modify DOM (add more elements of same tag)
+        if(this.id==='lv3' && this.parentNode){
+          var extra=document.createElement('x-live');
+          extra.id='lv_extra';
+          this.parentNode.appendChild(extra);
+          cbLog.push('extra_added');
+        }
+      }
+    });
+
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(container);
+
+    // Get live collection BEFORE creating elements
+    liveCollection=container.getElementsByTagName('x-live');
+    B('E1','initial_live_len='+liveCollection.length);
+
+    // Set innerHTML to create multiple CEs at once
+    container.innerHTML=
+      '<x-live id="lv1"></x-live>'+
+      '<x-live id="lv2"></x-live>'+
+      '<x-live id="lv3"></x-live>'+
+      '<x-live id="lv4"></x-live>'+
+      '<x-live id="lv5"></x-live>';
+
+    B('E2','after_innerHTML|log='+cbLog.join(';')+
+      '|final_live_len='+liveCollection.length+
+      '|children='+container.children.length);
+
+    container.parentNode.removeChild(container);
+  }catch(e){B('E0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- F: Selection API with custom element removal -->
+<script>
+log('\n--- F: Selection + CE removal ---');
+(function(){
+  try{
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    container.innerHTML='<span id="s1">hello</span><span id="s2">world</span><span id="s3">test</span>';
+    document.body.appendChild(container);
+
+    // Create a selection range
+    var range=document.createRange();
+    range.setStart(container.querySelector('#s1').firstChild, 2);
+    range.setEnd(container.querySelector('#s3').firstChild, 2);
+
+    var sel=window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+
+    B('F1','selection='+sel.toString()+'|rangeCount='+sel.rangeCount+
+      '|type='+sel.type);
+
+    // Remove the middle element
+    var s2=container.querySelector('#s2');
+    container.removeChild(s2);
+
+    // Check selection state
+    try{
+      B('F2','after_remove|sel='+sel.toString()+
+        '|rangeCount='+sel.rangeCount+
+        '|collapsed='+sel.isCollapsed+
+        '|type='+sel.type);
+    }catch(e){
+      B('F2','sel_err:'+e.name);
+    }
+
+    // Remove the anchor node
+    var s1=container.querySelector('#s1');
+    container.removeChild(s1);
+    try{
+      B('F3','after_anchor_remove|sel='+sel.toString()+
+        '|rangeCount='+sel.rangeCount+
+        '|type='+sel.type);
+    }catch(e){
+      B('F3','sel_err2:'+e.name);
+    }
+
+    sel.removeAllRanges();
+    container.parentNode.removeChild(container);
+  }catch(e){B('F0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- G: CSS transition/animation events on removed elements -->
+<script>
+log('\n--- G: CSS transition + removal ---');
+(function(){
+  try{
+    var style=document.createElement('style');
+    style.textContent=
+      '.anim-target{transition:opacity 0.05s;opacity:1;}'+
+      '.anim-target.fade{opacity:0;}'+
+      '@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}'+
+      '.spin-target{animation:spin 0.05s linear;}';
+    document.head.appendChild(style);
+
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(container);
+
+    var eventLog=[];
+
+    // Create element with transition
+    var el=document.createElement('div');
+    el.className='anim-target';
+    el.textContent='TRANSITION';
+    el.addEventListener('transitionend', function(e){
+      eventLog.push('tend:'+e.propertyName+':inDOM='+document.contains(el));
+    });
+    container.appendChild(el);
+
+    // Force layout
+    el.offsetHeight;
+
+    // Start transition then immediately remove
+    el.classList.add('fade');
+    container.removeChild(el);
+
+    B('G1','removed_during_transition|events='+eventLog.length);
+
+    // Animated element — remove during animation
+    var el2=document.createElement('div');
+    el2.className='spin-target';
+    el2.textContent='ANIMATION';
+    el2.addEventListener('animationend', function(e){
+      eventLog.push('aend:'+e.animationName+':inDOM='+document.contains(el2));
+    });
+    container.appendChild(el2);
+    el2.offsetHeight;
+
+    // Remove during animation
+    setTimeout(function(){
+      container.removeChild(el2);
+      B('G2','removed_during_animation|events='+eventLog.join(';'));
+
+      // Re-add to see if events still fire
+      container.appendChild(el);
+      container.appendChild(el2);
+
+      setTimeout(function(){
+        B('G3','final|events='+eventLog.join(';'));
+        style.parentNode.removeChild(style);
+        container.parentNode.removeChild(container);
+      }, 200);
+    }, 10);
+
+  }catch(e){B('G0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- H: createImageBitmap async + canvas mutation -->
+<script>
+log('\n--- H: ImageBitmap + canvas race ---');
+(function(){
+  try{
+    var canvas=document.createElement('canvas');
+    canvas.width=100;canvas.height=100;
+    var ctx=canvas.getContext('2d');
+
+    // Draw pattern
+    ctx.fillStyle='red';
+    ctx.fillRect(0,0,100,100);
+    ctx.fillStyle='blue';
+    ctx.fillRect(25,25,50,50);
+
+    // Start createImageBitmap (async)
+    var bitmapPromise=createImageBitmap(canvas);
+
+    // IMMEDIATELY mutate the canvas
+    ctx.fillStyle='green';
+    ctx.fillRect(0,0,100,100);
+
+    // Also resize the canvas
+    canvas.width=50;
+    canvas.height=50;
+
+    bitmapPromise.then(function(bmp){
+      B('H1','bitmap|w='+bmp.width+'|h='+bmp.height+
+        '|canvas_w='+canvas.width+'|canvas_h='+canvas.height);
+
+      // Draw bitmap back to resized canvas
+      var ctx2=canvas.getContext('2d');
+      ctx2.drawImage(bmp, 0, 0);
+
+      // Read pixels
+      var data=ctx2.getImageData(0,0,50,50).data;
+      // Check what color we got (original red or mutated green?)
+      B('H2','pixel[0,0]=rgba('+data[0]+','+data[1]+','+data[2]+','+data[3]+')'+
+        '|pixel[30,30]=rgba('+data[120]+','+data[121]+','+data[122]+','+data[123]+')');
+
+      bmp.close();
+
+      // Second test: createImageBitmap from removed canvas
+      var canvas2=document.createElement('canvas');
+      canvas2.width=64;canvas2.height=64;
+      var ctx3=canvas2.getContext('2d');
+      ctx3.fillStyle='#FF00FF';
+      ctx3.fillRect(0,0,64,64);
+
+      var promise2=createImageBitmap(canvas2);
+      canvas2=null; // Drop reference
+
+      promise2.then(function(bmp2){
+        B('H3','orphan_bitmap|w='+bmp2.width+'|h='+bmp2.height);
+        bmp2.close();
+      }).catch(function(e){
+        B('H3','orphan_err:'+e.name+':'+e.message.slice(0,60));
+      });
+
+    }).catch(function(e){
+      B('H1','bitmap_err:'+e.name+':'+e.message.slice(0,60));
+    });
+
+  }catch(e){B('H0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1267 COMPLETE ===');
+}, 4000);
+</script>
+
+</body>
+</html>

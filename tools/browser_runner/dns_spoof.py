@@ -19,17 +19,34 @@ import sys
 import threading
 
 SPOOF_DOMAINS = {
+    # Primary probe delivery
     b'manuals.playstation.net',
     b'ps5.np.playstation.net',
     b'www.playstation.com',
     b'ecode.np.cs.playstation.net',
     b'static.playstation.com',
+    # Terms of Service / Privacy / Legal pages
+    b'store.playstation.com',
+    b'web.np.playstation.net',
+    b'doc.dl.playstation.net',
+    b'legal.playstation.com',
+    b'privacy.playstation.com',
+    b'account.playstation.com',
+    b'my.playstation.com',
+    # Sony domains (in-game browser, system browser)
+    b'www.sony.com',
+    b'www.sonyentertainmentnetwork.com',
+    b'web.np.playstation.com',
+    b'auth.np.playstation.com',
+    b'api.playstation.com',
+    b'cdn.playstation.com',
 }
 
 
 class DNSHandler(socketserver.BaseRequestHandler):
     spoof_ip = '127.0.0.1'
     upstream = '8.8.8.8'
+    spoof_all = False
     query_count = 0
     lock = threading.Lock()
 
@@ -78,17 +95,19 @@ class DNSHandler(socketserver.BaseRequestHandler):
 
         ts = datetime.datetime.now().strftime('%H:%M:%S')
 
-        if qtype == 1 and qname in SPOOF_DOMAINS:
-            # Spoof A record
+        should_spoof = (qtype == 1 and
+                        (self.spoof_all or qname in SPOOF_DOMAINS))
+
+        if should_spoof:
             ip_bytes = socket.inet_aton(self.spoof_ip)
             print(f'[{ts}] #{count} SPOOF {self.client_address[0]}: '
                   f'{qname.decode()} -> {self.spoof_ip}')
             resp_flags = 0x8580  # QR=1, AA=1, RA=1
             header = txid + struct.pack('!HHHHH', resp_flags, 1, 1, 0, 0)
-            answer = b'\xc0\x0c' + struct.pack('!HHIH', 1, 1, 60, 4) + ip_bytes
+            answer = b'\xc0\x0c' + struct.pack('!HHIH', 1, 1, 5, 4) + ip_bytes
             return header + question + answer
         else:
-            # Forward to upstream
+            # Forward non-A or non-spoofed to upstream
             print(f'[{ts}] #{count} FWD   {self.client_address[0]}: '
                   f'{qname.decode()} (type={qtype})')
             try:
@@ -99,7 +118,6 @@ class DNSHandler(socketserver.BaseRequestHandler):
                 fwd.close()
                 return resp
             except Exception:
-                # NXDOMAIN
                 resp_flags = 0x8583
                 header = txid + struct.pack('!HHHHH', resp_flags, 1, 0, 0, 0)
                 return header + question
@@ -123,11 +141,14 @@ def main():
     parser.add_argument('--host', default='0.0.0.0', help='Listen address')
     parser.add_argument('--port', type=int, default=53, help='Listen port')
     parser.add_argument('--upstream', default='8.8.8.8', help='Upstream DNS')
+    parser.add_argument('--all', action='store_true',
+                        help='Spoof ALL A-record queries to our IP')
     args = parser.parse_args()
 
     spoof_ip = args.ip or get_local_ip()
     DNSHandler.spoof_ip = spoof_ip
     DNSHandler.upstream = args.upstream
+    DNSHandler.spoof_all = args.all
 
     try:
         server = socketserver.UDPServer((args.host, args.port), DNSHandler)
@@ -150,8 +171,11 @@ def main():
     print('  PS5 DNS Spoofer')
     print('=' * 50)
     print(f'  Listening: {args.host}:{args.port}')
-    for dom in sorted(SPOOF_DOMAINS):
-        print(f'  Spoofing:  {dom.decode()} -> {spoof_ip}')
+    if args.all:
+        print(f'  Mode:      ALL DOMAINS -> {spoof_ip}')
+    else:
+        for dom in sorted(SPOOF_DOMAINS):
+            print(f'  Spoofing:  {dom.decode()} -> {spoof_ip}')
     print(f'  Upstream:  {args.upstream}')
     print()
     print(f'  Set PS5 DNS to: {spoof_ip}')

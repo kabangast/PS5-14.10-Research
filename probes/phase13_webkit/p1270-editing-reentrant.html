@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1270</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1270-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1270: EDITING ENGINE RE-ENTRANCY ===');
+B('START','P1270');
+</script>
+
+<!-- A: MutationObserver fires during execCommand — modify edited content in callback -->
+<script>
+log('\n--- A: MutationObserver + execCommand re-entrancy ---');
+(function(){
+  try{
+    var container=document.createElement('div');
+    container.contentEditable='true';
+    container.style.cssText='position:absolute;left:-9999px;width:200px;height:200px';
+    container.innerHTML='<p id="ep1">Hello</p><p id="ep2">World</p><p id="ep3">Test</p>';
+    document.body.appendChild(container);
+    container.focus();
+
+    var mutLog=[];
+    var obsCount=0;
+    var MAX_OBS=10;
+
+    var obs=new MutationObserver(function(muts){
+      obsCount++;
+      if(obsCount>MAX_OBS)return;
+      mutLog.push('mut:'+muts.length+':'+muts[0].type);
+
+      // During the execCommand's DOM mutation, modify the same region
+      if(obsCount===1){
+        // Replace the innerHTML of the container while editing engine is mid-operation
+        try{
+          container.innerHTML='<p>REPLACED_DURING_EDIT</p><p>NEW_CONTENT</p>';
+          mutLog.push('innerHTML_replaced');
+        }catch(e){
+          mutLog.push('replace_err:'+e.name);
+        }
+      }
+    });
+    obs.observe(container,{childList:true,subtree:true,characterData:true});
+
+    // Select all and bold — this modifies the DOM, triggering the observer
+    var sel=window.getSelection();
+    sel.removeAllRanges();
+    var range=document.createRange();
+    range.selectNodeContents(container);
+    sel.addRange(range);
+
+    document.execCommand('bold');
+
+    obs.disconnect();
+    B('A1','obsCount='+obsCount+'|log='+mutLog.join(';')+
+      '|html='+container.innerHTML.slice(0,200));
+
+    // Test 2: insertHTML with observer that removes the insertion target
+    obsCount=0;mutLog=[];
+    container.innerHTML='<p>Before</p><p id="target">TARGET</p><p>After</p>';
+    container.focus();
+
+    var obs2=new MutationObserver(function(muts){
+      obsCount++;
+      if(obsCount>MAX_OBS)return;
+      mutLog.push('mut2:'+obsCount);
+      if(obsCount===1){
+        // Remove the parent of what's being edited
+        var tgt=container.querySelector('#target');
+        if(tgt&&tgt.parentNode){
+          tgt.parentNode.removeChild(tgt);
+          mutLog.push('target_removed');
+        }
+      }
+    });
+    obs2.observe(container,{childList:true,subtree:true,characterData:true});
+
+    sel.removeAllRanges();
+    range=document.createRange();
+    var tgtNode=container.querySelector('#target');
+    if(tgtNode&&tgtNode.firstChild){
+      range.setStart(tgtNode.firstChild,0);
+      range.setEnd(tgtNode.firstChild,6);
+      sel.addRange(range);
+    }
+
+    document.execCommand('insertHTML','<b>INJECTED</b>');
+
+    obs2.disconnect();
+    B('A2','obsCount='+obsCount+'|log='+mutLog.join(';')+
+      '|html='+container.innerHTML.slice(0,200));
+
+    container.parentNode.removeChild(container);
+  }catch(e){B('A0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- B: Custom Element connectedCallback fires during insertHTML -->
+<script>
+log('\n--- B: CE connectedCallback during insertHTML ---');
+(function(){
+  try{
+    var cbLog=[];
+    var editDiv;
+
+    customElements.define('x-edit-inject', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('cc:'+this.id);
+        // During our own connection (triggered by insertHTML), modify the editor
+        if(editDiv && this.id==='injected1'){
+          try{
+            // Try to clear the editor's content while it's mid-insertion
+            var firstChild=editDiv.firstChild;
+            if(firstChild&&firstChild!==this){
+              editDiv.removeChild(firstChild);
+              cbLog.push('removed_sibling');
+            }
+          }catch(e){
+            cbLog.push('sibling_err:'+e.name);
+          }
+        }
+      }
+      disconnectedCallback(){
+        cbLog.push('dc:'+this.id);
+      }
+    });
+
+    editDiv=document.createElement('div');
+    editDiv.contentEditable='true';
+    editDiv.style.cssText='position:absolute;left:-9999px;width:200px;height:200px';
+    editDiv.innerHTML='<p>Existing content here</p><p>More content</p>';
+    document.body.appendChild(editDiv);
+    editDiv.focus();
+
+    // Select all content
+    var sel=window.getSelection();
+    sel.removeAllRanges();
+    var range=document.createRange();
+    range.selectNodeContents(editDiv);
+    sel.addRange(range);
+
+    // Insert HTML that includes custom elements — their connectedCallback
+    // fires mid-insertion and modifies the container
+    document.execCommand('insertHTML',false,
+      '<x-edit-inject id="injected1">CE1</x-edit-inject>'+
+      '<p>between</p>'+
+      '<x-edit-inject id="injected2">CE2</x-edit-inject>');
+
+    B('B1','log='+cbLog.join(';')+
+      '|html='+editDiv.innerHTML.slice(0,300)+
+      '|children='+editDiv.childNodes.length);
+
+    // Test 2: insertHTML creates CE that adopts the editor to another document
+    cbLog=[];
+    customElements.define('x-edit-adopt', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('adopt-cc');
+        // Create iframe and try to adopt the editor into it
+        try{
+          var ifr=document.createElement('iframe');
+          ifr.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+          document.body.appendChild(ifr);
+          ifr.contentDocument.open();
+          ifr.contentDocument.write('<html><body></body></html>');
+          ifr.contentDocument.close();
+
+          // Adopt the parent editor into another document during insertHTML!
+          var adopted=ifr.contentDocument.adoptNode(editDiv);
+          cbLog.push('editor_adopted');
+          ifr.contentDocument.body.appendChild(adopted);
+
+          // Check if editing engine is confused
+          try{
+            var testSel=window.getSelection();
+            cbLog.push('sel_ranges='+testSel.rangeCount);
+          }catch(e){
+            cbLog.push('sel_err:'+e.name);
+          }
+
+          // Move it back
+          document.adoptNode(editDiv);
+          document.body.appendChild(editDiv);
+          cbLog.push('editor_restored');
+
+          ifr.parentNode.removeChild(ifr);
+        }catch(e){
+          cbLog.push('adopt_err:'+e.name+':'+e.message.slice(0,60));
+        }
+      }
+    });
+
+    editDiv.innerHTML='<p>Fresh content for adopt test</p>';
+    editDiv.focus();
+    sel.removeAllRanges();
+    range=document.createRange();
+    range.selectNodeContents(editDiv);
+    sel.addRange(range);
+
+    document.execCommand('insertHTML',false,
+      '<x-edit-adopt id="adopter">ADOPTER</x-edit-adopt>');
+
+    B('B2','log='+cbLog.join(';')+
+      '|html='+editDiv.innerHTML.slice(0,200)+
+      '|ownerDoc='+(editDiv.ownerDocument===document));
+
+    editDiv.parentNode.removeChild(editDiv);
+  }catch(e){B('B0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- C: SVG foreignObject + namespace confusion -->
+<script>
+log('\n--- C: SVG foreignObject + namespace ---');
+(function(){
+  try{
+    var svgNS='http://www.w3.org/2000/svg';
+    var htmlNS='http://www.w3.org/1999/xhtml';
+
+    // Create SVG with foreignObject
+    var svg=document.createElementNS(svgNS,'svg');
+    svg.setAttribute('width','200');
+    svg.setAttribute('height','200');
+    svg.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(svg);
+
+    var fo=document.createElementNS(svgNS,'foreignObject');
+    fo.setAttribute('width','200');
+    fo.setAttribute('height','200');
+    svg.appendChild(fo);
+
+    // Put HTML inside foreignObject
+    var htmlDiv=document.createElementNS(htmlNS,'div');
+    htmlDiv.textContent='HTML inside SVG';
+    fo.appendChild(htmlDiv);
+
+    B('C1','fo_children='+fo.childNodes.length+
+      '|div_ns='+htmlDiv.namespaceURI+
+      '|fo_ns='+fo.namespaceURI);
+
+    // Adopt HTML element OUT of SVG foreignObject into main document
+    var adopted=document.adoptNode(htmlDiv);
+    document.body.appendChild(adopted);
+
+    B('C2','after_adopt|ns='+adopted.namespaceURI+
+      '|in_svg='+svg.contains(adopted)+
+      '|in_body='+document.body.contains(adopted));
+
+    // Create a circle in SVG namespace, try to put it in HTML body
+    var circle=document.createElementNS(svgNS,'circle');
+    circle.setAttribute('r','10');
+    circle.setAttribute('cx','50');
+    circle.setAttribute('cy','50');
+
+    document.body.appendChild(circle);
+    B('C3','circle_in_body|ns='+circle.namespaceURI+
+      '|parent='+circle.parentNode.nodeName);
+
+    // Move HTML element INTO SVG (not in foreignObject)
+    var htmlSpan=document.createElement('span');
+    htmlSpan.textContent='HTML in SVG';
+    svg.appendChild(htmlSpan);
+    B('C4','html_in_svg|ns='+htmlSpan.namespaceURI+
+      '|parent_ns='+htmlSpan.parentNode.namespaceURI+
+      '|renders='+(htmlSpan.offsetWidth>0));
+
+    // Create element with wrong namespace then adopt across contexts
+    var wrongDiv=document.createElementNS(svgNS,'div');
+    wrongDiv.textContent='SVG-ns div';
+    fo.appendChild(wrongDiv);
+    B('C5','wrong_ns_div|ns='+wrongDiv.namespaceURI+
+      '|tag='+wrongDiv.tagName+
+      '|inFO='+fo.contains(wrongDiv));
+
+    // Adopt the wrong-ns div to body
+    document.adoptNode(wrongDiv);
+    document.body.appendChild(wrongDiv);
+    B('C6','adopted_wrong|ns='+wrongDiv.namespaceURI+
+      '|tag='+wrongDiv.tagName+
+      '|display='+getComputedStyle(wrongDiv).display);
+
+    // innerHTML on foreignObject — does it parse as HTML or SVG?
+    fo.innerHTML='<div style="color:red">innerHTML test</div><b>bold</b>';
+    var firstChild=fo.firstChild;
+    B('C7','fo_innerHTML|first_ns='+(firstChild?firstChild.namespaceURI:'null')+
+      '|first_tag='+(firstChild?firstChild.tagName:'null')+
+      '|children='+fo.childNodes.length);
+
+    // Clean up
+    adopted.parentNode.removeChild(adopted);
+    circle.parentNode.removeChild(circle);
+    htmlSpan.parentNode.removeChild(htmlSpan);
+    wrongDiv.parentNode.removeChild(wrongDiv);
+    svg.parentNode.removeChild(svg);
+  }catch(e){B('C0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- D: Range manipulation during execCommand via MutationObserver -->
+<script>
+log('\n--- D: Range manipulation during execCommand ---');
+(function(){
+  try{
+    var editDiv=document.createElement('div');
+    editDiv.contentEditable='true';
+    editDiv.style.cssText='position:absolute;left:-9999px;width:200px';
+    editDiv.innerHTML='<p id="dp1">Alpha</p><p id="dp2">Beta</p><p id="dp3">Gamma</p><p id="dp4">Delta</p>';
+    document.body.appendChild(editDiv);
+    editDiv.focus();
+
+    var mutLog=[];
+    var obsCount=0;
+
+    var obs=new MutationObserver(function(muts){
+      obsCount++;
+      if(obsCount>5)return;
+      mutLog.push('obs:'+obsCount);
+
+      // During the editing mutation, collapse the selection to a different position
+      try{
+        var sel=window.getSelection();
+        if(sel.rangeCount>0){
+          var dp4=editDiv.querySelector('#dp4');
+          if(dp4&&dp4.firstChild){
+            sel.collapse(dp4.firstChild, 2);
+            mutLog.push('sel_moved');
+          }
+        }
+      }catch(e){
+        mutLog.push('sel_err:'+e.name);
+      }
+    });
+    obs.observe(editDiv,{childList:true,subtree:true,characterData:true});
+
+    // Select first paragraph and delete it
+    var sel=window.getSelection();
+    sel.removeAllRanges();
+    var range=document.createRange();
+    var dp1=editDiv.querySelector('#dp1');
+    range.selectNodeContents(dp1);
+    sel.addRange(range);
+
+    document.execCommand('delete');
+
+    obs.disconnect();
+    B('D1','obsCount='+obsCount+'|log='+mutLog.join(';')+
+      '|html='+editDiv.innerHTML.slice(0,200));
+
+    // Test 2: Move range to a DIFFERENT contentEditable during execCommand
+    mutLog=[];obsCount=0;
+    var editDiv2=document.createElement('div');
+    editDiv2.contentEditable='true';
+    editDiv2.style.cssText='position:absolute;left:-9999px;width:200px';
+    editDiv2.innerHTML='<p>Other editor</p>';
+    document.body.appendChild(editDiv2);
+
+    var obs2=new MutationObserver(function(muts){
+      obsCount++;
+      if(obsCount>5)return;
+      mutLog.push('obs2:'+obsCount);
+      try{
+        // Move focus to the OTHER editor during this editor's mutation
+        editDiv2.focus();
+        var s=window.getSelection();
+        s.removeAllRanges();
+        var r=document.createRange();
+        r.selectNodeContents(editDiv2);
+        s.addRange(r);
+        mutLog.push('focus_moved');
+      }catch(e){
+        mutLog.push('focus_err:'+e.name);
+      }
+    });
+    obs2.observe(editDiv,{childList:true,subtree:true,characterData:true});
+
+    editDiv.focus();
+    sel.removeAllRanges();
+    range=document.createRange();
+    range.selectNodeContents(editDiv);
+    sel.addRange(range);
+
+    document.execCommand('bold');
+
+    obs2.disconnect();
+    B('D2','obsCount='+obsCount+'|log='+mutLog.join(';')+
+      '|ed1='+editDiv.innerHTML.slice(0,100)+
+      '|ed2='+editDiv2.innerHTML.slice(0,100));
+
+    editDiv.parentNode.removeChild(editDiv);
+    editDiv2.parentNode.removeChild(editDiv2);
+  }catch(e){B('D0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- E: contentEditable + adoptNode mid-operation -->
+<script>
+log('\n--- E: adoptNode the editor during execCommand ---');
+(function(){
+  try{
+    var editDiv=document.createElement('div');
+    editDiv.contentEditable='true';
+    editDiv.style.cssText='position:absolute;left:-9999px;width:200px';
+    editDiv.innerHTML='<p>Editable content</p><p>More paragraphs</p><p>Third one</p>';
+    document.body.appendChild(editDiv);
+    editDiv.focus();
+
+    // Create iframe
+    var ifr=document.createElement('iframe');
+    ifr.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+    document.body.appendChild(ifr);
+    ifr.contentDocument.open();
+    ifr.contentDocument.write('<html><body></body></html>');
+    ifr.contentDocument.close();
+
+    var mutLog=[];
+    var obsCount=0;
+
+    var obs=new MutationObserver(function(muts){
+      obsCount++;
+      if(obsCount>3)return;
+      mutLog.push('obs:'+obsCount);
+      // Adopt the ENTIRE editor into iframe document during editing mutation!
+      try{
+        var adopted=ifr.contentDocument.adoptNode(editDiv);
+        ifr.contentDocument.body.appendChild(adopted);
+        mutLog.push('adopted_to_iframe');
+      }catch(e){
+        mutLog.push('adopt_err:'+e.name+':'+e.message.slice(0,40));
+      }
+    });
+    obs.observe(editDiv,{childList:true,subtree:true,characterData:true});
+
+    var sel=window.getSelection();
+    sel.removeAllRanges();
+    var range=document.createRange();
+    range.selectNodeContents(editDiv);
+    sel.addRange(range);
+
+    var result;
+    try{
+      result=document.execCommand('bold');
+    }catch(e){
+      result='err:'+e.name;
+    }
+
+    obs.disconnect();
+    B('E1','result='+result+'|obsCount='+obsCount+'|log='+mutLog.join(';')+
+      '|ownerDoc='+(editDiv.ownerDocument===document?'main':'iframe')+
+      '|html='+editDiv.innerHTML.slice(0,200));
+
+    // Move it back and try again
+    try{
+      document.adoptNode(editDiv);
+      document.body.appendChild(editDiv);
+    }catch(e){}
+
+    // Test 2: Remove the editor's parent during execCommand
+    mutLog=[];obsCount=0;
+    var wrapper=document.createElement('div');
+    wrapper.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(wrapper);
+    wrapper.appendChild(editDiv);
+    editDiv.focus();
+
+    var obs2=new MutationObserver(function(muts){
+      obsCount++;
+      if(obsCount>3)return;
+      mutLog.push('obs2:'+obsCount);
+      // Remove the wrapper (parent of editor) during editing
+      try{
+        if(wrapper.parentNode){
+          wrapper.parentNode.removeChild(wrapper);
+          mutLog.push('wrapper_removed');
+        }
+      }catch(e){
+        mutLog.push('remove_err:'+e.name);
+      }
+    });
+    obs2.observe(editDiv,{childList:true,subtree:true,characterData:true});
+
+    sel.removeAllRanges();
+    range=document.createRange();
+    range.selectNodeContents(editDiv);
+    sel.addRange(range);
+
+    var result2;
+    try{
+      result2=document.execCommand('insertHTML',false,'<b>INJECTED</b>');
+    }catch(e){
+      result2='err:'+e.name;
+    }
+
+    obs2.disconnect();
+    B('E2','result='+result2+'|obsCount='+obsCount+'|log='+mutLog.join(';')+
+      '|in_dom='+document.body.contains(editDiv)+
+      '|html='+editDiv.innerHTML.slice(0,200));
+
+    // Cleanup
+    try{
+      if(wrapper.parentNode)wrapper.parentNode.removeChild(wrapper);
+      else if(editDiv.parentNode)editDiv.parentNode.removeChild(editDiv);
+    }catch(e){}
+    ifr.parentNode.removeChild(ifr);
+  }catch(e){B('E0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- F: DocumentFragment with live children + rapid adoption -->
+<script>
+log('\n--- F: DocumentFragment abuse ---');
+(function(){
+  try{
+    // Create a DocumentFragment with custom elements
+    var frag=document.createDocumentFragment();
+    var fragLog=[];
+
+    customElements.define('x-frag-child', class extends HTMLElement {
+      connectedCallback(){
+        fragLog.push('cc:'+this.id+':doc='+(this.ownerDocument===document?'main':'other'));
+      }
+      disconnectedCallback(){
+        fragLog.push('dc:'+this.id);
+      }
+      adoptedCallback(){
+        fragLog.push('ad:'+this.id);
+      }
+    });
+
+    for(var i=0;i<10;i++){
+      var el=document.createElement('x-frag-child');
+      el.id='fc'+i;
+      el.textContent='child'+i;
+      frag.appendChild(el);
+    }
+
+    B('F1','frag_children='+frag.childNodes.length+
+      '|log='+fragLog.join(';'));
+
+    // Append fragment to container — all children should get connectedCallback
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(container);
+    container.appendChild(frag);
+
+    B('F2','after_append|container_children='+container.childNodes.length+
+      '|frag_children='+frag.childNodes.length+
+      '|log='+fragLog.join(';'));
+
+    // Extract some children back into fragment
+    while(container.childNodes.length>5){
+      frag.appendChild(container.lastChild);
+    }
+    B('F3','split|container='+container.childNodes.length+
+      '|frag='+frag.childNodes.length+
+      '|log_len='+fragLog.length);
+
+    // Adopt fragment into iframe
+    var ifr=document.createElement('iframe');
+    ifr.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+    document.body.appendChild(ifr);
+    ifr.contentDocument.open();
+    ifr.contentDocument.write('<html><body></body></html>');
+    ifr.contentDocument.close();
+
+    // adoptNode on a DocumentFragment — does it adopt all children?
+    var adoptedFrag=ifr.contentDocument.adoptNode(frag);
+    B('F4','adopted_frag|children='+adoptedFrag.childNodes.length+
+      '|log='+fragLog.slice(-15).join(';'));
+
+    // Append adopted fragment to iframe body
+    ifr.contentDocument.body.appendChild(adoptedFrag);
+    B('F5','in_iframe|iframe_children='+ifr.contentDocument.body.childNodes.length+
+      '|log='+fragLog.slice(-10).join(';'));
+
+    // Now destroy the iframe — children become orphaned
+    ifr.parentNode.removeChild(ifr);
+
+    // Try to access the elements that were in the destroyed iframe
+    var orphans=fragLog.filter(function(s){return s.indexOf('dc:')===0;});
+    B('F6','after_iframe_destroy|disconnects='+orphans.length+
+      '|total_events='+fragLog.length);
+
+    container.parentNode.removeChild(container);
+  }catch(e){B('F0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- G: contentEditable insertHTML with nested tables + MutationObserver -->
+<script>
+log('\n--- G: Complex insertHTML + observer ---');
+(function(){
+  try{
+    var editDiv=document.createElement('div');
+    editDiv.contentEditable='true';
+    editDiv.style.cssText='position:absolute;left:-9999px;width:400px;height:200px';
+    editDiv.innerHTML='<p>Base content</p>';
+    document.body.appendChild(editDiv);
+    editDiv.focus();
+
+    var mutLog=[];
+    var obsCount=0;
+
+    var obs=new MutationObserver(function(muts){
+      obsCount++;
+      if(obsCount>8)return;
+      mutLog.push('m:'+obsCount+':'+muts.length+'muts');
+      // On each mutation, insert MORE content into the editor
+      if(obsCount<=3){
+        try{
+          var extra=document.createElement('p');
+          extra.textContent='Observer-added-'+obsCount;
+          editDiv.appendChild(extra);
+          mutLog.push('added:'+obsCount);
+        }catch(e){
+          mutLog.push('add_err:'+e.name);
+        }
+      }
+    });
+    obs.observe(editDiv,{childList:true,subtree:true,characterData:true,attributes:true});
+
+    // Select all and insert complex nested HTML
+    var sel=window.getSelection();
+    sel.removeAllRanges();
+    var range=document.createRange();
+    range.selectNodeContents(editDiv);
+    sel.addRange(range);
+
+    // Complex nested table + list + inline elements
+    document.execCommand('insertHTML',false,
+      '<table><tr><td>Cell1</td><td><ul><li>Item1</li><li>Item2</li></ul></td></tr>'+
+      '<tr><td colspan="2"><div contenteditable="false">Non-editable island</div></td></tr></table>'+
+      '<ol><li>Numbered<b>bold</b></li><li><a href="#">Link</a></li></ol>'+
+      '<blockquote><p>Quoted <em>text</em></p></blockquote>');
+
+    obs.disconnect();
+    B('G1','obsCount='+obsCount+'|log='+mutLog.join(';').slice(0,400)+
+      '|children='+editDiv.childNodes.length);
+
+    // Test 2: Nested contentEditable regions
+    mutLog=[];obsCount=0;
+    editDiv.innerHTML=
+      '<div contenteditable="true" id="inner1">'+
+      '<p>Inner editable</p>'+
+      '</div>'+
+      '<div contenteditable="false">'+
+      '<div contenteditable="true" id="inner2">'+
+      '<p>Nested editable</p>'+
+      '</div></div>';
+
+    // Try to bold across nested contentEditable boundaries
+    sel.removeAllRanges();
+    range=document.createRange();
+    range.selectNodeContents(editDiv);
+    sel.addRange(range);
+
+    var boldResult=document.execCommand('bold');
+    B('G2','bold_across_nested='+boldResult+
+      '|html='+editDiv.innerHTML.slice(0,300));
+
+    editDiv.parentNode.removeChild(editDiv);
+  }catch(e){B('G0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- H: Worker + Cache API + Blob URL interaction -->
+<script>
+log('\n--- H: Worker + Cache API + Blob URL ---');
+(function(){
+  try{
+    // Test: Worker accessing Cache API
+    var workerCode=
+      'var results=[];\n'+
+      'try{\n'+
+      '  if(typeof caches!=="undefined"){\n'+
+      '    results.push("caches=true");\n'+
+      '    caches.open("worker-test").then(function(cache){\n'+
+      '      results.push("opened");\n'+
+      '      var req=new Request("https://test.local/worker-key");\n'+
+      '      var resp=new Response("worker-value-"+Date.now());\n'+
+      '      return cache.put(req, resp).then(function(){\n'+
+      '        results.push("put_ok");\n'+
+      '        return cache.match(req);\n'+
+      '      }).then(function(matched){\n'+
+      '        return matched.text();\n'+
+      '      }).then(function(text){\n'+
+      '        results.push("match="+text.slice(0,30));\n'+
+      '        return cache.delete(req);\n'+
+      '      }).then(function(deleted){\n'+
+      '        results.push("deleted="+deleted);\n'+
+      '        postMessage(results.join("|"));\n'+
+      '      });\n'+
+      '    }).catch(function(e){\n'+
+      '      results.push("err:"+e.name+":"+e.message.slice(0,40));\n'+
+      '      postMessage(results.join("|"));\n'+
+      '    });\n'+
+      '  }else{\n'+
+      '    results.push("no_caches");\n'+
+      '    postMessage(results.join("|"));\n'+
+      '  }\n'+
+      '}catch(e){\n'+
+      '  postMessage("worker_err:"+e.name+":"+e.message.slice(0,60));\n'+
+      '}\n';
+
+    var blob=new Blob([workerCode],{type:'application/javascript'});
+    var url=URL.createObjectURL(blob);
+
+    var w=new Worker(url);
+    w.onmessage=function(e){
+      B('H1','worker_cache|'+e.data);
+      w.terminate();
+      URL.revokeObjectURL(url);
+
+      // Test 2: Main thread and worker share the same Cache
+      testSharedCache();
+    };
+    w.onerror=function(e){
+      B('H1','worker_err:'+e.message);
+      w.terminate();
+      URL.revokeObjectURL(url);
+      testSharedCache();
+    };
+
+    function testSharedCache(){
+      try{
+        caches.open('shared-test').then(function(cache){
+          var req=new Request('https://test.local/shared-key');
+          var resp=new Response('main-thread-wrote-this');
+          return cache.put(req, resp);
+        }).then(function(){
+          // Now read it from a worker
+          var code2=
+            'caches.open("shared-test").then(function(c){\n'+
+            '  return c.match(new Request("https://test.local/shared-key"));\n'+
+            '}).then(function(r){\n'+
+            '  if(!r){postMessage("no_match");return;}\n'+
+            '  return r.text();\n'+
+            '}).then(function(t){\n'+
+            '  postMessage("shared="+t);\n'+
+            '}).catch(function(e){\n'+
+            '  postMessage("err:"+e.name);\n'+
+            '});\n';
+          var b2=new Blob([code2],{type:'application/javascript'});
+          var u2=URL.createObjectURL(b2);
+          var w2=new Worker(u2);
+          w2.onmessage=function(e2){
+            B('H2','cross_thread|'+e2.data);
+            w2.terminate();
+            URL.revokeObjectURL(u2);
+            // Cleanup
+            caches.delete('shared-test');
+            caches.delete('worker-test');
+          };
+          w2.onerror=function(e2){
+            B('H2','cross_err:'+e2.message);
+            w2.terminate();
+            URL.revokeObjectURL(u2);
+          };
+        }).catch(function(e){
+          B('H2','cache_err:'+e.name);
+        });
+      }catch(e){
+        B('H2','outer_err:'+e.name);
+      }
+    }
+
+  }catch(e){B('H0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1270 COMPLETE ===');
+}, 8000);
+</script>
+
+</body>
+</html>

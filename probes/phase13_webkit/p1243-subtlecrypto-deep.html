@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1243</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1243-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+
+// Synchronous wrapper for async SubtleCrypto ops
+// Uses sync XHR sleep trick to wait for promises
+function syncWait(promise, timeout){
+  var done=false, result=null, error=null;
+  promise.then(function(r){result=r;done=true;},function(e){error=e;done=true;});
+  var start=Date.now();
+  while(!done && (Date.now()-start)<(timeout||5000)){
+    // Spin — microtasks resolve between script blocks, but we need sync
+    // This won't work for real async, we need a different approach
+  }
+  if(!done)return{ok:false,err:'TIMEOUT'};
+  if(error)return{ok:false,err:String(error.message||error).slice(0,80)};
+  return{ok:true,val:result};
+}
+
+log('=== P1243: SUBTLECRYPTO DEEP DIVE ===');
+log('Time: '+new Date().toISOString());
+B('START','P1243');
+</script>
+
+<!-- A: SubtleCrypto API inventory + key generation -->
+<script>
+log('\n--- A: SubtleCrypto inventory ---');
+var aR=[];
+
+// A1: List what's on crypto.subtle
+try{
+  var methods=[];
+  for(var k in crypto.subtle){
+    if(typeof crypto.subtle[k]==='function')methods.push(k);
+  }
+  aR.push('A1:methods='+methods.join(','));
+}catch(e){aR.push('A1:ERR:'+e.message.slice(0,60));}
+
+// A2: Check prototype chain
+try{
+  var proto=Object.getPrototypeOf(crypto.subtle);
+  var protoMethods=Object.getOwnPropertyNames(proto).filter(function(n){
+    return typeof crypto.subtle[n]==='function';
+  });
+  aR.push('A2:proto='+proto.constructor.name+'|methods='+protoMethods.join(','));
+}catch(e){aR.push('A2:ERR:'+e.message.slice(0,60));}
+
+// A3: Generate AES-GCM key (async — use Promise + beacon in then)
+try{
+  var p=crypto.subtle.generateKey(
+    {name:'AES-GCM',length:256},
+    true, // extractable
+    ['encrypt','decrypt']
+  );
+  // Can't sync wait, so chain to beacon
+  p.then(function(key){
+    var info='type='+key.type+'|algo='+key.algorithm.name+'|len='+key.algorithm.length+
+      '|extract='+key.extractable+'|usages='+key.usages.join('+');
+    B('A3',info);
+    log('A3: '+info);
+
+    // A4: Export the raw key
+    return crypto.subtle.exportKey('raw',key);
+  }).then(function(raw){
+    var bytes=new Uint8Array(raw);
+    var nonzero=0;for(var i=0;i<bytes.length;i++)if(bytes[i])nonzero++;
+    var info='raw_len='+bytes.length+'|nonzero='+nonzero;
+    B('A4',info);
+    log('A4: export raw: '+info);
+
+    // A5: Export as JWK
+    return crypto.subtle.exportKey('jwk',arguments[0]||null);
+  }).catch(function(e){
+    B('A4-5','ERR:'+e.message);
+    log('A4-5 err: '+e.message);
+  });
+}catch(e){aR.push('A3:ERR:'+e.message.slice(0,60));}
+
+B('A',aR.join('||'));
+log('A: '+aR.join(' | '));
+</script>
+
+<!-- B: Key import with wrong/mismatched data -->
+<script>
+log('\n--- B: Key import confusion ---');
+var bR=[];
+
+// B1: Import raw AES key with wrong length (should be 16/24/32 bytes)
+var wrongSizes=[0,1,7,15,17,31,33,48,64,128,255,256];
+var b1Results=[];
+var b1Chain=Promise.resolve();
+
+for(var i=0;i<wrongSizes.length;i++){
+  (function(sz){
+    b1Chain=b1Chain.then(function(){
+      return crypto.subtle.importKey(
+        'raw',
+        new Uint8Array(sz),
+        {name:'AES-GCM'},
+        false,
+        ['encrypt']
+      ).then(function(key){
+        b1Results.push(sz+':OK('+key.algorithm.length+')');
+      }).catch(function(e){
+        b1Results.push(sz+':'+e.message.slice(0,20));
+      });
+    });
+  })(wrongSizes[i]);
+}
+
+b1Chain.then(function(){
+  B('B1','sizes='+b1Results.join(','));
+  log('B1: '+b1Results.join(', '));
+});
+
+// B2: Import HMAC key with various sizes (HMAC accepts any size)
+var hmacChain=Promise.resolve();
+var b2Results=[];
+var hmacSizes=[0,1,8,32,64,128,256,1024];
+
+for(var i=0;i<hmacSizes.length;i++){
+  (function(sz){
+    hmacChain=hmacChain.then(function(){
+      return crypto.subtle.importKey(
+        'raw',
+        new Uint8Array(sz),
+        {name:'HMAC',hash:'SHA-256'},
+        true,
+        ['sign','verify']
+      ).then(function(key){
+        b2Results.push(sz+':OK');
+      }).catch(function(e){
+        b2Results.push(sz+':'+e.message.slice(0,15));
+      });
+    });
+  })(hmacSizes[i]);
+}
+
+hmacChain.then(function(){
+  B('B2','hmac='+b2Results.join(','));
+  log('B2: '+b2Results.join(', '));
+});
+
+// B3: Import key then use with WRONG algorithm
+var b3Chain=crypto.subtle.importKey(
+  'raw',
+  crypto.getRandomValues(new Uint8Array(32)),
+  {name:'AES-GCM'},
+  false,
+  ['encrypt','decrypt']
+).then(function(aesKey){
+  // Try to use AES key for HMAC sign
+  return crypto.subtle.sign('HMAC',aesKey,new Uint8Array([1,2,3])).then(function(sig){
+    B('B3','CROSS_ALGO_SIGN_OK:len='+new Uint8Array(sig).length);
+  }).catch(function(e){
+    B('B3','cross_sign:'+e.message.slice(0,60));
+  });
+}).catch(function(e){
+  B('B3','import_err:'+e.message.slice(0,40));
+});
+
+bR.push('B:async_queued');
+B('B',bR.join('||'));
+</script>
+
+<!-- C: Encrypt/decrypt with edge cases -->
+<script>
+log('\n--- C: Encrypt/decrypt edges ---');
+
+// C1: AES-GCM encrypt then decrypt round-trip
+var c1=crypto.subtle.generateKey(
+  {name:'AES-GCM',length:128},true,['encrypt','decrypt']
+).then(function(key){
+  var iv=crypto.getRandomValues(new Uint8Array(12));
+  var data=new Uint8Array([72,101,108,108,111]); // "Hello"
+  return crypto.subtle.encrypt({name:'AES-GCM',iv:iv},key,data).then(function(ct){
+    var ctBytes=new Uint8Array(ct);
+    return crypto.subtle.decrypt({name:'AES-GCM',iv:iv},key,ct).then(function(pt){
+      var ptBytes=new Uint8Array(pt);
+      var info='ct_len='+ctBytes.length+'|pt_len='+ptBytes.length+
+        '|pt='+Array.from(ptBytes).join(',');
+      B('C1',info);
+      log('C1: '+info);
+    });
+  });
+}).catch(function(e){B('C1','ERR:'+e.message.slice(0,60));});
+
+// C2: AES-GCM with zero-length plaintext
+var c2=crypto.subtle.generateKey(
+  {name:'AES-GCM',length:128},true,['encrypt','decrypt']
+).then(function(key){
+  var iv=crypto.getRandomValues(new Uint8Array(12));
+  return crypto.subtle.encrypt({name:'AES-GCM',iv:iv},key,new Uint8Array(0)).then(function(ct){
+    B('C2','empty_ct_len='+new Uint8Array(ct).length);
+    log('C2: empty ct len='+new Uint8Array(ct).length);
+    return crypto.subtle.decrypt({name:'AES-GCM',iv:iv},key,ct);
+  }).then(function(pt){
+    B('C2b','empty_pt_len='+new Uint8Array(pt).length);
+  });
+}).catch(function(e){B('C2','ERR:'+e.message.slice(0,60));});
+
+// C3: AES-GCM with wrong IV length
+var c3=crypto.subtle.generateKey(
+  {name:'AES-GCM',length:128},true,['encrypt','decrypt']
+).then(function(key){
+  var results=[];
+  var ivSizes=[0,1,4,8,11,12,13,16,32,64,256];
+  var chain=Promise.resolve();
+  for(var i=0;i<ivSizes.length;i++){
+    (function(sz){
+      chain=chain.then(function(){
+        return crypto.subtle.encrypt(
+          {name:'AES-GCM',iv:new Uint8Array(sz)},
+          key,
+          new Uint8Array([1])
+        ).then(function(){
+          results.push(sz+':ok');
+        }).catch(function(e){
+          results.push(sz+':'+e.message.slice(0,15));
+        });
+      });
+    })(ivSizes[i]);
+  }
+  return chain.then(function(){
+    B('C3','iv_sizes='+results.join(','));
+    log('C3: '+results.join(', '));
+  });
+}).catch(function(e){B('C3','ERR:'+e.message.slice(0,60));});
+
+// C4: AES-GCM with tagLength variants
+var c4=crypto.subtle.generateKey(
+  {name:'AES-GCM',length:128},true,['encrypt','decrypt']
+).then(function(key){
+  var results=[];
+  var tagLens=[0,1,32,64,96,104,112,120,128,256];
+  var iv=crypto.getRandomValues(new Uint8Array(12));
+  var chain=Promise.resolve();
+  for(var i=0;i<tagLens.length;i++){
+    (function(tl){
+      chain=chain.then(function(){
+        return crypto.subtle.encrypt(
+          {name:'AES-GCM',iv:iv,tagLength:tl},
+          key,
+          new Uint8Array([1])
+        ).then(function(ct){
+          results.push(tl+':ct='+new Uint8Array(ct).length);
+        }).catch(function(e){
+          results.push(tl+':'+e.message.slice(0,15));
+        });
+      });
+    })(tagLens[i]);
+  }
+  return chain.then(function(){
+    B('C4','tags='+results.join(','));
+    log('C4: '+results.join(', '));
+  });
+}).catch(function(e){B('C4','ERR:'+e.message.slice(0,60));});
+
+// C5: Decrypt with corrupted ciphertext (authentication should fail)
+var c5=crypto.subtle.generateKey(
+  {name:'AES-GCM',length:128},true,['encrypt','decrypt']
+).then(function(key){
+  var iv=crypto.getRandomValues(new Uint8Array(12));
+  return crypto.subtle.encrypt({name:'AES-GCM',iv:iv},key,new Uint8Array([1,2,3])).then(function(ct){
+    var corrupted=new Uint8Array(ct);
+    corrupted[0]^=0xFF; // Flip bits in ciphertext
+    return crypto.subtle.decrypt({name:'AES-GCM',iv:iv},key,corrupted.buffer).then(function(){
+      B('C5','CORRUPTED_DECRYPT_OK');
+    }).catch(function(e){
+      B('C5','corrupted:'+e.message.slice(0,40));
+    });
+  });
+}).catch(function(e){B('C5','ERR:'+e.message.slice(0,60));});
+</script>
+
+<!-- D: RSA key operations -->
+<script>
+log('\n--- D: RSA operations ---');
+
+// D1: RSA-OAEP key generation
+var d1=crypto.subtle.generateKey(
+  {name:'RSA-OAEP',modulusLength:2048,publicExponent:new Uint8Array([1,0,1]),hash:'SHA-256'},
+  true,
+  ['encrypt','decrypt']
+).then(function(keyPair){
+  var pub=keyPair.publicKey;
+  var priv=keyPair.privateKey;
+  var info='pub_type='+pub.type+'|pub_algo='+pub.algorithm.name+
+    '|mod='+pub.algorithm.modulusLength+
+    '|priv_type='+priv.type+'|priv_extract='+priv.extractable;
+  B('D1',info);
+  log('D1: '+info);
+
+  // D2: RSA encrypt/decrypt
+  var data=new Uint8Array([1,2,3,4,5]);
+  return crypto.subtle.encrypt({name:'RSA-OAEP'},pub,data).then(function(ct){
+    return crypto.subtle.decrypt({name:'RSA-OAEP'},priv,ct).then(function(pt){
+      var ptArr=new Uint8Array(pt);
+      B('D2','ct_len='+new Uint8Array(ct).length+'|pt='+Array.from(ptArr).join(','));
+      log('D2: ct_len='+new Uint8Array(ct).length+' pt='+Array.from(ptArr));
+    });
+  });
+}).catch(function(e){B('D1-2','ERR:'+e.message.slice(0,60));log('D1-2 err: '+e.message);});
+
+// D3: ECDSA key generation + sign
+var d3=crypto.subtle.generateKey(
+  {name:'ECDSA',namedCurve:'P-256'},
+  true,
+  ['sign','verify']
+).then(function(keyPair){
+  var info='curve='+keyPair.privateKey.algorithm.namedCurve;
+  B('D3',info);
+  log('D3: '+info);
+
+  var data=new Uint8Array([1,2,3]);
+  return crypto.subtle.sign({name:'ECDSA',hash:'SHA-256'},keyPair.privateKey,data).then(function(sig){
+    return crypto.subtle.verify({name:'ECDSA',hash:'SHA-256'},keyPair.publicKey,sig,data).then(function(valid){
+      B('D3b','sig_len='+new Uint8Array(sig).length+'|valid='+valid);
+      log('D3b: sig valid='+valid);
+    });
+  });
+}).catch(function(e){B('D3','ERR:'+e.message.slice(0,60));log('D3 err: '+e.message);});
+
+// D4: ECDH key agreement
+var d4=Promise.all([
+  crypto.subtle.generateKey({name:'ECDH',namedCurve:'P-256'},true,['deriveBits']),
+  crypto.subtle.generateKey({name:'ECDH',namedCurve:'P-256'},true,['deriveBits'])
+]).then(function(pairs){
+  return crypto.subtle.deriveBits(
+    {name:'ECDH',public:pairs[1].publicKey},
+    pairs[0].privateKey,
+    256
+  ).then(function(bits){
+    var bytes=new Uint8Array(bits);
+    var nonzero=0;for(var i=0;i<bytes.length;i++)if(bytes[i])nonzero++;
+    B('D4','deriveBits_len='+bytes.length+'|nonzero='+nonzero);
+    log('D4: ECDH deriveBits='+bytes.length+' nonzero='+nonzero);
+  });
+}).catch(function(e){B('D4','ERR:'+e.message.slice(0,60));log('D4 err: '+e.message);});
+
+// D5: PBKDF2 key derivation
+var d5=(function(){
+  var enc=new TextEncoder();
+  return crypto.subtle.importKey(
+    'raw',enc.encode('password'),{name:'PBKDF2'},false,['deriveBits','deriveKey']
+  ).then(function(baseKey){
+    return crypto.subtle.deriveBits(
+      {name:'PBKDF2',salt:enc.encode('salt'),iterations:100000,hash:'SHA-256'},
+      baseKey,
+      256
+    ).then(function(bits){
+      var bytes=new Uint8Array(bits);
+      B('D5','pbkdf2_len='+bytes.length+'|first3='+bytes[0]+','+bytes[1]+','+bytes[2]);
+      log('D5: PBKDF2 '+bytes.length+' bytes');
+    });
+  });
+})().catch(function(e){B('D5','ERR:'+e.message.slice(0,60));});
+</script>
+
+<!-- E: CryptoKey as structured clone target -->
+<script>
+log('\n--- E: CryptoKey cloning ---');
+
+// E1: Clone a CryptoKey via structuredClone
+var e1=crypto.subtle.generateKey(
+  {name:'AES-GCM',length:256},true,['encrypt','decrypt']
+).then(function(key){
+  try{
+    var clone=structuredClone(key);
+    var same=clone===key;
+    var info='cloned=yes|same='+ same+'|clone_type='+clone.type+
+      '|clone_algo='+clone.algorithm.name+'|clone_extract='+clone.extractable;
+    B('E1',info);
+    log('E1: '+info);
+  }catch(e){
+    B('E1','clone_err:'+e.message.slice(0,60));
+    log('E1 err: '+e.message);
+  }
+}).catch(function(e){B('E1','gen_err:'+e.message.slice(0,60));});
+
+// E2: Clone non-extractable key
+var e2=crypto.subtle.generateKey(
+  {name:'AES-GCM',length:256},false,['encrypt','decrypt']
+).then(function(key){
+  try{
+    var clone=structuredClone(key);
+    // Try to export the clone (original is non-extractable)
+    return crypto.subtle.exportKey('raw',clone).then(function(raw){
+      B('E2','NON_EXTRACT_EXPORTED:len='+new Uint8Array(raw).length);
+    }).catch(function(e){
+      B('E2','clone_ok|export:'+e.message.slice(0,40));
+    });
+  }catch(e){
+    B('E2','clone_err:'+e.message.slice(0,60));
+  }
+}).catch(function(e){B('E2','gen_err:'+e.message.slice(0,60));});
+
+// E3: CryptoKey in postMessage (MessageChannel)
+var e3=crypto.subtle.generateKey(
+  {name:'AES-GCM',length:128},true,['encrypt','decrypt']
+).then(function(key){
+  try{
+    var mc=new MessageChannel();
+    var received=false;
+    mc.port2.onmessage=function(ev){
+      received=true;
+      var rk=ev.data;
+      var info='received='+received+'|type='+rk.type+'|algo='+rk.algorithm.name;
+      B('E3',info);
+      log('E3: '+info);
+      // Try to use received key
+      crypto.subtle.encrypt(
+        {name:'AES-GCM',iv:crypto.getRandomValues(new Uint8Array(12))},
+        rk,
+        new Uint8Array([1,2,3])
+      ).then(function(ct){
+        B('E3b','use_transferred_key:ct_len='+new Uint8Array(ct).length);
+      }).catch(function(e){
+        B('E3b','use_err:'+e.message.slice(0,40));
+      });
+    };
+    mc.port1.postMessage(key);
+  }catch(e){
+    B('E3','post_err:'+e.message.slice(0,60));
+  }
+}).catch(function(e){B('E3','gen_err:'+e.message.slice(0,60));});
+</script>
+
+<!-- F: Algorithm confusion attacks -->
+<script>
+log('\n--- F: Algorithm confusion ---');
+
+// F1: Import raw key bytes, use as different algorithm
+// Import 32 bytes as AES-CBC, try to use as AES-GCM
+var f1=crypto.subtle.importKey(
+  'raw',crypto.getRandomValues(new Uint8Array(32)),
+  {name:'AES-CBC'},false,['encrypt']
+).then(function(cbcKey){
+  // Try encrypt with AES-GCM params on AES-CBC key
+  return crypto.subtle.encrypt(
+    {name:'AES-GCM',iv:new Uint8Array(12)},
+    cbcKey,
+    new Uint8Array([1,2,3])
+  ).then(function(){
+    B('F1','CBC_AS_GCM_OK');
+  }).catch(function(e){
+    B('F1','cbc_as_gcm:'+e.message.slice(0,50));
+  });
+}).catch(function(e){B('F1','ERR:'+e.message.slice(0,60));});
+
+// F2: Import same bytes as multiple algorithms
+var keyBytes=crypto.getRandomValues(new Uint8Array(32));
+var f2=Promise.all([
+  crypto.subtle.importKey('raw',keyBytes.slice(),{name:'AES-GCM'},true,['encrypt']),
+  crypto.subtle.importKey('raw',keyBytes.slice(),{name:'AES-CBC'},true,['encrypt']),
+  crypto.subtle.importKey('raw',keyBytes.slice(),{name:'AES-CTR'},true,['encrypt']),
+  crypto.subtle.importKey('raw',keyBytes.slice(),{name:'HMAC',hash:'SHA-256'},true,['sign']),
+]).then(function(keys){
+  var algos=keys.map(function(k){return k.algorithm.name;});
+  B('F2','multi_import='+algos.join(','));
+  log('F2: '+algos.join(', '));
+
+  // Try cross-use: use AES-GCM key for HMAC
+  return crypto.subtle.sign('HMAC',keys[0],new Uint8Array([1])).then(function(){
+    B('F2b','GCM_FOR_HMAC_OK');
+  }).catch(function(e){
+    B('F2b','gcm_hmac:'+e.message.slice(0,40));
+  });
+}).catch(function(e){B('F2','ERR:'+e.message.slice(0,60));});
+
+// F3: Export key then re-import as different algorithm
+var f3=crypto.subtle.generateKey(
+  {name:'AES-GCM',length:256},true,['encrypt','decrypt']
+).then(function(key){
+  return crypto.subtle.exportKey('raw',key).then(function(raw){
+    // Re-import as HMAC
+    return crypto.subtle.importKey(
+      'raw',raw,{name:'HMAC',hash:'SHA-256'},true,['sign','verify']
+    ).then(function(hmacKey){
+      // Sign with it
+      return crypto.subtle.sign('HMAC',hmacKey,new Uint8Array([1,2,3])).then(function(sig){
+        B('F3','re_import_ok|sig_len='+new Uint8Array(sig).length);
+        log('F3: re-import AES→HMAC, sig='+new Uint8Array(sig).length);
+      });
+    });
+  });
+}).catch(function(e){B('F3','ERR:'+e.message.slice(0,60));});
+
+// F4: Import JWK with mismatched algorithm field
+var f4=(function(){
+  var jwk={
+    kty:'oct',
+    k:'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', // 32 bytes base64url
+    alg:'A256GCM',
+    ext:true,
+    key_ops:['encrypt']
+  };
+  // Import with algorithm that doesn't match JWK 'alg'
+  return crypto.subtle.importKey(
+    'jwk',jwk,{name:'AES-CBC'},true,['encrypt']
+  ).then(function(key){
+    B('F4','JWK_MISMATCH_OK:algo='+key.algorithm.name);
+  }).catch(function(e){
+    B('F4','jwk_mismatch:'+e.message.slice(0,50));
+  });
+})().catch(function(e){B('F4','ERR:'+e.message.slice(0,60));});
+</script>
+
+<!-- G: Large/edge-case crypto operations -->
+<script>
+log('\n--- G: Large crypto operations ---');
+
+// G1: Encrypt very large buffer
+var g1=crypto.subtle.generateKey(
+  {name:'AES-GCM',length:128},false,['encrypt','decrypt']
+).then(function(key){
+  var iv=crypto.getRandomValues(new Uint8Array(12));
+  var big=new Uint8Array(1024*1024); // 1MB
+  var t0=performance.now();
+  return crypto.subtle.encrypt({name:'AES-GCM',iv:iv},key,big).then(function(ct){
+    var t1=performance.now();
+    B('G1','1MB_enc_ms='+(t1-t0).toFixed(1)+'|ct_len='+new Uint8Array(ct).length);
+    log('G1: 1MB encrypt in '+(t1-t0).toFixed(1)+'ms');
+
+    // Decrypt it back
+    return crypto.subtle.decrypt({name:'AES-GCM',iv:iv},key,ct).then(function(pt){
+      var ptArr=new Uint8Array(pt);
+      var allZero=true;
+      for(var i=0;i<100;i++)if(ptArr[i]!==0){allZero=false;break;}
+      B('G1b','dec_len='+ptArr.length+'|allzero='+allZero);
+    });
+  });
+}).catch(function(e){B('G1','ERR:'+e.message.slice(0,60));});
+
+// G2: SHA-256 digest
+var g2=crypto.subtle.digest('SHA-256',new Uint8Array([72,101,108,108,111])).then(function(hash){
+  var bytes=new Uint8Array(hash);
+  var hex='';for(var i=0;i<bytes.length;i++)hex+=('0'+bytes[i].toString(16)).slice(-2);
+  B('G2','sha256='+hex);
+  log('G2: SHA-256='+hex.slice(0,16)+'...');
+}).catch(function(e){B('G2','ERR:'+e.message.slice(0,60));});
+
+// G3: SHA-256 with empty input
+var g3=crypto.subtle.digest('SHA-256',new Uint8Array(0)).then(function(hash){
+  var bytes=new Uint8Array(hash);
+  var hex='';for(var i=0;i<bytes.length;i++)hex+=('0'+bytes[i].toString(16)).slice(-2);
+  B('G3','sha256_empty='+hex.slice(0,16));
+}).catch(function(e){B('G3','ERR:'+e.message.slice(0,60));});
+
+// G4: Available hash algorithms
+var algos=['SHA-1','SHA-256','SHA-384','SHA-512','MD5'];
+var g4Chain=Promise.resolve();
+var g4Results=[];
+for(var i=0;i<algos.length;i++){
+  (function(algo){
+    g4Chain=g4Chain.then(function(){
+      return crypto.subtle.digest(algo,new Uint8Array([1])).then(function(h){
+        g4Results.push(algo+':'+new Uint8Array(h).length);
+      }).catch(function(e){
+        g4Results.push(algo+':ERR');
+      });
+    });
+  })(algos[i]);
+}
+g4Chain.then(function(){
+  B('G4','algos='+g4Results.join(','));
+  log('G4: '+g4Results.join(', '));
+});
+</script>
+
+<!-- H: Performance timing (missed from P1242) + wrapKey -->
+<script>
+log('\n--- H: Performance timing + wrapKey ---');
+
+// H1: performance.now precision
+try{
+  var samples=[];
+  for(var i=0;i<20;i++)samples.push(performance.now());
+  var diffs=[];
+  for(var i=1;i<samples.length;i++){
+    var d=samples[i]-samples[i-1];
+    if(d>0)diffs.push(d.toFixed(4));
+  }
+  B('H1','first='+samples[0].toFixed(4)+'|diffs='+diffs.slice(0,8).join(','));
+  log('H1: perf.now first='+samples[0].toFixed(4));
+}catch(e){B('H1','ERR:'+e.message.slice(0,60));}
+
+// H2: performance.getEntries
+try{
+  var entries=performance.getEntries();
+  var types={};
+  for(var i=0;i<entries.length;i++){
+    var t=entries[i].entryType;types[t]=(types[t]||0)+1;
+  }
+  var summary=[];for(var k in types)summary.push(k+':'+types[k]);
+  B('H2','total='+entries.length+'|'+summary.join(','));
+}catch(e){B('H2','ERR:'+e.message.slice(0,60));}
+
+// H3: performance.timing
+try{
+  var t=performance.timing;
+  if(t){
+    B('H3','navStart='+t.navigationStart+'|domLoad='+t.domContentLoadedEventEnd+
+      '|load='+t.loadEventEnd);
+  }else{B('H3','no_timing');}
+}catch(e){B('H3','ERR:'+e.message.slice(0,60));}
+
+// H4: wrapKey/unwrapKey
+var h4=Promise.all([
+  crypto.subtle.generateKey({name:'AES-GCM',length:256},true,['encrypt','decrypt']),
+  crypto.subtle.generateKey({name:'AES-KW',length:256},true,['wrapKey','unwrapKey'])
+]).then(function(keys){
+  var targetKey=keys[0];
+  var wrappingKey=keys[1];
+  return crypto.subtle.wrapKey('raw',targetKey,wrappingKey,'AES-KW').then(function(wrapped){
+    var wBytes=new Uint8Array(wrapped);
+    B('H4','wrapped_len='+wBytes.length);
+    log('H4: wrapKey len='+wBytes.length);
+
+    // Unwrap it back
+    return crypto.subtle.unwrapKey(
+      'raw',wrapped,wrappingKey,'AES-KW',{name:'AES-GCM'},true,['encrypt','decrypt']
+    ).then(function(unwrapped){
+      B('H4b','unwrap_ok|type='+unwrapped.type+'|algo='+unwrapped.algorithm.name);
+    });
+  });
+}).catch(function(e){B('H4','ERR:'+e.message.slice(0,60));});
+</script>
+
+<!-- FINAL: Wait for all async operations -->
+<script>
+// Give async ops 8 seconds to complete, then send DONE
+setTimeout(function(){
+  log('\n=== P1243 COMPLETE ===');
+  B('DONE','all');
+}, 8000);
+</script>
+
+</body>
+</html>

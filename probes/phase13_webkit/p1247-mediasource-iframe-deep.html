@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1247</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+<video id="vid" style="width:1px;height:1px;position:absolute;left:-9999px"></video>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1247-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1247: MEDIASOURCE + IFRAME DEEP ===');
+log('Time: '+new Date().toISOString());
+B('START','P1247');
+</script>
+
+<!-- A: MediaSource deep test -->
+<script>
+log('\n--- A: MediaSource deep ---');
+var aR=[];
+
+// A1: MediaSource construction + properties
+try{
+  var ms=new MediaSource();
+  aR.push('A1:created|readyState='+ms.readyState+'|duration='+ms.duration);
+  aR.push('A1:isTypeSupported='+(typeof MediaSource.isTypeSupported));
+  aR.push('A1:activeSourceBuffers='+(ms.activeSourceBuffers?ms.activeSourceBuffers.length:'none'));
+  aR.push('A1:sourceBuffers='+(ms.sourceBuffers?ms.sourceBuffers.length:'none'));
+}catch(e){aR.push('A1:ERR:'+e.message.slice(0,80));}
+
+// A2: isTypeSupported for various codecs
+try{
+  var types=[
+    'video/mp4; codecs="avc1.42E01E"',        // H.264 Baseline
+    'video/mp4; codecs="avc1.4D401E"',        // H.264 Main
+    'video/mp4; codecs="avc1.64001E"',        // H.264 High
+    'video/mp4; codecs="hev1.1.6.L93.B0"',   // HEVC/H.265
+    'video/mp4; codecs="hvc1.1.6.L93.B0"',   // HEVC alt
+    'video/mp4; codecs="av01.0.01M.08"',      // AV1
+    'video/mp4; codecs="vp09.00.10.08"',      // VP9 in MP4
+    'video/webm; codecs="vp8"',               // VP8
+    'video/webm; codecs="vp9"',               // VP9
+    'video/webm; codecs="av01.0.01M.08"',     // AV1 in WebM
+    'audio/mp4; codecs="mp4a.40.2"',          // AAC-LC
+    'audio/mp4; codecs="mp4a.40.5"',          // HE-AAC
+    'audio/mp4; codecs="ac-3"',               // AC-3
+    'audio/mp4; codecs="ec-3"',               // E-AC-3
+    'audio/mp4; codecs="opus"',               // Opus in MP4
+    'audio/mp4; codecs="flac"',               // FLAC in MP4
+    'audio/webm; codecs="opus"',              // Opus in WebM
+    'audio/webm; codecs="vorbis"',            // Vorbis
+  ];
+  var sup=[];
+  for(var i=0;i<types.length;i++){
+    var t=types[i];
+    var short=t.split('"')[1]||t.split(';')[0];
+    sup.push(short+':'+(MediaSource.isTypeSupported(t)?'Y':'N'));
+  }
+  aR.push('A2:'+sup.join(','));
+}catch(e){aR.push('A2:ERR:'+e.message.slice(0,80));}
+
+// A3: Attach MediaSource to video via object URL
+try{
+  var ms3=new MediaSource();
+  var vid=document.getElementById('vid');
+  var objUrl=URL.createObjectURL(ms3);
+  vid.src=objUrl;
+  aR.push('A3:attached|url='+objUrl.slice(0,30));
+
+  ms3.addEventListener('sourceopen',function(){
+    B('A3','sourceopen|readyState='+ms3.readyState+'|duration='+ms3.duration);
+
+    // A4: Add SourceBuffer
+    try{
+      // Try H.264 first
+      var sb;
+      var codec='video/mp4; codecs="avc1.42E01E"';
+      if(MediaSource.isTypeSupported(codec)){
+        sb=ms3.addSourceBuffer(codec);
+        B('A4','sb_created|mode='+sb.mode+'|updating='+sb.updating+'|buffered='+sb.buffered.length);
+
+        // A5: appendBuffer with minimal ftyp+moov (crafted MP4 init segment)
+        try{
+          var initSeg=buildMinimalMP4Init();
+          sb.appendBuffer(initSeg);
+          sb.addEventListener('updateend',function onEnd(){
+            sb.removeEventListener('updateend',onEnd);
+            B('A5','append_ok|buffered='+sb.buffered.length+'|duration='+ms3.duration);
+
+            // A6: Try appending garbage data
+            try{
+              var garbage=new Uint8Array(256);
+              for(var i=0;i<256;i++)garbage[i]=i;
+              sb.appendBuffer(garbage.buffer);
+              sb.addEventListener('updateend',function onEnd2(){
+                sb.removeEventListener('updateend',onEnd2);
+                B('A6','garbage_append_ok|buffered='+sb.buffered.length);
+              });
+              sb.addEventListener('error',function onErr(){
+                sb.removeEventListener('error',onErr);
+                B('A6','garbage_append_err|buffered='+sb.buffered.length);
+              });
+            }catch(e){B('A6','garbage_err:'+e.message.slice(0,60));}
+
+          });
+          sb.addEventListener('error',function onInitErr(){
+            sb.removeEventListener('error',onInitErr);
+            B('A5','init_append_err|buffered='+sb.buffered.length);
+          });
+        }catch(e){B('A5','append_throw:'+e.message.slice(0,60));}
+      }else{
+        // Try webm
+        codec='video/webm; codecs="vp8"';
+        if(MediaSource.isTypeSupported(codec)){
+          sb=ms3.addSourceBuffer(codec);
+          B('A4','sb_webm|mode='+sb.mode);
+        }else{
+          B('A4','no_supported_codec');
+        }
+      }
+    }catch(e){B('A4','sb_err:'+e.message.slice(0,60));}
+  });
+
+  ms3.addEventListener('sourceclose',function(){
+    B('A3b','sourceclose');
+  });
+}catch(e){aR.push('A3:ERR:'+e.message.slice(0,80));}
+
+// Minimal MP4 init segment builder (ftyp + moov with minimal track)
+function buildMinimalMP4Init(){
+  // This builds a minimal valid MP4 init segment:
+  // ftyp box + moov box with mvhd + trak (tkhd + mdia(mdhd + hdlr + minf(vmhd + dinf + stbl)))
+  var buf=new ArrayBuffer(512);
+  var d=new DataView(buf);
+  var pos=0;
+
+  function w32(v){d.setUint32(pos,v);pos+=4;}
+  function w16(v){d.setUint16(pos,v);pos+=2;}
+  function w8(v){d.setUint8(pos,v);pos+=1;}
+  function wstr(s){for(var i=0;i<s.length;i++){d.setUint8(pos,s.charCodeAt(i));pos++;}}
+  function box(type,contentFn){
+    var sizePos=pos;
+    w32(0); // placeholder size
+    wstr(type);
+    contentFn();
+    var size=pos-sizePos;
+    d.setUint32(sizePos,size);
+  }
+
+  // ftyp
+  box('ftyp',function(){
+    wstr('isom'); // major brand
+    w32(0x200);   // minor version
+    wstr('isom'); // compatible brand
+    wstr('iso2');
+    wstr('avc1');
+    wstr('mp41');
+  });
+
+  // moov
+  box('moov',function(){
+    // mvhd (version 0, 108 bytes total)
+    box('mvhd',function(){
+      w32(0); // version + flags
+      w32(0); // creation time
+      w32(0); // modification time
+      w32(1000); // timescale
+      w32(0);    // duration
+      w32(0x00010000); // rate 1.0
+      w16(0x0100);     // volume 1.0
+      // 10 bytes reserved
+      for(var i=0;i<10;i++)w8(0);
+      // matrix (36 bytes) - identity
+      w32(0x00010000);w32(0);w32(0);
+      w32(0);w32(0x00010000);w32(0);
+      w32(0);w32(0);w32(0x40000000);
+      // pre-defined (24 bytes)
+      for(var i=0;i<24;i++)w8(0);
+      w32(2); // next_track_ID
+    });
+
+    // trak
+    box('trak',function(){
+      // tkhd
+      box('tkhd',function(){
+        w32(0x00000003); // version 0, flags=3 (enabled+in_movie)
+        w32(0); w32(0);  // creation, modification
+        w32(1);          // track ID
+        w32(0);          // reserved
+        w32(0);          // duration
+        w32(0);w32(0);   // reserved
+        w16(0);          // layer
+        w16(0);          // alternate group
+        w16(0);          // volume (0 for video)
+        w16(0);          // reserved
+        // matrix (36 bytes)
+        w32(0x00010000);w32(0);w32(0);
+        w32(0);w32(0x00010000);w32(0);
+        w32(0);w32(0);w32(0x40000000);
+        w32(320<<16);    // width 320
+        w32(240<<16);    // height 240
+      });
+
+      // mdia
+      box('mdia',function(){
+        // mdhd
+        box('mdhd',function(){
+          w32(0); // version+flags
+          w32(0); w32(0); // times
+          w32(90000); // timescale
+          w32(0);     // duration
+          w16(0x55C4); // language 'und'
+          w16(0);      // pre-defined
+        });
+
+        // hdlr
+        box('hdlr',function(){
+          w32(0); // version+flags
+          w32(0); // pre-defined
+          wstr('vide'); // handler type
+          w32(0);w32(0);w32(0); // reserved
+          wstr('VideoHandler');
+          w8(0); // null terminator
+        });
+
+        // minf
+        box('minf',function(){
+          // vmhd
+          box('vmhd',function(){
+            w32(1); // version 0, flags=1
+            w16(0); // graphicsmode
+            w16(0);w16(0);w16(0); // opcolor
+          });
+
+          // dinf
+          box('dinf',function(){
+            box('dref',function(){
+              w32(0); // version+flags
+              w32(1); // entry count
+              box('url ',function(){
+                w32(1); // flags=1 (self-contained)
+              });
+            });
+          });
+
+          // stbl
+          box('stbl',function(){
+            // stsd
+            box('stsd',function(){
+              w32(0); // version+flags
+              w32(1); // entry count
+              // avc1 entry - minimal
+              box('avc1',function(){
+                // 6 bytes reserved
+                for(var i=0;i<6;i++)w8(0);
+                w16(1);  // data ref index
+                // 16 bytes pre-defined+reserved
+                for(var i=0;i<16;i++)w8(0);
+                w16(320); // width
+                w16(240); // height
+                w32(0x00480000); // horiz res 72dpi
+                w32(0x00480000); // vert res
+                w32(0);          // reserved
+                w16(1);          // frame count
+                // 32 bytes compressor name
+                for(var i=0;i<32;i++)w8(0);
+                w16(0x0018); // depth
+                w16(0xFFFF); // pre-defined
+
+                // avcC (minimal)
+                box('avcC',function(){
+                  w8(1);    // config version
+                  w8(0x42); // profile (Baseline)
+                  w8(0xE0); // compat
+                  w8(0x1E); // level 3.0
+                  w8(0xFF); // lengthSizeMinusOne=3
+                  w8(0xE1); // numSPS=1
+                  // Minimal SPS (7 bytes)
+                  w16(7);
+                  w8(0x67);w8(0x42);w8(0xE0);w8(0x1E);
+                  w8(0xDA);w8(0x02);w8(0xD0);
+                  w8(0x01); // numPPS=1
+                  // Minimal PPS (4 bytes)
+                  w16(4);
+                  w8(0x68);w8(0xCE);w8(0x38);w8(0x80);
+                });
+              });
+            });
+
+            // stts
+            box('stts',function(){w32(0);w32(0);});
+            // stsc
+            box('stsc',function(){w32(0);w32(0);});
+            // stsz
+            box('stsz',function(){w32(0);w32(0);w32(0);});
+            // stco
+            box('stco',function(){w32(0);w32(0);});
+          });
+        });
+      });
+    });
+  });
+
+  return buf.slice(0,pos);
+}
+
+B('A',aR.join('||'));
+log('A: '+aR.join(' | '));
+</script>
+
+<!-- B: MediaSource edge cases -->
+<script>
+log('\n--- B: MediaSource edges ---');
+var bR=[];
+
+// B1: Multiple MediaSource objects
+try{
+  var msList=[];
+  for(var i=0;i<5;i++){
+    msList.push(new MediaSource());
+  }
+  bR.push('B1:created_5_instances');
+}catch(e){bR.push('B1:ERR:'+e.message.slice(0,60));}
+
+// B2: MediaSource.endOfStream before open
+try{
+  var ms2=new MediaSource();
+  ms2.endOfStream();
+  bR.push('B2:endOfStream_before_open=ok');
+}catch(e){bR.push('B2:'+e.name+':'+e.message.slice(0,40));}
+
+// B3: addSourceBuffer before open
+try{
+  var ms3=new MediaSource();
+  ms3.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+  bR.push('B3:addSB_before_open=ok');
+}catch(e){bR.push('B3:'+e.name+':'+e.message.slice(0,40));}
+
+// B4: removeSourceBuffer before open
+try{
+  var ms4=new MediaSource();
+  ms4.removeSourceBuffer(null);
+  bR.push('B4:removeSB_null=ok');
+}catch(e){bR.push('B4:'+e.name+':'+e.message.slice(0,40));}
+
+// B5: duration setter before open
+try{
+  var ms5=new MediaSource();
+  ms5.duration=10;
+  bR.push('B5:set_duration=ok');
+}catch(e){bR.push('B5:'+e.name+':'+e.message.slice(0,40));}
+
+// B6: setLiveSeekableRange
+try{
+  var ms6=new MediaSource();
+  if(ms6.setLiveSeekableRange){
+    ms6.setLiveSeekableRange(0,10);
+    bR.push('B6:setLiveSeekable=ok');
+  }else{
+    bR.push('B6:no_setLiveSeekableRange');
+  }
+}catch(e){bR.push('B6:'+e.name+':'+e.message.slice(0,40));}
+
+// B7: clearLiveSeekableRange
+try{
+  var ms7=new MediaSource();
+  if(ms7.clearLiveSeekableRange){
+    ms7.clearLiveSeekableRange();
+    bR.push('B7:clearLiveSeekable=ok');
+  }else{
+    bR.push('B7:no_clearLiveSeekableRange');
+  }
+}catch(e){bR.push('B7:'+e.name+':'+e.message.slice(0,40));}
+
+B('B',bR.join('||'));
+log('B: '+bR.join(' | '));
+</script>
+
+<!-- C: iframe deep test -->
+<script>
+log('\n--- C: iframe deep ---');
+var cR=[];
+
+// C1: blank iframe — can we write JS?
+try{
+  var iframe=document.createElement('iframe');
+  iframe.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(iframe);
+
+  var iDoc=iframe.contentDocument;
+  if(iDoc){
+    iDoc.open();
+    iDoc.write('<html><body><script>window.IFRAME_EXEC=true;<\/script></body></html>');
+    iDoc.close();
+    var exec=iframe.contentWindow.IFRAME_EXEC;
+    cR.push('C1:write_exec='+exec);
+  }else{
+    cR.push('C1:no_contentDocument');
+  }
+}catch(e){cR.push('C1:ERR:'+e.message.slice(0,60));}
+
+// C2: iframe — access parent from child
+try{
+  var iframe2=document.createElement('iframe');
+  iframe2.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(iframe2);
+  var iDoc2=iframe2.contentDocument;
+  iDoc2.open();
+  iDoc2.write('<html><body><script>window.PARENT_REF=(parent===window.parent);<\/script></body></html>');
+  iDoc2.close();
+  cR.push('C2:parent_ref='+iframe2.contentWindow.PARENT_REF);
+  cR.push('C2:same_origin='+(iframe2.contentWindow.parent===window));
+}catch(e){cR.push('C2:ERR:'+e.message.slice(0,60));}
+
+// C3: iframe detach during script execution
+try{
+  var iframe3=document.createElement('iframe');
+  iframe3.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(iframe3);
+  var iDoc3=iframe3.contentDocument;
+  iDoc3.open();
+  iDoc3.write('<html><body><script>window.BEFORE_DETACH=1;<\/script></body></html>');
+  iDoc3.close();
+  var beforeVal=iframe3.contentWindow.BEFORE_DETACH;
+
+  // Now detach the iframe
+  document.body.removeChild(iframe3);
+
+  // Can we still access contentWindow after detach?
+  try{
+    var afterWindow=iframe3.contentWindow;
+    var afterDoc=iframe3.contentDocument;
+    cR.push('C3:after_detach:cw='+(afterWindow?'yes':'no')+'|cd='+(afterDoc?'yes':'no'));
+    if(afterWindow){
+      try{
+        var v=afterWindow.BEFORE_DETACH;
+        cR.push('C3:read_after_detach='+v);
+      }catch(e2){cR.push('C3:read_err:'+e2.message.slice(0,30));}
+    }
+  }catch(e2){cR.push('C3:access_err:'+e2.message.slice(0,30));}
+}catch(e){cR.push('C3:ERR:'+e.message.slice(0,60));}
+
+// C4: Many iframes — resource limits
+try{
+  var count=0;
+  var iframes=[];
+  for(var i=0;i<50;i++){
+    try{
+      var f=document.createElement('iframe');
+      f.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+      document.body.appendChild(f);
+      iframes.push(f);
+      count++;
+    }catch(e){break;}
+  }
+  cR.push('C4:created_'+count+'_iframes');
+  // Cleanup
+  for(var i=0;i<iframes.length;i++){
+    try{document.body.removeChild(iframes[i]);}catch(e){}
+  }
+}catch(e){cR.push('C4:ERR:'+e.message.slice(0,60));}
+
+// C5: iframe with different sandbox combinations
+try{
+  var sandboxes=['','allow-scripts','allow-scripts allow-same-origin',
+    'allow-scripts allow-same-origin allow-forms'];
+  var results=[];
+  for(var i=0;i<sandboxes.length;i++){
+    var f=document.createElement('iframe');
+    f.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+    if(sandboxes[i])f.sandbox=sandboxes[i];
+    document.body.appendChild(f);
+    try{
+      var canAccess=!!(f.contentDocument);
+      results.push('sb'+i+':'+canAccess);
+    }catch(e){
+      results.push('sb'+i+':blocked');
+    }
+    document.body.removeChild(f);
+  }
+  cR.push('C5:'+results.join(','));
+}catch(e){cR.push('C5:ERR:'+e.message.slice(0,60));}
+
+// C6: iframe navigation / document replacement
+try{
+  var iframe6=document.createElement('iframe');
+  iframe6.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(iframe6);
+  var iDoc6=iframe6.contentDocument;
+
+  // Write initial content
+  iDoc6.open();
+  iDoc6.write('<html><body><script>window.GEN=1;<\/script></body></html>');
+  iDoc6.close();
+  var gen1=iframe6.contentWindow.GEN;
+
+  // Replace content
+  iDoc6=iframe6.contentDocument;
+  iDoc6.open();
+  iDoc6.write('<html><body><script>window.GEN=2;<\/script></body></html>');
+  iDoc6.close();
+  var gen2=iframe6.contentWindow.GEN;
+
+  cR.push('C6:gen1='+gen1+'|gen2='+gen2);
+  document.body.removeChild(iframe6);
+}catch(e){cR.push('C6:ERR:'+e.message.slice(0,60));}
+
+B('C',cR.join('||'));
+log('C: '+cR.join(' | '));
+</script>
+
+<!-- D: Cross-iframe GC / lifecycle races -->
+<script>
+log('\n--- D: Cross-iframe lifecycle ---');
+var dR=[];
+
+// D1: Create object in iframe, detach iframe, try to use object
+try{
+  var iframe=document.createElement('iframe');
+  iframe.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(iframe);
+
+  // Create objects in iframe's context
+  var iWin=iframe.contentWindow;
+  var iArr=iWin.Array(1,2,3);
+  var iObj=new iWin.Object();
+  iObj.test='cross_frame';
+  var iFunc=new iWin.Function('return 42');
+
+  // Detach iframe
+  document.body.removeChild(iframe);
+
+  // Try to use objects from detached frame
+  try{
+    var arrLen=iArr.length;
+    var objVal=iObj.test;
+    var funcResult=iFunc();
+    dR.push('D1:arr='+arrLen+'|obj='+objVal+'|func='+funcResult);
+  }catch(e){dR.push('D1:use_after_detach:'+e.message.slice(0,40));}
+}catch(e){dR.push('D1:ERR:'+e.message.slice(0,60));}
+
+// D2: Cross-frame prototype chain
+try{
+  var iframe2=document.createElement('iframe');
+  iframe2.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(iframe2);
+
+  var iWin2=iframe2.contentWindow;
+  // Is iframe Array the same as our Array?
+  var sameArray=(iWin2.Array===Array);
+  var sameObject=(iWin2.Object===Object);
+
+  // instanceof confusion
+  var ourArr=[1,2,3];
+  var theirArr=new iWin2.Array(1,2,3);
+  var ourInstanceofTheir=(ourArr instanceof iWin2.Array);
+  var theirInstanceofOur=(theirArr instanceof Array);
+
+  dR.push('D2:sameArr='+sameArray+'|sameObj='+sameObject);
+  dR.push('D2:crossInstanceof='+ourInstanceofTheir+'|'+theirInstanceofOur);
+
+  document.body.removeChild(iframe2);
+}catch(e){dR.push('D2:ERR:'+e.message.slice(0,60));}
+
+// D3: Store iframe objects in WeakRef, detach iframe, check WeakRef
+try{
+  var iframe3=document.createElement('iframe');
+  iframe3.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(iframe3);
+
+  var iObj3=new iframe3.contentWindow.Object();
+  iObj3.marker='weakref_test';
+  var weakRef=new WeakRef(iObj3);
+  iObj3=null; // Drop strong ref
+
+  // Detach iframe
+  document.body.removeChild(iframe3);
+  iframe3=null;
+
+  // Force GC pressure
+  var pressure=[];
+  for(var i=0;i<10000;i++)pressure.push({x:i,y:new ArrayBuffer(100)});
+  pressure=null;
+
+  var derefed=weakRef.deref();
+  dR.push('D3:weakref_after_detach='+(derefed?'alive:'+derefed.marker:'collected'));
+}catch(e){dR.push('D3:ERR:'+e.message.slice(0,60));}
+
+// D4: FinalizationRegistry with cross-frame objects
+try{
+  var finalized=false;
+  var fr=new FinalizationRegistry(function(held){
+    B('D4','finalized:'+held);
+    finalized=true;
+  });
+
+  var iframe4=document.createElement('iframe');
+  iframe4.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(iframe4);
+
+  var target=new iframe4.contentWindow.Object();
+  fr.register(target,'cross_frame_obj');
+  target=null;
+
+  document.body.removeChild(iframe4);
+  iframe4=null;
+
+  // GC pressure
+  var p2=[];
+  for(var i=0;i<20000;i++)p2.push(new ArrayBuffer(200));
+  p2=null;
+
+  dR.push('D4:registered|finalized_sync='+finalized);
+}catch(e){dR.push('D4:ERR:'+e.message.slice(0,60));}
+
+B('D',dR.join('||'));
+log('D: '+dR.join(' | '));
+</script>
+
+<!-- E: FontFace from URL (serve crafted font) -->
+<script>
+log('\n--- E: FontFace URL + data URI ---');
+var eR=[];
+
+// E1: FontFace from CSS @font-face with data URI (base64 minimal TTF)
+try{
+  // Build a minimal TrueType with bad cmap pointing past buffer
+  var ttf=new ArrayBuffer(128);
+  var v=new DataView(ttf);
+  v.setUint32(0,0x00010000); // sfVersion
+  v.setUint16(4,1);          // numTables=1
+  v.setUint16(6,16);v.setUint16(8,0);v.setUint16(10,16);
+  // Table record: 'cmap' with offset pointing past buffer
+  v.setUint32(12,0x636D6170); // 'cmap'
+  v.setUint32(16,0x12345678); // checksum
+  v.setUint32(20,0x00001000); // offset=4096 (way past 128 bytes!)
+  v.setUint32(24,0x00000100); // length=256
+
+  var bytes=new Uint8Array(ttf);
+  var b64='';
+  for(var i=0;i<bytes.length;i++){
+    b64+=String.fromCharCode(bytes[i]);
+  }
+  b64=btoa(b64);
+
+  var ff=new FontFace('badcmap','url(data:font/ttf;base64,'+b64+')');
+  ff.load().then(function(){
+    B('E1','LOADED_BAD_CMAP');
+  }).catch(function(e){
+    B('E1','bad_cmap:'+ff.status+'|'+e.message.slice(0,50));
+  });
+  eR.push('E1:created|status='+ff.status);
+}catch(e){eR.push('E1:ERR:'+e.message.slice(0,60));}
+
+// E2: FontFace from data URI with huge header values
+try{
+  var ttf2=new ArrayBuffer(256);
+  var v2=new DataView(ttf2);
+  v2.setUint32(0,0x00010000);
+  v2.setUint16(4,0xFFFF);     // numTables=65535 (huge!)
+  v2.setUint16(6,16);v2.setUint16(8,0);v2.setUint16(10,16);
+
+  var bytes2=new Uint8Array(ttf2);
+  var b64_2='';
+  for(var i=0;i<bytes2.length;i++)b64_2+=String.fromCharCode(bytes2[i]);
+  b64_2=btoa(b64_2);
+
+  var ff2=new FontFace('hugeTables','url(data:font/ttf;base64,'+b64_2+')');
+  ff2.load().then(function(){
+    B('E2','LOADED_HUGE_NUMTABLES');
+  }).catch(function(e){
+    B('E2','huge_tables:'+ff2.status+'|'+e.message.slice(0,50));
+  });
+}catch(e){eR.push('E2:ERR:'+e.message.slice(0,60));}
+
+// E3: @font-face via style element with data URI
+try{
+  var style=document.createElement('style');
+  // Use the bad cmap font from E1
+  var ttf3=new ArrayBuffer(64);
+  var v3=new DataView(ttf3);
+  v3.setUint32(0,0x00010000);
+  v3.setUint16(4,1);
+  v3.setUint32(12,0x676C7966); // 'glyf'
+  v3.setUint32(20,0);v3.setUint32(24,0xFFFFFFF0); // huge length
+
+  var bytes3=new Uint8Array(ttf3);
+  var b64_3='';
+  for(var i=0;i<bytes3.length;i++)b64_3+=String.fromCharCode(bytes3[i]);
+  b64_3=btoa(b64_3);
+
+  style.textContent='@font-face{font-family:"evilFont";src:url(data:font/ttf;base64,'+b64_3+');}';
+  document.head.appendChild(style);
+
+  // Create element using the font
+  var span=document.createElement('span');
+  span.style.fontFamily='"evilFont",monospace';
+  span.textContent='ABCDEFG';
+  document.body.appendChild(span);
+
+  // Check if font loaded
+  document.fonts.ready.then(function(){
+    var used=getComputedStyle(span).fontFamily;
+    B('E3','fonts_ready|used='+used.slice(0,40));
+    document.body.removeChild(span);
+    document.head.removeChild(style);
+  });
+  eR.push('E3:injected');
+}catch(e){eR.push('E3:ERR:'+e.message.slice(0,60));}
+
+B('E',eR.join('||'));
+log('E: '+eR.join(' | '));
+</script>
+
+<!-- F: Cache API deep -->
+<script>
+log('\n--- F: Cache API deep ---');
+var fR=[];
+
+// F1: Open cache, store, retrieve, match
+try{
+  if(typeof caches!=='undefined'){
+    caches.open('p1247test').then(function(cache){
+      // Store a response
+      var resp=new Response('test_data_12345',{
+        headers:{'Content-Type':'text/plain','X-Custom':'secret'}
+      });
+      return cache.put('/fake-resource',resp).then(function(){
+        return cache.match('/fake-resource');
+      }).then(function(matched){
+        if(matched){
+          return matched.text().then(function(txt){
+            B('F1','stored_matched|text='+txt+'|type='+matched.type+'|status='+matched.status);
+            return caches.delete('p1247test');
+          });
+        }else{
+          B('F1','no_match');
+          return caches.delete('p1247test');
+        }
+      });
+    }).catch(function(e){
+      B('F1','cache_err:'+e.message.slice(0,60));
+    });
+    fR.push('F1:attempted');
+  }else{
+    fR.push('F1:no_caches');
+  }
+}catch(e){fR.push('F1:ERR:'+e.message.slice(0,60));}
+
+// F2: Cache with large data
+try{
+  if(typeof caches!=='undefined'){
+    caches.open('p1247big').then(function(cache){
+      var bigData=new ArrayBuffer(1024*1024); // 1MB
+      new Uint8Array(bigData).fill(0x42);
+      var resp=new Response(bigData);
+      return cache.put('/big-resource',resp).then(function(){
+        return cache.match('/big-resource');
+      }).then(function(m){
+        if(m){
+          return m.arrayBuffer().then(function(ab){
+            var check=new Uint8Array(ab);
+            B('F2','big_cache|size='+ab.byteLength+'|first='+check[0]+'|last='+check[check.length-1]);
+            return caches.delete('p1247big');
+          });
+        }
+      });
+    }).catch(function(e){
+      B('F2','big_err:'+e.message.slice(0,60));
+    });
+  }
+}catch(e){fR.push('F2:ERR:'+e.message.slice(0,60));}
+
+B('F',fR.join('||'));
+log('F: '+fR.join(' | '));
+</script>
+
+<!-- FINAL -->
+<script>
+setTimeout(function(){
+  log('\n=== P1247 COMPLETE ===');
+  B('DONE','all');
+}, 10000);
+</script>
+
+</body>
+</html>

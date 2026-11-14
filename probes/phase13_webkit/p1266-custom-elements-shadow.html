@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1266</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1266-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1266: CUSTOM ELEMENTS + SHADOW DOM ===');
+B('START','P1266');
+</script>
+
+<!-- A: Custom Element lifecycle re-entrancy — connectedCallback removes self -->
+<script>
+log('\n--- A: CE connectedCallback self-removal ---');
+(function(){
+  try{
+    var connectCount=0;
+    var disconnectCount=0;
+
+    customElements.define('x-selfremove', class extends HTMLElement {
+      connectedCallback(){
+        connectCount++;
+        if(connectCount<=3){
+          // Remove self during connection!
+          if(this.parentNode) this.parentNode.removeChild(this);
+        }
+      }
+      disconnectedCallback(){
+        disconnectCount++;
+      }
+    });
+
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(container);
+
+    var el=document.createElement('x-selfremove');
+    container.appendChild(el); // triggers connectedCallback which removes it
+
+    B('A1','connect='+connectCount+'|disconnect='+disconnectCount+
+      '|in_dom='+container.contains(el));
+
+    // Try re-adding
+    container.appendChild(el);
+    B('A2','connect='+connectCount+'|disconnect='+disconnectCount+
+      '|in_dom='+container.contains(el));
+
+    container.parentNode.removeChild(container);
+  }catch(e){B('A0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- B: CE connectedCallback replaces innerHTML (destroys siblings) -->
+<script>
+log('\n--- B: CE connectedCallback destroys siblings ---');
+(function(){
+  try{
+    var cbLog=[];
+    customElements.define('x-destroyer', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('connect:'+this.id);
+        if(this.id==='d2' && this.parentNode){
+          // When d2 is connected, destroy all siblings
+          this.parentNode.innerHTML='<span>REPLACED</span>';
+        }
+      }
+      disconnectedCallback(){
+        cbLog.push('disconnect:'+this.id);
+      }
+    });
+
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(container);
+
+    // Create 5 elements, insert them all at once via innerHTML
+    container.innerHTML=
+      '<x-destroyer id="d1"></x-destroyer>'+
+      '<x-destroyer id="d2"></x-destroyer>'+
+      '<x-destroyer id="d3"></x-destroyer>'+
+      '<x-destroyer id="d4"></x-destroyer>'+
+      '<x-destroyer id="d5"></x-destroyer>';
+
+    B('B1','log='+cbLog.join(';')+
+      '|children='+container.childNodes.length+
+      '|html='+container.innerHTML.slice(0,100));
+
+    container.parentNode.removeChild(container);
+  }catch(e){B('B0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- C: CE adoptedCallback fires when moving between documents -->
+<script>
+log('\n--- C: CE adoptedCallback cross-document ---');
+(function(){
+  try{
+    var adoptLog=[];
+    customElements.define('x-adopted', class extends HTMLElement {
+      adoptedCallback(oldDoc, newDoc){
+        adoptLog.push('adopted:'+!!oldDoc+':'+!!newDoc);
+        // During adoption, try to access old document
+        try{
+          var oldBody=oldDoc.body;
+          adoptLog.push('oldBody='+!!oldBody);
+        }catch(e){
+          adoptLog.push('oldBody_err:'+e.name);
+        }
+      }
+      connectedCallback(){ adoptLog.push('connected'); }
+      disconnectedCallback(){ adoptLog.push('disconnected'); }
+    });
+
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(container);
+
+    var el=document.createElement('x-adopted');
+    el.textContent='adopt_me';
+    container.appendChild(el);
+
+    // Create iframe
+    var ifr=document.createElement('iframe');
+    ifr.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+    document.body.appendChild(ifr);
+    ifr.contentDocument.open();
+    ifr.contentDocument.write('<html><body></body></html>');
+    ifr.contentDocument.close();
+
+    B('C1','before_adopt|log='+adoptLog.join(';'));
+
+    // Adopt the element into iframe document
+    var adopted=ifr.contentDocument.adoptNode(el);
+    ifr.contentDocument.body.appendChild(adopted);
+
+    B('C2','after_adopt|log='+adoptLog.join(';')+
+      '|in_iframe='+(adopted.ownerDocument===ifr.contentDocument)+
+      '|in_main='+container.contains(el));
+
+    // Now adopt BACK to main document
+    var readopted=document.adoptNode(adopted);
+    container.appendChild(readopted);
+
+    B('C3','readopted|log='+adoptLog.join(';')+
+      '|back_in_main='+container.contains(readopted));
+
+    // Rapid cross-document adoption cycles
+    for(var i=0;i<20;i++){
+      ifr.contentDocument.adoptNode(readopted);
+      ifr.contentDocument.body.appendChild(readopted);
+      document.adoptNode(readopted);
+      container.appendChild(readopted);
+    }
+    B('C4','20_cycles|log_len='+adoptLog.length);
+
+    container.parentNode.removeChild(container);
+    ifr.parentNode.removeChild(ifr);
+  }catch(e){B('C0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- D: Shadow DOM + slotting + mutation -->
+<script>
+log('\n--- D: Shadow DOM slotting ---');
+(function(){
+  try{
+    customElements.define('x-shadow', class extends HTMLElement {
+      constructor(){
+        super();
+        this.attachShadow({mode:'open'});
+        this.shadowRoot.innerHTML='<style>:host{display:block}</style><slot name="s1"></slot><div id="inner">SHADOW</div><slot></slot>';
+      }
+    });
+
+    var host=document.createElement('x-shadow');
+    host.style.cssText='position:absolute;left:-9999px';
+    host.innerHTML='<span slot="s1">SLOTTED_1</span><span>DEFAULT_SLOT</span>';
+    document.body.appendChild(host);
+
+    B('D1','shadowRoot='+!!host.shadowRoot+
+      '|mode='+host.shadowRoot.mode+
+      '|inner='+host.shadowRoot.getElementById('inner').textContent);
+
+    // Query slotted elements
+    var slot1=host.shadowRoot.querySelector('slot[name="s1"]');
+    var assigned=slot1.assignedNodes();
+    B('D2','slot1_assigned='+assigned.length+
+      '|text='+((assigned[0]&&assigned[0].textContent)||'none'));
+
+    // Mutate light DOM — does slot update?
+    var newSlotted=document.createElement('b');
+    newSlotted.setAttribute('slot','s1');
+    newSlotted.textContent='NEW_SLOTTED';
+    host.appendChild(newSlotted);
+
+    var assigned2=slot1.assignedNodes();
+    B('D3','after_mutation|assigned='+assigned2.length+
+      '|texts='+assigned2.map(function(n){return n.textContent;}).join(','));
+
+    // Remove slotted element while it's assigned
+    host.removeChild(newSlotted);
+    var assigned3=slot1.assignedNodes();
+    B('D4','after_remove|assigned='+assigned3.length);
+
+    // Event that crosses shadow boundary
+    var eventLog=[];
+    host.addEventListener('click', function(e){
+      eventLog.push('host:'+e.target.tagName+':composed='+e.composed);
+    });
+    host.shadowRoot.addEventListener('click', function(e){
+      eventLog.push('shadow:'+e.target.tagName);
+    });
+
+    // Dispatch click on inner shadow element
+    var inner=host.shadowRoot.getElementById('inner');
+    inner.dispatchEvent(new Event('click', {bubbles:true, composed:true}));
+    B('D5','event_log='+eventLog.join(';'));
+
+    host.parentNode.removeChild(host);
+  }catch(e){B('D0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- E: CE disconnectedCallback modifies tree during removal -->
+<script>
+log('\n--- E: CE disconnectedCallback tree mutation ---');
+(function(){
+  try{
+    var cbLog=[];
+    customElements.define('x-ondisconnect', class extends HTMLElement {
+      disconnectedCallback(){
+        cbLog.push('dc:'+this.id);
+        // During disconnection, try to add a NEW element to the parent
+        // (parent might be in inconsistent state during batch removal)
+        try{
+          if(this.id==='od2'){
+            var zombie=document.createElement('div');
+            zombie.id='zombie';
+            zombie.textContent='ZOMBIE';
+            // Try adding to the document body (not the removed parent)
+            document.body.appendChild(zombie);
+            cbLog.push('zombie_added');
+          }
+        }catch(e){
+          cbLog.push('zombie_err:'+e.name);
+        }
+      }
+      connectedCallback(){
+        cbLog.push('cc:'+this.id);
+      }
+    });
+
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    container.innerHTML=
+      '<x-ondisconnect id="od1"></x-ondisconnect>'+
+      '<x-ondisconnect id="od2"></x-ondisconnect>'+
+      '<x-ondisconnect id="od3"></x-ondisconnect>';
+    document.body.appendChild(container);
+
+    B('E1','before|log='+cbLog.join(';'));
+
+    // Remove container (triggers all disconnectedCallbacks)
+    document.body.removeChild(container);
+
+    B('E2','after|log='+cbLog.join(';')+
+      '|zombie_exists='+!!document.getElementById('zombie'));
+
+    // Clean up zombie if it exists
+    var z=document.getElementById('zombie');
+    if(z) z.parentNode.removeChild(z);
+
+  }catch(e){B('E0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- F: Range + adoption + Custom Element -->
+<script>
+log('\n--- F: Range + adoptNode ---');
+(function(){
+  try{
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    container.innerHTML='<p>one</p><p>two</p><p>three</p><p>four</p><p>five</p>';
+    document.body.appendChild(container);
+
+    var range=document.createRange();
+    range.setStart(container.childNodes[1],0);
+    range.setEnd(container.childNodes[3],0);
+
+    B('F1','range='+range.toString()+'|startC='+range.startContainer.nodeName);
+
+    // Remove start node
+    container.removeChild(container.childNodes[1]);
+    B('F2','removed_start|collapsed='+range.collapsed+
+      '|str='+range.toString()+
+      '|nodes='+container.childNodes.length);
+
+    // Extract contents
+    try{
+      var frag=range.extractContents();
+      B('F3','extracted|frag_children='+frag.childNodes.length+
+        '|cont_children='+container.childNodes.length);
+    }catch(e){
+      B('F3','extract_err:'+e.name);
+    }
+
+    // Adopt node across documents with active range
+    var ifr=document.createElement('iframe');
+    ifr.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+    document.body.appendChild(ifr);
+    ifr.contentDocument.open();
+    ifr.contentDocument.write('<html><body></body></html>');
+    ifr.contentDocument.close();
+
+    var range2=document.createRange();
+    container.innerHTML='<span>A</span><span>B</span><span>C</span>';
+    range2.selectNode(container.childNodes[1]);
+
+    var adopted=ifr.contentDocument.adoptNode(container.childNodes[1]);
+    B('F4','adopted|range2_collapsed='+range2.collapsed+
+      '|owner='+(adopted.ownerDocument===ifr.contentDocument));
+
+    container.parentNode.removeChild(container);
+    ifr.parentNode.removeChild(ifr);
+  }catch(e){B('F0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- G: TreeWalker + NodeIterator over mutating tree (fixed from P1265) -->
+<script>
+log('\n--- G: TreeWalker + mutation ---');
+(function(){
+  try{
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    for(var i=0;i<20;i++){
+      var p=document.createElement('p');
+      p.textContent='n'+i;
+      container.appendChild(p);
+    }
+    document.body.appendChild(container);
+
+    // TreeWalker: remove next sibling during walk
+    var tw=document.createTreeWalker(container,NodeFilter.SHOW_ELEMENT);
+    var visited=[];
+    var node=tw.firstChild();
+    while(node && visited.length<30){
+      visited.push(node.textContent);
+      if(node.nextSibling) container.removeChild(node.nextSibling);
+      node=tw.nextNode();
+    }
+    B('G1','tw_visited='+visited.length+'|vals='+visited.slice(0,10).join(','));
+
+    // NodeIterator: insert before current during walk
+    container.innerHTML='';
+    for(var i=0;i<10;i++){
+      var s=document.createElement('span');
+      s.textContent='i'+i;
+      container.appendChild(s);
+    }
+
+    var ni=document.createNodeIterator(container,NodeFilter.SHOW_ELEMENT);
+    var visited2=[];
+    var n=ni.nextNode(); // container
+    n=ni.nextNode(); // first child
+    var insertCount=0;
+    while(n && visited2.length<30){
+      visited2.push(n.textContent);
+      if(visited2.length===3 && insertCount===0){
+        insertCount++;
+        var ins=document.createElement('b');
+        ins.textContent='INS';
+        container.insertBefore(ins, n);
+      }
+      n=ni.nextNode();
+    }
+    B('G2','ni_visited='+visited2.length+'|vals='+visited2.slice(0,12).join(','));
+
+    container.parentNode.removeChild(container);
+  }catch(e){B('G0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- H: MutationObserver with capped iterations (fixed from P1265) -->
+<script>
+log('\n--- H: MutationObserver capped ---');
+(function(){
+  try{
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(container);
+
+    var cbCount=0;
+    var MAX=20; // Hard cap
+    var obs=new MutationObserver(function(muts){
+      cbCount++;
+      if(cbCount<MAX){
+        container.appendChild(document.createElement('span'));
+        if(container.childNodes.length>10){
+          container.removeChild(container.firstChild);
+        }
+      }
+    });
+    obs.observe(container,{childList:true});
+    container.appendChild(document.createElement('div')); // Trigger
+
+    setTimeout(function(){
+      obs.disconnect();
+      B('H1','callbacks='+cbCount+'|children='+container.childNodes.length);
+
+      // Test: observer that replaces innerHTML in callback
+      var obs2count=0;
+      var obs2=new MutationObserver(function(muts){
+        obs2count++;
+        if(obs2count===1){
+          container.innerHTML='<b>REPLACED_IN_OBSERVER</b>';
+        }else if(obs2count===2){
+          // Second callback from the innerHTML replacement
+          B('H2','obs2_count='+obs2count+
+            '|html='+container.innerHTML.slice(0,50));
+        }
+        if(obs2count>5) obs2.disconnect(); // Safety cap
+      });
+      obs2.observe(container,{childList:true,subtree:true});
+      container.innerHTML='<span>trigger</span>';
+
+      setTimeout(function(){
+        obs2.disconnect();
+        B('H3','final_obs2='+obs2count);
+        container.parentNode.removeChild(container);
+      },200);
+    },200);
+
+  }catch(e){B('H0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1266 COMPLETE ===');
+}, 3000);
+</script>
+
+</body>
+</html>

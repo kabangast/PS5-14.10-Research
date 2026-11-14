@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>P1268</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font:11px/1.4 monospace;padding:8px;overflow-y:auto}
+#log{white-space:pre-wrap;word-break:break-all}
+</style>
+</head>
+<body>
+<div id="log"></div>
+
+<script>
+var L=document.getElementById('log');
+function log(s){L.textContent+=s+'\n';}
+function B(tag,data){
+  try{
+    var u='/beacon.php?tag=P1268-'+encodeURIComponent(tag);
+    if(data)u+='&data='+encodeURIComponent(String(data).slice(0,900));
+    u+='&t='+Date.now();
+    var x=new XMLHttpRequest();x.open('GET',u,false);x.send(null);
+  }catch(e){}
+}
+log('=== P1268: ELEMENTINTERNALS DEEP DIVE ===');
+B('START','P1268');
+</script>
+
+<!-- A: ElementInternals full API surface probe -->
+<script>
+log('\n--- A: ElementInternals API surface ---');
+(function(){
+  try{
+    customElements.define('x-probe-a', class extends HTMLElement {
+      static formAssociated=true;
+      constructor(){super();this._i=this.attachInternals();}
+    });
+
+    var el=document.createElement('x-probe-a');
+    var i=el._i;
+
+    // Enumerate all properties on ElementInternals
+    var props=[];
+    for(var k in i) props.push(k);
+    var ownProps=Object.getOwnPropertyNames(Object.getPrototypeOf(i));
+    B('A1','for_in='+props.slice(0,30).join(',')+
+      '|own='+ownProps.slice(0,30).join(','));
+
+    // Test each API
+    var results=[];
+
+    // Shadow root
+    try{ results.push('shadowRoot='+(i.shadowRoot===null?'null':typeof i.shadowRoot)); }
+    catch(e){ results.push('shadowRoot_err:'+e.name); }
+
+    // Form
+    try{ results.push('form='+(i.form===null?'null':typeof i.form)); }
+    catch(e){ results.push('form_err:'+e.name); }
+
+    // Validation
+    try{ results.push('willValidate='+i.willValidate); }
+    catch(e){ results.push('willValidate_err:'+e.name); }
+    try{ results.push('validity='+JSON.stringify(i.validity&&{valid:i.validity.valid,cMissing:i.validity.valueMissing})); }
+    catch(e){ results.push('validity_err:'+e.name); }
+    try{ results.push('validationMessage='+i.validationMessage); }
+    catch(e){ results.push('validationMessage_err:'+e.name); }
+
+    // States (CustomStateSet)
+    try{
+      var s=i.states;
+      results.push('states='+typeof s+'|size='+(s?s.size:'?'));
+      if(s&&s.add){
+        s.add('--loading');
+        s.add('--active');
+        results.push('states_after_add='+s.size);
+        results.push('has_loading='+s.has('--loading'));
+        s.delete('--loading');
+        results.push('after_delete='+s.size);
+      }
+    }catch(e){ results.push('states_err:'+e.name+':'+e.message.slice(0,50)); }
+
+    // Labels
+    try{ results.push('labels='+i.labels+'|len='+(i.labels?i.labels.length:'?')); }
+    catch(e){ results.push('labels_err:'+e.name); }
+
+    B('A2',results.join('|'));
+
+    // ARIA properties
+    var ariaResults=[];
+    var ariaProps=['role','ariaLabel','ariaDescribedBy','ariaChecked','ariaDisabled',
+      'ariaExpanded','ariaHidden','ariaLive','ariaRequired','ariaSelected','ariaValueNow',
+      'ariaValueMin','ariaValueMax','ariaValueText','ariaAutoComplete','ariaBusy',
+      'ariaOrientation','ariaPlaceholder','ariaSort'];
+    for(var j=0;j<ariaProps.length;j++){
+      var p=ariaProps[j];
+      try{
+        var v=i[p];
+        i[p]='test_'+p;
+        ariaResults.push(p+'='+v+'>'+i[p]);
+      }catch(e){
+        ariaResults.push(p+'_err');
+      }
+    }
+    B('A3','aria='+ariaResults.slice(0,15).join(';'));
+
+    // setFormValue with different types
+    var form=document.createElement('form');
+    form.style.cssText='position:absolute;left:-9999px';
+    form.appendChild(el);
+    el.setAttribute('name','probe_field');
+    document.body.appendChild(form);
+
+    var valResults=[];
+    try{ i.setFormValue('string_val'); valResults.push('str=ok'); }catch(e){valResults.push('str_err:'+e.name);}
+    try{ i.setFormValue(null); valResults.push('null=ok'); }catch(e){valResults.push('null_err:'+e.name);}
+    try{ i.setFormValue(new FormData()); valResults.push('fd=ok'); }catch(e){valResults.push('fd_err:'+e.name);}
+    try{ i.setFormValue(new File(['data'],'test.txt')); valResults.push('file=ok'); }catch(e){valResults.push('file_err:'+e.name);}
+
+    B('A4','formValue='+valResults.join('|'));
+
+    // Validation methods
+    var vResults=[];
+    try{ i.setValidity({valueMissing:true},'Field required'); vResults.push('setValidity=ok'); }
+    catch(e){vResults.push('setValidity_err:'+e.name);}
+    try{ vResults.push('checkValidity='+el.checkValidity()); }
+    catch(e){vResults.push('checkValidity_err:'+e.name);}
+    try{ vResults.push('reportValidity='+el.reportValidity()); }
+    catch(e){vResults.push('reportValidity_err:'+e.name);}
+    try{ i.setValidity({}); vResults.push('clear=ok'); }
+    catch(e){vResults.push('clear_err:'+e.name);}
+    try{ vResults.push('valid_after_clear='+i.validity.valid); }
+    catch(e){vResults.push('valid_err:'+e.name);}
+
+    B('A5','validation='+vResults.join('|'));
+
+    form.parentNode.removeChild(form);
+  }catch(e){B('A0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- B: ElementInternals + adoptNode across documents -->
+<script>
+log('\n--- B: EI + adoptNode cross-document ---');
+(function(){
+  try{
+    var cbLog=[];
+    customElements.define('x-ei-adopt', class extends HTMLElement {
+      static formAssociated=true;
+      constructor(){
+        super();
+        this._i=this.attachInternals();
+      }
+      connectedCallback(){ cbLog.push('cc'); }
+      disconnectedCallback(){ cbLog.push('dc'); }
+      adoptedCallback(old,nw){ cbLog.push('adopted'); }
+      formAssociatedCallback(f){ cbLog.push('fa:'+(f?f.id:'null')); }
+    });
+
+    var form=document.createElement('form');
+    form.id='mainform';
+    form.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(form);
+
+    var el=document.createElement('x-ei-adopt');
+    el.setAttribute('name','adoptfield');
+    form.appendChild(el);
+
+    B('B1','initial|log='+cbLog.join(';')+
+      '|form='+!!el._i.form+
+      '|willValidate='+el._i.willValidate);
+
+    // Set internals state before adoption
+    el._i.setFormValue('pre_adopt_value');
+    try{el._i.states.add('--before-adopt');}catch(e){}
+    el._i.setValidity({customError:true},'custom error');
+
+    // Create iframe and adopt
+    var ifr=document.createElement('iframe');
+    ifr.style.cssText='width:1px;height:1px;position:absolute;left:-9999px';
+    document.body.appendChild(ifr);
+    ifr.contentDocument.open();
+    ifr.contentDocument.write('<html><body><form id="ifrform"></form></body></html>');
+    ifr.contentDocument.close();
+
+    var adopted=ifr.contentDocument.adoptNode(el);
+    B('B2','after_adopt|log='+cbLog.join(';'));
+
+    // Check internals state after adoption
+    try{
+      B('B3','internals_after_adopt|form='+(el._i.form?el._i.form.id:'null')+
+        '|willValidate='+el._i.willValidate+
+        '|valid='+el._i.validity.valid+
+        '|msg='+el._i.validationMessage);
+    }catch(e){
+      B('B3','internals_err:'+e.name+':'+e.message.slice(0,60));
+    }
+
+    // Add to iframe's form
+    ifr.contentDocument.getElementById('ifrform').appendChild(adopted);
+    B('B4','in_iframe_form|log='+cbLog.join(';'));
+
+    // Check internals again — does it reference the iframe's form?
+    try{
+      B('B5','iframe_form|form='+(el._i.form?el._i.form.id:'null')+
+        '|willValidate='+el._i.willValidate);
+    }catch(e){
+      B('B5','iframe_form_err:'+e.name);
+    }
+
+    // Adopt back and destroy iframe
+    document.adoptNode(adopted);
+    form.appendChild(adopted);
+
+    // Destroy iframe while internals may still reference its form
+    ifr.parentNode.removeChild(ifr);
+
+    try{
+      B('B6','after_iframe_destroy|form='+(el._i.form?el._i.form.id:'null')+
+        '|valid='+el._i.validity.valid+
+        '|log='+cbLog.join(';'));
+    }catch(e){
+      B('B6','destroy_err:'+e.name+':'+e.message.slice(0,60));
+    }
+
+    form.parentNode.removeChild(form);
+  }catch(e){B('B0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- C: Form submission during lifecycle callbacks -->
+<script>
+log('\n--- C: Form submission during callbacks ---');
+(function(){
+  try{
+    var cbLog=[];
+    customElements.define('x-submit-abuse', class extends HTMLElement {
+      static formAssociated=true;
+      constructor(){super();this._i=this.attachInternals();}
+      connectedCallback(){
+        cbLog.push('cc');
+        this._i.setFormValue('connected_value');
+      }
+      formResetCallback(){
+        cbLog.push('reset');
+        // During reset, try to submit the form!
+        try{
+          if(this._i.form){
+            this._i.setFormValue('reset_value');
+            // requestSubmit triggers validation
+            this._i.form.requestSubmit();
+            cbLog.push('submit_during_reset_ok');
+          }
+        }catch(e){
+          cbLog.push('submit_err:'+e.name);
+        }
+      }
+      formAssociatedCallback(f){
+        cbLog.push('fa:'+(f?'form':'null'));
+        // During form association, modify own validation
+        if(f){
+          this._i.setValidity({tooLong:true},'too long during assoc');
+          cbLog.push('validity_set_during_assoc');
+        }
+      }
+    });
+
+    var submitted=false;
+    var form=document.createElement('form');
+    form.id='submitform';
+    form.style.cssText='position:absolute;left:-9999px';
+    form.addEventListener('submit',function(e){
+      e.preventDefault();
+      submitted=true;
+      cbLog.push('form_submitted');
+    });
+    document.body.appendChild(form);
+
+    var el=document.createElement('x-submit-abuse');
+    el.setAttribute('name','abusefield');
+    form.appendChild(el);
+
+    B('C1','after_add|log='+cbLog.join(';')+
+      '|submitted='+submitted);
+
+    // Reset the form
+    form.reset();
+    B('C2','after_reset|log='+cbLog.join(';')+
+      '|submitted='+submitted);
+
+    // Try requestSubmit normally
+    try{
+      form.requestSubmit();
+      B('C3','manual_submit|submitted='+submitted+
+        '|log='+cbLog.join(';'));
+    }catch(e){
+      B('C3','submit_err:'+e.name);
+    }
+
+    form.parentNode.removeChild(form);
+  }catch(e){B('C0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- D: Shadow DOM + form participation -->
+<script>
+log('\n--- D: Shadow DOM form participation ---');
+(function(){
+  try{
+    customElements.define('x-shadow-form', class extends HTMLElement {
+      static formAssociated=true;
+      constructor(){
+        super();
+        this._i=this.attachInternals();
+        this.attachShadow({mode:'open'});
+        this.shadowRoot.innerHTML='<input type="text" value="shadow_input"><slot></slot>';
+      }
+      connectedCallback(){
+        this._i.setFormValue('shadow_element_value');
+      }
+    });
+
+    var form=document.createElement('form');
+    form.id='shadowform';
+    form.style.cssText='position:absolute;left:-9999px';
+    document.body.appendChild(form);
+
+    var el=document.createElement('x-shadow-form');
+    el.setAttribute('name','shadowfield');
+    form.appendChild(el);
+
+    // Check: does the shadow input participate in the form?
+    var fd=new FormData(form);
+    var entries=[];
+    fd.forEach(function(v,k){entries.push(k+'='+v);});
+    B('D1','formdata='+entries.join(';'));
+
+    // Add a named input inside shadow DOM
+    var shadowInput=el.shadowRoot.querySelector('input');
+    shadowInput.name='shadow_inner';
+
+    fd=new FormData(form);
+    entries=[];
+    fd.forEach(function(v,k){entries.push(k+'='+v);});
+    B('D2','after_name|formdata='+entries.join(';'));
+
+    // Add light DOM child (slotted) with name
+    var slotted=document.createElement('input');
+    slotted.type='hidden';
+    slotted.name='slotted_field';
+    slotted.value='slotted_value';
+    el.appendChild(slotted);
+
+    fd=new FormData(form);
+    entries=[];
+    fd.forEach(function(v,k){entries.push(k+'='+v);});
+    B('D3','with_slotted|formdata='+entries.join(';'));
+
+    // What about internals shadowRoot reference?
+    try{
+      B('D4','internals_shadow='+(el._i.shadowRoot===el.shadowRoot)+
+        '|mode='+(el._i.shadowRoot?el._i.shadowRoot.mode:'null'));
+    }catch(e){
+      B('D4','internals_shadow_err:'+e.name);
+    }
+
+    form.parentNode.removeChild(form);
+  }catch(e){B('D0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- E: History API + DOM mutation during popstate -->
+<script>
+log('\n--- E: History API ---');
+(function(){
+  try{
+    var popLog=[];
+    window.addEventListener('popstate',function(e){
+      popLog.push('pop:'+JSON.stringify(e.state));
+    });
+
+    // Push states
+    try{
+      history.pushState({page:1},'','#p1');
+      history.pushState({page:2},'','#p2');
+      history.pushState({page:3},'','#p3');
+      B('E1','pushed_3|loc='+location.hash);
+    }catch(e){
+      B('E1','push_err:'+e.name+':'+e.message.slice(0,60));
+    }
+
+    // replaceState
+    try{
+      history.replaceState({page:3,extra:'replaced'},'','#p3r');
+      B('E2','replaced|loc='+location.hash);
+    }catch(e){
+      B('E2','replace_err:'+e.name);
+    }
+
+    // Go back
+    try{
+      history.back();
+      setTimeout(function(){
+        B('E3','after_back|loc='+location.hash+'|pops='+popLog.join(';'));
+
+        history.back();
+        setTimeout(function(){
+          B('E4','after_back2|loc='+location.hash+'|pops='+popLog.join(';'));
+
+          // Clean up — go forward to where we were
+          history.go(2);
+          setTimeout(function(){
+            B('E5','restored|loc='+location.hash+'|pops='+popLog.join(';'));
+          },100);
+        },100);
+      },100);
+    }catch(e){
+      B('E3','back_err:'+e.name);
+    }
+
+  }catch(e){B('E0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- F: Blob URL lifecycle -->
+<script>
+log('\n--- F: Blob URL lifecycle ---');
+(function(){
+  try{
+    // Create blob and URL
+    var blob=new Blob(['Hello Blob'],{type:'text/plain'});
+    var url=URL.createObjectURL(blob);
+    B('F1','url='+url.slice(0,60)+'|blob_size='+blob.size);
+
+    // Read via XHR
+    try{
+      var xhr=new XMLHttpRequest();
+      xhr.open('GET',url,false);
+      xhr.send();
+      B('F2','read_ok|status='+xhr.status+'|text='+xhr.responseText);
+    }catch(e){
+      B('F2','read_err:'+e.name);
+    }
+
+    // Revoke URL
+    URL.revokeObjectURL(url);
+
+    // Try to read revoked URL
+    try{
+      var xhr2=new XMLHttpRequest();
+      xhr2.open('GET',url,false);
+      xhr2.send();
+      B('F3','revoked_read|status='+xhr2.status+'|len='+xhr2.responseText.length+
+        '|VULN='+(xhr2.status===200));
+    }catch(e){
+      B('F3','revoked_err:'+e.name);
+    }
+
+    // Double revoke
+    try{
+      URL.revokeObjectURL(url);
+      B('F4','double_revoke=ok');
+    }catch(e){
+      B('F4','double_revoke_err:'+e.name);
+    }
+
+    // Many blob URLs — test for counter overflow
+    var urls=[];
+    for(var i=0;i<100;i++){
+      urls.push(URL.createObjectURL(new Blob([i+''])));
+    }
+    B('F5','created_100|first='+urls[0].slice(-20)+'|last='+urls[99].slice(-20));
+
+    // Revoke all
+    for(var i=0;i<100;i++) URL.revokeObjectURL(urls[i]);
+
+    // Blob with huge size
+    try{
+      var parts=[];
+      for(var i=0;i<100;i++) parts.push(new ArrayBuffer(65536));
+      var bigBlob=new Blob(parts);
+      var bigUrl=URL.createObjectURL(bigBlob);
+      B('F6','big_blob|size='+bigBlob.size+'|url='+bigUrl.slice(-20));
+      URL.revokeObjectURL(bigUrl);
+    }catch(e){
+      B('F6','big_err:'+e.name);
+    }
+
+  }catch(e){B('F0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- G: Performance API + timing -->
+<script>
+log('\n--- G: Performance API ---');
+(function(){
+  try{
+    // Resolution test
+    var times=[];
+    for(var i=0;i<20;i++) times.push(performance.now());
+    var diffs=[];
+    for(var i=1;i<times.length;i++) diffs.push((times[i]-times[i-1]).toFixed(6));
+    B('G1','resolution|diffs='+diffs.slice(0,10).join(','));
+
+    // Performance entries
+    var navEntries=performance.getEntriesByType('navigation');
+    B('G2','nav_entries='+navEntries.length+
+      (navEntries[0]?'|type='+navEntries[0].type+'|dur='+navEntries[0].duration.toFixed(2):''));
+
+    // Resource entries
+    var resEntries=performance.getEntriesByType('resource');
+    B('G3','resource_entries='+resEntries.length+
+      '|first='+(resEntries[0]?resEntries[0].name.slice(-30):'none'));
+
+    // Can we add marks/measures?
+    try{
+      performance.mark('test_start');
+      for(var i=0;i<1000;i++){var x=Math.random();}
+      performance.mark('test_end');
+      performance.measure('test_measure','test_start','test_end');
+      var m=performance.getEntriesByName('test_measure');
+      B('G4','mark_measure=ok|duration='+m[0].duration.toFixed(4));
+    }catch(e){
+      B('G4','mark_err:'+e.name);
+    }
+
+    // PerformanceObserver
+    try{
+      var observed=[];
+      var obs=new PerformanceObserver(function(list){
+        list.getEntries().forEach(function(e){
+          observed.push(e.name+':'+e.duration.toFixed(2));
+        });
+      });
+      obs.observe({entryTypes:['measure']});
+      performance.mark('obs_start');
+      performance.mark('obs_end');
+      performance.measure('obs_measure','obs_start','obs_end');
+      setTimeout(function(){
+        obs.disconnect();
+        B('G5','observer|observed='+observed.join(';'));
+      },100);
+    }catch(e){
+      B('G5','observer_err:'+e.name);
+    }
+
+  }catch(e){B('G0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<!-- H: document.execCommand + contentEditable abuse -->
+<script>
+log('\n--- H: execCommand + contentEditable ---');
+(function(){
+  try{
+    // Feature check
+    var cmds=['bold','italic','insertText','insertHTML','createLink',
+      'delete','forwardDelete','selectAll','copy','cut','paste',
+      'undo','redo','insertImage','formatBlock','insertOrderedList',
+      'insertUnorderedList','indent','outdent','justifyCenter'];
+
+    var container=document.createElement('div');
+    container.contentEditable='true';
+    container.innerHTML='<p>Hello <b>World</b> Test</p>';
+    container.style.cssText='position:absolute;left:-9999px;width:200px';
+    document.body.appendChild(container);
+    container.focus();
+
+    // Select all text
+    var sel=window.getSelection();
+    sel.selectAllChildren(container);
+
+    var results=[];
+    // Test which commands are supported
+    for(var i=0;i<cmds.length;i++){
+      try{
+        var supported=document.queryCommandSupported(cmds[i]);
+        results.push(cmds[i]+'='+supported);
+      }catch(e){
+        results.push(cmds[i]+'=err');
+      }
+    }
+    B('H1','commands='+results.join(';'));
+
+    // Try insertHTML (dangerous — can inject arbitrary content)
+    try{
+      document.execCommand('insertHTML',false,'<img src=x onerror="B(\'H_XSS\',\'fired\')">');
+      B('H2','insertHTML|html='+container.innerHTML.slice(0,100));
+    }catch(e){
+      B('H2','insertHTML_err:'+e.name);
+    }
+
+    // Try insertText to overwrite
+    try{
+      sel.selectAllChildren(container);
+      document.execCommand('insertText',false,'REPLACED');
+      B('H3','insertText|html='+container.innerHTML.slice(0,100));
+    }catch(e){
+      B('H3','insertText_err:'+e.name);
+    }
+
+    // Undo
+    try{
+      document.execCommand('undo');
+      B('H4','undo|html='+container.innerHTML.slice(0,100));
+    }catch(e){
+      B('H4','undo_err:'+e.name);
+    }
+
+    // createLink
+    try{
+      sel.selectAllChildren(container);
+      document.execCommand('createLink',false,'javascript:alert(1)');
+      B('H5','createLink|html='+container.innerHTML.slice(0,100));
+    }catch(e){
+      B('H5','createLink_err:'+e.name);
+    }
+
+    container.parentNode.removeChild(container);
+  }catch(e){B('H0','err:'+e.name+':'+e.message.slice(0,120));}
+})();
+</script>
+
+<script>
+setTimeout(function(){
+  B('DONE','all');
+  log('\n=== P1268 COMPLETE ===');
+}, 4000);
+</script>
+
+</body>
+</html>
